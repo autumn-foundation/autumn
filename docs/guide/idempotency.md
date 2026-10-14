@@ -265,8 +265,8 @@ Responses that modify the Autumn `Session` are cached after the outer
 login, checkout flash, or session rotation receives the finalized cached
 response instead of re-entering the mutating handler.
 
-If the handler changes the tenant in the session, Autumn locks the retry's
-key before it saves the session. A request that arrives during the save gets
+If the handler changes the tenant in the session, Autumn locks the key that a
+retry will use before it saves the session. A request that arrives during the save gets
 `409`. It does not run the handler again.
 
 Routes mounted through `AppBuilder::merge()` or `AppBuilder::nest()` are raw

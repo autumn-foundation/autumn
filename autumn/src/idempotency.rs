@@ -1372,6 +1372,8 @@ struct InFlightLock {
     store: Arc<dyn IdempotencyStore>,
     key: String,
     owner: String,
+    /// How long the store keeps the lock. Alias locks use the same time.
+    in_flight_ttl: Duration,
 }
 
 impl InFlightLock {
@@ -1424,9 +1426,8 @@ struct DeferredIdempotencyState {
     storage_key: String,
     key_context: StorageKeyContext,
     alias_storage_keys: Vec<String>,
-    /// Alias keys locked by `lock.owner`; the commit frees them.
+    /// Alias keys that `lock.owner` holds. The commit frees them.
     locked_alias_keys: Vec<String>,
-    in_flight_ttl: Duration,
     primary_replay_after_guard_denial: bool,
     idempotency_key: String,
     record: IdempotencyRecord,
@@ -1436,17 +1437,18 @@ struct DeferredIdempotencyState {
 }
 
 impl DeferredIdempotencyState {
-    /// The alias key for a retry, or `None` when it is the primary key or
-    /// already registered. Also records a guard-denied primary replay.
+    /// Return the alias key for a retry. Return `None` if the key is the
+    /// primary key or is already registered. This also records a primary
+    /// replay after guard denial.
     fn alias_key(
         &mut self,
         session_id: Option<&str>,
         primary_replay_after_guard_denial: bool,
         tenant_override: Option<&str>,
     ) -> Option<String> {
-        // Honor the override only when this request itself resolved a
-        // tenant. A `public_paths` route resolves none on any retry, so a
-        // forced tenant would make the alias unmatchable.
+        // Use the override only if this request resolved a tenant. A
+        // `public_paths` route resolves no tenant on a retry. A forced tenant
+        // would make the alias key differ from the retry's key.
         let tenant_override = tenant_override.filter(|_| self.key_context.tenant.is_some());
         let storage_key = self.key_context.storage_key(session_id, tenant_override);
         if primary_replay_after_guard_denial && storage_key != self.storage_key {
@@ -1531,8 +1533,9 @@ impl DeferredIdempotencyCommit {
         Ok(())
     }
 
-    /// The store, key, owner and lock TTL for a new alias, or `None` when
-    /// there is nothing to lock. Sync, so no guard lives across an await.
+    /// Return the store, key, owner and lock TTL for a new alias. Return
+    /// `None` if there is nothing to lock. This function is not async, so no
+    /// lock guard stays held across an await.
     fn alias_reservation(
         &self,
         session_id: Option<&str>,
@@ -1550,18 +1553,18 @@ impl DeferredIdempotencyCommit {
                 Arc::clone(&state.store),
                 key,
                 state.lock.owner.clone(),
-                state.in_flight_ttl,
+                state.lock.in_flight_ttl,
             ))
         });
         drop(guard);
         reservation
     }
 
-    /// Lock the alias key a retry will use, before the session is saved.
+    /// Lock the alias key that a retry will use, before the session is saved.
     ///
-    /// Fails when another owner holds the key, or the store errors: the
-    /// caller then fails closed. A held alias lock stays until the TTL when
-    /// the commit fails.
+    /// Return an error if another owner holds the key or the store fails.
+    /// The caller then rejects the request. If the commit fails, the lock
+    /// stays until its TTL ends.
     async fn reserve_session_alias(
         &self,
         session_id: Option<&str>,
@@ -1663,11 +1666,12 @@ pub(crate) fn add_deferred_session_replay_key(
     }
 }
 
-/// Lock the alias key before the session is saved, so a request that
-/// presents the saved session finds the key in flight. `None` when no commit
-/// is pending; an `Err` from the future means fail closed.
+/// Lock the alias key before the session is saved. A request with the saved
+/// session then finds the key in flight. Return `None` if no commit is
+/// pending. If the future returns `Err`, reject the request.
 ///
-/// Owns its inputs: the future must be `Send`, and `Response` is not `Sync`.
+/// This function copies its inputs. The future must be `Send`, and
+/// `Response` is not `Sync`.
 pub(crate) fn reserve_deferred_session_replay_key(
     response: &Response<Body>,
     session_id: Option<&str>,
@@ -1936,6 +1940,7 @@ async fn lock_stale_cookie_key(
             store: Arc::clone(store),
             key: key.to_owned(),
             owner,
+            in_flight_ttl,
         }))
     } else {
         Err(StaleKeyInFlight)
@@ -1972,6 +1977,7 @@ async fn lock_request_keys(
         store: Arc::clone(store),
         key: prepared.storage_key.clone(),
         owner,
+        in_flight_ttl,
     };
     Some((lock, stale_lock))
 }
@@ -2105,10 +2111,6 @@ fn cacheable_response_record(
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one request pipeline; the call to `handle_cache_miss` wraps"
-)]
 async fn handle_idempotent_request<S>(
     mut inner: S,
     config: IdempotencyRequestConfig,
@@ -2226,16 +2228,7 @@ where
         };
 
     let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, ttl, lock_deadline_ms);
-    handle_cache_miss(
-        inner,
-        store,
-        CacheTtls { ttl, in_flight_ttl },
-        prepared,
-        metrics.as_ref(),
-        lock,
-        probe,
-    )
-    .await
+    handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock, probe).await
 }
 
 /// Carry the stale cookie's recovery point over to the request's key (see
@@ -2316,16 +2309,10 @@ fn take_replay_markers(extensions: &mut axum::http::Extensions) -> (Vec<(String,
     (replay_metadata, cache_committed_error)
 }
 
-/// How long a response and an in-flight lock last.
-struct CacheTtls {
-    ttl: Duration,
-    in_flight_ttl: Duration,
-}
-
 async fn handle_cache_miss<S>(
     mut inner: S,
     store: Arc<dyn IdempotencyStore>,
-    CacheTtls { ttl, in_flight_ttl }: CacheTtls,
+    ttl: Duration,
     prepared: PreparedIdempotencyRequest,
     metrics: Option<&crate::middleware::MetricsCollector>,
     lock: InFlightLock,
@@ -2417,7 +2404,6 @@ where
                     key_context,
                     alias_storage_keys: Vec::new(),
                     locked_alias_keys: Vec::new(),
-                    in_flight_ttl,
                     primary_replay_after_guard_denial: false,
                     idempotency_key,
                     record,
@@ -2908,6 +2894,7 @@ mod tests {
             store: memory.clone(),
             key: "key".to_owned(),
             owner: "owner-a".to_owned(),
+            in_flight_ttl: Duration::from_secs(60),
         });
 
         assert!(
@@ -2927,6 +2914,7 @@ mod tests {
             store: memory.clone(),
             key: "key".to_owned(),
             owner: "owner-a".to_owned(),
+            in_flight_ttl: Duration::from_secs(60),
         }
         .release()
         .await;
@@ -3481,7 +3469,6 @@ mod tests {
             },
             alias_storage_keys: vec!["alias".to_owned()],
             locked_alias_keys: Vec::new(),
-            in_flight_ttl: Duration::from_secs(60),
             primary_replay_after_guard_denial: false,
             idempotency_key: "k".to_owned(),
             record: IdempotencyRecord {
@@ -3496,6 +3483,7 @@ mod tests {
                 store,
                 key: "primary".to_owned(),
                 owner: "me".to_owned(),
+                in_flight_ttl: Duration::from_secs(60),
             },
         });
 
@@ -3528,7 +3516,6 @@ mod tests {
             key_context,
             alias_storage_keys: Vec::new(),
             locked_alias_keys: Vec::new(),
-            in_flight_ttl: Duration::from_secs(60),
             primary_replay_after_guard_denial: false,
             idempotency_key: "k".to_owned(),
             record: IdempotencyRecord {
@@ -3543,6 +3530,7 @@ mod tests {
                 store,
                 key: "primary".to_owned(),
                 owner: "me".to_owned(),
+                in_flight_ttl: Duration::from_secs(60),
             },
         });
         (commit, alias)
@@ -3568,10 +3556,13 @@ mod tests {
             .await
             .expect("commit");
         assert!(memory.get_now(&alias).is_some(), "the alias has a response");
-        memory.unlock_now(&alias, "other");
+        assert!(
+            memory.try_lock_now(&alias, "other", Duration::from_secs(60)),
+            "the commit frees the alias lock"
+        );
         assert!(
             memory.try_lock_now("primary", "other", Duration::from_secs(60)),
-            "the primary lock is free"
+            "the commit frees the primary lock"
         );
     }
 
@@ -3585,6 +3576,26 @@ mod tests {
         let result = commit.reserve_session_alias(Some("sid"), false, None).await;
 
         assert!(result.is_err(), "a held alias must fail closed");
+    }
+
+    /// A reservation records a primary replay after guard denial.
+    #[tokio::test]
+    async fn reserve_records_primary_replay_after_guard_denial() {
+        let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        let (commit, _alias) = alias_commit(&memory);
+
+        commit
+            .reserve_session_alias(Some("sid"), true, None)
+            .await
+            .expect("reserve");
+
+        let flag = commit
+            .inner
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .is_some_and(|state| state.primary_replay_after_guard_denial);
+        assert!(flag, "the primary replay flag is set");
     }
 
     /// A failed commit keeps the alias locked until its TTL.

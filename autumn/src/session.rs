@@ -1080,6 +1080,7 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
+                // No lock here: a destroyed session saves nothing.
                 crate::idempotency::add_deferred_session_replay_key(
                     &response,
                     None,
@@ -1109,8 +1110,9 @@ where
                 let finalized_tenant = tenancy_session_key
                     .as_deref()
                     .and_then(|key| data.get(key).cloned());
-                // Lock the alias before the session is visible: a request
-                // with the saved session then finds its key in flight.
+                // Lock the alias before the session is saved. A request with the
+                // saved session then finds its key in flight. If a later step
+                // fails, the lock stays until its TTL ends.
                 if let Some(reserve) = crate::idempotency::reserve_deferred_session_replay_key(
                     &response,
                     Some(&sid),
