@@ -2377,12 +2377,18 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
                 .trim_end_matches('.')
                 .to_ascii_lowercase()
         };
+        // An omitted port defaults to `PGPORT`, then to 5432.
         let port = params.get("port").map_or_else(
-            || parsed.port().unwrap_or(5432),
+            || {
+                parsed
+                    .port()
+                    .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()))
+                    .unwrap_or(5432)
+            },
             |v| v.parse().unwrap_or(5432),
         );
         // `dbname` is presence-based. An empty name defaults to `PGDATABASE`,
-        // then to the user name, as in libpq.
+        // then to the user name, then to the OS login, as in libpq.
         let name = params.get("dbname").cloned().unwrap_or_else(|| {
             parsed
                 .path_segments()
@@ -2399,8 +2405,8 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
                         .cloned()
                         .filter(|v| !v.is_empty())
                         .or_else(|| Some(decode(parsed.username())).filter(|v| !v.is_empty()))
-                        .or_else(|| env("PGUSER"))
-                        .unwrap_or_default()
+                        .or_else(|| env("PGUSER").filter(|v| !v.is_empty()))
+                        .unwrap_or_else(crate::pg::current_os_user)
                 })
         } else {
             name
@@ -9058,6 +9064,18 @@ mod tests {
             "postgres://prod/x?dbname=",
             "postgres://prod/db1",
             &|k| (k == "PGDATABASE").then(|| "db1".to_owned())
+        ));
+        // An omitted port defaults to `PGPORT`.
+        assert!(same_database_with(
+            "postgres://prod.example/app",
+            "postgres://prod.example:6543/app",
+            &|k| (k == "PGPORT").then(|| "6543".to_owned())
+        ));
+        // With no `dbname`, `PGDATABASE` or user, the OS login names the database.
+        assert!(same_database_with(
+            "postgres://prod.example/?dbname=",
+            &format!("postgres://prod.example/{}", crate::pg::current_os_user()),
+            &|_| None
         ));
         // A non-Postgres scheme never names a Postgres database.
         assert!(!same_database_with(

@@ -705,7 +705,7 @@ fn find_last_pair<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a st
 /// string sets no `user` (see `connect_raw.rs`'s use of `whoami::username()`)
 /// — used here only to resolve the same effective username for `.pgpass`
 /// matching, not to set it explicitly (that stays `tokio_postgres`'s job).
-fn current_os_user() -> String {
+pub fn current_os_user() -> String {
     whoami::username().unwrap_or_else(|_| "postgres".to_owned())
 }
 
