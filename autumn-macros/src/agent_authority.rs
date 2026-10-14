@@ -2331,7 +2331,8 @@ impl Analyzer {
                 && call_path_name(call)
                     .is_some_and(|name| ASYNC_COMBINATORS.contains(&name.as_str()))
             {
-                for arg in &call.args {
+                // Only the future operand is awaited. The duration is not.
+                for arg in call.args.iter().skip(1) {
                     let inner = strip_transparent(arg);
                     if matches!(inner, Expr::Call(_) | Expr::MethodCall(_) | Expr::Path(_))
                         && !self.awaited_is_readable(inner)
@@ -6605,6 +6606,14 @@ mod tests {
                 diesel::sql_query("SELECT * FROM payouts FOR UPDATE").load::<P>(&mut *db).await?;
                 Ok(())
             }"#,
+        ),
+        (
+            "timeout with a computed duration",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                let delay = retry_delay();
+                tokio::time::timeout(delay, repo.find_all()).await??;
+                Ok(())
+            }",
         ),
         (
             "no handles at all",
