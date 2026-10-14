@@ -394,6 +394,7 @@ struct GatedSaveStore {
     inner: Arc<SessionMemoryStore>,
     saved: Arc<tokio::sync::Notify>,
     resume: Arc<tokio::sync::Notify>,
+    gated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionStore for GatedSaveStore {
@@ -411,8 +412,11 @@ impl SessionStore for GatedSaveStore {
         data: std::collections::HashMap<String, String>,
     ) -> Result<(), autumn_web::session::SessionStoreError> {
         self.inner.save(id, data).await?;
-        self.saved.notify_one();
-        self.resume.notified().await;
+        // Only the first save pauses; later requests pass through.
+        if self.gated.swap(false, Ordering::SeqCst) {
+            self.saved.notify_one();
+            self.resume.notified().await;
+        }
         Ok(())
     }
 
@@ -452,6 +456,7 @@ async fn concurrent_retry_during_session_commit_does_not_rerun_handler() {
         inner: Arc::new(inner),
         saved: Arc::clone(&saved),
         resume: Arc::clone(&resume),
+        gated: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
 
     let idempotency_store: Arc<dyn IdempotencyStore> = Arc::new(MemoryIdempotencyStore::new(
@@ -481,7 +486,10 @@ async fn concurrent_retry_during_session_commit_does_not_rerun_handler() {
     let first = tokio::spawn(app.clone().oneshot(request()));
     saved.notified().await;
 
-    let second = app.oneshot(request()).await.unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(10), app.oneshot(request()))
+        .await
+        .expect("second request must not hang")
+        .unwrap();
     resume.notify_one();
     let first = first.await.unwrap().unwrap();
 
