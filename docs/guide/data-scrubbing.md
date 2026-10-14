@@ -77,7 +77,8 @@ Two sources need **no declaration at all**:
   plaintext strategy is refused outright. `null` is accepted on a nullable
   encrypted column. The scrub needs the target's `active_record_encryption`
   credentials for this and refuses before writing anything if they are missing.
-  The scan reads every file under `src/`, in any module. It also refuses if it
+  The scan reads every file under `src/`, in any module. Two models that
+  encrypt one column in different modes are an error, not a last-wins merge. It also refuses if it
   cannot tell *which* columns are encrypted — a host with
   the CLI and `scrub.toml` but no `src/` tree must name them, with their mode,
   under `[tables.<t>.encrypted]`:
@@ -746,8 +747,8 @@ apply-time error.
   duration, so a row inserted between the classification snapshot and the
   rewrite cannot slip through.
 - **A schema change mid-run is refused.** After the locks are taken, the
-  transaction compares `public`'s tables, columns and RLS state with the snapshot
-  the plan was built from, and compares again before commit. A migration that changed the
+  transaction compares `public`'s tables, columns, RLS state, triggers and rules
+  with the snapshot the plan was built from, and compares again before commit. A migration that changed the
   schema in that window rolls the run back. The locks cover only the tables the
   run writes, so a change to any other table after the last comparison is not
   caught. Re-run the command. The SQL that `--dry-run` prints has the target

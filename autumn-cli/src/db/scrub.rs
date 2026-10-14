@@ -3828,11 +3828,7 @@ fn classify_and_apply(
                 unpopulated: &facts.unpopulated_views,
             },
             sampling.as_ref(),
-            (
-                &facts.public_base_tables,
-                &facts.public_columns,
-                &facts.rls_tables,
-            ),
+            facts,
             label,
         )
         .inspect_err(|_| warn_committed(&committed))?;
@@ -4920,37 +4916,56 @@ const PUBLIC_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind IN ('r', 'p', 'f') AND att.attnum > 0 AND NOT att.attisdropped";
 
-/// Compare `snapshot` with the schema this connection sees now.
+/// Compare the facts the plan was built from with what this connection sees now.
+///
+/// Covers the names the plan classified, and the hazards the refusals read: the
+/// RLS set and the trigger and rule sets. A migration that lands between the
+/// probe and the locks must not leave a stale answer behind.
 fn live_schema_drift(
     conn: &mut PgConnection,
-    snapshot: SchemaSnapshot<'_>,
+    facts: &DatabaseFacts,
 ) -> Result<Vec<String>, diesel::result::Error> {
-    let tables: BTreeSet<String> = sql_query(PUBLIC_BASE_TABLES)
-        .load::<NameRow>(conn)?
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
+    let names = |conn: &mut PgConnection, sql: &str| -> Result<BTreeSet<String>, _> {
+        Ok::<_, diesel::result::Error>(
+            sql_query(sql)
+                .load::<NameRow>(conn)?
+                .into_iter()
+                .map(|r| r.name)
+                .collect(),
+        )
+    };
+    let tables = names(conn, PUBLIC_BASE_TABLES)?;
     let columns = pair_set(sql_query(PUBLIC_COLUMNS).load::<PairRow>(conn)?);
-    let rls: BTreeSet<String> = sql_query(RLS_RESTRICTED_TABLES)
-        .load::<NameRow>(conn)?
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
-    let mut drift = schema_drift((snapshot.0, snapshot.1), (&tables, &columns));
-    drift.extend(
-        rls.symmetric_difference(snapshot.2)
-            .map(|t| format!("{t} (row-level security changed)")),
+    let mut drift = schema_drift(
+        (&facts.public_base_tables, &facts.public_columns),
+        (&tables, &columns),
     );
+    let mut triggered = names(conn, &triggers_reaching(""))?;
+    triggered.extend(names(conn, &rules_reaching(""))?);
+    let mut delete_triggered = names(conn, &triggers_reaching("AND (t.tgtype & 8) <> 0 "))?;
+    delete_triggered.extend(names(conn, &rules_reaching("AND r.ev_type = '4' "))?);
+    for (label, before, after) in [
+        (
+            "row-level security",
+            &facts.rls_tables,
+            names(conn, RLS_RESTRICTED_TABLES)?,
+        ),
+        ("triggers or rules", &facts.triggered_tables, triggered),
+        (
+            "DELETE triggers or rules",
+            &facts.delete_triggered_tables,
+            delete_triggered,
+        ),
+    ] {
+        drift.extend(
+            after
+                .symmetric_difference(before)
+                .map(|t| format!("{t} ({label} changed)")),
+        );
+    }
     drift.sort();
     Ok(drift)
 }
-
-/// Tables, columns and RLS-bound tables as the plan saw them.
-type SchemaSnapshot<'a> = (
-    &'a BTreeSet<String>,
-    &'a BTreeSet<(String, String)>,
-    &'a BTreeSet<String>,
-);
 
 /// List the tables and columns that differ between two snapshots, sorted.
 fn schema_drift(
@@ -6743,7 +6758,7 @@ fn execute(
     purges: &[(String, String)],
     views: &ViewRefresh<'_>,
     sampling: Option<&sample::SamplePlan>,
-    snapshot: SchemaSnapshot<'_>,
+    facts: &DatabaseFacts,
     label: &str,
 ) -> Result<Applied, ScrubError> {
     if plan.tables.is_empty() && purges.is_empty() && views.ordered.is_empty() && sampling.is_none()
@@ -6777,7 +6792,7 @@ fn execute(
         // The locks above wait for a concurrent migration to commit, then see
         // its schema. Compare against the snapshot the plan was built from, so
         // a column added in that window cannot commit unclassified.
-        drift = live_schema_drift(conn, snapshot)?;
+        drift = live_schema_drift(conn, facts)?;
         if !drift.is_empty() {
             return Err(sample::SampleFailure::Db(
                 diesel::result::Error::RollbackTransaction,
@@ -6929,7 +6944,7 @@ fn execute(
         }
         // Again, as the last check before commit: a table the plan does not
         // lock can change after the first comparison.
-        drift = live_schema_drift(conn, snapshot)?;
+        drift = live_schema_drift(conn, facts)?;
         if !drift.is_empty() {
             return Err(sample::SampleFailure::Db(
                 diesel::result::Error::RollbackTransaction,

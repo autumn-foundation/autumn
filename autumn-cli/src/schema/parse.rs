@@ -117,6 +117,19 @@ pub enum SchemaParseError {
         /// 1-based column of the error span.
         column: usize,
     },
+    /// Two models map one column to different `#[encrypted]` modes. Taking
+    /// either would re-encrypt the column in a mode the application may not
+    /// read.
+    #[error(
+        "{table}.{column} is #[encrypted] in both modes by different models; \
+         remove the model that is not production code"
+    )]
+    ConflictingEncryptedMode {
+        /// The table both models map to.
+        table: String,
+        /// The column both models encrypt.
+        column: String,
+    },
     /// A models file or directory could not be read.
     #[error("failed to read {path}: {source}")]
     Io {
@@ -479,7 +492,12 @@ pub fn parse_encrypted_columns_path(
             continue;
         }
         for (table, columns) in parse_encrypted_columns(src)? {
-            out.entry(table).or_default().extend(columns);
+            let known = out.entry(table.clone()).or_default();
+            for (column, deterministic) in columns {
+                if known.insert(column.clone(), deterministic) == Some(!deterministic) {
+                    return Err(SchemaParseError::ConflictingEncryptedMode { table, column });
+                }
+            }
         }
     }
     Ok(out)
@@ -2232,7 +2250,7 @@ mod tests {
             SchemaParseError::Io { path, .. } => {
                 assert!(path.contains("does_not_exist.rs"), "path names the input");
             }
-            other @ SchemaParseError::Syntax { .. } => panic!("expected Io error, got {other:?}"),
+            other => panic!("expected Io error, got {other:?}"),
         }
     }
 
@@ -2535,6 +2553,28 @@ mod tests {
         .unwrap();
         let found = parse_encrypted_columns_path(dir.path()).unwrap();
         assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A file no module reaches may still hold a stray model. Two modes for one
+    /// column is an error, not a last-wins merge.
+    #[test]
+    fn conflicting_encrypted_modes_are_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("z_fixture.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let err = parse_encrypted_columns_path(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, SchemaParseError::ConflictingEncryptedMode { ref column, .. } if column == "email"),
+            "{err:?}"
+        );
     }
 
     /// A model in an inline module, at any depth, is still a model.
