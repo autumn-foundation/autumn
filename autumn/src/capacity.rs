@@ -549,13 +549,13 @@ impl CapacityContract {
     ///
     /// Both names go through [`normalize_profile_name`], so `production` and
     /// `PROD` compare equal. An unnamed running profile cannot be compared,
-    /// so it counts as a match.
+    /// so it counts as a match. A blank contract profile never matches a named one.
     #[must_use]
     pub(crate) fn calibrated_under(&self, running: Option<&str>) -> bool {
         let Some(running) = running.and_then(normalize_profile_name) else {
             return true;
         };
-        normalize_profile_name(&self.calibration.profile).is_none_or(|own| own == running)
+        normalize_profile_name(&self.calibration.profile).is_some_and(|own| own == running)
     }
 }
 
@@ -1264,6 +1264,16 @@ mod tests {
         );
         assert_eq!(
             resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some("Staging")),
+            AdmissionLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn a_blank_calibrated_profile_matches_no_named_profile() {
+        let (_dir, path) = local_contract_under("  ");
+        let host = HostProfile::detect();
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some("prod")),
             AdmissionLimit::Unlimited
         );
     }
