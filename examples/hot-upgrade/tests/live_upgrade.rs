@@ -4,10 +4,9 @@
 //! clients, upgrades it in place to the real `hot-upgrade-v2` binary with
 //! `SIGUSR2`, and proves the properties the issue asks for:
 //!
-//! * zero refused connections, and no request fails twice in a row, across
-//!   the cutover — an isolated mid-flight reset (`ECONNRESET`/`ECONNABORTED`)
-//!   is retried once, but only up to `MAX_TOLERATED_RESETS` of them, so a
-//!   systemic source of resets still fails the run rather than being masked;
+//! * zero failed connections across the cutover. A refused connection, or a
+//!   reset one (`ECONNRESET`), fails the run. Nothing is retried: a retry
+//!   would hide a dropped connection (issue #2372);
 //! * a value written before the upgrade is readable after it (from the *new*
 //!   binary, whose state shape is different);
 //! * the state migration ran (`upgrades=1`) and the counter did not reset;
@@ -154,29 +153,6 @@ async fn wait_until_ready(
     }
 }
 
-/// A connection reset (`ECONNRESET`) or abort (`ECONNABORTED`) mid-flight.
-///
-/// Autumn's in-place upgrade hands the successor the *same* listening socket
-/// by duplicating its fd across the `exec`
-/// (`HandoffSocket::from_listener`/`upgrade.rs`), not by binding a second
-/// `SO_REUSEPORT` socket — so there is no accept-queue race between two
-/// listeners to blame a reset on; predecessor and successor share one kernel
-/// socket throughout. The one observed instance of this (issue #2462, macOS
-/// only, did not reproduce on a re-run) has no confirmed root cause. Treating
-/// it as retryable-up-to-a-small-bound (`with_reset_retry`, and the count
-/// asserted against `MAX_TOLERATED_RESETS` below) means an isolated anomaly
-/// doesn't fail the run, while a systemic source of resets — which would
-/// point at a genuine defect in the handoff or drain path — still does.
-///
-/// This is distinct from `ECONNREFUSED`, which means nothing was listening —
-/// the actual zero-downtime violation.
-fn is_mid_flight_reset(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-    )
-}
-
 /// True once a write answered `200` from the `v2` build.
 fn v2_accepted_a_write(writes: &Mutex<Vec<Observation>>) -> bool {
     writes
@@ -188,175 +164,6 @@ fn v2_accepted_a_write(writes: &Mutex<Vec<Observation>>) -> bool {
 
 fn is_connection_refused(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionRefused
-}
-
-/// How many mid-flight resets a single run may retry past before the test
-/// fails anyway. One or two is the isolated anomaly issue #2462 observed;
-/// anywhere near double digits stops being noise and starts being evidence of
-/// a real defect in the handoff or drain path, which `with_reset_retry`
-/// retrying past a reset must not be allowed to hide.
-const MAX_TOLERATED_RESETS: u64 = 5;
-
-/// Runs `attempt` once; if it fails with a mid-flight reset, waits out a
-/// short backoff and runs it exactly one more time, returning that outcome.
-/// A refused connection is never retried — there is nothing to wait out, the
-/// guarantee is already broken.
-///
-/// The backoff (rather than retrying immediately) gives whatever caused the
-/// reset a moment to resolve, so the retry doesn't land in the same narrow
-/// window that reset the first attempt. The caller is responsible for
-/// bounding how many resets a run may retry past — see
-/// `MAX_TOLERATED_RESETS`.
-///
-/// A successful retry's `latency` is overwritten to cover the *whole* span
-/// from the first attempt's start through the retry's completion (failed
-/// attempt + backoff + retry), not just the retry's own timing — otherwise a
-/// first attempt that stalled for seconds before resetting would report only
-/// the few milliseconds the cheap retry took, hiding exactly the cutover
-/// latency spike this test exists to catch.
-async fn with_reset_retry<F, Fut>(
-    reset_retries: &AtomicU64,
-    mut attempt: F,
-) -> std::io::Result<Observation>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<Observation>>,
-{
-    let started = Instant::now();
-    match attempt().await {
-        Err(error) if is_mid_flight_reset(&error) => {
-            reset_retries.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let mut retried = attempt().await;
-            if let Ok(observation) = &mut retried {
-                observation.latency = started.elapsed();
-            }
-            retried
-        }
-        other => other,
-    }
-}
-
-#[cfg(test)]
-mod reset_retry_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn retries_exactly_once_after_a_mid_flight_reset() {
-        let attempts = AtomicU64::new(0);
-        let reset_retries = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || {
-            let attempts = &attempts;
-            async move {
-                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-                } else {
-                    Ok(Observation {
-                        status: 200,
-                        body: String::new(),
-                        latency: Duration::ZERO,
-                    })
-                }
-            }
-        })
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "the retried attempt should succeed: {result:?}"
-        );
-        assert_eq!(attempts.load(Ordering::Relaxed), 2, "exactly one retry");
-        assert_eq!(reset_retries.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn a_second_reset_after_retry_is_reported_as_a_failure() {
-        let reset_retries = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || async {
-            Err::<Observation, _>(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-        })
-        .await;
-
-        assert!(result.is_err(), "two resets in a row must not be swallowed");
-        assert!(is_mid_flight_reset(&result.unwrap_err()));
-        assert_eq!(
-            reset_retries.load(Ordering::Relaxed),
-            1,
-            "retried exactly once, not looped"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_retried_success_reports_latency_spanning_the_whole_attempt() {
-        let reset_retries = AtomicU64::new(0);
-        let attempts = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || {
-            let attempts = &attempts;
-            async move {
-                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-                } else {
-                    Ok(Observation {
-                        status: 200,
-                        body: String::new(),
-                        // Deliberately tiny: if this leaked through
-                        // unmodified, the assertion below would fail.
-                        latency: Duration::from_millis(1),
-                    })
-                }
-            }
-        })
-        .await
-        .expect("the retried attempt should succeed");
-
-        assert!(
-            result.latency >= Duration::from_millis(15),
-            "latency must cover the failed first attempt plus the backoff, \
-             not just the retry's own reported {:?}",
-            result.latency
-        );
-    }
-
-    #[tokio::test]
-    async fn a_refused_connection_is_never_retried() {
-        let attempts = AtomicU64::new(0);
-        let reset_retries = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || {
-            let attempts = &attempts;
-            async move {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
-            }
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert!(is_connection_refused(&result.unwrap_err()));
-        assert_eq!(
-            attempts.load(Ordering::Relaxed),
-            1,
-            "refused is not retried"
-        );
-        assert_eq!(reset_retries.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn an_unrelated_error_is_never_retried() {
-        let attempts = AtomicU64::new(0);
-        let reset_retries = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || {
-            let attempts = &attempts;
-            async move {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
-            }
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(attempts.load(Ordering::Relaxed), 1);
-        assert_eq!(reset_retries.load(Ordering::Relaxed), 0);
-    }
 }
 
 /// How many times a single request may land on the *successor's own*
@@ -372,10 +179,7 @@ mod reset_retry_tests {
 /// the narrow window between "accepting connections" and "finished
 /// `on_startup` hooks". That is not a connection failure — this test's own
 /// header documents "zero refused connections", not "zero 503s" — so it is
-/// retried rather than failing the run outright, the same way
-/// `with_reset_retry` treats a mid-flight reset as expected-but-bounded
-/// rather than either silently swallowed or an unconditional hard failure.
-/// A defect that left the successor perpetually unready must still fail the
+/// retried rather than failing the run outright. A defect that left the successor perpetually unready must still fail the
 /// test, hence the bound rather than an unbounded retry loop.
 const MAX_STARTUP_BARRIER_RETRIES: u32 = 20;
 
@@ -479,10 +283,7 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         // This weakens nothing. `wait_for_exit` still caps the wait at 30s, so
         // a predecessor that genuinely fails to drain still fails the
         // assertion, and the connection guarantees below — `refused == 0`,
-        // `hard == 0`, and the `MAX_TOLERATED_RESETS` bound (#2510) — are
-        // untouched by it. Verified rather than assumed: under CPU
-        // oversubscription with this pin in place, the refusal/reset assertions
-        // still fired on their own, so the budget is not what was holding them.
+        // and `hard == 0` — are untouched by it.
         .env("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "30")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -523,12 +324,10 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(Mutex::new(Vec::<Observation>::new()));
     let writes = Arc::new(Mutex::new(Vec::<Observation>::new()));
-    // A refused connection means nothing was listening — the actual
-    // zero-downtime violation. A mid-flight reset gets one free retry (see
-    // `with_reset_retry`); only a *second* failure in a row is a hard one.
+    // A refused connection means nothing was listening. Any other error is a
+    // connection dropped mid-flight. Both break zero downtime. No retry.
     let refused_errors = Arc::new(AtomicU64::new(0));
     let hard_failures = Arc::new(AtomicU64::new(0));
-    let reset_retries = Arc::new(AtomicU64::new(0));
     let startup_barrier_hits = Arc::new(AtomicU64::new(0));
 
     let mut load = Vec::new();
@@ -539,7 +338,6 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         let writes = Arc::clone(&writes);
         let refused_errors = Arc::clone(&refused_errors);
         let hard_failures = Arc::clone(&hard_failures);
-        let reset_retries = Arc::clone(&reset_retries);
         let startup_barrier_hits = Arc::clone(&startup_barrier_hits);
         let successor_pid = Arc::clone(&successor_pid);
         // Six readers and two writers: reads must never fail, writes may be
@@ -552,18 +350,7 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         let _ = writes;
         load.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
-                // `/bump` is not idempotent, so a reset that lands after the
-                // server already applied it — but before the client read the
-                // response — means the retry can double-apply the write. That
-                // is a real, at-least-once-delivery trade-off, not a bug: the
-                // guarantees this test checks (`hits` never goes backwards,
-                // 200/503-only outcomes) hold regardless, and it mirrors how
-                // any client that retries past a reset behaves in practice.
-                match with_startup_barrier_retry(&startup_barrier_hits, || {
-                    with_reset_retry(&reset_retries, || get(&addr, path))
-                })
-                .await
-                {
+                match with_startup_barrier_retry(&startup_barrier_hits, || get(&addr, path)).await {
                     Ok(observation) => {
                         if let Some(reported) = parse_line(&observation.body)
                             && reported.version == "v2"
@@ -649,13 +436,11 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
 
     let refused = refused_errors.load(Ordering::Relaxed);
     let hard = hard_failures.load(Ordering::Relaxed);
-    let retried = reset_retries.load(Ordering::Relaxed);
     let startup_barrier = startup_barrier_hits.load(Ordering::Relaxed);
     println!(
-        "connection failures across cutover: refused={refused} hard_failures_after_retry={hard} mid_flight_resets_retried={retried} startup_barrier_hits_retried={startup_barrier}"
+        "connection failures across cutover: refused={refused} dropped={hard} startup_barrier_hits_retried={startup_barrier}"
     );
-    // Not bounded like `retried` below: unlike a mid-flight reset (which has
-    // no known-benign cause at all), a startup-barrier hit is *expected* to
+    // A startup-barrier hit is *expected* to
     // scale with how long the successor's own `on_startup` hooks take —
     // dozens of hits across 8 polling tasks during a slow (contended)
     // startup is normal, not evidence of a defect. `with_startup_barrier_retry`
@@ -669,21 +454,8 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     );
     assert_eq!(
         hard, 0,
-        "a request failed even after retrying once past a mid-flight reset \
-         (ECONNRESET/ECONNABORTED); logs:\n{logged}"
-    );
-    // Bounded, not unconditional: the successor is handed the *same*
-    // listening socket (a duplicated fd, not a second `SO_REUSEPORT`
-    // listener — see `is_mid_flight_reset`), so there is no known-benign
-    // mechanism that should reset a connection at all. Tolerating a lone
-    // reset keeps an unreproduced macOS anomaly (#2462) from failing the
-    // run; this bound keeps a *systemic* source of resets — real evidence of
-    // a defect in the handoff or drain path — from silently passing.
-    assert!(
-        retried <= MAX_TOLERATED_RESETS,
-        "{retried} mid-flight resets is too many to be an isolated anomaly \
-         (bound: {MAX_TOLERATED_RESETS}) — this looks like a real handoff/drain \
-         defect, not noise; logs:\n{logged}"
+        "a connection was dropped across the cutover (ECONNRESET and the \
+         like); logs:\n{logged}"
     );
     // Six readers over five seconds put this in the thousands on any machine
     // that is not pathologically loaded; the floor is set well under that so a
