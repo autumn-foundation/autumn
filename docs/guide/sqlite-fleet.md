@@ -209,10 +209,10 @@ and which database has it.
 - Each open database runs its own commit-hook worker, in every process role
   (`web` included: a `worker` process does not open fleet databases). Hooks
   queued in a database drain while it is open, and resume on its next open.
-  Hooks are at-least-once, and closing a database (idle, `max_open`,
-  shutdown) while a hook runs can replay it after the next open; write
-  hooks to be idempotent
-  ([#3231](https://github.com/autumn-foundation/autumn/issues/3231)).
+  Before a database closes (idle, `max_open`, shutdown), its worker
+  finishes the hook it runs and acks it, for up to 10 seconds. A hook that
+  does not finish in that time can run again after the next open. Hooks stay
+  at-least-once: write them to be idempotent.
 - A replicated database takes a fresh base snapshot each time it reopens.
   Size `max_open` so busy tenants stay open.
 - A deleted database's replica stays in object storage until you remove it.
