@@ -393,6 +393,15 @@ a claim a reviewer needs evidence for:
 | `metadata.skipped` | present when a legal hold blocked the sweep |
 | `metadata.error` | present when the sweep failed |
 
+If Autumn cannot write the audit record, the dataset report gets an `error`
+that starts with `audit record not written` and states how many rows were
+removed. Rows can already be gone, so this is a failure: `autumn db retention`
+exits non-zero.
+
+If any dataset reports an `error`, the `autumn-retention-sweep` task fails
+after all datasets ran. It shows as failed in `/actuator/tasks` and triggers
+[task failure alerts](operator-alerts.md).
+
 A dataset held back by a legal hold is recorded even though nothing was
 deleted — "the policy wanted to delete this and did not" is exactly what a
 compliance reviewer needs to see. Dry runs (including the default read-only
