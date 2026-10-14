@@ -2327,9 +2327,32 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 /// An unparsable URL never claims a match (the guard errs toward "different",
 /// leaving the profile guard as the enforcement).
 fn same_database(a: &str, b: &str) -> bool {
+    let pghost = std::env::var("PGHOST").ok();
+    same_database_with(a, b, pghost.as_deref())
+}
+
+/// [`same_database`] with `PGHOST` passed in, so tests need no process env.
+///
+/// A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host from
+/// the `host` / `hostaddr` query parameter, then from `pghost`. An unresolved
+/// host is empty: libpq then uses its default socket.
+fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
     let parts = |raw: &str| -> Option<(String, u16, String)> {
         let parsed = url::Url::parse(raw).ok()?;
-        let host = parsed.host_str()?.to_ascii_lowercase();
+        let query = |key: &str| {
+            parsed
+                .query_pairs()
+                .find(|(k, v)| k == key && !v.is_empty())
+                .map(|(_, v)| v.into_owned())
+        };
+        let host = parsed
+            .host_str()
+            .map(str::to_owned)
+            .or_else(|| query("hostaddr"))
+            .or_else(|| query("host"))
+            .or_else(|| pghost.filter(|h| !h.is_empty()).map(str::to_owned))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         let port = parsed.port().unwrap_or(5432);
         let name = parsed
             .path_segments()
@@ -2364,6 +2387,7 @@ fn same_database(a: &str, b: &str) -> bool {
 /// the workflow it exists for.
 fn guard_configured_source(
     artifact_profile: Option<&str>,
+    destination_profile: &str,
     project_root: &Path,
     targets: &[(String, String)],
     allowed: bool,
@@ -2375,21 +2399,31 @@ fn guard_configured_source(
         .map(str::to_owned)
         .into_iter()
         .chain(profiles_with_config(project_root))
-        .filter(|p| !super::is_safe_destructive_profile(p))
+        .filter(|p| !super::is_safe_destructive_profile(p) && p != destination_profile)
         .collect();
     candidates.sort();
     candidates.dedup();
 
     for profile in candidates {
-        let table = migrate::read_autumn_toml_table_with_profile(Some(&profile));
-        let Some(declared) = migrate::resolve_primary_database_url_from_sources(
+        let table = migrate::read_autumn_toml_table_with_profile_in(project_root, Some(&profile));
+        // Control plus every shard: a restore writes all of them.
+        let declared: Vec<String> = migrate::resolve_primary_database_url_from_sources(
             |_| Err(std::env::VarError::NotPresent),
             table.as_ref(),
-        ) else {
-            continue;
-        };
+        )
+        .into_iter()
+        .chain(
+            migrate::try_resolve_shard_database_urls_from_sources(
+                |_| Err(std::env::VarError::NotPresent),
+                table.as_ref(),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, url)| url),
+        )
+        .collect();
         for (_, url) in targets {
-            if same_database(&declared, url) {
+            if declared.iter().any(|d| same_database(d, url)) {
                 return Err(ScrubError::OverwritesConfiguredTarget {
                     profile,
                     database: parsed_db_name(url),
@@ -2511,6 +2545,7 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         );
         guard_configured_source(
             artifact_profile.as_deref(),
+            &profile,
             Path::new("."),
             &targets,
             args.allow_source_overwrite,
@@ -8824,13 +8859,113 @@ mod tests {
         )];
         let empty = tempfile::tempdir().unwrap();
         assert!(
-            guard_configured_source(Some("prod"), empty.path(), &targets, false).is_ok(),
+            guard_configured_source(Some("prod"), "staging", empty.path(), &targets, false).is_ok(),
             "no config overlay means nothing to compare against"
         );
         assert!(
-            guard_configured_source(Some("prod"), empty.path(), &targets, true).is_ok(),
+            guard_configured_source(Some("prod"), "staging", empty.path(), &targets, true).is_ok(),
             "--allow-source-overwrite is the waiver"
         );
+    }
+
+    fn overlay(dir: &Path, profile: &str, body: &str) {
+        std::fs::write(dir.join(format!("autumn-{profile}.toml")), body).unwrap();
+    }
+
+    fn control_target(url: &str) -> Vec<(String, String)> {
+        vec![("control".to_owned(), url.to_owned())]
+    }
+
+    #[test]
+    fn the_destination_profile_is_not_a_protected_source() {
+        // Issue #2366 (18): the documented drill scrubs `staging` with an
+        // `autumn-staging.toml` present. That overlay names the destination.
+        let dir = tempfile::tempdir().unwrap();
+        let url = "postgres://app:pw@stg.example.com:5432/myapp";
+        overlay(
+            dir.path(),
+            "staging",
+            &format!("[database]\nprimary_url = \"{url}\"\n"),
+        );
+        assert!(
+            guard_configured_source(
+                Some("prod"),
+                "staging",
+                dir.path(),
+                &control_target(url),
+                false
+            )
+            .is_ok()
+        );
+        // The same overlay still guards when it is not the destination.
+        assert!(
+            guard_configured_source(
+                Some("prod"),
+                "other",
+                dir.path(),
+                &control_target(url),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_protected_shard_url_is_compared_too() {
+        // Issue #2366 (9): a source shard is a protected database.
+        let dir = tempfile::tempdir().unwrap();
+        overlay(
+            dir.path(),
+            "prod",
+            "[database]\nprimary_url = \"postgres://a@prod.example.com/ctl\"\n\n\
+             [[database.shards]]\nname = \"s1\"\n\
+             primary_url = \"postgres://a@prod.example.com/shard1\"\n",
+        );
+        let targets = vec![
+            (
+                "control".to_owned(),
+                "postgres://a@stg.example.com/ctl".to_owned(),
+            ),
+            (
+                "s1".to_owned(),
+                "postgres://a@prod.example.com/shard1".to_owned(),
+            ),
+        ];
+        assert!(
+            guard_configured_source(Some("prod"), "staging", dir.path(), &targets, false).is_err()
+        );
+    }
+
+    #[test]
+    fn hostless_urls_name_the_same_database() {
+        // Issue #2366 (8): no URL authority, so the host comes from libpq.
+        assert!(same_database_with(
+            "postgres:///prod?user=app&host=/var/run/postgresql",
+            "postgres:///prod?host=/var/run/postgresql",
+            None
+        ));
+        assert!(!same_database_with(
+            "postgres:///prod?host=/var/run/postgresql",
+            "postgres:///prod?host=/tmp",
+            None
+        ));
+        // Bare form resolves through `PGHOST`.
+        assert!(same_database_with(
+            "postgres:///prod",
+            "postgres://h.example.com/prod",
+            Some("h.example.com")
+        ));
+        assert!(!same_database_with(
+            "postgres:///prod",
+            "postgres://h.example.com/prod",
+            None
+        ));
+        // A different database on the same socket stays different.
+        assert!(!same_database_with(
+            "postgres:///prod?host=/tmp",
+            "postgres:///other?host=/tmp",
+            None
+        ));
     }
 
     #[test]
