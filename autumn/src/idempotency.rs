@@ -1531,6 +1531,32 @@ impl DeferredIdempotencyCommit {
         Ok(())
     }
 
+    /// The store, key, owner and lock TTL for a new alias, or `None` when
+    /// there is nothing to lock. Sync, so no guard lives across an await.
+    fn alias_reservation(
+        &self,
+        session_id: Option<&str>,
+        primary_replay_after_guard_denial: bool,
+        tenant_override: Option<&str>,
+    ) -> Option<(Arc<dyn IdempotencyStore>, String, String, Duration)> {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let reservation = guard.as_mut().and_then(|state| {
+            let key = state.alias_key(
+                session_id,
+                primary_replay_after_guard_denial,
+                tenant_override,
+            )?;
+            Some((
+                Arc::clone(&state.store),
+                key,
+                state.lock.owner.clone(),
+                state.in_flight_ttl,
+            ))
+        });
+        drop(guard);
+        reservation
+    }
+
     /// Lock the alias key a retry will use, before the session is saved.
     ///
     /// Fails when another owner holds the key, or the store errors: the
@@ -1542,24 +1568,13 @@ impl DeferredIdempotencyCommit {
         primary_replay_after_guard_denial: bool,
         tenant_override: Option<&str>,
     ) -> Result<(), IdempotencyStoreError> {
-        let (store, key, owner, in_flight_ttl) = {
-            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-            let Some(state) = guard.as_mut() else {
-                return Ok(());
-            };
-            let Some(key) = state.alias_key(
-                session_id,
-                primary_replay_after_guard_denial,
-                tenant_override,
-            ) else {
-                return Ok(());
-            };
-            (
-                Arc::clone(&state.store),
-                key,
-                state.lock.owner.clone(),
-                state.in_flight_ttl,
-            )
+        let reservation = self.alias_reservation(
+            session_id,
+            primary_replay_after_guard_denial,
+            tenant_override,
+        );
+        let Some((store, key, owner, in_flight_ttl)) = reservation else {
+            return Ok(());
         };
         if !acquire_lock(store.as_ref(), &key, &owner, in_flight_ttl).await {
             return Err(IdempotencyStoreError::backend(
@@ -2090,6 +2105,10 @@ fn cacheable_response_record(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one request pipeline; the call to `handle_cache_miss` wraps"
+)]
 async fn handle_idempotent_request<S>(
     mut inner: S,
     config: IdempotencyRequestConfig,
