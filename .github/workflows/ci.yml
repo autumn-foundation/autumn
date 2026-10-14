@@ -2341,6 +2341,17 @@ jobs:
             --test integration_tests -- --ignored idempotency_ \
             | tee "$RUNNER_TEMP/idempotency-pg-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-cov.log"
+          # Issue #2875: the Postgres tracking store's database-clock expiry
+          # runs only in these Docker tests. Check the count: a filter that
+          # matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored pg_clock_skew:: \
+            | tee "$RUNNER_TEMP/tracking-clock-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-clock-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored pg_tracking_cleanup_deletes_expired_rows \
+            | tee "$RUNNER_TEMP/tracking-cleanup-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-cleanup-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
