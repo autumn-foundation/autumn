@@ -157,6 +157,21 @@ const DEV_READY_FILE_SUFFIX: &str = ".state";
 )]
 const COOPERATIVE_STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
 
+/// How long a stop waits for a still-booting app before it gives up.
+///
+/// The app watches the signal file only after startup, which includes managed
+/// Postgres `initdb` and migrations. A stop that arrives earlier waits for the
+/// app to finish booting, then starts its normal budget. The CI cold-boot
+/// budget is eight minutes; this leaves room above it.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const COOPERATIVE_STOP_BOOT_CAP: Duration = Duration::from_secs(15 * 60);
+
 /// The cooperative-stop budget for an app whose configured graceful-drain
 /// budget is `drain_secs` (`prestop_grace_secs + shutdown_timeout_secs`).
 ///
@@ -262,24 +277,34 @@ fn resolve_cooperative_stop_budget(package: Option<&str>) -> Duration {
     let base_dir = package
         .and_then(find_manifest_dir)
         .unwrap_or_else(|| PathBuf::from("."));
-    // `autumn dev` is always a debug build, so the build-mode default is `dev`;
-    // an explicit `AUTUMN_ENV`/`AUTUMN_PROFILE` still wins, which is exactly the
-    // case (a prod-profile dev run) that the old fixed budget got wrong.
+    // `autumn dev` is always a debug build, so the build default is `dev`; an
+    // explicit `AUTUMN_ENV`/`AUTUMN_PROFILE` still wins.
     let profile = crate::serve::effective_profile(None, false);
-    // Resolve through the SAME `.env` overlay `start_server` injects into the
-    // child. The CLI deliberately never mutates its own environment, so a budget
-    // read from `std::env` alone would miss an `AUTUMN_SERVER__*` override the
-    // child does honor — and the parent would then force-kill the app in the
-    // middle of a valid shutdown, skipping exactly the managed-Postgres teardown
-    // this mechanism exists to protect. Real shell variables still win over
-    // `.env`, which is what `DotenvOsEnv` implements; a malformed `.env` falls
-    // back to the plain environment rather than failing the stop.
-    let denv: Box<dyn autumn_web::config::Env> = match autumn_web::dotenv::os_env_with_dotenv() {
-        Ok(env) => Box::new(env),
-        Err(_) => Box::new(autumn_web::config::OsEnv),
-    };
+    stop_budget_in(&base_dir, &profile)
+}
+
+/// The stop budget for the app whose manifest is in `base_dir`.
+///
+/// Reads `.env` from `base_dir`, as the app does. The CLI never mutates its own
+/// environment, so a plain `std::env` read would miss an `AUTUMN_SERVER__*`
+/// override the app honors, and the parent would force-kill a valid drain.
+/// Real shell variables still win over `.env`. A malformed `.env` falls back to
+/// the plain environment rather than failing the stop.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_budget_in(base_dir: &Path, profile: &str) -> Duration {
+    let denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_in(base_dir, profile) {
+            Ok(env) => Box::new(env),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
     let (prestop, shutdown) =
-        crate::serve::resolve_shutdown_budget_from(&base_dir, Some(&profile), &|key| {
+        crate::serve::resolve_shutdown_budget_from(base_dir, Some(profile), &|key| {
             denv.var(key).ok().filter(|value| !value.trim().is_empty())
         });
     cooperative_stop_budget(prestop.saturating_add(shutdown))
@@ -306,6 +331,8 @@ enum StopOutcome {
     /// distinct from [`Self::Escalated`] so the warning blames the dev setup
     /// rather than accusing the app of ignoring a request it never received.
     Unreachable,
+    /// The app never finished booting within the boot cap and was killed.
+    BootTimedOut,
     /// There was no child to stop.
     NotRunning,
 }
@@ -1350,13 +1377,25 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
         *child = None;
         return;
     };
-    let budget = stop_budget_for_running_child(
-        dev_ready_file_path().and_then(child_reported_stop_budget),
-        recorded_child_stop_budget(),
-        || resolve_cooperative_stop_budget(package),
+    let budget = std::cell::Cell::new(Duration::ZERO);
+    let outcome = stop_child_cooperatively(
+        child,
+        signal_path,
+        dev_ready_file_path(),
+        COOPERATIVE_STOP_BOOT_CAP,
+        || {
+            let resolved = stop_budget_for_running_child(
+                dev_ready_file_path().and_then(child_reported_stop_budget),
+                recorded_child_stop_budget(),
+                || resolve_cooperative_stop_budget(package),
+            );
+            budget.set(resolved);
+            resolved
+        },
     );
-    match stop_child_cooperatively(child, signal_path, budget) {
-        StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget)),
+    match outcome {
+        StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget.get())),
+        StopOutcome::BootTimedOut => eprintln!("{}", boot_timeout_warning()),
         StopOutcome::Unreachable => eprintln!(
             "{}",
             unreachable_warning("the target directory is not writable")
@@ -1832,6 +1871,24 @@ fn escalation_warning(timeout: Duration) -> String {
     )
 }
 
+/// The warning printed when the app was still booting at the boot cap.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn boot_timeout_warning() -> String {
+    format!(
+        "  Warning: the app was still starting after {}s and was force-stopped. \
+         Its shutdown hooks did not run, so a managed Postgres cluster may still \
+         be running and holding its data dir; the next start recovers the \
+         cluster through crash recovery, which is slower than a clean stop.",
+        COOPERATIVE_STOP_BOOT_CAP.as_secs()
+    )
+}
+
 /// The warning printed when the shutdown request could not be delivered.
 ///
 /// Distinct from [`escalation_warning`]: nothing is wrong with the app here, so
@@ -1854,8 +1911,57 @@ fn unreachable_warning(error: &str) -> String {
     )
 }
 
+/// How a wait for a booting app ended.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootWait {
+    /// The app is up (or no ready file is tracked): the stop budget can start.
+    Ready,
+    /// The app exited while booting.
+    Exited,
+    /// The app was still booting at the cap.
+    TimedOut,
+}
+
+/// Wait until the app finishes booting, exits, or `cap` passes.
+///
+/// The app watches the signal file only after startup. Its ready file marks
+/// that point. With no ready file to track, the app is assumed up.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn wait_until_booted(proc: &mut Child, ready_file: Option<&Path>, cap: Duration) -> BootWait {
+    let Some(ready_file) = ready_file else {
+        return BootWait::Ready;
+    };
+    let start = std::time::Instant::now();
+    loop {
+        if ready_file.exists() {
+            return BootWait::Ready;
+        }
+        match proc.try_wait() {
+            Ok(Some(_)) => return BootWait::Exited,
+            Ok(None) if start.elapsed() < cap => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) | Err(_) => return BootWait::TimedOut,
+        }
+    }
+}
+
 /// Stop `child` cooperatively: request a graceful shutdown via the signal file,
-/// wait up to `timeout` for it to drain, then force-kill if it has not.
+/// wait for the app to finish booting, then wait up to `budget()` for it to
+/// drain. Force-kill if it does not.
+///
+/// `budget` runs only after boot, so it sees the budget the app reported.
 ///
 /// This is the Windows stop path, but it is compiled on every platform so Linux
 /// CI exercises it. On Unix `stop_server` keeps using `SIGTERM`, which is the
@@ -1870,7 +1976,9 @@ fn unreachable_warning(error: &str) -> String {
 fn stop_child_cooperatively(
     child: &mut Option<Child>,
     signal_path: &Path,
-    timeout: Duration,
+    ready_file: Option<&Path>,
+    boot_cap: Duration,
+    budget: impl FnOnce() -> Duration,
 ) -> StopOutcome {
     let Some(proc) = child.as_mut() else {
         return StopOutcome::NotRunning;
@@ -1882,12 +1990,22 @@ fn stop_child_cooperatively(
             let _ = proc.wait();
             StopOutcome::Unreachable
         }
-        Ok(()) if crate::process::wait_with_timeout(proc, timeout).is_ok() => StopOutcome::Graceful,
-        Ok(()) => {
-            let _ = proc.kill();
-            let _ = proc.wait();
-            StopOutcome::Escalated
-        }
+        Ok(()) => match wait_until_booted(proc, ready_file, boot_cap) {
+            BootWait::Exited => StopOutcome::Graceful,
+            BootWait::TimedOut => {
+                let _ = proc.kill();
+                let _ = proc.wait();
+                StopOutcome::BootTimedOut
+            }
+            BootWait::Ready if crate::process::wait_with_timeout(proc, budget()).is_ok() => {
+                StopOutcome::Graceful
+            }
+            BootWait::Ready => {
+                let _ = proc.kill();
+                let _ = proc.wait();
+                StopOutcome::Escalated
+            }
+        },
     };
 
     // Always clear the request, on both paths: the next child must not inherit
@@ -2154,7 +2272,9 @@ mod tests {
                 .expect("spawn stand-in app"),
         );
 
-        let outcome = stop_child_cooperatively(&mut child, &path, Duration::from_secs(10));
+        let outcome = stop_child_cooperatively(&mut child, &path, None, BOOT_CAP, || {
+            Duration::from_secs(10)
+        });
         assert_eq!(outcome, StopOutcome::Graceful);
         assert!(child.is_none(), "a stopped child must be reaped");
         assert!(
@@ -2178,7 +2298,9 @@ mod tests {
                 .expect("spawn unresponsive app"),
         );
 
-        let outcome = stop_child_cooperatively(&mut child, &path, Duration::from_millis(300));
+        let outcome = stop_child_cooperatively(&mut child, &path, None, BOOT_CAP, || {
+            Duration::from_millis(300)
+        });
         assert_eq!(outcome, StopOutcome::Escalated);
         assert!(child.is_none(), "escalation must still reap the child");
         assert!(!path.exists());
@@ -2203,9 +2325,116 @@ mod tests {
                 .spawn()
                 .expect("spawn app"),
         );
-        let outcome = stop_child_cooperatively(&mut child, &path, Duration::from_millis(200));
+        let outcome = stop_child_cooperatively(&mut child, &path, None, BOOT_CAP, || {
+            Duration::from_millis(200)
+        });
         assert_eq!(outcome, StopOutcome::Unreachable);
         assert!(child.is_none(), "the child must still be stopped");
+    }
+
+    const BOOT_CAP: Duration = Duration::from_secs(30);
+
+    // ── A booting app is not yet watching (#2444) ──────────────────────────
+    //
+    // The app watches the signal file only after startup (managed Postgres
+    // `initdb`, migrations). A stop that arrives earlier must not start its
+    // deadline until the app is up, or it kills a booting app and orphans the
+    // postmaster that boot just started.
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_during_boot_waits_for_ready_before_it_starts_the_deadline() {
+        // Stand-in app: boots for 1s, writes the ready file, then honors the
+        // signal. The 300ms budget is shorter than the boot, so only a
+        // deadline that starts at ready lets it exit gracefully.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let ready = tmp.path().join("dev-ready.state");
+        let script = format!(
+            "sleep 1; echo 30 > {r}; while [ ! -f {s} ]; do sleep 0.05; done; exit 0",
+            r = ready.display(),
+            s = path.display()
+        );
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .spawn()
+                .expect("spawn booting app"),
+        );
+        let outcome = stop_child_cooperatively(&mut child, &path, Some(&ready), BOOT_CAP, || {
+            Duration::from_millis(300)
+        });
+        assert_eq!(outcome, StopOutcome::Graceful);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_during_boot_is_graceful_when_the_app_exits_before_ready() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let ready = tmp.path().join("dev-ready.state");
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 0.5; exit 0")
+                .spawn()
+                .expect("spawn app"),
+        );
+        let outcome = stop_child_cooperatively(&mut child, &path, Some(&ready), BOOT_CAP, || {
+            Duration::from_millis(100)
+        });
+        assert_eq!(outcome, StopOutcome::Graceful);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_boot_that_never_finishes_is_killed_at_the_boot_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let ready = tmp.path().join("dev-ready.state");
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .expect("spawn hung app"),
+        );
+        let started = std::time::Instant::now();
+        let outcome = stop_child_cooperatively(
+            &mut child,
+            &path,
+            Some(&ready),
+            Duration::from_millis(300),
+            || Duration::from_secs(20),
+        );
+        assert_eq!(outcome, StopOutcome::BootTimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.is_none(), "the child must be reaped");
+    }
+
+    // ── `.env` comes from the selected package (#2444) ─────────────────────
+
+    #[test]
+    fn the_stop_budget_reads_dotenv_from_the_package_dir_not_the_cli_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=300\n",
+        )
+        .unwrap();
+        let budget = stop_budget_in(tmp.path(), "dev");
+        assert!(
+            budget >= cooperative_stop_budget(300),
+            "package .env must set the budget, got {budget:?}"
+        );
+    }
+
+    #[test]
+    fn boot_timeout_warning_names_the_cap_and_the_consequence() {
+        let warning = boot_timeout_warning();
+        assert!(warning.contains("900s"), "{warning}");
+        assert!(warning.contains("Postgres"), "{warning}");
     }
 
     #[test]
@@ -2223,7 +2452,7 @@ mod tests {
         let path = signal_path(tmp.path());
         let mut child = None;
         assert_eq!(
-            stop_child_cooperatively(&mut child, &path, Duration::from_secs(1)),
+            stop_child_cooperatively(&mut child, &path, None, BOOT_CAP, || Duration::from_secs(1)),
             StopOutcome::NotRunning
         );
     }

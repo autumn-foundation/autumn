@@ -424,6 +424,22 @@ pub fn os_env_with_dotenv_for_profile(profile: &str) -> Result<DotenvOsEnv, Dote
     })
 }
 
+/// Like [`os_env_with_dotenv_for_profile`], but reads `.env` from `dir`.
+///
+/// For a CLI that supervises another package: the app reads `.env` beside its
+/// own manifest, so the CLI must read the same file, not the one in its own
+/// working directory.
+///
+/// # Errors
+/// Returns a [`DotenvError`] if a `.env` file in `dir` cannot be read or parsed.
+pub fn os_env_with_dotenv_in(dir: &Path, profile: &str) -> Result<DotenvOsEnv, DotenvError> {
+    Ok(DotenvOsEnv {
+        overlay: resolve_dotenv_vars(dir, profile, &OsEnv)?
+            .into_iter()
+            .collect(),
+    })
+}
+
 /// Like [`os_env_with_dotenv_for_profile`] but resolves dotenv gating against
 /// a caller-supplied `base`.
 ///
@@ -453,6 +469,14 @@ mod tests {
     use super::*;
     use crate::config::MockEnv;
     use std::path::PathBuf;
+
+    #[test]
+    fn os_env_with_dotenv_in_reads_the_given_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "AUTUMN_TEST_2444_KEY=from-dir\n").unwrap();
+        let env = os_env_with_dotenv_in(dir.path(), "dev").unwrap();
+        assert_eq!(env.var("AUTUMN_TEST_2444_KEY").as_deref(), Ok("from-dir"));
+    }
 
     #[test]
     fn dotenv_profile_selection_reproduces_offsite_wrong_profile_bug() {
