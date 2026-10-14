@@ -2352,24 +2352,21 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
         // libpq applies query parameters after the authority. The last repeat
         // wins, even when empty. Values use percent-decoding only: `+` is a
         // literal, not a space.
-        let mut params: BTreeMap<&str, String> = BTreeMap::new();
-        for pair in parsed.query().unwrap_or_default().split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                params.insert(key, decode(value));
-            }
+        let mut params: BTreeMap<String, String> = BTreeMap::new();
+        for (key, value) in crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or_default()) {
+            params.insert(key, value);
         }
-        let host = params
+        // `host` and `hostaddr` are presence-based: an explicit empty value
+        // means the default, and it does not fall back to the environment.
+        let hostaddr = params
             .get("hostaddr")
-            .filter(|v| !v.is_empty())
             .cloned()
-            .or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty()))
-            .or_else(|| {
-                params
-                    .get("host")
-                    .map_or_else(|| parsed.host_str().map(decode), |v| Some(v.clone()))
-            })
-            .filter(|h| !h.is_empty())
-            .or_else(|| env("PGHOST").filter(|h| !h.is_empty()))
+            .or_else(|| env("PGHOSTADDR"))
+            .filter(|v| !v.is_empty());
+        let host = hostaddr
+            .or_else(|| params.get("host").cloned())
+            .or_else(|| parsed.host_str().map(decode))
+            .or_else(|| env("PGHOST"))
             .unwrap_or_default();
         // A socket directory is case-sensitive. A DNS name is not. An IPv6
         // address has no brackets.
@@ -9018,6 +9015,24 @@ mod tests {
             "postgres://a/app?hostaddr=10.0.0.2",
             "postgres://b/app",
             &addr
+        ));
+        // An explicit empty `host=` means the default socket, not `PGHOST`.
+        let pghost = |k: &str| (k == "PGHOST").then(|| "h.example.com".to_owned());
+        assert!(!same_database_with(
+            "postgres:///app?host=",
+            "postgres://h.example.com/app",
+            &pghost
+        ));
+        assert!(same_database_with(
+            "postgres:///app?host=",
+            "postgres:///app?host=",
+            &pghost
+        ));
+        // Parameter names are percent-decoded, as the connection parser does.
+        assert!(same_database_with(
+            "postgres:///app?ho%73t=prod.example.com",
+            "postgres://prod.example.com/app",
+            &|_| None
         ));
         // A non-Postgres scheme never names a Postgres database.
         assert!(!same_database_with(
