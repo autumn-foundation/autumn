@@ -2496,7 +2496,7 @@ fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
 
     let mut out = BTreeSet::new();
     for (path, result) in scanned {
-        if disabled.iter().any(|d| path.starts_with(d)) {
+        if disabled.excludes(&path) {
             continue;
         }
         match result {
@@ -2610,7 +2610,9 @@ fn database_endpoint(
         .or_else(|| env("PGUSER").filter(|n| !n.is_empty()))?;
     // Named query parameters apply after the authority, so they win. `hostaddr`
     // is the network address libpq connects to; `host` is then only a name.
-    let named = query("hostaddr").or_else(|| query("host"));
+    let named = query("hostaddr")
+        .or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty()))
+        .or_else(|| query("host"));
     let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if let Some(list) = named {
         let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
         let ports = if listed.len() == hosts.len() {
@@ -2627,7 +2629,14 @@ fn database_endpoint(
     } else {
         listed.into_iter().unzip()
     };
-    Some((pair_endpoints(hosts, own_ports, query("port"), env), name))
+    // A named `port` overrides the authority's port, as the host does.
+    let query_port = query("port");
+    let own_ports = if query_port.is_some() {
+        vec![None; hosts.len()]
+    } else {
+        own_ports
+    };
+    Some((pair_endpoints(hosts, own_ports, query_port, env), name))
 }
 
 /// Pair hosts with ports as libpq does. A port list matches the host list by
@@ -2769,8 +2778,9 @@ fn conninfo_endpoint(
     // `hostaddr` is the network address libpq connects to.
     let host_list = values
         .get("hostaddr")
-        .or_else(|| values.get("host"))
         .cloned()
+        .or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty()))
+        .or_else(|| values.get("host").cloned())
         .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
         .unwrap_or_default();
     let hosts: Vec<String> = host_list.split(',').map(normalize_host).collect();
@@ -4755,6 +4765,8 @@ pub struct DatabaseFacts {
     /// Every materialized view in `public` as `name:populated`. The drift check
     /// compares it, because the refresh list is fixed at probe time.
     pub public_materialized_views: BTreeSet<String>,
+    /// Every user trigger and rule by identity. The drift check compares it.
+    pub trigger_identities: BTreeSet<String>,
     /// Every foreign key in `public`, whole constraints rather than the loose
     /// columns above: `--sample` walks this graph to decide which rows a subset
     /// must carry for every reference to resolve.
@@ -4920,6 +4932,23 @@ const PUBLIC_BASE_TABLES: &str = "SELECT rel.relname AS name FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind IN ('r', 'p', 'f')";
 
+/// Every user trigger and rewrite rule on a `public` relation, by identity:
+/// name, event bits and enabled state. A table-name set cannot see a second
+/// trigger added to a table that already has one.
+const TRIGGER_IDENTITIES: &str = "SELECT rel.relname || ':trigger:' || t.tgname || ':' || t.tgtype::text \
+         || ':' || t.tgenabled::text AS name \
+     FROM pg_trigger t \
+     JOIN pg_class rel ON rel.oid = t.tgrelid \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE NOT t.tgisinternal \
+     UNION ALL \
+     SELECT rel.relname || ':rule:' || r.rulename || ':' || r.ev_type::text \
+         || ':' || r.ev_enabled::text AS name \
+     FROM pg_rewrite r \
+     JOIN pg_class rel ON rel.oid = r.ev_class \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE r.rulename <> '_RETURN'";
+
 /// Every materialized view in `public`, with its population state. The refresh
 /// list is drawn from the probe, so a view created later would keep stale rows.
 const PUBLIC_MATVIEWS: &str = "SELECT rel.relname || ':' || rel.relispopulated::text AS name \
@@ -4972,6 +5001,11 @@ fn live_schema_drift(
             "materialized view",
             &facts.public_materialized_views,
             names(conn, PUBLIC_MATVIEWS)?,
+        ),
+        (
+            "trigger or rule",
+            &facts.trigger_identities,
+            names(conn, TRIGGER_IDENTITIES)?,
         ),
         ("triggers or rules", &facts.triggered_tables, triggered),
         (
@@ -5625,6 +5659,7 @@ fn probe_database_facts(
     // classified by nothing at all and still report a clean scrub.
     let public_base_tables = names(PUBLIC_BASE_TABLES, &mut conn)?.into_iter().collect();
     let public_materialized_views = names(PUBLIC_MATVIEWS, &mut conn)?.into_iter().collect();
+    let trigger_identities = names(TRIGGER_IDENTITIES, &mut conn)?.into_iter().collect();
 
     let public_columns = pair_set(
         sql_query(PUBLIC_COLUMNS)
@@ -5658,6 +5693,7 @@ fn probe_database_facts(
         public_columns,
         public_base_tables,
         public_materialized_views,
+        trigger_identities,
         foreign_keys,
     })
 }
@@ -10148,6 +10184,16 @@ mod tests {
             "postgres://prod.example/app?hostaddr=10.0.0.5",
             "postgres://10.0.0.5/app",
             &env
+        ));
+        assert!(same_database_in(
+            "postgres://db:5432/app?port=6543",
+            "postgres://db:6543/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://prod.example/app",
+            "postgres://10.0.0.5/app",
+            &env_of(&[("PGHOSTADDR", "10.0.0.5")])
         ));
         assert!(same_database_in(
             "postgres:///app?host=a,b&port=,6543",

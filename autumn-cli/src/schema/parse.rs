@@ -492,7 +492,7 @@ pub fn parse_encrypted_columns_path(
     let disabled = disabled_module_paths(&sources);
     let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
     for (file, src) in &sources {
-        if disabled.iter().any(|d| file.starts_with(d)) {
+        if disabled.excludes(file) {
             continue;
         }
         for (table, columns) in parse_encrypted_columns(src)? {
@@ -517,34 +517,66 @@ pub fn parse_encrypted_columns_path(
 /// crate roots), is production code and is left out. A source that does not
 /// parse adds nothing: the caller reports that.
 #[must_use]
-pub fn disabled_module_paths(sources: &[(std::path::PathBuf, String)]) -> Vec<std::path::PathBuf> {
-    let mut found = ModulePaths::default();
-    for (file, src) in sources {
-        let Ok(parsed) = syn::parse_file(src) else {
-            continue;
+pub fn disabled_module_paths(sources: &[(std::path::PathBuf, String)]) -> DisabledModules {
+    let mut active: Vec<&(std::path::PathBuf, String)> = sources.iter().collect();
+    // A declaration inside a test-only file does not enable anything, so repeat
+    // without the files the last round excluded. The set only shrinks.
+    loop {
+        let mut found = ModulePaths::default();
+        for (file, src) in &active {
+            let Ok(parsed) = syn::parse_file(src) else {
+                continue;
+            };
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let parent = file.parent().unwrap_or_else(|| Path::new(""));
+            let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            collect_module_paths(
+                &parsed.items,
+                (&module_dir, parent),
+                !production_enabled(&parsed.attrs),
+                &mut found,
+            );
+        }
+        let modules = DisabledModules {
+            disabled: found.disabled,
+            enabled: found.enabled,
         };
-        let stem = file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-        let parent = file.parent().unwrap_or_else(|| Path::new(""));
-        let module_dir = if matches!(stem, "lib" | "main" | "mod") {
-            parent.to_path_buf()
-        } else {
-            parent.join(stem)
-        };
-        collect_module_paths(
-            &parsed.items,
-            (&module_dir, parent),
-            !production_enabled(&parsed.attrs),
-            &mut found,
-        );
+        let before = active.len();
+        active.retain(|(file, _)| !modules.excludes(file));
+        if active.len() == before {
+            return modules;
+        }
     }
-    found
-        .disabled
-        .into_iter()
-        .filter(|p| !found.enabled.contains(p))
-        .collect()
+}
+
+/// The paths `cfg`-disabled and enabled modules load, from
+/// [`disabled_module_paths`].
+pub struct DisabledModules {
+    disabled: Vec<std::path::PathBuf>,
+    enabled: Vec<std::path::PathBuf>,
+}
+
+impl DisabledModules {
+    /// Whether `file` is test code: under a disabled path, and not under a more
+    /// specific path that an enabled declaration loads (`#[cfg(test)] mod
+    /// fixtures;` beside `#[path = "fixtures/models.rs"] mod models;`).
+    #[must_use]
+    pub fn excludes(&self, file: &Path) -> bool {
+        self.disabled.iter().any(|d| {
+            file.starts_with(d)
+                && !self
+                    .enabled
+                    .iter()
+                    .any(|e| file.starts_with(e) && e.starts_with(d))
+        })
+    }
 }
 
 #[derive(Default)]
@@ -2632,6 +2664,25 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "mod models;\n").unwrap();
         std::fs::write(
             dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// An enabled file under a disabled module's directory stays production.
+    #[test]
+    fn an_enabled_path_under_a_disabled_directory_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod fixtures;\n#[path = \"fixtures/models.rs\"] mod production_models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("models.rs"),
             "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
         )
         .unwrap();
