@@ -628,6 +628,9 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
     }
     let mut paths = Vec::new();
     let mut stack = vec![path.to_path_buf()];
+    let mut visited = std::collections::BTreeSet::from([
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    ]);
     while let Some(dir) = stack.pop() {
         let read = std::fs::read_dir(&dir).map_err(|source| SchemaParseError::Io {
             path: dir.display().to_string(),
@@ -639,18 +642,25 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
                 source,
             })?;
             let candidate = entry.path();
-            let file_type = entry.file_type().map_err(|source| SchemaParseError::Io {
-                path: candidate.display().to_string(),
-                source,
-            })?;
-            if file_type.is_dir() {
-                stack.push(candidate);
-            } else if file_type.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
+            // `metadata` follows a symlink, as `Path::is_dir` does for the
+            // models path itself. A dangling link has no metadata and is skipped.
+            let Ok(meta) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if meta.is_dir() {
+                // A link back up the tree must not loop the walk.
+                if visited
+                    .insert(std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone()))
+                {
+                    stack.push(candidate);
+                }
+            } else if meta.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
                 paths.push(candidate);
             }
         }
     }
     paths.sort();
+    paths.dedup();
     Ok(paths)
 }
 
@@ -2575,6 +2585,26 @@ mod tests {
             matches!(err, SchemaParseError::ConflictingEncryptedMode { ref column, .. } if column == "email"),
             "{err:?}"
         );
+    }
+
+    /// A symlinked model file or directory is followed, and a link back up the
+    /// tree does not loop.
+    #[cfg(unix)]
+    #[test]
+    fn encrypted_columns_follow_symlinked_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(
+            real.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(real.path().join("models.rs"), dir.path().join("models.rs"))
+            .unwrap();
+        std::os::unix::fs::symlink(real.path(), dir.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
     }
 
     /// A model in an inline module, at any depth, is still a model.

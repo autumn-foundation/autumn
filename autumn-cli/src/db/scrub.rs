@@ -4744,6 +4744,9 @@ pub struct DatabaseFacts {
     /// and be reported clean. `pg_class` shows them all, and the difference is
     /// a refusal.
     pub public_base_tables: BTreeSet<String>,
+    /// Every materialized view in `public` as `name:populated`. The drift check
+    /// compares it, because the refresh list is fixed at probe time.
+    pub public_materialized_views: BTreeSet<String>,
     /// Every foreign key in `public`, whole constraints rather than the loose
     /// columns above: `--sample` walks this graph to decide which rows a subset
     /// must carry for every reference to resolve.
@@ -4909,6 +4912,13 @@ const PUBLIC_BASE_TABLES: &str = "SELECT rel.relname AS name FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind IN ('r', 'p', 'f')";
 
+/// Every materialized view in `public`, with its population state. The refresh
+/// list is drawn from the probe, so a view created later would keep stale rows.
+const PUBLIC_MATVIEWS: &str = "SELECT rel.relname || ':' || rel.relispopulated::text AS name \
+     FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relkind = 'm'";
+
 /// Every live column of those tables.
 const PUBLIC_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
      FROM pg_attribute att \
@@ -4949,6 +4959,11 @@ fn live_schema_drift(
             "row-level security",
             &facts.rls_tables,
             names(conn, RLS_RESTRICTED_TABLES)?,
+        ),
+        (
+            "materialized view",
+            &facts.public_materialized_views,
+            names(conn, PUBLIC_MATVIEWS)?,
         ),
         ("triggers or rules", &facts.triggered_tables, triggered),
         (
@@ -5601,6 +5616,7 @@ fn probe_database_facts(
     // `BASE TABLE`, so a foreign table left pointing at production would be
     // classified by nothing at all and still report a clean scrub.
     let public_base_tables = names(PUBLIC_BASE_TABLES, &mut conn)?.into_iter().collect();
+    let public_materialized_views = names(PUBLIC_MATVIEWS, &mut conn)?.into_iter().collect();
 
     let public_columns = pair_set(
         sql_query(PUBLIC_COLUMNS)
@@ -5633,6 +5649,7 @@ fn probe_database_facts(
         framework_tables,
         public_columns,
         public_base_tables,
+        public_materialized_views,
         foreign_keys,
     })
 }
