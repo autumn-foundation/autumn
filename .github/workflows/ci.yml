@@ -3303,6 +3303,11 @@ jobs:
             Stop-Process -Id $dev.Id -Force -ErrorAction SilentlyContinue
             Get-Process -Name 'tier1_app' -ErrorAction SilentlyContinue | Stop-Process -Force
             Get-Process -Name 'postgres' -ErrorAction SilentlyContinue | Stop-Process -Force
+            # `Stop-Process` returns before the process has gone. The next step
+            # starts Postgres on this data directory again, and that start fails
+            # while the old postmaster still holds it. Wait for the exit.
+            Get-Process -Name 'postgres', 'tier1_app' -ErrorAction SilentlyContinue |
+              Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
           }
 
       - name: "Journey: the daemon starts, is discoverable, and serves"
