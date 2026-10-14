@@ -58,6 +58,13 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     db.execute_sql("TRUNCATE TABLE users CASCADE").await;
     db.execute_sql("TRUNCATE TABLE autumn_jobs CASCADE").await;
 
+    // The handler reads `registration_open` from the app's runtime config.
+    // Its dev-profile default is a Postgres URL nothing listens on, so build
+    // the config service against the test database.
+    temp_env::with_vars([("AUTUMN_DATABASE__URL", Some(db.url()))], || {
+        reddit_clone::init_config();
+    });
+
     // 2. Setup the Webhook Outbound Plugin with a process-local InMemory store
     let store = Arc::new(InMemoryOutboundWebhookStore::new());
     let plugin = OutboundWebhookPlugin::new(store.clone()).with_initial_backoff_ms(1);
