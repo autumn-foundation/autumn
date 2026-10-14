@@ -62,21 +62,74 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
+/// Take a non-empty run of token bytes off the front of `bytes`.
+fn take_token(bytes: &[u8]) -> Option<&[u8]> {
+    let len = bytes.iter().take_while(|b| is_token_byte(**b)).count();
+    (len > 0).then(|| &bytes[len..])
+}
+
+/// Take a quoted string (with `\` escapes) off the front of `bytes`.
+/// Returns `None` when the string is not closed.
+fn take_quoted(bytes: &[u8]) -> Option<&[u8]> {
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(&bytes[i + 1..]),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Drop leading spaces and tabs.
+fn skip_ows(bytes: &[u8]) -> &[u8] {
+    let len = bytes
+        .iter()
+        .take_while(|b| **b == b' ' || **b == b'\t')
+        .count();
+    &bytes[len..]
+}
+
+/// `true` when `value` is `type/subtype` plus zero or more `; name=value`
+/// parameters, as RFC 9110 defines them.
+fn is_media_type(value: &str) -> bool {
+    let Some(rest) = take_token(skip_ows(value.as_bytes())) else {
+        return false;
+    };
+    let Some(mut rest) = rest.strip_prefix(b"/").and_then(take_token).map(skip_ows) else {
+        return false;
+    };
+    while !rest.is_empty() {
+        let param = rest
+            .strip_prefix(b";")
+            .map(skip_ows)
+            .and_then(take_token)
+            .and_then(|r| r.strip_prefix(b"="));
+        let after_value = param.and_then(|r| {
+            if r.first() == Some(&b'"') {
+                take_quoted(r)
+            } else {
+                take_token(r)
+            }
+        });
+        match after_value {
+            Some(r) => rest = skip_ows(r),
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Check a declared `Content-Type`.
 ///
 /// The byte rule is the runtime rule (`usable_recorded_content_type`):
 /// non-blank, visible ASCII or tab. Keep both in step. A test in `autumn`
-/// pins the runtime byte set. On top of that, the part before `;` must be
-/// `type/subtype` with token bytes only, and a comma is never allowed.
+/// pins the runtime byte set. The value must also be a well-formed media type.
 fn validate_content_type(lit: &LitStr) -> syn::Result<()> {
     let value = lit.value();
     let legal = |b: u8| b == b'\t' || (0x20..0x7f).contains(&b);
-    let essence = value.split(';').next().unwrap_or_default().trim();
-    let well_formed = essence.split_once('/').is_some_and(|(kind, subtype)| {
-        let token = |t: &str| !t.is_empty() && t.bytes().all(is_token_byte);
-        token(kind) && token(subtype)
-    });
-    if value.trim().is_empty() || !value.bytes().all(legal) || value.contains(',') || !well_formed {
+    if value.trim().is_empty() || !value.bytes().all(legal) || !is_media_type(&value) {
         return Err(syn::Error::new(
             lit.span(),
             "`content_type` must be a media type, \
@@ -827,6 +880,13 @@ mod tests {
             quote! { "/a", content_type = "image/png, text/html" },
             quote! { "/a", content_type = "text /plain" },
             quote! { "/a", content_type = "text/plain; a=\"b\"; c=d," },
+            quote! { "/a", content_type = "text/html; =" },
+            quote! { "/a", content_type = "text/html; a=" },
+            quote! { "/a", content_type = "text/html; a" },
+            quote! { "/a", content_type = "text/html;" },
+            quote! { "/a", content_type = "text/html; charset=\"unterminated" },
+            quote! { "/a", content_type = "text/html; a=b c" },
+            quote! { "/a", content_type = "text/html; a=\"x\"y" },
             quote! { "/a", content_type = "a/b", content_type = "c/d" },
         ] {
             let generated = expand(bad.clone());
@@ -846,6 +906,8 @@ mod tests {
             "application/rss+xml;\tprofile=\"x\"",
             "image/svg+xml",
             "  text/csv  ",
+            "text/html; a=\"x\\\"y\"; b=c",
+            "text/html ; charset=utf-8",
         ] {
             let generated = expand(quote! { "/a", content_type = #good });
             assert!(!generated.contains("compile_error"), "{good}: {generated}");
