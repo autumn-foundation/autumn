@@ -2335,8 +2335,9 @@ fn same_database(a: &str, b: &str) -> bool {
 /// Tests then do not set process environment variables.
 ///
 /// A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host
-/// from the `hostaddr` parameter, then `host`, then `pghost`. A `hostaddr`
-/// wins over a host in the URL authority, as in libpq.
+/// from the `hostaddr` parameter, then `host`, then the URL authority, then
+/// `pghost`. Query parameters win over the authority, and the last repeat of a
+/// parameter wins, as in libpq.
 /// If no host is found, the host is empty and libpq uses its default socket.
 fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
     let decode = |raw: &str| {
@@ -2346,25 +2347,29 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
     };
     let parts = |raw: &str| -> Option<(String, u16, String)> {
         let parsed = url::Url::parse(raw).ok()?;
+        // libpq applies query parameters after the authority, and the last
+        // repeat of a parameter wins.
         let query = |key: &str| {
             parsed
                 .query_pairs()
-                .find(|(k, v)| k == key && !v.is_empty())
+                .filter(|(k, v)| k == key && !v.is_empty())
+                .last()
                 .map(|(_, v)| v.into_owned())
         };
-        let host = parsed
-            .host_str()
-            .map(decode)
-            .filter(|_| query("hostaddr").is_none())
-            .or_else(|| query("hostaddr"))
+        let host = query("hostaddr")
             .or_else(|| query("host"))
+            .or_else(|| parsed.host_str().map(decode))
             .or_else(|| pghost.filter(|h| !h.is_empty()).map(str::to_owned))
-            .unwrap_or_default()
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        let port = parsed
-            .port()
-            .or_else(|| query("port").and_then(|p| p.parse().ok()))
+            .unwrap_or_default();
+        // A socket directory is case-sensitive. A DNS name is not.
+        let host = if host.starts_with(['/', '@']) {
+            host
+        } else {
+            host.trim_end_matches('.').to_ascii_lowercase()
+        };
+        let port = query("port")
+            .and_then(|p| p.parse().ok())
+            .or_else(|| parsed.port())
             .unwrap_or(5432);
         let name = query("dbname")
             .or_else(|| {
@@ -9062,6 +9067,25 @@ mod tests {
         assert!(same(
             "postgres://prod.example.com/prod?hostaddr=10.0.0.1",
             "postgres://10.0.0.1/prod"
+        ));
+        // Query parameters override the authority. The last repeat wins.
+        assert!(same(
+            "postgres://placeholder/prod?host=a.example.com",
+            "postgres://a.example.com/prod"
+        ));
+        assert!(same(
+            "postgres://x/db?host=stg&host=prod",
+            "postgres://prod/db"
+        ));
+        assert!(same("postgres://h:1/db?port=6432", "postgres://h:6432/db"));
+        // Socket paths are case-sensitive. DNS names are not.
+        assert!(!same(
+            "postgres:///db?host=/run/PostgreSQL",
+            "postgres:///db?host=/run/postgresql"
+        ));
+        assert!(same(
+            "postgres://Prod.Example.com/db",
+            "postgres://prod.example.com/db"
         ));
         // A URL that does not parse still matches itself.
         assert!(same(
