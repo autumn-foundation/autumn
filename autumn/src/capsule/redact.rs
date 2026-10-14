@@ -178,6 +178,13 @@ impl RedactedValues {
 /// has no length rule at all.
 const MIN_ECHO_LEN: usize = 4;
 
+/// Most `Cookie:` pairs recorded from one header.
+///
+/// [`mask_echoes`] costs O(text × needles), so the echo set must stay bounded.
+/// Browsers send far fewer cookies per request. The whole header value is
+/// always recorded, whatever the cap.
+const MAX_COOKIE_PAIRS: usize = 256;
+
 /// Build the capsule's request record, masking every sensitive value.
 ///
 /// Takes the request head and the body separately, because the capture layer
@@ -1092,12 +1099,10 @@ fn redact_headers(
 /// the one place valid UTF-8 is genuinely required, and a value that is not
 /// UTF-8 cannot appear in a message to be masked out of anyway.
 ///
-/// What this still does **not** read: a `token68`-style credential separated
-/// from its scheme by HTAB rather than SP (RFC 7235 says `1*SP`, and the split
-/// below follows it), and the pre-trim spelling of an RFC 6265 quoted cookie
-/// value (`session="abc"` records `abc`, not `"abc"`). Both are spellings a
-/// sloppy handler could hold; both predate this function's byte port and are
-/// tracked separately rather than widened into it.
+/// The scheme may be followed by SP, HTAB or Unicode whitespace: RFC 7235
+/// says `1*SP`, but a sloppy handler splits on any whitespace. A quoted cookie
+/// value records both the quoted and the unquoted spelling. At most
+/// [`MAX_COOKIE_PAIRS`] cookie pairs are recorded per header.
 pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
     let trimmed = trim_ows(value);
     // Only headers whose *syntax* this understands. A custom sensitive header
@@ -1121,7 +1126,7 @@ pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mu
     // read as one. The rest of the value is kept whole, so a credential that
     // itself contains spaces (`AWS4-HMAC-SHA256 Credential=…, Signature=…`)
     // stays intact.
-    if is_authorization && let Some((scheme, credential)) = split_once_byte(trimmed, b' ') {
+    if is_authorization && let Some((scheme, credential)) = split_scheme(trimmed) {
         let credential = trim_ows(credential);
         if is_auth_scheme(scheme) && !credential.is_empty() {
             values.insert(credential);
@@ -1155,15 +1160,25 @@ pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mu
     // with the same set but produces the static message, would call that a
     // mismatch.
     if is_cookie && trimmed.contains(&b'=') {
-        let pairs: Vec<&[u8]> = if name == "set-cookie" {
-            trimmed.split(|byte| *byte == b';').take(1).collect()
+        let limit = if name == "set-cookie" {
+            1
         } else {
-            trimmed.split(|byte| *byte == b';').collect()
+            MAX_COOKIE_PAIRS
         };
-        for pair in pairs {
+        for pair in trimmed.split(|byte| *byte == b';').take(limit) {
             if let Some((_, cookie_value)) = split_once_byte(pair, b'=') {
-                let cookie_value = trim_matches_byte(trim_ows(cookie_value), b'"');
-                record_cookie_value(cookie_value, values);
+                let spelled = trim_ows(cookie_value);
+                let unquoted = trim_matches_byte(spelled, b'"');
+                record_cookie_value(unquoted, values);
+                // A handler that splits on `=` holds the quotes too. That is
+                // an inferred spelling, so it gets the same floor as a decoded
+                // one.
+                if unquoted.len() != spelled.len()
+                    && spelled.len() >= MIN_ECHO_LEN
+                    && !unquoted.iter().all(u8::is_ascii_whitespace)
+                {
+                    record_cookie_value(spelled, values);
+                }
             }
         }
     }
@@ -1391,27 +1406,55 @@ fn record_basic_credentials(credential: &[u8], values: &mut RedactedValues) {
 /// `&str` literals (`is_auth_scheme("Negotiate")`).
 fn is_auth_scheme(word: impl AsRef<[u8]>) -> bool {
     let word = word.as_ref();
-    !word.is_empty()
-        && word.iter().copied().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
+    !word.is_empty() && word.iter().copied().all(is_token_byte)
+}
+
+/// Whether `byte` is an RFC 7230 `tchar`.
+const fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Split `<scheme><whitespace><rest>` at the first whitespace.
+///
+/// The scheme is a token, so the first non-token byte must be whitespace:
+/// SP, HTAB or a Unicode space. Anything else is not a scheme. Splitting
+/// there cannot cut a credential, because a token holds no whitespace.
+fn split_scheme(value: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = value
+        .iter()
+        .copied()
+        .position(|byte| !is_token_byte(byte))?;
+    let scheme = value.get(..end).filter(|scheme| !scheme.is_empty())?;
+    let rest = value.get(end..)?;
+    let width = match rest.first()? {
+        b' ' | b'\t' => 1,
+        _ => rest
+            .utf8_chunks()
+            .next()?
+            .valid()
+            .chars()
+            .next()
+            .filter(|c| c.is_whitespace())?
+            .len_utf8(),
+    };
+    Some((scheme, rest.get(width..)?))
 }
 
 // ── Byte equivalents of the `str` methods the parse above needs ─────────────
@@ -2984,6 +3027,111 @@ mod tests {
         assert!(
             cookie.contains(b"sess-abcdef"),
             "a padded cookie value is recorded as the handler holds it"
+        );
+    }
+
+    /// A sloppy client may separate scheme and credential with HTAB, or with
+    /// Unicode space only. A handler that splits on whitespace holds the bare
+    /// credential, so it must join the echo set.
+    #[test]
+    fn any_whitespace_after_the_scheme_still_yields_the_credential() {
+        for separated in [
+            "Bearer\thunter2secret",
+            "Bearer \t hunter2secret",
+            "Bearer\u{a0}hunter2secret",
+        ] {
+            let (_request, values) = redact(
+                Request::get("/").header(header::AUTHORIZATION, separated),
+                CapturedBody::Absent,
+                &filter_with(&[]),
+            );
+            assert!(
+                values.contains(b"hunter2secret"),
+                "the credential must survive this separator ({separated:?})"
+            );
+        }
+
+        // The split stays at the first separator: later whitespace belongs to
+        // the credential, so auth-params still parse.
+        let (_request, params) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                "Digest\tresponse=deadbeef,\tnonce=cafebabe",
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(params.contains(b"deadbeef"), "first param value");
+        assert!(params.contains(b"cafebabe"), "param after an HTAB");
+
+        // A non-token head is still not a scheme.
+        let (_request, not_scheme) = redact(
+            Request::get("/").header(header::AUTHORIZATION, "a=b\tvalue1234"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            !not_scheme.contains(b"value1234"),
+            "a head holding `=` is not a scheme"
+        );
+    }
+
+    /// A handler that splits on `=` holds the wire spelling, quotes and all.
+    /// One that uses a cookie parser holds the unquoted form. Record both.
+    #[test]
+    fn a_quoted_cookie_value_records_both_spellings() {
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, "session=\"abcdef\"; theme=\"x\"; e=\"\""),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"abcdef"), "the unquoted spelling");
+        assert!(values.contains(b"\"abcdef\""), "the wire spelling");
+        assert!(
+            !values.contains(b"\"x\""),
+            "a quoted spelling under the floor is not recorded"
+        );
+        assert!(
+            !values.contains(b"\"\""),
+            "an empty quoted value is nothing"
+        );
+
+        let mut binds = vec![BindValue::Value(b"\"abcdef\"".to_vec())];
+        mask_binds(&mut binds, &values);
+        assert_eq!(binds.first(), Some(&BindValue::Masked));
+
+        // The quoted form also decodes, as the unquoted one does.
+        let (_request, encoded) = redact(
+            Request::get("/").header(header::COOKIE, "session=\"abc%2Fdef\""),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(encoded.contains(b"\"abc%2Fdef\""));
+        assert!(encoded.contains(b"abc/def"));
+        assert!(encoded.contains(b"\"abc/def\""));
+    }
+
+    /// A `Cookie:` header with many pairs must not grow the echo set without
+    /// bound.
+    #[test]
+    fn cookie_pairs_beyond_the_cap_are_not_recorded() {
+        let header_value = (0..MAX_COOKIE_PAIRS + 10)
+            .map(|i| format!("k{i}=value{i:05}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, header_value),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"value00000"), "first pair");
+        assert!(
+            values.contains(format!("value{:05}", MAX_COOKIE_PAIRS - 1).as_bytes()),
+            "last pair under the cap"
+        );
+        assert!(
+            !values.contains(format!("value{:05}", MAX_COOKIE_PAIRS).as_bytes()),
+            "first pair over the cap"
         );
     }
 
