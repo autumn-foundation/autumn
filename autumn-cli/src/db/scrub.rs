@@ -2414,11 +2414,9 @@ fn guard_configured_source(
     let mut candidates: Vec<String> = artifact_profile
         .map(str::to_owned)
         .into_iter()
-        .chain(
-            profiles_with_config(project_root)
-                .into_iter()
-                .filter(|p| p != destination_profile),
-        )
+        .chain(profiles_with_config(project_root).into_iter().filter(|p| {
+            migrate::canonical_profile(p) != migrate::canonical_profile(destination_profile)
+        }))
         .filter(|p| !super::is_safe_destructive_profile(p))
         .collect();
     candidates.sort();
@@ -9006,6 +9004,21 @@ mod tests {
                 false
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_profile_alias_still_names_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "postgres://a@prod.example.com/app";
+        overlay(
+            dir.path(),
+            "prod",
+            &format!("[database]\nprimary_url = \"{url}\"\n"),
+        );
+        assert!(
+            guard_configured_source(None, "production", dir.path(), &control_target(url), false)
+                .is_ok()
         );
     }
 
