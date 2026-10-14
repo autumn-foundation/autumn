@@ -16893,7 +16893,10 @@ mod tests {
         // mistake for an address.
         let payload = serve_ready_payload(7, "");
         assert!(payload.lines().all(|l| !l.trim().is_empty()), "{payload:?}");
-        assert_eq!(payload.lines().nth(1), Some(SHUTDOWN_SIGNAL_CAPABILITY_LINE));
+        assert_eq!(
+            payload.lines().nth(1),
+            Some(SHUTDOWN_SIGNAL_CAPABILITY_LINE)
+        );
     }
 
     #[test]

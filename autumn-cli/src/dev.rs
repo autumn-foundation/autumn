@@ -2596,10 +2596,7 @@ mod tests {
     #[test]
     fn no_ready_file_means_the_child_is_still_booting() {
         // Cannot tell a slow boot from an old child. Keep the cooperative wait.
-        assert_eq!(
-            shutdown_support_from_ready(None),
-            ShutdownSupport::Unknown
-        );
+        assert_eq!(shutdown_support_from_ready(None), ShutdownSupport::Unknown);
     }
 
     #[test]
@@ -2639,7 +2636,10 @@ mod tests {
         assert_eq!(outcome, StopOutcome::Unsupported);
         assert!(start.elapsed() < Duration::from_secs(10), "must not wait");
         assert!(child.is_none(), "the child must be reaped");
-        assert!(!path.exists(), "no request is sent to a child that ignores it");
+        assert!(
+            !path.exists(),
+            "no request is sent to a child that ignores it"
+        );
     }
 
     #[test]
