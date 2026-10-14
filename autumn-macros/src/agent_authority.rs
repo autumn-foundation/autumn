@@ -910,7 +910,7 @@ struct Analyzer {
     /// A `use` lasts until the end of its block.
     tokio_imports: HashSet<String>,
     /// Macro names the handler defines or imports. They are never read as the
-    /// standard macro of that name. The set is handler-wide.
+    /// standard macro of that name. A block restores it when it ends.
     shadowed_macros: HashSet<String>,
 }
 
@@ -1268,6 +1268,7 @@ impl Analyzer {
         // A `use` in this block ends with it. So does a local `fn`, whose name
         // covers the whole block, so it hides an import before its own line.
         let imports = self.tokio_imports.clone();
+        let macros = self.shadowed_macros.clone();
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Item(syn::Item::Fn(item)) => self.hide_import(&item.sig.ident),
@@ -1302,6 +1303,7 @@ impl Analyzer {
             self.stmt(stmt);
         }
         self.tokio_imports = imports;
+        self.shadowed_macros = macros;
         for saved in outer.into_iter().rev() {
             self.unshadow(saved);
         }
@@ -1447,7 +1449,14 @@ impl Analyzer {
             for name in &names {
                 self.forget(name);
             }
-            self.mark_pattern_unread(pat, &init.expr);
+            // A tuple initialiser is paired element by element below.
+            let paired = matches!(
+                (pat, &*init.expr),
+                (Pat::Tuple(p), Expr::Tuple(t)) if p.elems.len() == t.elems.len()
+            );
+            if !paired {
+                self.mark_pattern_unread(pat, &init.expr);
+            }
         }
         if let Pat::Ident(ident) = pat {
             let name = ident.ident.to_string();
@@ -1476,11 +1485,7 @@ impl Analyzer {
             for (element_pat, element) in pat.elems.iter().zip(tuple.elems.iter()) {
                 let handle = self.expr_handle(element);
                 self.rebind(element_pat, handle.as_ref());
-                if let Pat::Ident(ident) = element_pat
-                    && self.is_unread_call(element)
-                {
-                    self.unread_futures.insert(ident.ident.to_string());
-                }
+                self.mark_pattern_unread(element_pat, element);
             }
             return;
         }
@@ -7053,6 +7058,22 @@ mod tests {
                 let tokio = 1;
                 tokio::time::sleep(d).await;
                 Ok(tokio)
+            }",
+        ),
+        (
+            "a use of format ends with its block",
+            r#"async fn h() -> R {
+                { use crate::macros::format; }
+                let label = format!("ok");
+                Ok(label)
+            }"#,
+        ),
+        (
+            "an inert future in a tuple beside an unread one",
+            r"async fn h(d: Duration) -> R {
+                let (delay, n) = (tokio::time::sleep(d), 1);
+                delay.await;
+                Ok(n)
             }",
         ),
         (
