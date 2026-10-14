@@ -384,6 +384,11 @@ where
                     }
                     // The first request came, or the wait ended: drain now.
                     () = fresh_wait(&first_request, fresh_until), if waiting_fresh && !shutting_down => {
+                        // No request in time: close. Else a partial head
+                        // could hold the drain when no timer is set.
+                        if !first_request.is_seen() {
+                            break;
+                        }
                         fresh_until = None;
                         grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
                         conn.as_mut().graceful_shutdown();
@@ -1716,6 +1721,22 @@ mod tests {
         server.await.expect("task").expect("serve");
         let text = String::from_utf8_lossy(&raw);
         assert!(text.starts_with("HTTP/1.1 200"), "got {text:?}");
+    }
+
+    #[tokio::test]
+    async fn a_partial_request_does_not_hold_the_drain_past_the_grace() {
+        use tokio::io::AsyncWriteExt as _;
+        let (addr, stop, server) = start_server().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        // A head that never completes. No timers are set.
+        client.write_all(b"GET / HT").await.expect("write");
+        let done = tokio::time::timeout(FRESH_CONN_GRACE + Duration::from_secs(3), server).await;
+        assert!(
+            done.is_ok(),
+            "an incomplete request must not block the drain"
+        );
     }
 
     #[tokio::test]
