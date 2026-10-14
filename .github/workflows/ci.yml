@@ -2916,16 +2916,6 @@ jobs:
       # workflow file invalid, so every job in this file silently stops running.
       # They are exported from the first step instead.
       CARGO_TARGET_DIR: ${{ github.workspace }}\target
-      # Keeps the workspace build (autumn-cli) lean. The scaffolded app does
-      # not need it: `autumn new` sets its own dev profile (issue #2448), and
-      # this job builds that app as generated.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      # Second, independent mitigation for the same limit. `/DEBUG:LongSymbolTruncate`
-      # is what the linker itself recommends in the LNK4318 warning that precedes
-      # the fatal LNK4319, so this exact toolchain supports it. Belt and braces
-      # deliberately: a Windows CI cycle costs ~35 minutes, and the previous
-      # single-remedy attempt did not hold.
-      RUSTFLAGS: "-Clink-arg=/DEBUG:LongSymbolTruncate"
     steps:
       - uses: actions/checkout@v7
       # Pinned to the exact MSRV, not `@stable` (2026-09-28 finding, 🚦
@@ -2985,6 +2975,11 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "AUTUMN_MANAGED_PG_DATA_DIR=$env:RUNNER_TEMP\tier1-pg"
 
       - name: Build the CLI
+        # Env is set on this step only. A job-wide CARGO_PROFILE_DEV_DEBUG or
+        # RUSTFLAGS would override the scaffold's own dev profile (issue #2448)
+        # and hide a broken fix.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo build -p autumn-cli --bin autumn
 
       - name: "Journey: autumn new (managed Postgres)"
