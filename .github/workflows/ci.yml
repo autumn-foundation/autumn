@@ -2406,6 +2406,10 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- built_artifact:: \
             | tee "$RUNNER_TEMP/cli-built-artifact-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-built-artifact-cov.log"
+          # Issue #2448: same gap for `new::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- new:: \
+            | tee "$RUNNER_TEMP/cli-new-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-new-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
