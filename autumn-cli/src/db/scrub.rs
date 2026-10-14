@@ -478,8 +478,9 @@ impl std::fmt::Display for ScrubError {
                 f,
                 "{} column(s) are primary, foreign or partition keys but declared PII:\n{}\n  \
                  Rewriting a key column would break referential integrity or move rows \
-                 between partitions. Declare these columns `safe`. For a foreign key, \
-                 scrub the referenced table's own PII columns.",
+                 between partitions. Declare these columns `safe`; an `#[encrypted]` one \
+                 then keeps its ciphertext. For a foreign key, scrub the referenced \
+                 table's own PII columns.",
                 columns.len(),
                 bullet_list(columns),
             ),
@@ -1431,37 +1432,42 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             let declared_safe = declared_safe_here
                 || (!anonymized && inputs.config.defaults.safe_columns.contains(&column.name));
 
-            let (spec, source) = if is_encrypted {
-                // An at-rest-encrypted column is never rewritten with a plain
-                // string: the resolved strategy is always a re-encryption (see
-                // `Strategy::Encrypted`), so a declaration can only choose to
-                // NULL it, never to write plaintext into it.
-                match declared_pii {
-                    None | Some(Strategy::Encrypted) => {
-                        (Strategy::Encrypted, ClassSource::Encrypted)
+            let (spec, source) =
+                if is_encrypted && is_key && declared_pii.is_none() && declared_safe {
+                    // A structural column is never rewritten, and re-encrypting it
+                    // is still a write. The declaration says the ciphertext stays.
+                    continue;
+                } else if is_encrypted {
+                    // An at-rest-encrypted column is never rewritten with a plain
+                    // string: the resolved strategy is always a re-encryption (see
+                    // `Strategy::Encrypted`), so a declaration can only choose to
+                    // NULL it, never to write plaintext into it.
+                    match declared_pii {
+                        None | Some(Strategy::Encrypted) => {
+                            (Strategy::Encrypted, ClassSource::Encrypted)
+                        }
+                        Some(Strategy::Null) => (Strategy::Null, ClassSource::Config),
+                        Some(other) => {
+                            plaintext_into_encrypted.push((qualified, other.as_str()));
+                            continue;
+                        }
                     }
-                    Some(Strategy::Null) => (Strategy::Null, ClassSource::Config),
-                    Some(other) => {
-                        plaintext_into_encrypted.push((qualified, other.as_str()));
+                } else if let Some(strategy) = declared_pii {
+                    (strategy, ClassSource::Config)
+                } else if declared_safe {
+                    continue;
+                } else if anonymized {
+                    // A table-level inference never claims the structural columns:
+                    // rewriting a key would break referential integrity, and the
+                    // registration says nothing about them.
+                    if is_key {
                         continue;
                     }
-                }
-            } else if let Some(strategy) = declared_pii {
-                (strategy, ClassSource::Config)
-            } else if declared_safe {
-                continue;
-            } else if anonymized {
-                // A table-level inference never claims the structural columns:
-                // rewriting a key would break referential integrity, and the
-                // registration says nothing about them.
-                if is_key {
+                    (Strategy::Auto, ClassSource::GdprAnonymize)
+                } else {
+                    unclassified.push(qualified);
                     continue;
-                }
-                (Strategy::Auto, ClassSource::GdprAnonymize)
-            } else {
-                unclassified.push(qualified);
-                continue;
-            };
+                };
 
             if is_key {
                 key_pii.push(qualified);
@@ -1705,10 +1711,8 @@ fn check_safe_overrides_encrypted(
             // IR does not carry, so the two tests disagreed about what counts as
             // structural.
             //
-            // Necessary but NOT sufficient to make such a column configurable:
-            // classification resolves `#[encrypted]` before it looks at `safe`,
-            // so a structural encrypted column still fails as `PiiOnKeyColumn`
-            // with no declaration that terminates. Tracked in #2366.
+            // Classification honours that `safe` declaration for a structural
+            // column: the ciphertext stays where it is.
             if by_name
                 .get(table.as_str())
                 .and_then(|t| {
@@ -8019,6 +8023,55 @@ mod tests {
             matches!(err, ScrubError::CheckConstrainedColumn { ref column } if column == "users.bio"),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_structural_encrypted_column_can_be_declared_safe() {
+        // `users.email` is `#[encrypted]` and another table references it, so it
+        // can never be rewritten. The only honest outcome is that the ciphertext
+        // stays; a `safe` declaration must be able to say so.
+        let facts = DatabaseFacts {
+            foreign_key_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let encrypted = encrypted_columns_of("users", &["email"]);
+        let safe = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "bio"]
+            [tables.users]
+            safe = ["email"]
+            [tables.users.pii]
+            full_name = "name"
+            "#,
+        )
+        .unwrap();
+        let plan = plan_with_facts(&[users_table()], &safe, &encrypted, &no_anonymize(), &facts)
+            .expect("a declared-safe structural encrypted column terminates");
+        assert!(plan.column("users", "email").is_none());
+
+        let undeclared = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "bio"]
+            [tables.users.pii]
+            full_name = "name"
+            "#,
+        )
+        .unwrap();
+        let err = plan_with_facts(
+            &[users_table()],
+            &undeclared,
+            &encrypted,
+            &no_anonymize(),
+            &facts,
+        )
+        .expect_err("without a declaration it still fails");
+        assert!(
+            matches!(err, ScrubError::PiiOnKeyColumn { ref columns } if columns == &vec!["users.email".to_owned()]),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("ciphertext"), "{err}");
     }
 
     #[test]
