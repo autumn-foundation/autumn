@@ -304,6 +304,16 @@ fn package_dir(package: Option<&str>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The member directory to watch for `.env` edits, if it is not the project
+/// root, which is already watched.
+fn member_dir_to_watch(member_dir: &Path, cwd: &Path) -> Option<PathBuf> {
+    let same = match (member_dir.canonicalize(), cwd.canonicalize()) {
+        (Ok(member), Ok(root)) => member == root,
+        _ => false,
+    };
+    (!same).then(|| member_dir.to_path_buf())
+}
+
 /// This app's cooperative-stop budget, resolved from its own configuration.
 ///
 /// Delegates to the same profile-aware resolver `autumn serve stop` uses, so the
@@ -729,6 +739,16 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // Watch the project root for config and build script changes.
     if let Err(e) = watcher.watch(Path::new("."), notify::RecursiveMode::NonRecursive) {
         eprintln!("  Warning: could not watch project root: {e}");
+    }
+
+    // A selected workspace member keeps its `.env` in its own directory, which
+    // the app and the stop budget both read.
+    if let Some(dir) = package
+        .and_then(find_manifest_dir)
+        .and_then(|dir| member_dir_to_watch(&dir, &cwd))
+        && let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive)
+    {
+        eprintln!("  Warning: could not watch {}: {e}", dir.display());
     }
 
     eprintln!("  Watching for changes... (press Ctrl+C to stop)\n");
@@ -2914,6 +2934,20 @@ mod tests {
             classify_change(Path::new(".git/.env"), DebouncedEventKind::Any, &[]),
             ChangeEffect::Ignore
         );
+    }
+
+    #[test]
+    fn a_member_dir_outside_the_root_is_watched() {
+        let root = tempfile::TempDir::new().unwrap();
+        let member = root.path().join("api");
+        std::fs::create_dir(&member).unwrap();
+        assert_eq!(member_dir_to_watch(&member, root.path()), Some(member));
+    }
+
+    #[test]
+    fn the_project_root_is_not_watched_twice() {
+        let root = tempfile::TempDir::new().unwrap();
+        assert_eq!(member_dir_to_watch(root.path(), root.path()), None);
     }
 
     #[test]
