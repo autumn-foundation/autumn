@@ -2280,29 +2280,134 @@ fn qualified_ident(table: &str) -> String {
 ///
 /// Returns [`ScrubError::SourceScan`] if the source is not valid Rust, or
 /// [`ScrubError::UnresolvableAnonymize`] for a non-literal table name.
+#[cfg(test)]
 fn extract_anonymize_tables(src: &str) -> Result<BTreeSet<String>, ScrubError> {
+    scan_anonymize_source(src).map(|(tables, _)| tables)
+}
+
+/// [`extract_anonymize_tables`], plus the out-of-line modules the source
+/// disables with `#[cfg(test)]` (`#[cfg(test)] mod tests;`), whose files must
+/// not be scanned either.
+fn scan_anonymize_source(src: &str) -> Result<(BTreeSet<String>, Vec<String>), ScrubError> {
     use syn::visit::Visit as _;
 
     let file = syn::parse_file(src).map_err(|e| ScrubError::SourceScan {
         detail: e.to_string(),
     })?;
+    if !production_enabled(&file.attrs) {
+        return Ok((BTreeSet::new(), Vec::new()));
+    }
     let mut scan = AnonymizeScan::default();
     scan.visit_file(&file);
     if let Some(detail) = scan.unresolved.into_iter().next() {
         return Err(ScrubError::UnresolvableAnonymize { detail });
     }
-    Ok(scan.tables)
+    Ok((scan.tables, scan.disabled_modules))
 }
 
-/// `syn` visitor collecting `ModelRegistration::anonymize("<table>")` calls.
+/// Whether the `#[cfg(...)]` attributes leave an item in a production build.
+///
+/// Only `test` is known to be off. Every other predicate (a feature, a target)
+/// is unknown and counts as on: that keeps a registration the app might really
+/// have, and erring toward scrubbing is the safe direction.
+fn production_enabled(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().filter(|a| a.path().is_ident("cfg")).all(|a| {
+        a.parse_args::<syn::Meta>()
+            .map_or(true, |m| cfg_value(&m) != Some(false))
+    })
+}
+
+/// A `cfg` predicate's value when it is known without the build's settings.
+fn cfg_value(meta: &syn::Meta) -> Option<bool> {
+    use syn::punctuated::Punctuated;
+
+    match meta {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+        syn::Meta::List(list) => {
+            let inner: Vec<Option<bool>> = list
+                .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                .ok()?
+                .iter()
+                .map(cfg_value)
+                .collect();
+            if list.path.is_ident("not") {
+                inner.first().copied().flatten().map(|v| !v)
+            } else if list.path.is_ident("all") {
+                if inner.contains(&Some(false)) {
+                    Some(false)
+                } else if inner.iter().all(|v| *v == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("any") {
+                if inner.contains(&Some(true)) {
+                    Some(true)
+                } else if !inner.is_empty() && inner.iter().all(|v| *v == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `syn` visitor collecting `ModelRegistration::anonymize("<table>")` calls
+/// outside `cfg`-disabled syntax.
 #[derive(Default)]
 struct AnonymizeScan {
     tables: BTreeSet<String>,
     unresolved: Vec<String>,
+    /// Out-of-line modules a `cfg` turns off.
+    disabled_modules: Vec<String>,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        let attrs: &[syn::Attribute] = match item {
+            syn::Item::Mod(i) => &i.attrs,
+            syn::Item::Fn(i) => &i.attrs,
+            syn::Item::Impl(i) => &i.attrs,
+            syn::Item::Const(i) => &i.attrs,
+            syn::Item::Static(i) => &i.attrs,
+            _ => &[],
+        };
+        if !production_enabled(attrs) {
+            if let syn::Item::Mod(module) = item
+                && module.content.is_none()
+            {
+                self.disabled_modules.push(module.ident.to_string());
+            }
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        let attrs: &[syn::Attribute] = match item {
+            syn::ImplItem::Fn(i) => &i.attrs,
+            syn::ImplItem::Const(i) => &i.attrs,
+            _ => &[],
+        };
+        if production_enabled(attrs) {
+            syn::visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if production_enabled(&local.attrs) {
+            syn::visit::visit_local(self, local);
+        }
+    }
+
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if !production_enabled(&node.attrs) {
+            return;
+        }
         if let syn::Expr::Path(path) = &*node.func {
             let segments = &path.path.segments;
             let is_anonymize = segments.len() >= 2
@@ -2324,44 +2429,75 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
     }
 }
 
-/// Scan every `.rs` file under `root` (recursively) for anonymize registrations.
+/// Scan every production `.rs` file under `root` (recursively) for anonymize
+/// registrations. A file reached only through a `#[cfg(test)] mod x;` is test
+/// code and is skipped with everything below it.
 fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
-    let mut out = BTreeSet::new();
     if !root.is_dir() {
-        return Ok(out);
+        return Ok(BTreeSet::new());
     }
+    let io_err = |path: &Path, e: &dyn std::fmt::Display| ScrubError::SourceScan {
+        detail: format!("{}: {e}", path.display()),
+    };
+    let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|e| ScrubError::SourceScan {
-            detail: format!("{}: {e}", dir.display()),
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|e| ScrubError::SourceScan {
-                detail: format!("{}: {e}", dir.display()),
-            })?;
+        for entry in std::fs::read_dir(&dir).map_err(|e| io_err(&dir, &e))? {
+            let entry = entry.map_err(|e| io_err(&dir, &e))?;
             let path = entry.path();
-            let file_type = entry.file_type().map_err(|e| ScrubError::SourceScan {
-                detail: format!("{}: {e}", path.display()),
-            })?;
+            let file_type = entry.file_type().map_err(|e| io_err(&path, &e))?;
             if file_type.is_dir() {
                 stack.push(path);
             } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-                let src = std::fs::read_to_string(&path).map_err(|e| ScrubError::SourceScan {
-                    detail: format!("{}: {e}", path.display()),
-                })?;
-                let found = extract_anonymize_tables(&src).map_err(|e| match e {
-                    ScrubError::SourceScan { detail } => ScrubError::SourceScan {
-                        detail: format!("{}: {detail}", path.display()),
-                    },
-                    ScrubError::UnresolvableAnonymize { detail } => {
-                        ScrubError::UnresolvableAnonymize {
-                            detail: format!("{} — {detail}", path.display()),
-                        }
-                    }
-                    other => other,
-                })?;
-                out.extend(found);
+                files.push(path);
             }
+        }
+    }
+    files.sort();
+
+    let mut scanned = Vec::with_capacity(files.len());
+    let mut disabled: Vec<PathBuf> = Vec::new();
+    for path in files {
+        let src = std::fs::read_to_string(&path).map_err(|e| io_err(&path, &e))?;
+        let result = scan_anonymize_source(&src);
+        if let Ok((_, modules)) = &result {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let parent = path.parent().unwrap_or(root);
+            let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            disabled.extend(
+                modules
+                    .iter()
+                    .flat_map(|m| [module_dir.join(format!("{m}.rs")), module_dir.join(m)]),
+            );
+        }
+        scanned.push((path, result));
+    }
+
+    let mut out = BTreeSet::new();
+    for (path, result) in scanned {
+        if disabled.iter().any(|d| path.starts_with(d)) {
+            continue;
+        }
+        match result {
+            Ok((tables, _)) => out.extend(tables),
+            Err(ScrubError::SourceScan { detail }) => {
+                return Err(ScrubError::SourceScan {
+                    detail: format!("{}: {detail}", path.display()),
+                });
+            }
+            Err(ScrubError::UnresolvableAnonymize { detail }) => {
+                return Err(ScrubError::UnresolvableAnonymize {
+                    detail: format!("{} — {detail}", path.display()),
+                });
+            }
+            Err(other) => return Err(other),
         }
     }
     Ok(out)
@@ -2400,15 +2536,11 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 
 /// Whether two connection strings address the same database: same host, same
 /// port, same database name. Credentials are deliberately ignored — a read-only
-/// role pointed at production is still production.
+/// role pointed at production is still production. `env` supplies `PGHOST` /
+/// `PGPORT` for hostless URLs.
 ///
 /// An unparsable URL never claims a match (the guard errs toward "different",
 /// leaving the profile guard as the enforcement).
-fn same_database(a: &str, b: &str) -> bool {
-    same_database_in(a, b, &|key| std::env::var(key).ok())
-}
-
-/// [`same_database`] with an explicit environment, for `PGHOST` / `PGPORT`.
 fn same_database_in(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
     match (database_endpoint(a, env), database_endpoint(b, env)) {
         (Some((hosts_a, port_a, name_a)), Some((hosts_b, port_b, name_b))) => {
@@ -2469,10 +2601,10 @@ fn without_userinfo(raw: &str) -> String {
         return raw.to_owned();
     };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    match rest[..end].rfind('@') {
-        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
-        None => raw.to_owned(),
-    }
+    rest[..end].rfind('@').map_or_else(
+        || raw.to_owned(),
+        |at| format!("{scheme}://{}", &rest[at + 1..]),
+    )
 }
 
 /// The write targets an artifact restore actually wrote to.
@@ -9258,20 +9390,23 @@ mod tests {
     #[test]
     fn same_database_compares_host_port_and_name_ignoring_credentials() {
         // Same server + database, different credentials: still the same target.
-        assert!(same_database(
+        assert!(same_database_in(
             "postgres://app:pw@db.example.com:5432/myapp",
-            "postgres://readonly:other@db.example.com:5432/myapp"
+            "postgres://readonly:other@db.example.com:5432/myapp",
+            &env_of(&[])
         ));
-        assert!(!same_database(
+        assert!(!same_database_in(
             "postgres://app:pw@db.example.com:5432/myapp",
-            "postgres://app:pw@db.example.com:5432/myapp_staging"
+            "postgres://app:pw@db.example.com:5432/myapp_staging",
+            &env_of(&[])
         ));
-        assert!(!same_database(
+        assert!(!same_database_in(
             "postgres://app:pw@db.example.com:5432/myapp",
-            "postgres://app:pw@staging.example.com:5432/myapp"
+            "postgres://app:pw@staging.example.com:5432/myapp",
+            &env_of(&[])
         ));
         // An unparsable URL never claims a match.
-        assert!(!same_database("not a url", "not a url"));
+        assert!(!same_database_in("not a url", "not a url", &env_of(&[])));
     }
 
     fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -9417,6 +9552,71 @@ mod tests {
         assert!(
             found["cards"].contains_key("pan"),
             "a model outside src/models must not escape the scan"
+        );
+    }
+
+    #[test]
+    fn registrations_under_cfg_test_are_not_production_registrations() {
+        let found = |src: &str| extract_anonymize_tables(src).unwrap();
+        let reg = |t: &str| format!("fn f() {{ ModelRegistration::anonymize(\"{t}\"); }}");
+
+        assert!(found(&format!("#[cfg(test)] mod tests {{ {} }}", reg("a"))).is_empty());
+        assert!(found(&format!("#[cfg(test)] {}", reg("a"))).is_empty());
+        assert!(found(&format!("#![cfg(test)]\n{}", reg("a"))).is_empty());
+        assert!(
+            found(&format!(
+                "#[cfg(all(test, feature = \"x\"))] mod t {{ {} }}",
+                reg("a")
+            ))
+            .is_empty()
+        );
+        assert!(
+            found(&format!(
+                "struct S; #[cfg(test)] impl S {{ {} }}",
+                reg("a").replace("fn f", "fn g")
+            ))
+            .is_empty()
+        );
+        // Enabled or unknown cfgs keep their registrations: erring toward the
+        // scrub is the safe direction.
+        for cfg in [
+            "not(test)",
+            "any(test, feature = \"x\")",
+            "feature = \"x\"",
+            "unix",
+        ] {
+            assert_eq!(
+                found(&format!("#[cfg({cfg})] mod m {{ {} }}", reg("a"))),
+                BTreeSet::from(["a".to_owned()]),
+                "cfg({cfg})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_line_cfg_test_module_file_is_not_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path();
+        std::fs::create_dir_all(src.join("tests")).unwrap();
+        std::fs::write(src.join("lib.rs"), "#[cfg(test)] mod tests;\nmod live;\n").unwrap();
+        std::fs::write(
+            src.join("tests.rs"),
+            "mod deep;\nfn f() { ModelRegistration::anonymize(\"fixture\"); }",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("tests").join("deep.rs"),
+            "fn f() { ModelRegistration::anonymize(\"deep_fixture\"); }",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("live.rs"),
+            "fn f() { ModelRegistration::anonymize(\"users\"); }",
+        )
+        .unwrap();
+        assert_eq!(
+            scan_anonymize_tables(src).unwrap(),
+            BTreeSet::from(["users".to_owned()])
         );
     }
 
