@@ -912,6 +912,10 @@ struct Analyzer {
     /// Macro names the handler defines or imports. They are never read as the
     /// standard macro of that name. A block restores it when it ends.
     shadowed_macros: HashSet<String>,
+    /// Names that mean the `diesel` crate in this handler.
+    diesel_roots: HashSet<String>,
+    /// Write constructors a `use` brought in, by local name, with the verb.
+    diesel_fns: HashMap<String, String>,
 }
 
 /// All state of one name except `handles`. A scope saves it when it shadows
@@ -997,6 +1001,8 @@ impl Analyzer {
             // The `tokio` crate is in scope until a name hides it.
             tokio_imports: HashSet::from(["tokio".to_string()]),
             shadowed_macros: HashSet::new(),
+            diesel_roots: HashSet::from(["diesel".to_string()]),
+            diesel_fns: HashMap::new(),
             effects: Vec::new(),
             seen: HashSet::new(),
             effect_free_sites: Vec::new(),
@@ -1374,6 +1380,12 @@ impl Analyzer {
             }
             self.shadowed_macros.extend(names);
             tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
+            diesel_imports(
+                &import.tree,
+                &mut Vec::new(),
+                &mut self.diesel_roots,
+                &mut self.diesel_fns,
+            );
             return;
         }
         let syn::Item::Macro(m) = item else {
@@ -1461,7 +1473,7 @@ impl Analyzer {
         if let Pat::Ident(ident) = pat {
             let name = ident.ident.to_string();
             // Read the old state first. `forget` clears it.
-            let unread = self.is_unread_call(&init.expr);
+            let unread = self.carries_unread(&init.expr);
             let table = self.table_of(strip_transparent(&init.expr));
             self.forget(&name);
             if let Some(table) = table {
@@ -2558,6 +2570,11 @@ impl Analyzer {
                 .get_ident()
                 .is_none_or(|ident| !self.unread_futures.contains(&ident.to_string())),
             Expr::Macro(m) => self.macro_is_readable(&m.mac),
+            // `jobs.0.await`, `futs[i].await`: as readable as the container.
+            Expr::Field(f) => self.awaited_is_readable(strip_transparent(&f.base)),
+            Expr::Index(i) => self.awaited_is_readable(strip_transparent(&i.expr)),
+            Expr::Unary(u) => self.awaited_is_readable(strip_transparent(&u.expr)),
+            Expr::Reference(r) => self.awaited_is_readable(strip_transparent(&r.expr)),
             // `(async move { … }).await`, `if …{…}.await` — the block's own
             // statements are walked, so there is nothing unread here.
             _ => true,
@@ -2616,7 +2633,12 @@ impl Analyzer {
 
     /// Can the analysis read this macro? A macro naming a handle is already refused.
     fn macro_is_readable(&self, mac: &syn::Macro) -> bool {
-        let name = mac.path.segments.last().map(|s| s.ident.to_string());
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .filter(|_| macro_path_is_standard(&mac.path));
         let inert = name
             .as_ref()
             .is_some_and(|name| !self.shadowed_macros.contains(name))
@@ -2628,10 +2650,12 @@ impl Analyzer {
     /// Macros that only build a value. Expression position may use them when
     /// no token awaits or spawns.
     fn expr_macro_is_readable(&self, mac: &syn::Macro) -> bool {
-        let pure = mac.path.segments.last().is_some_and(|s| {
-            let name = s.ident.to_string();
-            PURE_VALUE_MACROS.contains(&name.as_str()) && !self.shadowed_macros.contains(&name)
-        }) && !tokens_contain_await(&mac.tokens)
+        let pure = macro_path_is_standard(&mac.path)
+            && mac.path.segments.last().is_some_and(|s| {
+                let name = s.ident.to_string();
+                PURE_VALUE_MACROS.contains(&name.as_str()) && !self.shadowed_macros.contains(&name)
+            })
+            && !tokens_contain_await(&mac.tokens)
             && !tokens_contain_spawn(&mac.tokens);
         pure || self.macro_is_readable(mac)
     }
@@ -3188,6 +3212,17 @@ impl Analyzer {
         true
     }
 
+    /// Is this path rooted at the `diesel` crate, or a constructor a `use`
+    /// imported from it?
+    fn is_diesel_path(&self, path: &syn::Path) -> bool {
+        path.segments
+            .iter()
+            .any(|segment| self.diesel_roots.contains(&segment.ident.to_string()))
+            || path
+                .get_ident()
+                .is_some_and(|ident| self.diesel_fns.contains_key(&ident.to_string()))
+    }
+
     /// A `diesel::`-qualified write whose target table cannot be read.
     ///
     /// Returns the target as source text, for the diagnostic.
@@ -3196,9 +3231,10 @@ impl Analyzer {
             return None;
         };
         let segments = &path.path.segments;
-        let verb = segments.last()?.ident.to_string();
+        let last = segments.last()?.ident.to_string();
+        let verb = self.diesel_fns.get(&last).cloned().unwrap_or(last);
         let write = matches!(verb.as_str(), "insert_into" | "update" | "delete");
-        let diesel = segments.iter().any(|segment| segment.ident == "diesel");
+        let diesel = self.is_diesel_path(&path.path);
         let arg = call.args.first()?;
         (write && diesel && self.table_of(arg).is_none()).then(|| arg.to_token_stream().to_string())
     }
@@ -3254,8 +3290,9 @@ impl Analyzer {
             return None;
         };
         let segments = &path.path.segments;
-        let name = segments.last()?.ident.to_string();
-        let qualified_by_diesel = segments.iter().any(|segment| segment.ident == "diesel");
+        let last = segments.last()?.ident.to_string();
+        let name = self.diesel_fns.get(&last).cloned().unwrap_or(last);
+        let qualified_by_diesel = self.is_diesel_path(&path.path);
         let table = call.args.first().and_then(|arg| self.table_of(arg));
         // A bare `update(x)` is far too common to claim as a diesel write; a
         // `diesel::`-qualified call, or one handed a `<table>::table`, is not.
@@ -3518,6 +3555,47 @@ const TOKIO_INERT_IMPORTS: &[&str] = &[
     "tokio::time::timeout",
     "tokio::task::yield_now",
 ];
+
+/// Collect the names a `use` gives to the `diesel` crate and to its write
+/// constructors (`use diesel as orm;`, `use diesel::delete as remove;`).
+fn diesel_imports(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    roots: &mut HashSet<String>,
+    fns: &mut HashMap<String, String>,
+) {
+    const VERBS: &[&str] = &["insert_into", "update", "delete"];
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            diesel_imports(&path.tree, prefix, roots, fns);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let ident = name.ident.to_string();
+            if prefix.is_empty() && ident == "diesel" {
+                roots.insert(ident);
+            } else if prefix.as_slice() == ["diesel"] && VERBS.contains(&ident.as_str()) {
+                fns.insert(ident.clone(), ident);
+            }
+        }
+        syn::UseTree::Rename(rename) => {
+            let ident = rename.ident.to_string();
+            let local = rename.rename.to_string();
+            if prefix.is_empty() && ident == "diesel" {
+                roots.insert(local);
+            } else if prefix.as_slice() == ["diesel"] && VERBS.contains(&ident.as_str()) {
+                fns.insert(local, ident);
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                diesel_imports(item, prefix, roots, fns);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
 
 /// Every name a `use` tree binds, whatever its source.
 fn use_leaf_names(tree: &syn::UseTree, out: &mut HashSet<String>) {
@@ -4185,6 +4263,25 @@ fn tokens_contain_await(tokens: &TokenStream) -> bool {
         TokenTree::Group(group) => tokens_contain_await(&group.stream()),
         _ => false,
     })
+}
+
+/// A bare macro name, or one under a crate whose macros are known.
+fn macro_path_is_standard(path: &syn::Path) -> bool {
+    const CRATES: &[&str] = &[
+        "std",
+        "core",
+        "alloc",
+        "tracing",
+        "log",
+        "serde_json",
+        "maud",
+        "anyhow",
+    ];
+    path.segments.len() == 1
+        || path
+            .segments
+            .first()
+            .is_some_and(|s| CRATES.contains(&s.ident.to_string().as_str()))
 }
 
 /// Does a macro body name a `spawn`-family function?
@@ -6694,6 +6791,45 @@ mod tests {
             r"async fn h(d: Duration) -> R {
                 tokio::time::sleep(d).await;
                 mod tokio { pub mod time { pub async fn sleep(d: Duration) { start_finance_job().await; } } }
+                Ok(())
+            }",
+        ),
+        (
+            "unread future stored in a tuple",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let jobs = (start_finance_job(),);
+                jobs.0.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "qualified application macro with a standard name",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                let _ = crate::format!();
+                Ok(())
+            }",
+        ),
+        (
+            "diesel renamed by a use",
+            ExpectedKind::Rejected,
+            "select_target",
+            r"async fn h(mut db: Db) -> R {
+                use diesel as orm;
+                orm::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel delete renamed by a use",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(mut db: Db) -> R {
+                use diesel::delete as remove;
+                remove(refunds::table).execute(&mut *db).await?;
                 Ok(())
             }",
         ),
