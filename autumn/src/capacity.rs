@@ -551,7 +551,7 @@ impl CapacityContract {
     /// `PROD` compare equal. An unnamed running profile cannot be compared,
     /// so it counts as a match.
     #[must_use]
-    pub fn calibrated_under(&self, running: Option<&str>) -> bool {
+    pub(crate) fn calibrated_under(&self, running: Option<&str>) -> bool {
         let Some(running) = running.and_then(normalize_profile_name) else {
             return true;
         };
@@ -577,7 +577,7 @@ pub fn resolve_configured_admission_limit(
 }
 
 /// [`resolve_configured_admission_limit`] with a profile default ceiling
-/// (#3057). It does not check the contract's calibrated profile; see
+/// (#3057). It does not check the calibrated profile. For that, use
 /// [`resolve_configured_admission_limit_for_profile`].
 #[must_use]
 pub fn resolve_configured_admission_limit_with_default(
@@ -735,9 +735,9 @@ pub fn resolve_admission_limit_with_default(
 
 /// [`resolve_admission_limit_with_default`] that also checks the profile (#2418).
 ///
-/// A contract calibrated under a different profile than `running_profile`
-/// licenses no limit. The result is the fallback, as for a host mismatch.
-/// `None` skips the check.
+/// If the contract was calibrated under a different profile than
+/// `running_profile`, it gives no limit. The function then returns the
+/// fallback, as it does for a host mismatch. `None` skips the check.
 #[must_use]
 pub fn resolve_admission_limit_for_profile(
     explicit: Option<usize>,
@@ -780,8 +780,8 @@ pub fn resolve_admission_limit_for_profile(
             contract_profile = %contract.calibration.profile,
             running_profile = running_profile.unwrap_or_default(),
             fallback = fallback.source(),
-            "capacity contract was calibrated under another profile; \
-             using the fallback admission limit"
+            "capacity contract was calibrated under another profile, so \
+             the fallback admission limit applies"
         );
         return fallback;
     }
@@ -1252,6 +1252,20 @@ mod tests {
                 "{running}"
             );
         }
+    }
+
+    #[test]
+    fn custom_profile_names_must_match_exactly() {
+        let (_dir, path) = local_contract_under("staging");
+        let host = HostProfile::detect();
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some("staging")),
+            AdmissionLimit::Contract(64)
+        );
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some("Staging")),
+            AdmissionLimit::Unlimited
+        );
     }
 
     #[test]

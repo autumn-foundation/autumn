@@ -368,7 +368,7 @@ pub struct ResolvedBinary {
 }
 
 /// Like [`find_binary_in_profile`], and also returns the owning package's
-/// directory. Both come from one selection, so they cannot disagree (#2418).
+/// directory. Both come from one selection, so they always match (#2418).
 pub fn find_resolved_binary_in_profile(
     package: Option<&str>,
     bin: Option<&str>,

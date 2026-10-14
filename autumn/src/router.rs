@@ -7851,6 +7851,60 @@ mod tests {
         }
     }
 
+    // ── #2418: the router passes the running profile to the contract check ──
+
+    fn contract_file_under(profile: &str) -> (tempfile::TempDir, String) {
+        use crate::capacity::{
+            CONTRACT_VERSION, Calibration, CapacityContract, Envelope, HostProfile, Provenance,
+        };
+        let contract = CapacityContract {
+            version: CONTRACT_VERSION,
+            provenance: Provenance {
+                autumn_version: "0.0.0".to_owned(),
+                calibrated_at: "2026-09-01T12:00:00Z".to_owned(),
+                git_commit: None,
+                git_dirty: false,
+                route_graph_digest: String::new(),
+            },
+            host: HostProfile::detect(),
+            envelope: Envelope {
+                sustained_rps: 1000.0,
+                p99_latency_ms: 10.0,
+                saturation_concurrency: 40,
+                admission_limit: 48,
+            },
+            calibration: Calibration {
+                profile: profile.to_owned(),
+                ..Calibration::default()
+            },
+            routes: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::capacity::CONTRACT_FILE_NAME);
+        std::fs::write(&path, contract.to_toml().expect("serialize")).expect("write contract");
+        (dir, path.to_str().expect("utf-8 path").to_owned())
+    }
+
+    #[test]
+    fn the_load_shed_layer_enforces_only_a_contract_for_the_running_profile() {
+        let (_dir, path) = contract_file_under("staging");
+        let mut config = AutumnConfig {
+            profile: Some("prod".into()),
+            ..AutumnConfig::default()
+        };
+        config.server.capacity_contract = Some(path);
+
+        let state = test_state();
+        assert!(build_load_shed_layer(&config, &state).is_some());
+        let mismatched = state.metrics.snapshot().http.admission.limit;
+        assert_ne!(mismatched, 48, "a staging contract must not bind prod");
+
+        config.profile = Some("staging".into());
+        let state = test_state();
+        assert!(build_load_shed_layer(&config, &state).is_some());
+        assert_eq!(state.metrics.snapshot().http.admission.limit, 48);
+    }
+
     // ── submit-token production memory guard wiring (Finding O) ─────────────
 
     #[test]

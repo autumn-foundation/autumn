@@ -394,8 +394,8 @@ fn build_binary(
         &crate::routes::CargoProfile::from_release(true),
     );
     // The package directory comes from the same selection as the binary.
-    // The child must boot in it: autumn reads `autumn.toml` from the working
-    // directory, not from the workspace root.
+    // The child must start in that directory. Autumn reads `autumn.toml` from
+    // the working directory, not from the workspace root.
     crate::routes::find_resolved_binary_in_profile(
         opts.package,
         opts.bin,
