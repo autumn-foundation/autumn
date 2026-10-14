@@ -727,12 +727,14 @@ apply-time error.
   partitions or aborts), and on a `CHECK`-constrained column, where no
   fabricated value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
   column and on a `NULLS NOT DISTINCT` unique index; a constant replacement is
-  refused on any column covered by a unique index — composite, partial, and the
-  input columns of a unique *expression* index (`(lower(email))`), whose
-  uniqueness a per-row token cannot preserve through an arbitrary expression,
-  and the *predicate* columns of a partial unique index, where a rewrite changes
-  which rows the index covers; and a `varchar(n)` bound narrows the generated token or refuses,
-  rather than truncating into collisions.
+  refused on any column covered by a unique index, composite and partial
+  included. PII is refused outright on a column read by a unique index
+  *expression* (`(lower(email))`) or *predicate*, and on a column of an
+  *exclusion* constraint: a value unique on its own can still collide after the
+  expression, and a predicate column decides which rows the index covers. A
+  `varchar(n)` bound narrows the generated token or refuses, rather than
+  truncating into collisions. A constraint declared on one partition only is
+  read as a constraint of its parent.
 - **Writes cannot be redirected.** Every statement is `public`-qualified and the
   transaction pins `search_path`, so a role- or database-level tenant
   `search_path` cannot send an `UPDATE` to a table nothing classified. The
@@ -761,14 +763,15 @@ apply-time error.
   column too — and refuses on any difference, so a privilege gap can never look
   like a clean bill of health. Foreign tables count as part of that universe: one
   left pointing at production would otherwise be classified by nothing.
-- **Row-level security is refused** on every table the run reads or writes: the
+- **Row-level security that binds the role is refused** on every table the run reads or writes: the
   ones it rewrites, the ones `[framework] purge` and `never_include` empty, the
   ones the sample reads to decide what to keep, and both endpoints of every
   foreign key the run re-counts. A role that does not bypass RLS sees only the
   rows its policies expose, and each phase then reports a success it cannot
   stand behind — a partial rewrite, a table reported emptied that is not, or a
-  re-count that misses the orphan it exists to find. Connect as the table owner
-  or a `BYPASSRLS` role.
+  re-count that misses the orphan it exists to find. A superuser, a `BYPASSRLS`
+  role and the table owner are not bound, so they pass — except that the owner
+  is bound again on a `FORCE ROW LEVEL SECURITY` table.
 
   The re-count's endpoints matter more than they look: a framework-owned table
   the run never writes still gets checked, because a constraint a migration left

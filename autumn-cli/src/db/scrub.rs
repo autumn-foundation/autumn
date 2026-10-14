@@ -219,6 +219,15 @@ pub enum ScrubError {
         /// `table.column`.
         column: String,
     },
+    /// A PII column is an operand of a constraint no per-row token can be
+    /// shown to keep satisfied: a unique index expression or predicate, or an
+    /// exclusion constraint.
+    IndexOperandColumn {
+        /// `table.column`.
+        column: String,
+        /// What the column is an operand of.
+        kind: &'static str,
+    },
     /// The target holds `#[encrypted]` columns but no encryption key could be
     /// resolved, so a valid replacement envelope cannot be produced.
     EncryptionKeyUnavailable {
@@ -542,6 +551,14 @@ impl std::fmt::Display for ScrubError {
                  CHECK, which is why the type alone does not reveal this).\n  \
                  Declare the column `safe` if the constraint means it holds no free-form PII, \
                  or drop the constraint on the copy before scrubbing."
+            ),
+            Self::IndexOperandColumn { column, kind } => write!(
+                f,
+                "{column:?} is an operand of {kind}, so no per-row value can be shown to \
+                 keep that constraint satisfied (a value unique on its own can still \
+                 collide once the expression or predicate is applied).\n  \
+                 Declare the column `safe` if it holds no free-form PII, or drop the \
+                 constraint on the copy before scrubbing."
             ),
             Self::EncryptionKeyUnavailable { profile, detail } => write!(
                 f,
@@ -1526,6 +1543,18 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             // model-IR-only `ColumnType::Enum`) is what actually catches it.
             if inputs.facts.checked_columns.contains(&pair) {
                 return Err(ScrubError::CheckConstrainedColumn { column: qualified });
+            }
+            if inputs.facts.unique_expression_columns.contains(&pair) {
+                return Err(ScrubError::IndexOperandColumn {
+                    column: qualified,
+                    kind: "a unique index expression or predicate",
+                });
+            }
+            if inputs.facts.exclusion_columns.contains(&pair) {
+                return Err(ScrubError::IndexOperandColumn {
+                    column: qualified,
+                    kind: "an exclusion constraint",
+                });
             }
             if plan.strategy == Strategy::Auto {
                 plan.strategy = auto_strategy(column).map_err(|e| qualify(e, &qualified))?;
@@ -4182,6 +4211,12 @@ pub struct DatabaseFacts {
     /// question for a migration diff and the wrong one for "can this rewrite
     /// collide".
     pub unique_columns: BTreeSet<(String, String)>,
+    /// Columns read by a unique index's expression or predicate. Injectivity on
+    /// a column's own value does not survive an arbitrary expression: every
+    /// scrubbed address starts `scrubbed+`, so `UNIQUE (left(email, 1))` collides.
+    pub unique_expression_columns: BTreeSet<(String, String)>,
+    /// Columns named by an exclusion constraint, which is not `indisunique`.
+    pub exclusion_columns: BTreeSet<(String, String)>,
     /// Columns covered by a `NULLS NOT DISTINCT` unique index, where more than
     /// one `NULL` is itself a uniqueness violation.
     pub nulls_not_distinct_columns: BTreeSet<(String, String)>,
@@ -4411,7 +4446,7 @@ const PARTITION_KEY_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS c
              || '($|[^[:alnum:]_])'))";
 
 /// Move each sub-partitioned table's key columns onto its root table.
-fn fold_partition_keys(
+fn fold_into_parent(
     keys: impl IntoIterator<Item = (String, String)>,
     partitions: &BTreeMap<String, String>,
 ) -> BTreeSet<(String, String)> {
@@ -4619,7 +4654,7 @@ fn probe_database_facts(
     } else {
         "i.indkey"
     };
-    let mut unique_columns = pair_set(
+    let unique_columns = pair_set(
         sql_query(format!(
             "SELECT rel.relname AS tbl, att.attname AS col \
              FROM pg_index i \
@@ -4647,14 +4682,13 @@ fn probe_database_facts(
     // `pg_depend` records both the expression- and the predicate-referenced
     // columns, so one query covers them.
     //
-    // NOTE: adding them here is only a PARTIAL guard, and deliberately recorded
-    // as such. `Strategy::allowed_on_unique` permits `email`/`name`/`redact` on
-    // a unique column because those are injective on the column's own value —
-    // but injectivity does not survive an arbitrary expression. Every scrubbed
-    // address starts `scrubbed+`, so `UNIQUE (left(email, 1))` still collides at
-    // execution time. A correct guard needs its own refusal for expression
-    // operands rather than folding them into the unique set; tracked in #2366.
-    unique_columns.extend(pair_set(
+    // They get their own set, not a place in `unique_columns`: a strategy that
+    // is injective on the column's own value says nothing about an arbitrary
+    // expression over it, so no strategy is permitted on these.
+    //
+    // Plain key columns also appear in `pg_depend`, as `a` (auto); only the
+    // expression and predicate operands are `n` (normal).
+    let unique_expression_columns = pair_set(
         sql_query(
             "SELECT rel.relname AS tbl, att.attname AS col \
              FROM pg_index i \
@@ -4662,12 +4696,37 @@ fn probe_database_facts(
              JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
              JOIN pg_depend d ON d.objid = i.indexrelid AND d.refobjid = i.indrelid \
              JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = d.refobjsubid \
-             WHERE i.indisunique AND d.refobjsubid > 0 \
+             WHERE i.indisunique AND d.refobjsubid > 0 AND d.deptype = 'n' \
              AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)",
         )
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
-    ));
+    );
+
+    // An exclusion constraint's backing index is `indisexclusion`, not
+    // `indisunique`, so the probes above never see it. Both its plain columns
+    // (`indkey`) and any expression or predicate operands count.
+    let exclusion_columns = pair_set(
+        sql_query(format!(
+            "SELECT rel.relname AS tbl, att.attname AS col \
+             FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             JOIN pg_attribute att ON att.attrelid = rel.oid \
+             AND att.attnum = ANY({key_slice}) \
+             WHERE i.indisexclusion AND att.attnum > 0 \
+             UNION \
+             SELECT rel.relname, att.attname \
+             FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             JOIN pg_depend d ON d.objid = i.indexrelid AND d.refobjid = i.indrelid \
+             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = d.refobjsubid \
+             WHERE i.indisexclusion AND d.refobjsubid > 0"
+        ))
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+    );
 
     // `NULLS NOT DISTINCT` (PG15+) makes a second NULL a violation, so the
     // `null` strategy stops being unique-safe. `indnullsnotdistinct` does not
@@ -4725,6 +4784,17 @@ fn probe_database_facts(
             BTreeMap::new()
         };
 
+    // A constraint declared on a partition alone (a child-only `CHECK`, a local
+    // unique index) still fires when the run's `UPDATE` reaches that partition
+    // through its parent, and the plan only looks at the parent. Fold each
+    // constraint fact onto the root, as the partition keys are below.
+    let foreign_key_columns = fold_into_parent(foreign_key_columns, &partitions);
+    let checked_columns = fold_into_parent(checked_columns, &partitions);
+    let unique_columns = fold_into_parent(unique_columns, &partitions);
+    let unique_expression_columns = fold_into_parent(unique_expression_columns, &partitions);
+    let exclusion_columns = fold_into_parent(exclusion_columns, &partitions);
+    let nulls_not_distinct_columns = fold_into_parent(nulls_not_distinct_columns, &partitions);
+
     // Partition-key columns. `partattrs` holds `0` for an expression key. For
     // those tables, match the column names in the key definition. An over-match
     // refuses a non-key column, which is safe. Sub-partition keys fold into the
@@ -4736,7 +4806,7 @@ fn probe_database_facts(
                     .load(&mut conn)
                     .map_err(|e| ScrubError::Sql(e.to_string()))?,
             );
-            fold_partition_keys(rows, &partitions)
+            fold_into_parent(rows, &partitions)
         } else {
             BTreeSet::new()
         };
@@ -5063,6 +5133,8 @@ fn probe_database_facts(
         checked_columns,
         generated_columns,
         unique_columns,
+        unique_expression_columns,
+        exclusion_columns,
         nulls_not_distinct_columns,
         partitions,
         partition_key_columns,
@@ -8102,6 +8174,59 @@ mod tests {
     }
 
     #[test]
+    fn an_index_expression_or_exclusion_operand_is_refused_for_every_strategy() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "full_name", "bio"]
+            [tables.users.pii]
+            email = "email"
+            "#,
+        )
+        .unwrap();
+        for facts in [
+            DatabaseFacts {
+                unique_expression_columns: BTreeSet::from([(
+                    "users".to_owned(),
+                    "email".to_owned(),
+                )]),
+                ..DatabaseFacts::default()
+            },
+            DatabaseFacts {
+                exclusion_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
+                ..DatabaseFacts::default()
+            },
+        ] {
+            let err = plan_with_facts(
+                &[users_table()],
+                &config,
+                &empty_encrypted(),
+                &no_anonymize(),
+                &facts,
+            )
+            .expect_err("injective on its own value is not injective under an expression");
+            assert!(
+                matches!(err, ScrubError::IndexOperandColumn { ref column, .. } if column == "users.email"),
+                "got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partition_only_constraint_folds_into_its_parent() {
+        let partitions = BTreeMap::from([("users_2026".to_owned(), "users".to_owned())]);
+        let checks = fold_into_parent(
+            vec![
+                ("users_2026".to_owned(), "email".to_owned()),
+                ("orders".to_owned(), "total".to_owned()),
+            ],
+            &partitions,
+        );
+        assert!(checks.contains(&("users".to_owned(), "email".to_owned())));
+        assert!(checks.contains(&("orders".to_owned(), "total".to_owned())));
+    }
+
+    #[test]
     fn the_referenced_side_of_a_foreign_key_is_refused() {
         // `orders.user_email REFERENCES users(email)` leaves `users.email` with
         // no `references` of its own, so only the probed catalog set can see it.
@@ -8220,7 +8345,7 @@ mod tests {
             partitions: BTreeMap::from([("users_2026".to_owned(), "users".to_owned())]),
             ..DatabaseFacts::default()
         };
-        let keys = fold_partition_keys(
+        let keys = fold_into_parent(
             vec![("users_2026".to_owned(), "email".to_owned())],
             &facts.partitions,
         );
