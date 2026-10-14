@@ -15546,8 +15546,8 @@ pub struct Vault {
             assert!(matches!(r.status, CheckStatus::Fail), "{bad}");
             let detail = r.detail.as_deref().unwrap_or_default();
             assert!(
-                detail.contains("cache_dir"),
-                "detail must name cache_dir: {detail}"
+                detail.contains("cache_dir") && detail.contains(bad),
+                "detail must name cache_dir and {bad}: {detail}"
             );
         }
     }
@@ -15573,8 +15573,10 @@ pub struct Vault {
             assert!(matches!(r.status, CheckStatus::Fail), "{bad}");
             let detail = r.detail.as_deref().unwrap_or_default();
             assert!(
-                detail.contains("[server.tls.acme]") && detail.contains("table"),
-                "detail must say acme must be a table: {detail}"
+                detail.contains("[server.tls.acme]")
+                    && detail.contains("table")
+                    && detail.contains(bad),
+                "detail must say acme must be a table and show {bad}: {detail}"
             );
         }
     }
@@ -15599,6 +15601,55 @@ pub struct Vault {
             "{detail}"
         );
         assert!(!detail.contains("at least one domain"), "{detail}");
+    }
+
+    // #2413: doctor and the runtime must agree on every bad ACME value shape.
+    #[test]
+    fn acme_doctor_agrees_with_runtime_deserialize() {
+        let bad_values = ["42", "true", "[\"x\"]", "{ x = 1 }"];
+        let mut cases = vec![
+            "[server.tls]\nacme = \"yes\"".to_owned(),
+            "[server.tls]\nacme = 7".to_owned(),
+            "[server.tls.acme]\ndomains = [\"a.example.com\"]\ncontact_email = \"o@example.com\""
+                .to_owned(),
+        ];
+        for bad in bad_values {
+            for key in ["cache_dir", "contact_email", "domains"] {
+                let email = if key == "contact_email" {
+                    bad
+                } else {
+                    "\"o@example.com\""
+                };
+                let domains = if key == "domains" {
+                    bad
+                } else {
+                    "[\"a.example.com\"]"
+                };
+                let dir = if key == "cache_dir" {
+                    bad
+                } else {
+                    "\"/var/acme\""
+                };
+                cases.push(format!(
+                    "[server.tls.acme]\ndomains = {domains}\ncontact_email = {email}\ncache_dir = {dir}"
+                ));
+            }
+        }
+        for text in cases {
+            let raw: toml::Table = toml::from_str(&text).unwrap();
+            let doctor_fails = resolve_acme_doctor_config(Some(&raw))
+                .and_then(|acme| check_acme_config_impl(&acme))
+                .is_some();
+            let runtime_ok = raw
+                .get("server")
+                .and_then(|server| server.get("tls"))
+                .cloned()
+                .is_some_and(|tls| {
+                    tls.try_into::<autumn_web::config::TlsConfig>()
+                        .is_ok_and(|tls| tls.acme.as_ref().is_none_or(|a| a.validate().is_ok()))
+                });
+            assert_eq!(doctor_fails, !runtime_ok, "disagreement on:\n{text}");
+        }
     }
 
     // Regression (#1608, Codex P2): a malformed `http_challenge_port` must FAIL,
