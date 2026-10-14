@@ -925,6 +925,7 @@ struct Analyzer {
 
 /// All state of one name except `handles`. A scope saves it when it shadows
 /// the name.
+#[allow(clippy::struct_excessive_bools)]
 struct Shadow {
     name: String,
     handle: Option<Handle>,
@@ -2583,6 +2584,59 @@ impl Analyzer {
         true
     }
 
+    /// A call through a name an earlier binding made a `spawn`, an ambiguous
+    /// effect verb, or one effect verb. Returns whether it handled the call.
+    fn call_through_alias(&mut self, call: &ExprCall) -> bool {
+        // A name bound to `tokio::spawn` detaches exactly as the direct
+        // spelling does.
+        if let Expr::Path(path) = strip_transparent(&call.func)
+            && let Some(ident) = path.path.get_ident()
+            && self.spawn_aliases.contains(&ident.to_string())
+        {
+            let alias = ident.to_string();
+            self.spawn_error(call.span(), &alias);
+            return true;
+        }
+        if self.refuse_ambiguous_call(call) {
+            return true;
+        }
+        // A name bound to an effect verb performs that verb; the alias is the
+        // only thing at this call site that names it.
+        if let Expr::Path(path) = strip_transparent(&call.func)
+            && let Some(ident) = path.path.get_ident()
+            && let Some(aliased) = self.fn_aliases.get(&ident.to_string()).cloned()
+        {
+            self.aliased_effect(call, ident.to_string().as_str(), &aliased);
+            return true;
+        }
+        false
+    }
+
+    /// A name bound to different effect verbs on different paths: which one
+    /// runs cannot be read, so a call through it is refused.
+    fn refuse_ambiguous_call(&mut self, call: &ExprCall) -> bool {
+        let Expr::Path(path) = strip_transparent(&call.func) else {
+            return false;
+        };
+        let Some(ident) = path.path.get_ident() else {
+            return false;
+        };
+        if !self.ambiguous_fns.contains(&ident.to_string()) {
+            return false;
+        }
+        let (action, name) = (self.action.clone(), ident.to_string());
+        self.error(
+            call.span(),
+            format!(
+                "agent authority: `{name}` is bound to different effect functions on \
+                 different paths, so which one this call runs cannot be read, and \
+                 `{action}`'s effects cannot be proven.\n\nCall each effect directly, or \
+                 declare the site with `#[agent_effect(..., reason = \"...\")]`. {GUIDE}"
+            ),
+        );
+        true
+    }
+
     fn spawn_error(&mut self, span: Span, name: &str) {
         let action = self.action.clone();
         self.error(
@@ -2924,43 +2978,7 @@ impl Analyzer {
             self.expr(arg);
         }
 
-        // A call through a name bound to `tokio::spawn` detaches exactly as
-        // the direct spelling does.
-        if let Expr::Path(path) = strip_transparent(&call.func)
-            && let Some(ident) = path.path.get_ident()
-            && self.spawn_aliases.contains(&ident.to_string())
-        {
-            let alias = ident.to_string();
-            self.spawn_error(call.span(), &alias);
-            return;
-        }
-
-        // A name bound to different effect verbs on different paths: which
-        // one runs cannot be read, so the call is refused.
-        if let Expr::Path(path) = strip_transparent(&call.func)
-            && let Some(ident) = path.path.get_ident()
-            && self.ambiguous_fns.contains(&ident.to_string())
-        {
-            let (action, name) = (self.action.clone(), ident.to_string());
-            self.error(
-                call.span(),
-                format!(
-                    "agent authority: `{name}` is bound to different effect functions on \
-                     different paths, so which one this call runs cannot be read, and \
-                     `{action}`'s effects cannot be proven.\n\nCall each effect directly, or \
-                     declare the site with `#[agent_effect(..., reason = \"...\")]`. {GUIDE}"
-                ),
-            );
-            return;
-        }
-
-        // A call through a name bound to an effect verb performs that verb;
-        // the alias is the only thing at this call site that names it.
-        if let Expr::Path(path) = strip_transparent(&call.func)
-            && let Some(ident) = path.path.get_ident()
-            && let Some(aliased) = self.fn_aliases.get(&ident.to_string()).cloned()
-        {
-            self.aliased_effect(call, ident.to_string().as_str(), &aliased);
+        if self.call_through_alias(call) {
             return;
         }
 
