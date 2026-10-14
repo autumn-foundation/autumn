@@ -2381,6 +2381,8 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
             || parsed.port().unwrap_or(5432),
             |v| v.parse().unwrap_or(5432),
         );
+        // `dbname` is presence-based. An empty name defaults to `PGDATABASE`,
+        // then to the user name, as in libpq.
         let name = params.get("dbname").cloned().unwrap_or_else(|| {
             parsed
                 .path_segments()
@@ -2388,9 +2390,21 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
                 .map(decode)
                 .unwrap_or_default()
         });
-        if name.is_empty() {
-            return None;
-        }
+        let name = if name.is_empty() {
+            env("PGDATABASE")
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    params
+                        .get("user")
+                        .cloned()
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| Some(decode(parsed.username())).filter(|v| !v.is_empty()))
+                        .or_else(|| env("PGUSER"))
+                        .unwrap_or_default()
+                })
+        } else {
+            name
+        };
         Some((host, port, name))
     };
     match (parts(a), parts(b)) {
@@ -9033,6 +9047,17 @@ mod tests {
             "postgres:///app?ho%73t=prod.example.com",
             "postgres://prod.example.com/app",
             &|_| None
+        ));
+        // An empty `dbname` defaults to `PGDATABASE`, then to the user name.
+        assert!(same_database_with(
+            "postgres://app@prod/app?dbname=",
+            "postgres://app@prod/app",
+            &|_| None
+        ));
+        assert!(same_database_with(
+            "postgres://prod/x?dbname=",
+            "postgres://prod/db1",
+            &|k| (k == "PGDATABASE").then(|| "db1".to_owned())
         ));
         // A non-Postgres scheme never names a Postgres database.
         assert!(!same_database_with(
