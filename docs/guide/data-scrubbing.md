@@ -761,8 +761,9 @@ apply-time error.
   column). A structural one (a referenced key, say) is declared `safe` and keeps
   its ciphertext.
 - **A libpq `service` source needs the waiver.** The guard cannot read a
-  service file. A protected profile that connects through `service=` makes the
-  guard refuse until you pass `--allow-source-overwrite`.
+  service file. A protected profile that connects through `service=`, or a
+  nonempty `PGSERVICE` in the environment, makes the guard refuse until you pass
+  `--allow-source-overwrite`.
 - **Test-only registrations are ignored.** A `ModelRegistration::anonymize` call
   under `#[cfg(test)]` (an inline module, a `#[cfg(test)] mod tests;` file, or
   `#![cfg(test)]`) is not a production registration. Other `cfg` predicates are

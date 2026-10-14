@@ -2608,6 +2608,7 @@ fn database_endpoint(
                 .filter(|n| !n.is_empty())
         })
         .or_else(|| env("PGDATABASE").filter(|n| !n.is_empty()))
+        .or_else(|| query("user"))
         .or(user)
         .or_else(|| env("PGUSER").filter(|n| !n.is_empty()))?;
     // Named query parameters apply after the authority, so they win. `hostaddr`
@@ -2961,7 +2962,10 @@ fn guard_configured_source(
             .collect();
         // A libpq `service` names its host and port in a file this guard does
         // not read. Refuse rather than model it as the default local endpoint.
-        if urls.iter().any(|url| uses_libpq_service(url)) {
+        // The ambient `PGSERVICE` applies to a string that names none.
+        let ambient_service =
+            !urls.is_empty() && std::env::var("PGSERVICE").is_ok_and(|service| !service.is_empty());
+        if ambient_service || urls.iter().any(|url| uses_libpq_service(url)) {
             return Err(ScrubError::SourceScan {
                 detail: format!(
                     "the {profile:?} profile uses a libpq `service`, whose host the source \
@@ -10298,6 +10302,11 @@ mod tests {
         assert!(same_database_in(
             "postgres:///app?hostaddr=10.0.0.1&hostaddr=10.0.0.5",
             "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://alice@prod/?user=app",
+            "postgres://app@prod/app",
             &env
         ));
         assert!(same_database_in(
