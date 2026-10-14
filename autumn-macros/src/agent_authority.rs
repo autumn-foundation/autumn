@@ -1863,7 +1863,23 @@ impl Analyzer {
             // `[start(); 1]` repeats one element.
             Expr::Repeat(rep) => self.carries_unread(&rep.expr),
             Expr::Reference(r) => self.carries_unread(&r.expr),
-            Expr::Struct(s) => s.fields.iter().any(|f| self.carries_unread(&f.expr)),
+            // `..old` keeps every field `old` held.
+            Expr::Struct(s) => {
+                s.fields.iter().any(|f| self.carries_unread(&f.expr))
+                    || s.rest
+                        .as_ref()
+                        .is_some_and(|rest| self.carries_unread(rest))
+            }
+            // `start() as Pin<Box<dyn Future>>` is the same future.
+            Expr::Cast(c) => self.carries_unread(&c.expr),
+            // `loop { break start(); }` and `'a: { break 'a start() }` yield
+            // their `break` values.
+            Expr::Loop(l) => break_values(&l.body)
+                .iter()
+                .any(|value| self.carries_unread(value)),
+            Expr::Block(b) if b.label.is_some() => break_values(&b.block)
+                .iter()
+                .any(|value| self.carries_unread(value)),
             // `vec![start()]` builds a container of its elements.
             Expr::Macro(m) if m.mac.path.is_ident("vec") => vec_elements(&m.mac)
                 .iter()
@@ -4538,6 +4554,23 @@ fn tokens_contain_await(tokens: &TokenStream) -> bool {
         TokenTree::Group(group) => tokens_contain_await(&group.stream()),
         _ => false,
     })
+}
+
+/// The values a `break` hands out of a block, at any depth. Deeper loops'
+/// breaks are included, which only makes the callers more careful.
+fn break_values(block: &Block) -> Vec<Expr> {
+    struct Breaks(Vec<Expr>);
+    impl<'ast> syn::visit::Visit<'ast> for Breaks {
+        fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
+            if let Some(value) = &node.expr {
+                self.0.push((**value).clone());
+            }
+            syn::visit::visit_expr_break(self, node);
+        }
+    }
+    let mut breaks = Breaks(Vec::new());
+    syn::visit::Visit::visit_block(&mut breaks, block);
+    breaks.0
 }
 
 /// The element expressions of a `vec![a, b]` or `vec![x; n]`. Empty when the
@@ -7384,6 +7417,37 @@ mod tests {
             "awaited call",
             r"async fn h() -> R {
                 let fut = (|| start_finance_job())();
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future coerced by a cast",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = Box::pin(start_finance_job()) as Pin<Box<dyn Future<Output = ()>>>;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future kept by a struct update",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let old = Holder { future: start_finance_job() };
+                let new = Holder { flag: true, ..old };
+                new.future.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future yielded by a loop break",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = loop { break start_finance_job(); };
                 fut.await?;
                 Ok(())
             }",
