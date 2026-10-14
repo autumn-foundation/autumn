@@ -1380,8 +1380,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     if ledger_upcast.is_some() && ledger_schema_version.unwrap_or(1) < 2 {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "ledgered(upcast = ...) needs `schema_version = 2` or more: the hook converts \
-             a snapshot older than the current version, and nothing is older than version 1",
+            "ledgered(upcast = ...) needs `schema_version = 2` or more. The hook converts \
+             a snapshot older than the current version. Nothing is older than version 1",
         ));
     }
     if let Some(spec) = &retention {
@@ -5344,15 +5344,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // the current shape. When that fails, skip the live check.
                                 // A schema error is not tamper evidence.
                                 match Self::__autumn_ledger_upcast(record_id, head) {
-                                    ::core::result::Result::Ok((snapshot, _)) => {
-                                        if Self::__autumn_ledger_live_matches(&snapshot, live_value) {
+                                    ::core::result::Result::Ok((snapshot, stored)) => {
+                                        // Only a head from an older schema version may
+                                        // lack a column. A head at the current version
+                                        // is compared strictly.
+                                        let older = stored
+                                            < <#model_name as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION;
+                                        if Self::__autumn_ledger_live_matches(&snapshot, live_value, older) {
                                             ::autumn_web::ledger::LedgerLiveState::Matches
                                         } else {
                                             ::autumn_web::ledger::LedgerLiveState::Diverged
                                         }
                                     }
-                                    ::core::result::Result::Err(_) =>
-                                        ::autumn_web::ledger::LedgerLiveState::NotChecked,
+                                    ::core::result::Result::Err(err) => {
+                                        ::autumn_web::ledger::note_live_check_skipped(
+                                            #table_name,
+                                            record_id,
+                                            &err,
+                                        );
+                                        ::autumn_web::ledger::LedgerLiveState::NotChecked
+                                    }
                                 }
                             }
                         }
@@ -5396,6 +5407,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// carries the `key_id` that encrypted it, so a retired key still
                 /// decrypts.
                 ///
+                /// `tolerate_new_columns` is set only for a head written under an older
+                /// schema version. See `autumn_web::ledger::snapshots_agree`.
+                ///
                 /// A column whose key is gone entirely cannot be compared at all;
                 /// it is dropped from **both** sides rather than read as a
                 /// divergence. Only that residue is invisible to the cross-check,
@@ -5404,6 +5418,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 fn __autumn_ledger_live_matches(
                     head: &::autumn_web::reexports::serde_json::Value,
                     live: &::autumn_web::reexports::serde_json::Value,
+                    tolerate_new_columns: bool,
                 ) -> bool {
                     let mut head = head.clone();
                     let mut live = live.clone();
@@ -5420,8 +5435,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             object.remove(column);
                         }
                     }
-                    // #2326: compare the columns both shapes have.
-                    ::autumn_web::ledger::snapshots_agree(&head, &live)
+                    // #2326: a head from an older schema may lack a new column.
+                    ::autumn_web::ledger::snapshots_agree(&head, &live, tolerate_new_columns)
                 }
 
                 /// The live row encoded through the model's durable codec, or
@@ -28702,6 +28717,15 @@ mod tests {
     }
 
     #[test]
+    fn ledgered_rejects_a_schema_version_that_overflows() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = 99999999999)"
+                .parse()
+                .unwrap();
+        assert!(parse_repo_args(tokens).is_err());
+    }
+
+    #[test]
     fn schema_options_need_the_ledger() {
         let tokens: proc_macro2::TokenStream =
             "Post, soft_delete, ledgered(schema_version = 2), ledgered = false"
@@ -28721,13 +28745,22 @@ mod tests {
             quote! { pub trait PostRepository {} },
         )
         .to_string();
+        // Each append site stamps first. So the first stamp comes before the
+        // first append, and the counts match.
         let stamp = generated
             .find("stamp_schema_version")
             .expect("each snapshot is stamped");
-        let append = generated[stamp..]
-            .find("append_revision")
-            .expect("the revision is appended after the stamp");
-        assert!(append > 0);
+        let append = generated
+            .find("ledger :: append_revision (")
+            .expect("the revision is appended");
+        assert!(stamp < append, "the stamp must come before the append");
+        assert_eq!(
+            generated
+                .matches("ledger :: stamp_schema_version (")
+                .count(),
+            generated.matches("ledger :: append_revision (").count(),
+            "every append site stamps its snapshot"
+        );
         assert!(
             generated.contains("const LEDGER_SCHEMA_VERSION : u32 = 3"),
             "the record impl declares the version: {generated}"

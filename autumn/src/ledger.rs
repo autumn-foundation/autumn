@@ -1802,9 +1802,9 @@ pub enum LedgerError {
     #[error(
         "ledger revision {seq} of {table}#{record_id} does not match the current model \
          schema: {detail}. The model changed after this revision was written. Add \
-         `#[serde(default)]` to a new field. Or set `ledgered(schema_version = N, \
-         upcast = path)` to convert a renamed or retyped one. Or run `ledger_verify` \
-         to check for an edit"
+         `#[serde(default)]` to a new field. To convert a renamed or retyped field, \
+         set `ledgered(schema_version = N, upcast = path)`. To check for an edit, \
+         run `ledger_verify`"
     )]
     SnapshotSchemaMismatch {
         /// Table of the ledgered model.
@@ -1860,22 +1860,22 @@ pub trait LedgeredRecord: crate::version_history::VersionedRecord {
 
     /// Version of the snapshot shape this model writes (#2326).
     ///
-    /// Declare `ledgered(schema_version = 2)` after you rename or retype a
-    /// snapshot field. A revision written at a later version than 1 carries
-    /// the number inside its hashed snapshot. An older revision carries none and
-    /// counts as version 1.
+    /// Raise the version when you rename or retype a snapshot field, or add a
+    /// column. A model at version 2 or more writes the version into each new
+    /// snapshot, inside the hash. A snapshot with no version is version 1.
     const LEDGER_SCHEMA_VERSION: u32 = 1;
 
     /// Convert a snapshot written at `from_version` to the current shape (#2326).
     ///
     /// The ledger calls it only for a snapshot older than
     /// [`LEDGER_SCHEMA_VERSION`](Self::LEDGER_SCHEMA_VERSION). The default does
-    /// nothing. Declare `ledgered(schema_version = N, upcast = path)` to run your
-    /// function. It must handle every version below `N`.
+    /// nothing. To use your own function, declare
+    /// `ledgered(schema_version = N, upcast = path)`. Your function must handle
+    /// every version below `N`.
     ///
     /// # Errors
     ///
-    /// A message that says why the snapshot cannot be converted.
+    /// Returns a message that says why the snapshot cannot be converted.
     fn ledger_upcast(_from_version: u32, _snapshot: &mut serde_json::Value) -> Result<(), String> {
         Ok(())
     }
@@ -2164,7 +2164,7 @@ pub fn verification_from_read_error(
 /// The key sits inside the hashed snapshot, so an edit to it breaks the chain.
 /// A model at version 1 writes no marker. A snapshot without one counts as
 /// version 1, so chains written before versions existed keep their hashes.
-/// The `$` keeps it apart from every column name.
+/// No column name starts with `$`, so the key cannot clash with a column.
 pub const SNAPSHOT_SCHEMA_KEY: &str = "$schema_version";
 
 /// The function type of an `upcast` hook (#2326).
@@ -2183,15 +2183,16 @@ pub fn stamp_schema_version(snapshot: &mut serde_json::Value, current: u32) {
 
 /// Bring a stored snapshot to the current model shape (#2326).
 ///
-/// Returns the converted snapshot, without the marker, and the version it was
-/// written at. Runs `hook` only for a snapshot older than `current`. A snapshot
-/// from a newer model comes back unchanged: the caller reports it if it does not
-/// decode.
+/// Returns the converted snapshot and the version it was written at. The
+/// snapshot has no marker. Runs `hook` only for a snapshot older than `current`.
+/// A snapshot from a newer model comes back unchanged. If the model cannot
+/// decode it, the caller reports the error.
 ///
 /// # Errors
 ///
-/// [`LedgerError::SnapshotSchemaMismatch`] for a damaged marker or a failing
-/// hook. Neither is tamper evidence: `ledger_verify` shows an edit.
+/// [`LedgerError::SnapshotSchemaMismatch`] for a damaged marker, a failing
+/// hook, or a hook that panics. None of them is tamper evidence. Use
+/// `ledger_verify` to find an edit.
 #[doc(hidden)]
 pub fn upcast_snapshot(
     table: &str,
@@ -2221,7 +2222,11 @@ pub fn upcast_snapshot(
             })?,
     };
     if stored < current {
-        hook(stored, &mut value).map_err(|message| {
+        // A hook is app code. A panic in it must not stop an audit.
+        let ran =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(stored, &mut value)))
+                .unwrap_or_else(|_| Err("the hook panicked".to_string()));
+        ran.map_err(|message| {
             schema_mismatch(
                 table,
                 record_id,
@@ -2262,20 +2267,43 @@ pub fn schema_mismatch_at(
 
 /// Whether the stored head and the live row agree (#2326).
 ///
-/// Compares the columns both have. A column that only one side has comes from a
-/// schema change: the head cannot say what the new column held. This is not tamper
-/// evidence. An edit to the head breaks its hash, and an edit to the live row
-/// changes a column the head has.
+/// With `tolerate_new_columns` set, this compares the columns both have. Set it
+/// only when the head was written under an older schema version than the
+/// model's. A column that only one side has comes from that schema change. The
+/// head cannot say what a new column held, and the next write records it.
+///
+/// With the flag clear, the two must be equal. Then a column that the head lacks
+/// is a difference. This keeps the check strict for a head at the current
+/// version, so an out-of-band edit to such a column is found.
 #[doc(hidden)]
 #[must_use]
-pub fn snapshots_agree(head: &serde_json::Value, live: &serde_json::Value) -> bool {
+pub fn snapshots_agree(
+    head: &serde_json::Value,
+    live: &serde_json::Value,
+    tolerate_new_columns: bool,
+) -> bool {
     match (head.as_object(), live.as_object()) {
-        (Some(head), Some(live)) => head.iter().all(|(column, value)| {
+        (Some(head), Some(live)) if tolerate_new_columns => head.iter().all(|(column, value)| {
             live.get(column)
                 .is_none_or(|other| canonical_json(value) == canonical_json(other))
         }),
         _ => canonical_json(head) == canonical_json(live),
     }
+}
+
+/// Log that `ledger_verify` skipped the live-row check for a record (#2326).
+///
+/// The head could not be converted to the current schema. The hash chain is
+/// still verified. The skip is not tamper evidence, but a quiet skip would hide
+/// a broken upcast function.
+#[doc(hidden)]
+pub fn note_live_check_skipped(table: &str, record_id: i64, error: &crate::AutumnError) {
+    tracing::warn!(
+        table,
+        record_id,
+        %error,
+        "ledger_verify skipped the live-row check: the head revision could not be converted"
+    );
 }
 
 /// Refuse to reconstruct a model from a snapshot whose `#[encrypted]` column
@@ -4706,26 +4734,62 @@ mod tests {
     }
 
     #[test]
-    fn the_live_check_ignores_columns_only_one_side_has() {
+    fn the_live_check_ignores_columns_only_one_side_has_after_a_schema_change() {
         // A column added since the head was written is not tamper evidence.
         let head = json!({ "title": "a" });
         let live = json!({ "title": "a", "region": "eu" });
-        assert!(snapshots_agree(&head, &live));
+        assert!(snapshots_agree(&head, &live, true));
         // Nor is a column the model dropped.
-        assert!(snapshots_agree(&live, &head));
+        assert!(snapshots_agree(&live, &head, true));
+    }
+
+    #[test]
+    fn the_live_check_is_strict_when_no_schema_change_is_declared() {
+        // Without a version bump, a column the head lacks is a difference. An
+        // out-of-band edit to it must not pass.
+        let head = json!({ "title": "a" });
+        let live = json!({ "title": "a", "role": "admin" });
+        assert!(!snapshots_agree(&head, &live, false));
+        assert!(!snapshots_agree(&live, &head, false));
+        assert!(snapshots_agree(&live, &live, false));
     }
 
     #[test]
     fn the_live_check_still_sees_a_changed_value() {
         let head = json!({ "title": "a", "amount": 1 });
         let live = json!({ "title": "a", "amount": 2, "region": "eu" });
-        assert!(!snapshots_agree(&head, &live));
+        assert!(!snapshots_agree(&head, &live, true));
+        assert!(!snapshots_agree(&head, &live, false));
     }
 
     #[test]
     fn the_live_check_compares_non_objects_whole() {
-        assert!(snapshots_agree(&json!(1), &json!(1)));
-        assert!(!snapshots_agree(&json!(1), &json!(2)));
-        assert!(!snapshots_agree(&json!({}), &json!(2)));
+        assert!(snapshots_agree(&json!(1), &json!(1), true));
+        assert!(!snapshots_agree(&json!(1), &json!(2), true));
+        assert!(!snapshots_agree(&json!({}), &json!(2), true));
+    }
+
+    fn panic_upcast(_: u32, _: &mut serde_json::Value) -> Result<(), String> {
+        panic!("the hook has a bug")
+    }
+
+    #[test]
+    fn a_hook_that_panics_is_a_schema_error() {
+        let err =
+            upcast_snapshot("t", 3, 2, &json!({ "subject": "a" }), 2, panic_upcast).unwrap_err();
+        let (record_id, seq, detail) = mismatch(&err);
+        assert_eq!((record_id, seq), (3, 2));
+        assert!(detail.contains("the hook panicked"), "{detail}");
+    }
+
+    #[test]
+    fn a_marked_snapshot_read_by_a_version_one_model_loses_the_marker() {
+        // A rollback: the model is older than the revision. The hook is skipped.
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 2);
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 1, refuse_upcast).unwrap();
+        assert_eq!((value, stored), (json!({ "title": "a" }), 2));
+        let shown = schema_mismatch_at("t", 1, 1, stored, 1, "cannot decode").to_string();
+        assert!(shown.contains("newer"), "{shown}");
     }
 }

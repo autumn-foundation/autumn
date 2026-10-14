@@ -217,7 +217,7 @@ A revision keeps the columns the model had when the revision was written. After
 you change the model, `ledger_as_of` and `ledger_diff` must still read it.
 
 - **Add a field.** Use `Option<T>`, or add `#[serde(default)]`. An old revision
-  reads the default.
+  reads the default. Also raise the schema version. See the verify rule below.
 - **Rename or retype a field.** Raise the schema version. Write an upcast
   function that converts an old snapshot:
 
@@ -247,20 +247,33 @@ How it works:
 - The ledger calls your function only for a snapshot older than the current
   version. The function gets the version the revision was written at. It must
   handle every version below `N`. The model then reads the converted snapshot
-  with its usual rules, so `#[serde(default)]` still fills a new field.
+  with its usual rules, so `#[serde(default)]` still fills a new field. A
+  function that panics gives the same error as one that returns an error.
+- `schema_version = 0`, and `upcast` without `schema_version = 2` or more, are
+  compile errors.
 - If the function returns an error, `ledger_as_of` and `ledger_diff` return
   `LedgerError::SnapshotSchemaMismatch` with your message. This is not tamper
   evidence.
-- A revision written by a newer model, for example after a rollback, cannot be
-  converted. If the model cannot read it, the error names both versions.
+- A revision written by a newer model, for example after a rollback, is not
+  converted. If the model can still decode it, the ledger reads it. If not, the
+  error names both versions.
 - `ledger_diff` converts both revisions to the current shape before it compares
   them. It shows only real changes. A renamed field is not a change.
-- `ledger_verify` converts the head revision in the same way. Then it compares
-  the columns that the head and the live row both have. A column added after
-  the head was written is not compared, so a deploy does not report
-  `LiveStateMismatch`. If your function fails, the live check is skipped. The
-  hash chain is still checked. An edit to a column that the head has is still
-  found.
+
+How `ledger_verify` treats a schema change:
+
+- It converts the head revision with your function. Then it compares the head
+  with the live row.
+- If the head is older than the model's schema version, it compares only the
+  columns that both have. A column that the head never recorded is not compared.
+  The next write records it. So a deploy does not cause a `LiveStateMismatch`
+  report. **Raise the schema version when you add a column.** Without this, a
+  record whose head predates the column reports `LiveStateMismatch`.
+- If the head is at the model's schema version, the comparison is strict. A
+  column that the head lacks is a difference. This keeps an out-of-band edit to
+  such a column visible.
+- If your function fails on the head, `ledger_verify` skips the live check and
+  writes a warning to the log. The hash chain is still checked.
 
 ## Bitemporality
 

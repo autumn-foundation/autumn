@@ -1102,7 +1102,9 @@ What to know when writing app code against it:
   an older snapshot (issue #2326). The version is stored in each new snapshot as
   `"$schema_version"`, inside the hash. A failing function is
   `SnapshotSchemaMismatch`, not tamper evidence. `ledger_verify` converts the
-  head before its live-row check and compares the columns both shapes have.
+  head before its live-row check. For a head older than the model's version it
+  compares only the columns both shapes have, so raise `schema_version` when you
+  add a column. A head at the current version is compared strictly.
 - **Two time axes.** `recorded_at` is transaction time; `valid_from` defaults to
   it, or comes from your own column via `ledgered(valid_time = "effective_at")`
   (`DateTime<Utc>` / `NaiveDateTime` / `Option` of either). Query both with
