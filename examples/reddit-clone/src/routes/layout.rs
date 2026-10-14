@@ -127,6 +127,8 @@ pub fn layout_with_seo(
 ) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
+        // The page chrome is English. User content may be in any script, so
+        // `lang` states the chrome only.
         html lang="en" {
             head {
                 meta charset="utf-8";
@@ -303,6 +305,36 @@ pub fn analytics_snippet(consent: &autumn_web::consent::Consent) -> Markup {
     }
 }
 
+/// An error summary for the top of a re-rendered form.
+///
+/// A `role="alert"` region present at page load is not announced, and a
+/// full-page 422 moves no focus. So the summary takes focus on render
+/// (`autofocus` on a `tabindex="-1"` box) and links each message to its field.
+/// Renders nothing when the form is valid.
+pub fn form_error_summary<T>(form: &autumn_web::form::ChangesetForm<T>) -> Markup {
+    let errors = form.changeset.all_errors();
+    let mut fields: Vec<&String> = errors.keys().collect();
+    fields.sort();
+    html! {
+        @if !fields.is_empty() {
+            div id="error-summary" tabindex="-1" autofocus
+                aria-labelledby="error-summary-title"
+                class="mb-4 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-700" {
+                h2 id="error-summary-title" class="font-semibold mb-1" {
+                    "Please fix the following errors"
+                }
+                ul class="list-disc pl-5" {
+                    @for field in fields {
+                        @for message in &errors[field] {
+                            li { a href=(format!("#{field}")) class="underline" { (message) } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Timestamp display helper.
 pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
     let now = chrono::Utc::now().naive_utc();
@@ -328,7 +360,39 @@ mod tests {
     use autumn_web::html;
     use autumn_web::seo::SeoMeta;
 
-    use super::{layout, layout_with_seo};
+    use autumn_web::IntoChangeset as _;
+    use autumn_web::form::ChangesetForm;
+    use validator::Validate;
+
+    use super::{form_error_summary, layout, layout_with_seo};
+
+    #[derive(serde::Serialize, serde::Deserialize, Validate, Clone, Default)]
+    struct Probe {
+        #[validate(length(min = 1, message = "Title is required"))]
+        title: String,
+    }
+
+    #[test]
+    fn a_valid_form_has_no_error_summary() {
+        let form = ChangesetForm::from_changeset(
+            Probe {
+                title: "ok".to_owned(),
+            }
+            .into_changeset(),
+        );
+        assert!(form_error_summary(&form).into_string().is_empty());
+    }
+
+    #[test]
+    fn an_invalid_form_gets_a_focused_summary_that_links_each_field() {
+        let form = ChangesetForm::from_changeset(Probe::default().into_changeset());
+        let out = form_error_summary(&form).into_string();
+        assert!(out.contains(r#"id="error-summary""#), "{out}");
+        assert!(out.contains(r#"tabindex="-1""#), "{out}");
+        assert!(out.contains("autofocus"), "{out}");
+        assert!(out.contains(r##"href="#title""##), "{out}");
+        assert!(out.contains("Title is required"), "{out}");
+    }
 
     #[test]
     fn layout_still_renders_the_site_title_suffix() {

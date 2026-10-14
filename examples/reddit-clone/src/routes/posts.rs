@@ -52,7 +52,7 @@ fn posts_per_page() -> i64 {
         .unwrap_or(25)
 }
 
-use super::layout::{layout, layout_with_seo, time_ago, vote_controls};
+use super::layout::{form_error_summary, layout, layout_with_seo, time_ago, vote_controls};
 
 // ── Front page — hot posts across all subreddits ───────────────
 
@@ -500,6 +500,7 @@ fn submit_form_markup(
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { (heading) }
+            (form_error_summary(form))
             (form.form_tag(&paths::submit(), "post", html! {
                 @if let Some(sub) = fixed_sub {
                     input type="hidden" name="subreddit_id" value=(sub.id);
@@ -589,6 +590,28 @@ fn submit_form_markup(
             }))
         }
     }
+}
+
+/// Tag chips. Shows `name`, the author's spelling. `slug` is only a URL key
+/// and is a hash for names with no Latin text.
+fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
+    html! {
+        div class="flex flex-wrap gap-2 mt-3" {
+            @for tag in tags {
+                span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
+                    "#" (tag.name)
+                }
+            }
+        }
+    }
+}
+
+/// The manage-tags input value. Uses names so a save keeps the spelling.
+fn tag_input_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
+    tags.into_iter()
+        .map(|tag| tag.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Render one field's validation messages, in the element its control points
@@ -1137,13 +1160,7 @@ pub async fn show(
                         // reads the batched `post_tags` join loaded above, no
                         // per-tag query.
                         @if !post_tags.is_empty() {
-                            div class="flex flex-wrap gap-2 mt-3" {
-                                @for tag in &post_tags {
-                                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
-                                        "#" (tag.slug)
-                                    }
-                                }
-                            }
+                            (tag_chips(post_tags.iter().map(|tag| &***tag)))
                         }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
@@ -1161,7 +1178,7 @@ pub async fn show(
                                 input type="hidden" name="_csrf" value=(csrf.token());
                                 input type="text" name="tags"
                                       aria-label="Post tags"
-                                      value=(post_tags.iter().map(|t| t.slug.clone()).collect::<Vec<_>>().join(", "))
+                                      value=(tag_input_value(post_tags.iter().map(|tag| &***tag)))
                                       placeholder="tags, comma separated"
                                       class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
                                              focus:outline-none focus:ring-2 focus:ring-orange-400" {}
@@ -1279,6 +1296,7 @@ fn edit_form_markup(form: &ChangesetForm<EditPostForm>, sub_slug: &str, post_slu
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Edit Post" }
+            (form_error_summary(form))
             (form.form_tag(&paths::update(sub_slug, post_slug), "post", html! {
                 div {
                     (field_errors("title", form))
@@ -1780,6 +1798,39 @@ autumn_web::paths![
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tag(name: &str, slug: &str) -> Tag {
+        Tag {
+            id: 1,
+            name: name.to_owned(),
+            slug: slug.to_owned(),
+        }
+    }
+
+    #[test]
+    fn tag_chips_show_the_name_not_the_slug() {
+        let out = tag_chips(&[tag("日本語", "n1a3b86"), tag("Web Dev", "web-dev")]).into_string();
+        assert!(out.contains("#日本語"), "{out}");
+        assert!(out.contains("#Web Dev"), "{out}");
+        assert!(!out.contains("n1a3b86"), "{out}");
+    }
+
+    #[test]
+    fn the_tag_input_keeps_the_authors_spelling() {
+        let tags = [tag("Web Dev", "web-dev"), tag("日本語", "n1a3b86")];
+        assert_eq!(tag_input_value(&tags), "Web Dev, 日本語");
+        // Saving the value again must not change a tag.
+        let parsed = parse_tag_names(&tag_input_value(&tags));
+        assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+    }
+
+    #[test]
+    fn a_rejected_submit_form_leads_with_a_focused_error_summary() {
+        let rendered = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        let blank = submit_form_markup(&blank_submit_form(), &[], None).into_string();
+        assert!(!blank.contains("error-summary"), "{blank}");
+    }
 
     #[tokio::test]
     async fn post_publication_enqueue_failure_is_returned_to_submit() {
