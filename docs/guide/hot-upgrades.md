@@ -136,14 +136,14 @@ Same port, same socket, no restart — and `note=hello`, written to the old
 build's memory, is being read out of the new build's.
 
 `cargo test -p hot-upgrade --test live_upgrade` proves it under load: eight
-concurrent clients across the cutover, zero refused connections, zero failed
-reads, the pre-upgrade value intact, and the cutover latency spike measured.
+concurrent clients across the cutover, no lost request, zero failed reads, the pre-upgrade value intact, and the cutover latency spike measured.
 
 The test checks that no request is lost. It does not check that every answer
 is final. A client retries a reset connection once. The test allows at most
 five resets per run. A client also retries a `503` from the new build's startup
-barrier, for up to 30 seconds. A refused connection is never retried. It fails
-the test.
+barrier, for up to 30 seconds. A refused connection is retried for up to two
+seconds. The test allows at most five refusals per run. A connection that stays
+refused fails the test.
 
 ---
 
