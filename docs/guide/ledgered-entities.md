@@ -203,11 +203,64 @@ Some consequences worth knowing:
 - If a snapshot does not decode into the current model, `ledger_as_of` and
   `ledger_diff` return `LedgerError::SnapshotSchemaMismatch`. This is not tamper
   evidence. To read old revisions after adding a required field, put
-  `#[serde(default)]` on it. Run `ledger_verify` to rule out an edit. The ledger does not
-  convert renamed fields or changed types yet.
+  `#[serde(default)]` on it. For a renamed or retyped field, set a schema
+  version and an upcast function. See
+  [Changing a model's shape](#changing-a-models-shape). Run `ledger_verify` to
+  rule out an edit.
 - A field added as `Option<T>` needs no attribute. An old snapshot without it
   reads as `None`. `ledger_diff` shows no change for that field until a
   revision sets it. This does not hold with `skip_serializing_if`.
+
+## Changing a model's shape
+
+A revision keeps the columns the model had when the revision was written. After
+you change the model, `ledger_as_of` and `ledger_diff` must still read it.
+
+- **Add a field.** Use `Option<T>`, or add `#[serde(default)]`. An old revision
+  reads the default.
+- **Rename or retype a field.** Raise the schema version. Write an upcast
+  function that converts an old snapshot:
+
+```rust
+#[repository(Invoice, soft_delete, ledgered(schema_version = 2, upcast = upcast_invoice))]
+pub trait InvoiceRepository {}
+
+// Version 1 called `title` `subject`.
+fn upcast_invoice(from_version: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+    if from_version < 2 {
+        let object = snapshot.as_object_mut().ok_or("the snapshot is not an object")?;
+        if let Some(subject) = object.remove("subject") {
+            object.insert("title".to_string(), subject);
+        }
+    }
+    Ok(())
+}
+```
+
+How it works:
+
+- A model at schema version 2 or more writes `"$schema_version": N` into each new
+  snapshot. The revision hash covers it, so an edit to it breaks the chain. A
+  snapshot without the key is version 1. A model at version 1 writes no key, so
+  existing chains keep their hashes. `ledger_revisions` returns the snapshot
+  as stored, key included.
+- The ledger calls your function only for a snapshot older than the current
+  version. The function gets the version the revision was written at. It must
+  handle every version below `N`. The model then reads the converted snapshot
+  with its usual rules, so `#[serde(default)]` still fills a new field.
+- If the function returns an error, `ledger_as_of` and `ledger_diff` return
+  `LedgerError::SnapshotSchemaMismatch` with your message. This is not tamper
+  evidence.
+- A revision written by a newer model, for example after a rollback, cannot be
+  converted. If the model cannot read it, the error names both versions.
+- `ledger_diff` converts both revisions to the current shape before it compares
+  them. It shows only real changes. A renamed field is not a change.
+- `ledger_verify` converts the head revision in the same way. Then it compares
+  the columns that the head and the live row both have. A column added after
+  the head was written is not compared, so a deploy does not report
+  `LiveStateMismatch`. If your function fails, the live check is skipped. The
+  hash chain is still checked. An edit to a column that the head has is still
+  found.
 
 ## Bitemporality
 

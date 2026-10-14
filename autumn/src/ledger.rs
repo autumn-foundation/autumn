@@ -1802,7 +1802,9 @@ pub enum LedgerError {
     #[error(
         "ledger revision {seq} of {table}#{record_id} does not match the current model \
          schema: {detail}. The model changed after this revision was written. Add \
-         `#[serde(default)]` to a new field. Or run `ledger_verify` to check for an edit"
+         `#[serde(default)]` to a new field. Or set `ledgered(schema_version = N, \
+         upcast = path)` to convert a renamed or retyped one. Or run `ledger_verify` \
+         to check for an edit"
     )]
     SnapshotSchemaMismatch {
         /// Table of the ledgered model.
@@ -1854,6 +1856,28 @@ pub trait LedgeredRecord: crate::version_history::VersionedRecord {
     /// reader key the chain on the same non-null column (#2319).
     fn ledger_tenant_id(&self) -> Option<&str> {
         None
+    }
+
+    /// Version of the snapshot shape this model writes (#2326).
+    ///
+    /// Declare `ledgered(schema_version = 2)` after you rename or retype a
+    /// snapshot field. A revision written at a later version than 1 carries
+    /// the number inside its hashed snapshot. An older revision carries none and
+    /// counts as version 1.
+    const LEDGER_SCHEMA_VERSION: u32 = 1;
+
+    /// Convert a snapshot written at `from_version` to the current shape (#2326).
+    ///
+    /// The ledger calls it only for a snapshot older than
+    /// [`LEDGER_SCHEMA_VERSION`](Self::LEDGER_SCHEMA_VERSION). The default does
+    /// nothing. Declare `ledgered(schema_version = N, upcast = path)` to run your
+    /// function. It must handle every version below `N`.
+    ///
+    /// # Errors
+    ///
+    /// A message that says why the snapshot cannot be converted.
+    fn ledger_upcast(_from_version: u32, _snapshot: &mut serde_json::Value) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -2133,6 +2157,125 @@ pub fn verification_from_read_error(
             detail: format!("revision {seq} is stored in a form other than its canonical text"),
         }),
     })
+}
+
+/// Snapshot key that holds the schema version a revision was written at (#2326).
+///
+/// The key sits inside the hashed snapshot, so an edit to it breaks the chain.
+/// A model at version 1 writes no marker. A snapshot without one counts as
+/// version 1, so chains written before versions existed keep their hashes.
+/// The `$` keeps it apart from every column name.
+pub const SNAPSHOT_SCHEMA_KEY: &str = "$schema_version";
+
+/// The function type of an `upcast` hook (#2326).
+#[doc(hidden)]
+pub type SnapshotUpcast = fn(u32, &mut serde_json::Value) -> Result<(), String>;
+
+/// Add the schema version marker to a new snapshot, when the model is past version 1.
+#[doc(hidden)]
+pub fn stamp_schema_version(snapshot: &mut serde_json::Value, current: u32) {
+    if current > 1
+        && let Some(object) = snapshot.as_object_mut()
+    {
+        object.insert(SNAPSHOT_SCHEMA_KEY.to_string(), serde_json::json!(current));
+    }
+}
+
+/// Bring a stored snapshot to the current model shape (#2326).
+///
+/// Returns the converted snapshot, without the marker, and the version it was
+/// written at. Runs `hook` only for a snapshot older than `current`. A snapshot
+/// from a newer model comes back unchanged: the caller reports it if it does not
+/// decode.
+///
+/// # Errors
+///
+/// [`LedgerError::SnapshotSchemaMismatch`] for a damaged marker or a failing
+/// hook. Neither is tamper evidence: `ledger_verify` shows an edit.
+#[doc(hidden)]
+pub fn upcast_snapshot(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    snapshot: &serde_json::Value,
+    current: u32,
+    hook: SnapshotUpcast,
+) -> crate::AutumnResult<(serde_json::Value, u32)> {
+    let mut value = snapshot.clone();
+    let Some(object) = value.as_object_mut() else {
+        return Ok((value, 1));
+    };
+    let stored = match object.remove(SNAPSHOT_SCHEMA_KEY) {
+        None => 1,
+        Some(marker) => marker
+            .as_u64()
+            .and_then(|version| u32::try_from(version).ok())
+            .filter(|version| *version >= 1)
+            .ok_or_else(|| {
+                schema_mismatch(
+                    table,
+                    record_id,
+                    seq,
+                    "the snapshot has a damaged schema version marker",
+                )
+            })?,
+    };
+    if stored < current {
+        hook(stored, &mut value).map_err(|message| {
+            schema_mismatch(
+                table,
+                record_id,
+                seq,
+                &format!("the upcast hook failed for schema version {stored}: {message}"),
+            )
+        })?;
+    }
+    Ok((value, stored))
+}
+
+/// [`schema_mismatch`] with the two schema versions in the detail (#2326).
+#[doc(hidden)]
+#[must_use]
+pub fn schema_mismatch_at(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    stored: u32,
+    current: u32,
+    detail: &str,
+) -> crate::AutumnError {
+    let origin = if stored > current {
+        " This revision was written by a newer model."
+    } else {
+        ""
+    };
+    schema_mismatch(
+        table,
+        record_id,
+        seq,
+        &format!(
+            "{detail} (the revision is at schema version {stored}, the model is at \
+             {current}.{origin})"
+        ),
+    )
+}
+
+/// Whether the stored head and the live row agree (#2326).
+///
+/// Compares the columns both have. A column that only one side has comes from a
+/// schema change: the head cannot say what the new column held. This is not tamper
+/// evidence. An edit to the head breaks its hash, and an edit to the live row
+/// changes a column the head has.
+#[doc(hidden)]
+#[must_use]
+pub fn snapshots_agree(head: &serde_json::Value, live: &serde_json::Value) -> bool {
+    match (head.as_object(), live.as_object()) {
+        (Some(head), Some(live)) => head.iter().all(|(column, value)| {
+            live.get(column)
+                .is_none_or(|other| canonical_json(value) == canonical_json(other))
+        }),
+        _ => canonical_json(head) == canonical_json(live),
+    }
 }
 
 /// Refuse to reconstruct a model from a snapshot whose `#[encrypted]` column
@@ -4423,5 +4566,166 @@ mod tests {
             detail: "x".into(),
         });
         assert!(verification_from_read_error(4, err).is_err());
+    }
+
+    // ── Schema versions and upcasting (#2326) ────────────────────────
+
+    /// A v1 snapshot named a field `subject`. v2 calls it `title`.
+    fn rename_subject(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+        if from < 2 {
+            let object = snapshot.as_object_mut().ok_or("not an object")?;
+            if let Some(subject) = object.remove("subject") {
+                object.insert("title".into(), subject);
+            }
+        }
+        Ok(())
+    }
+
+    fn refuse_upcast(_: u32, _: &mut serde_json::Value) -> Result<(), String> {
+        Err("no rule for this shape".into())
+    }
+
+    fn note_from_version(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+        snapshot["seen"] = json!(from);
+        Ok(())
+    }
+
+    fn mismatch(err: &crate::AutumnError) -> (i64, i64, String) {
+        match err.downcast_ref::<LedgerError>() {
+            Some(LedgerError::SnapshotSchemaMismatch {
+                record_id,
+                seq,
+                detail,
+                ..
+            }) => (*record_id, *seq, detail.clone()),
+            other => panic!("expected SnapshotSchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_one_model_adds_no_marker() {
+        // Chains written before versions existed must keep their hashes.
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 1);
+        assert_eq!(snapshot, json!({ "title": "a" }));
+    }
+
+    #[test]
+    fn a_later_schema_version_is_stamped_into_the_snapshot() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 3);
+        assert_eq!(snapshot[SNAPSHOT_SCHEMA_KEY], json!(3));
+        // The marker sits inside the hashed snapshot, so an edit shows as a break.
+        assert!(canonical_json(&snapshot).contains(SNAPSHOT_SCHEMA_KEY));
+    }
+
+    #[test]
+    fn an_unmarked_snapshot_is_version_one() {
+        let snapshot = json!({ "title": "a" });
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 1, refuse_upcast).unwrap();
+        assert_eq!((value, stored), (snapshot, 1));
+    }
+
+    #[test]
+    fn an_older_snapshot_is_converted_by_the_hook() {
+        let snapshot = json!({ "subject": "a", "amount": 1 });
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 2, rename_subject).unwrap();
+        assert_eq!(stored, 1);
+        assert_eq!(value, json!({ "title": "a", "amount": 1 }));
+    }
+
+    #[test]
+    fn the_marker_is_removed_before_the_model_reads_the_snapshot() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 2);
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 2, refuse_upcast).unwrap();
+        assert_eq!(stored, 2);
+        assert_eq!(value, json!({ "title": "a" }));
+    }
+
+    #[test]
+    fn a_snapshot_at_the_current_version_skips_the_hook() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 2);
+        upcast_snapshot("t", 1, 1, &snapshot, 2, refuse_upcast).expect("the hook is not called");
+    }
+
+    #[test]
+    fn the_hook_receives_the_stored_version() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 2);
+        let (value, _) = upcast_snapshot("t", 1, 1, &snapshot, 3, note_from_version).unwrap();
+        assert_eq!(value["seen"], json!(2));
+    }
+
+    #[test]
+    fn a_failing_hook_is_a_schema_error_and_not_tamper_evidence() {
+        let err =
+            upcast_snapshot("t", 7, 4, &json!({ "subject": "a" }), 2, refuse_upcast).unwrap_err();
+        let (record_id, seq, detail) = mismatch(&err);
+        assert_eq!((record_id, seq), (7, 4));
+        assert!(detail.contains("no rule for this shape"), "{detail}");
+        assert!(detail.contains("schema version 1"), "{detail}");
+    }
+
+    #[test]
+    fn a_snapshot_from_a_newer_model_is_flagged_and_not_converted() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 5);
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 2, refuse_upcast).unwrap();
+        assert_eq!(stored, 5);
+        assert_eq!(value, json!({ "title": "a" }));
+        let shown = schema_mismatch_at("t", 1, 1, stored, 2, "cannot decode").to_string();
+        assert!(shown.contains("schema version 5"), "{shown}");
+        assert!(shown.contains("newer"), "{shown}");
+    }
+
+    #[test]
+    fn a_damaged_marker_is_a_schema_error() {
+        for bad in [json!("x"), json!(0), json!(-1), json!(1.5), json!(null)] {
+            let snapshot = json!({ "title": "a", SNAPSHOT_SCHEMA_KEY: bad });
+            let err = upcast_snapshot("t", 1, 1, &snapshot, 2, rename_subject).unwrap_err();
+            let (_, _, detail) = mismatch(&err);
+            assert!(detail.contains("schema version marker"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_that_is_not_an_object_passes_through() {
+        let (value, stored) = upcast_snapshot("t", 1, 1, &json!([1, 2]), 2, refuse_upcast).unwrap();
+        assert_eq!((value, stored), (json!([1, 2]), 1));
+    }
+
+    #[test]
+    fn the_schema_error_names_the_versions_and_the_remedies() {
+        let shown = schema_mismatch_at("t", 1, 2, 1, 3, "cannot decode").to_string();
+        assert!(shown.contains("schema version 1"), "{shown}");
+        assert!(shown.contains("model is at 3"), "{shown}");
+        assert!(shown.contains("upcast"), "{shown}");
+        assert!(shown.contains("serde(default)"), "{shown}");
+    }
+
+    #[test]
+    fn the_live_check_ignores_columns_only_one_side_has() {
+        // A column added since the head was written is not tamper evidence.
+        let head = json!({ "title": "a" });
+        let live = json!({ "title": "a", "region": "eu" });
+        assert!(snapshots_agree(&head, &live));
+        // Nor is a column the model dropped.
+        assert!(snapshots_agree(&live, &head));
+    }
+
+    #[test]
+    fn the_live_check_still_sees_a_changed_value() {
+        let head = json!({ "title": "a", "amount": 1 });
+        let live = json!({ "title": "a", "amount": 2, "region": "eu" });
+        assert!(!snapshots_agree(&head, &live));
+    }
+
+    #[test]
+    fn the_live_check_compares_non_objects_whole() {
+        assert!(snapshots_agree(&json!(1), &json!(1)));
+        assert!(!snapshots_agree(&json!(1), &json!(2)));
+        assert!(!snapshots_agree(&json!({}), &json!(2)));
     }
 }
