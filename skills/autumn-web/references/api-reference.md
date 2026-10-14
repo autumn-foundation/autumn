@@ -1239,7 +1239,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   step-up claim is stashed for the duration; a record whose recorded target no
   longer matches the session's effective user is stale and is ignored; an
   `auth.session_key` colliding with `RESERVED_SESSION_KEYS` is refused
-  (`is_reserved_session_key`).
+  (`is_reserved_session_key`). Extra identity keys (for example `user_email`)
+  swap only when `ImpersonationPolicy::target_session_values` returns them;
+  `end_impersonation` restores the operator's values.
   Admin UI: `AdminPlugin::with_impersonation(gate)`,
   `autumn_admin_plugin::{impersonation_banner_for, impersonation_banner,
   ImpersonationBanner, AdminImpersonation, IMPERSONATION_BANNER_CSS}`, routes

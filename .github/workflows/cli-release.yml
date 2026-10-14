@@ -1,24 +1,22 @@
 name: CLI Release Binaries
 
 # Builds prebuilt `autumn` CLI binaries for Linux + macOS (x86_64 + aarch64)
-# and Windows (x86_64) and attaches them — with sha256 checksums — to a GitHub Release.
+# and Windows (x86_64), with sha256 checksums, and attests each archive.
+# It uploads workflow artifacts only. `release.yml` uploads to the release.
 #
-# Binaries correspond to DELIBERATE, TAGGED CRATE RELEASES, not trunk. This is a
-# reusable workflow invoked by `release.yml` (its `binaries` job) right after the
-# GitHub Release for a `v[0-9]+.*` tag is created — so it runs only once the Publish
-# Gate has passed and the release exists, and it uploads to that release. Cutting a
-# release is always an explicit maintainer action; there are no rolling/nightly
-# trunk-dev builds, and `releases/latest/download/...` always means "the latest
-# RELEASED version".
-#
-# It is deliberately NOT triggered by `on: release`: release.yml creates the release
-# with the default GITHUB_TOKEN, and events raised by GITHUB_TOKEN do not start new
-# workflow runs, so an `on: release` trigger would silently never fire. Invoking it
-# as a reusable job from release.yml side-steps that entirely and is deterministic.
+# Binaries correspond to DELIBERATE, TAGGED CRATE RELEASES, not trunk. The
+# Publish Gate (`publish-gate.yml`, its `cli-binaries` job) calls this workflow
+# on a `v[0-9]+.*` tag push. The tag push
+# starts the gate. So the provenance names the tag and the tagged commit
+# (#2380). `release.yml` then downloads the archives and uploads them to the
+# release. Cutting a release is always an explicit maintainer action; there are
+# no rolling/nightly trunk-dev builds, and `releases/latest/download/...`
+# always means "the latest RELEASED version".
 #
 # `workflow_dispatch` is a manual escape hatch: supply a `tag` to (re)build a
-# specific released tag and attach to its release, or leave it blank to build the
-# current ref for validation (uploads workflow artifacts, no release upload).
+# specific released tag, or leave it blank to build the current ref for
+# validation (no attestation). To re-upload assets, re-run the `binaries` job
+# of the Release workflow.
 #
 # Distribution contract (see scripts/install.sh and the README "Install" section):
 #   - Version-pinned: .../releases/download/<tag>/autumn-<target>.tar.gz  (Windows: .zip)
@@ -32,18 +30,18 @@ on:
   workflow_call:
     inputs:
       tag:
-        description: "Release tag to build from and attach binaries to (e.g. v0.6.0)."
+        description: "Release tag to build from (e.g. v0.6.0)."
         required: true
         type: string
   workflow_dispatch:
     inputs:
       tag:
-        description: "Released tag to build from and attach to (e.g. v0.6.0). Blank = build the current ref for validation only (artifacts, no release upload)."
+        description: "Released tag to build from (e.g. v0.6.0). Blank = build the current ref for validation only (no attestation)."
         required: false
         type: string
 
 permissions:
-  contents: write
+  contents: read
   # Keyless SLSA build-provenance attestation for every archive this workflow
   # attaches (issue #1615). `id-token: write` mints the OIDC identity Sigstore
   # signs over; `attestations: write` publishes the attestation. Consumers
@@ -85,7 +83,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          # `refs/tags/` stops a branch with the same name from winning.
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.99.0
@@ -157,13 +156,8 @@ jobs:
       # above is not a release asset), so an unattested asset never reaches a
       # live release.
       #
-      # NOTE ON THE RECORDED SOURCE REF: this workflow is invoked as a reusable
-      # workflow from release.yml, which is `workflow_run`-triggered and so
-      # executes in DEFAULT-BRANCH context. The OIDC claims — and therefore the
-      # provenance's source ref and commit — name the default branch, not the
-      # tag, even though the checkout above is `ref: inputs.tag`. The subject
-      # digest, repository and run are exact; the ref is not. Verify with
-      # `--repo`, not `--source-ref`. See docs/guide/supply-chain.md.
+      # The caller's `github` context sets the recorded ref. The Publish Gate
+      # calls this on a tag push, so it is the tag. See docs/guide/supply-chain.md.
       - name: Attest build provenance for the release archive
         # Only for real releases. A blank-tag `workflow_dispatch` is a
         # validation build that is never uploaded anywhere, and publishing a
@@ -173,16 +167,3 @@ jobs:
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: autumn-${{ matrix.target }}.*
-
-      - name: Attach to release
-        if: ${{ inputs.tag != '' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          # Glob expands to the archive + its .sha256 (.tar.gz on Linux/macOS, .zip on Windows).
-          gh release upload "$TAG" \
-            autumn-${{ matrix.target }}.* \
-            --clobber --repo "$GITHUB_REPOSITORY"

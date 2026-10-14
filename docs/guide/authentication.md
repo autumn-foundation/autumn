@@ -899,7 +899,22 @@ middleware from request extensions, so it follows the impersonated user only if
 that loader reads the auth session key. The same caveat applies to any identity
 key your app writes alongside `user_id` at login (a generated `{model}_id` /
 `{model}_email`, a `tenant_id`): impersonation swaps the configured auth session
-key and nothing else, so map the rest yourself if your handlers read them.
+key. To swap more keys, return them from
+`ImpersonationPolicy::target_session_values`. `end_impersonation` restores the
+operator's values.
+
+```rust
+fn target_session_values<'a>(
+    &'a self,
+    ctx: &'a PolicyContext,
+    target: &'a ImpersonationTarget,
+) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
+    Box::pin(async move {
+        // Read the email from your own user store. `None` removes the key.
+        vec![("user_email".to_owned(), lookup_email(ctx, target).await)]
+    })
+}
+```
 
 `RequireAuth` publishes the log context's `user_id` as the **effective** user,
 so log lines follow the target. `RateLimitPrincipal` is the **operator**, so an
@@ -946,7 +961,7 @@ And what it refuses:
 - **No self-destructive configuration.** `auth.session_key` must not be one of
   the keys impersonation reserves for its own bookkeeping (`impersonator_id`,
   `impersonated_id`, `impersonation_session_id`, `impersonator_role`,
-  `impersonator_last_strong_auth_at`, `role`) — the swap would clobber its own
+  `impersonator_last_strong_auth_at`, `impersonator_identity_keys`, `role`) — the swap would clobber its own
   record — nor the live step-up claim `last_strong_auth_at`, which the swap
   stashes aside; a collision there would let a numeric target id satisfy
   step-up with no reauthentication. Both directions refuse the

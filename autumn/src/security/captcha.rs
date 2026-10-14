@@ -642,10 +642,9 @@ async fn extract_token_from_form(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
         .unwrap_or_default();
 
-    if !content_type.starts_with("application/x-www-form-urlencoded") {
+    if !crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
         return None;
     }
 
@@ -738,14 +737,12 @@ where
 
         // Only enforce CAPTCHA on application/x-www-form-urlencoded requests.
         // JSON APIs, multipart uploads, and external webhooks pass through unchallenged.
-        // Use ASCII lowercase comparison — HTTP media types are case-insensitive.
         let content_type = req
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        if !content_type.starts_with("application/x-www-form-urlencoded") {
+        if !crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -1227,6 +1224,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mixed_case_urlencoded_post_still_requires_captcha_token() {
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")));
+        let app = router_with_layer(layer);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", " Application/X-WWW-Form-Urlencoded")
+                    .body(Body::from("field=value"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extract_token_reads_mixed_case_urlencoded_body() {
+        let mut req = Request::builder()
+            .method("POST")
+            .header(
+                "Content-Type",
+                "APPLICATION/X-WWW-FORM-URLENCODED; charset=UTF-8",
+            )
+            .body(Body::from("captcha=abc&x=1"))
+            .unwrap();
+        let token = extract_token_from_form(&mut req, "captcha", 1024).await;
+        assert_eq!(token.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn extract_token_ignores_other_content_types() {
+        let mut req = Request::builder()
+            .method("POST")
+            .header("Content-Type", "text/plain")
+            .body(Body::from("captcha=abc"))
+            .unwrap();
+        assert_eq!(
+            extract_token_from_form(&mut req, "captcha", 1024).await,
+            None
+        );
     }
 
     #[test]
