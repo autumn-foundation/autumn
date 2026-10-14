@@ -1275,6 +1275,7 @@ impl Analyzer {
         // covers the whole block, so it hides an import before its own line.
         let imports = self.tokio_imports.clone();
         let macros = self.shadowed_macros.clone();
+        let diesel = (self.diesel_roots.clone(), self.diesel_fns.clone());
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Item(syn::Item::Fn(item)) => self.hide_import(&item.sig.ident),
@@ -1310,6 +1311,7 @@ impl Analyzer {
         }
         self.tokio_imports = imports;
         self.shadowed_macros = macros;
+        (self.diesel_roots, self.diesel_fns) = diesel;
         for saved in outer.into_iter().rev() {
             self.unshadow(saved);
         }
@@ -2638,7 +2640,7 @@ impl Analyzer {
             .segments
             .last()
             .map(|s| s.ident.to_string())
-            .filter(|_| macro_path_is_standard(&mac.path));
+            .filter(|_| macro_path_is_standard(&mac.path, &self.shadowed_macros));
         let inert = name
             .as_ref()
             .is_some_and(|name| !self.shadowed_macros.contains(name))
@@ -2650,7 +2652,7 @@ impl Analyzer {
     /// Macros that only build a value. Expression position may use them when
     /// no token awaits or spawns.
     fn expr_macro_is_readable(&self, mac: &syn::Macro) -> bool {
-        let pure = macro_path_is_standard(&mac.path)
+        let pure = macro_path_is_standard(&mac.path, &self.shadowed_macros)
             && mac.path.segments.last().is_some_and(|s| {
                 let name = s.ident.to_string();
                 PURE_VALUE_MACROS.contains(&name.as_str()) && !self.shadowed_macros.contains(&name)
@@ -4266,7 +4268,7 @@ fn tokens_contain_await(tokens: &TokenStream) -> bool {
 }
 
 /// A bare macro name, or one under a crate whose macros are known.
-fn macro_path_is_standard(path: &syn::Path) -> bool {
+fn macro_path_is_standard(path: &syn::Path, shadowed: &HashSet<String>) -> bool {
     const CRATES: &[&str] = &[
         "std",
         "core",
@@ -4278,10 +4280,10 @@ fn macro_path_is_standard(path: &syn::Path) -> bool {
         "anyhow",
     ];
     path.segments.len() == 1
-        || path
-            .segments
-            .first()
-            .is_some_and(|s| CRATES.contains(&s.ident.to_string().as_str()))
+        || path.segments.first().is_some_and(|s| {
+            let root = s.ident.to_string();
+            CRATES.contains(&root.as_str()) && !shadowed.contains(&root)
+        })
 }
 
 /// Does a macro body name a `spawn`-family function?
@@ -6834,6 +6836,16 @@ mod tests {
             }",
         ),
         (
+            "standard macro root shadowed by a use",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                use crate::evil as std;
+                let _ = std::format!();
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -7480,6 +7492,29 @@ mod tests {
             expansion.contains("\"payouts\"") && !expansion.contains("\"SET\""),
             "a MERGE action was read as a second table: {expansion}"
         );
+    }
+
+    #[test]
+    fn a_diesel_import_ends_with_its_block() {
+        // Inside the block `remove` is `diesel::delete`. After it, `remove`
+        // is an application function, not a diesel write.
+        let inside = expand(
+            GRANT,
+            r"async fn h(mut db: Db) -> R {
+                { use diesel::delete as remove; remove(refunds::table).execute(&mut *db).await?; }
+                Ok(())
+            }",
+        );
+        let outside = expand(
+            GRANT,
+            r"async fn h(mut db: Db) -> R {
+                { use diesel::delete as remove; }
+                remove(refunds::table).execute(&mut *db).await?;
+                Ok(())
+            }",
+        );
+        assert!(inside.contains("allows_unbounded_write"), "{inside}");
+        assert!(!outside.contains("allows_unbounded_write"), "{outside}");
     }
 
     #[test]

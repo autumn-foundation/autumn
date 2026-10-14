@@ -1066,6 +1066,49 @@ means "refresh at each read", not "read the database at each read".
 **Automation:** `manual` - it is a behaviour change, and no code rewrite
 applies.
 
+### Agent authority: the analyser refuses more handler shapes
+
+**Why:** The `#[agent_operable]` analyser let some handler shapes through
+with no proof (issue #2451). It now refuses them. Each refusal names the call
+site and the `#[agent_effect(...)]` that resolves it.
+
+**Before (`{X.Y}`):** these compiled. A module-level `use tokio::time::sleep;`
+made a bare `sleep` look inert, a binding named `session` or `cache` was
+trusted by name, and an opaque macro with no handle in its tokens passed:
+
+```rust
+#[agent_operable(grant = RefundDrafter)]
+async fn drafts(session: Session, d: Duration) -> R {
+    sleep(d).await;
+    session.refresh().await?;
+    schedule!();
+    Ok(())
+}
+```
+
+**After (`{(X+1).0}`):** write the `tokio` path, type the parameter, and
+declare the opaque macro:
+
+```rust
+#[agent_operable(grant = RefundDrafter)]
+async fn drafts(session: Session, d: Duration) -> R {
+    tokio::time::sleep(d).await;
+    session.refresh().await?; // `Session` is the type that makes it inert
+    #[agent_effect(jobs(NotifyFinance), reason = "schedule! enqueues it")]
+    schedule!();
+    Ok(())
+}
+```
+
+Other new refusals: an awaited callee that is not a path, an unread future
+held in a tuple, block or pattern, a `diesel::` write whose table is not
+`<table>::table`, and any macro in expression position that is not a plain
+value macro (`format!`, `vec!`, `json!`). `tx.commit()` is inert only on a
+transaction from `db.begin()` or a `tx` callback.
+
+**Automation:** `manual` - each refusal needs a choice that only the author
+can make.
+
 ### Config: `HttpClientConfig` and `RequestTimeoutsConfig` get new fields
 
 **Why:** Deadline propagation and the retry budget (issue #3058) need

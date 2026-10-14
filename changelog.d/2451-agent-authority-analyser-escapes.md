@@ -16,6 +16,11 @@
 - **agent authority:** the manifest keeps the first route per `operation_id`,
   as the MCP server does. It marks a skipped route `not-exposed` with the
   caveat `duplicate-operation-id`. `--check` does not fail on it.
-- **Migration:** Autumn now refuses bare `sleep(..)`, `session.x()`,
-  `cache.x()` and `tx.commit()` on untyped values. Use `tokio::time::sleep`,
-  a typed parameter, or `#[agent_effect(...)]`.
+
+### Breaking Changes
+
+- **Breaking:** the `#[agent_operable]` analyser now refuses handler shapes
+  that compiled before ([migration guide](docs/migrations/next.md)). Examples:
+  a bare `sleep(..)`, `session.x()` or `cache.x()` on an untyped value, an
+  opaque macro, and a `diesel::` write to an unresolved table. Write the
+  `tokio` path, type the parameter, or add `#[agent_effect(...)]`.
