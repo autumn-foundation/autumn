@@ -242,7 +242,7 @@ fn recorded_child_stop_budget() -> Option<Duration> {
 static CHILD_READY_TRACKABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
-/// Whether removing the old ready file left no file behind.
+/// Whether removing an old marker file left no file behind.
 #[cfg_attr(
     unix,
     allow(
@@ -250,7 +250,7 @@ static CHILD_READY_TRACKABLE: std::sync::atomic::AtomicBool =
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-fn ready_file_cleared(removal: &std::io::Result<()>) -> bool {
+fn marker_cleared(removal: &std::io::Result<()>) -> bool {
     match removal {
         Ok(()) => true,
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
@@ -1383,8 +1383,10 @@ fn start_server(
     // mechanism — on Unix `stop_server` signals, and an unset variable keeps
     // the runtime's watcher inert.
     #[cfg(not(unix))]
+    let mut signal_cleared = true;
+    #[cfg(not(unix))]
     if let Some(signal_path) = dev_shutdown_signal_path() {
-        clear_cooperative_shutdown(signal_path);
+        signal_cleared = marker_cleared(&std::fs::remove_file(signal_path));
         command.env(DEV_SHUTDOWN_SIGNAL_ENV, signal_path);
         // Resolve the child's stop budget from the config it is about to boot
         // with, and keep it for the stop. `autumn.toml` is watched, so by the
@@ -1398,13 +1400,15 @@ fn start_server(
     // first so this child cannot be stopped on its predecessor's number.
     #[cfg(not(unix))]
     if let Some(ready) = dev_ready_file_path() {
-        let cleared = ready_file_cleared(&std::fs::remove_file(ready));
+        // A stale shutdown request makes the child drain at boot and skip its
+        // ready write, so readiness cannot be tracked then either.
+        let cleared = marker_cleared(&std::fs::remove_file(ready)) && signal_cleared;
         CHILD_READY_TRACKABLE.store(cleared, Ordering::SeqCst);
         if cleared {
             command.env(SERVE_READY_FILE_ENV, ready);
         } else {
             eprintln!(
-                "  Warning: could not clear {}. A stop will not wait for startup.",
+                "  Warning: could not clear {} or the shutdown file. A stop will not wait for startup.",
                 ready.display()
             );
         }
@@ -2946,9 +2950,9 @@ mod tests {
     fn a_ready_file_that_could_not_be_removed_is_not_cleared() {
         let gone = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         let locked = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert!(ready_file_cleared(&Ok(())));
-        assert!(ready_file_cleared(&gone));
-        assert!(!ready_file_cleared(&locked));
+        assert!(marker_cleared(&Ok(())));
+        assert!(marker_cleared(&gone));
+        assert!(!marker_cleared(&locked));
     }
 
     #[test]
