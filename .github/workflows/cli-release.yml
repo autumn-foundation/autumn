@@ -39,7 +39,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Released tag to build from and attach to (e.g. v0.6.0). Blank = build the current ref for validation only (artifacts, no release upload)."
+        description: "Released tag to build from and attach to (e.g. v0.6.0). Run this workflow from that tag ref, or nothing is attached. Blank = build the current ref for validation only (artifacts, no release upload)."
         required: false
         type: string
       attach_to_release:
@@ -177,7 +177,9 @@ jobs:
           subject-path: autumn-${{ matrix.target }}.*
 
       - name: Attach to release
-        if: ${{ inputs.tag != '' && inputs.attach_to_release }}
+        # Attach only when this run IS the tag ref. A dispatch from a branch
+        # carries branch provenance and `--clobber` would replace tag-attested assets.
+        if: ${{ inputs.tag != '' && inputs.attach_to_release && github.ref == format('refs/tags/{0}', inputs.tag) }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

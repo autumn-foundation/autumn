@@ -892,8 +892,10 @@ fn cli_release_attach_step_is_optional_and_defaults_on() {
         .find(|l| l.trim_start().starts_with("if:"))
         .expect("`Attach to release` must be conditional");
     assert!(
-        condition.contains("inputs.tag != ''") && condition.contains("inputs.attach_to_release"),
-        "attach only for a real tag, and only when asked:\n{condition}"
+        condition.contains("inputs.tag != ''")
+            && condition.contains("inputs.attach_to_release")
+            && condition.contains("github.ref == format('refs/tags/{0}', inputs.tag)"),
+        "attach only for a real tag, only when asked, and only from that tag ref:\n{condition}"
     );
 }
 
