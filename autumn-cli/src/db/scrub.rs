@@ -2376,13 +2376,17 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
             .or_else(|| env("PGHOST"))
             .unwrap_or_default();
         // A socket directory is case-sensitive. A DNS name is not. An IPv6
-        // address has no brackets.
+        // address has no brackets and one canonical spelling.
         let host = if host.starts_with(['/', '@']) {
             host
         } else {
-            host.trim_matches(['[', ']'])
+            let name = host
+                .trim_matches(['[', ']'])
                 .trim_end_matches('.')
-                .to_ascii_lowercase()
+                .to_ascii_lowercase();
+            // An IP literal has one canonical spelling.
+            name.parse::<std::net::IpAddr>()
+                .map_or(name, |ip| ip.to_string())
         };
         // An omitted port defaults to `PGPORT`, then to 5432.
         let port = params.get("port").map_or_else(
@@ -2399,7 +2403,7 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
         let name = params
             .get("dbname")
             .cloned()
-            .unwrap_or_else(|| decode(parsed.path().trim_start_matches('/')));
+            .unwrap_or_else(|| decode(parsed.path().strip_prefix('/').unwrap_or_default()));
         let name = if name.is_empty() {
             env("PGDATABASE")
                 .filter(|v| !v.is_empty())
@@ -9100,6 +9104,18 @@ mod tests {
         assert!(!same_database_with(
             "postgres://prod/db/name",
             "postgres://prod/db",
+            &|_| None
+        ));
+        // Only the path delimiter is stripped: `//app` names the database `/app`.
+        assert!(same_database_with(
+            "postgres://prod//app",
+            "postgres://prod/%2Fapp",
+            &|_| None
+        ));
+        // IP literals compare by address, not by spelling.
+        assert!(same_database_with(
+            "postgres:///app?hostaddr=0:0:0:0:0:0:0:1",
+            "postgres://[::1]/app",
             &|_| None
         ));
         // The default socket directory is unknown, so an empty host may be any
