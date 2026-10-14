@@ -2633,6 +2633,50 @@ pub mod pg {
         }
 
         #[test]
+        fn debug_output_hides_the_password() {
+            let store = PgExperimentStore::new(
+                "postgres://autumn:hunter2@127.0.0.1:1/autumn?connect_timeout=2",
+            );
+            let shown = format!("{store:?}");
+            assert!(shown.contains("PgExperimentStore"), "{shown}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+        }
+
+        #[test]
+        fn clone_keeps_the_ttl_and_starts_with_an_empty_snapshot() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![running("exp")]);
+            let copy = store.clone();
+            assert_eq!(copy.shared.cache_ttl, Duration::from_secs(60));
+            assert!(!copy.shared.is_loaded());
+            assert!(store.shared.is_loaded(), "the original keeps its snapshot");
+        }
+
+        #[test]
+        fn poll_listener_refreshes_until_the_store_drops() {
+            let store = std::sync::Arc::new(PgExperimentStore::new(DEAD_URL));
+            let handle = PgExperimentStore::spawn_poll_listener(
+                std::sync::Arc::clone(&store),
+                Duration::from_millis(10),
+            );
+            for _ in 0..1000 {
+                if store.refresh_errors() >= 1 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(store.refresh_errors() >= 1, "the listener refreshed");
+            drop(store);
+            for _ in 0..3000 {
+                if handle.is_finished() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("poll listener outlived its store");
+        }
+
+        #[test]
         fn poll_listener_stops_when_the_store_drops() {
             let store = std::sync::Arc::new(PgExperimentStore::new(DEAD_URL));
             let handle = PgExperimentStore::spawn_poll_listener(
@@ -2661,6 +2705,8 @@ pub(crate) struct ProbeStore {
     inner: InMemoryExperimentStore,
     pub(crate) preloads: std::sync::atomic::AtomicUsize,
     pub(crate) threads: Mutex<Vec<std::thread::ThreadId>>,
+    /// Make `get_assignment` panic.
+    panic_on_assignment: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -2706,6 +2752,12 @@ impl ExperimentStore for ProbeStore {
         actor: &str,
     ) -> Result<Option<Assignment>, ExperimentStoreError> {
         self.seen();
+        assert!(
+            !self
+                .panic_on_assignment
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "store call panicked"
+        );
         self.inner.get_assignment(experiment, actor)
     }
     fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError> {
@@ -2811,69 +2863,14 @@ mod tests {
         assert_eq!(sticky.variant, variant);
     }
 
-    /// Panics on the first per-actor call.
-    struct PanicStore(InMemoryExperimentStore);
-
-    impl ExperimentStore for PanicStore {
-        fn get(&self, name: &str) -> Result<Option<ExperimentConfig>, ExperimentStoreError> {
-            self.0.get(name)
-        }
-        fn list(&self) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
-            self.0.list()
-        }
-        fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
-            self.0.upsert(config)
-        }
-        fn set_state(
-            &self,
-            name: &str,
-            state: ExperimentState,
-            winner: Option<&str>,
-        ) -> Result<(), ExperimentStoreError> {
-            self.0.set_state(name, state, winner)
-        }
-        fn set_variants(
-            &self,
-            name: &str,
-            variants: Vec<VariantConfig>,
-            actor: Option<&str>,
-        ) -> Result<(), ExperimentStoreError> {
-            self.0.set_variants(name, variants, actor)
-        }
-        fn get_assignment(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<Option<Assignment>, ExperimentStoreError> {
-            panic!("store call panicked");
-        }
-        fn record_assignment(&self, a: Assignment) -> Result<String, ExperimentStoreError> {
-            self.0.record_assignment(a)
-        }
-        fn get_override(&self, e: &str, a: &str) -> Result<Option<String>, ExperimentStoreError> {
-            self.0.get_override(e, a)
-        }
-        fn set_override(&self, e: &str, a: &str, v: &str) -> Result<(), ExperimentStoreError> {
-            self.0.set_override(e, a, v)
-        }
-        fn has_assignment_in_group(
-            &self,
-            a: &str,
-            g: &str,
-            x: &str,
-        ) -> Result<bool, ExperimentStoreError> {
-            self.0.has_assignment_in_group(a, g, x)
-        }
-        fn history(&self, e: &str, l: usize) -> Result<Vec<ChangeRecord>, ExperimentStoreError> {
-            self.0.history(e, l)
-        }
-    }
-
     #[tokio::test]
     async fn assign_async_maps_a_store_panic_to_a_store_error() {
-        let store = PanicStore(InMemoryExperimentStore::new());
+        let store = Arc::new(ProbeStore::default());
         store.upsert(running_config("exp")).unwrap();
-        let svc = ExperimentService::new(Arc::new(store));
+        store
+            .panic_on_assignment
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let svc = ExperimentService::new(store);
         let result = svc.assign_async("exp", "user:1", None).await;
         assert!(
             matches!(
@@ -2907,6 +2904,25 @@ mod tests {
             panic!("load panicked")
         });
         crate::feature_flags::preload_with("test", "none", wait, || Err("failed".to_owned()));
+    }
+
+    #[test]
+    fn probe_store_delegates_to_the_in_memory_store() {
+        let store = ProbeStore::default();
+        store.upsert(running_config("exp")).unwrap();
+        store
+            .set_state("exp", ExperimentState::Concluded, Some("control"))
+            .unwrap();
+        store
+            .set_variants("exp", vec![VariantConfig::new("control", 100)], None)
+            .unwrap();
+        store.set_override("exp", "user:1", "control").unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(
+            store.get("exp").unwrap().unwrap().winner.as_deref(),
+            Some("control")
+        );
+        assert!(!store.history("exp", 10).unwrap().is_empty());
     }
 
     #[test]
