@@ -114,7 +114,8 @@ saying the hooks may not have run.** Degraded, but never silent.
 If the app is still starting, `autumn dev` waits for it to finish. The app reads
 the stop request only after it starts. Startup includes managed Postgres
 `initdb` and migrations. The budget starts when the app is up. If the app is
-still starting after 15 minutes, `autumn dev` kills it and prints a warning.
+no ready signal comes after 15 minutes, `autumn dev` uses the normal budget
+anyway.
 
 ## Tier 2 — supported via WSL2
 

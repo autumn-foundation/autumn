@@ -479,6 +479,14 @@ mod tests {
     }
 
     #[test]
+    fn os_env_with_dotenv_in_skips_a_gated_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "AUTUMN_TEST_2444_GATED=x\n").unwrap();
+        let env = os_env_with_dotenv_in(dir.path(), "prod").unwrap();
+        assert!(env.var("AUTUMN_TEST_2444_GATED").is_err());
+    }
+
+    #[test]
     fn dotenv_profile_selection_reproduces_offsite_wrong_profile_bug() {
         // Reproduction for issue #1619 P2 #6: an offsite override + credential
         // live ONLY in `.env.test`. With the ambient shell profile unset (default
