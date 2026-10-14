@@ -2368,6 +2368,41 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
         }
     }
 
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        let attrs: &[syn::Attribute] = match expr {
+            syn::Expr::Block(e) => &e.attrs,
+            syn::Expr::Unsafe(e) => &e.attrs,
+            syn::Expr::Async(e) => &e.attrs,
+            syn::Expr::Closure(e) => &e.attrs,
+            syn::Expr::If(e) => &e.attrs,
+            syn::Expr::Match(e) => &e.attrs,
+            syn::Expr::MethodCall(e) => &e.attrs,
+            syn::Expr::Macro(e) => &e.attrs,
+            syn::Expr::Call(e) => &e.attrs,
+            syn::Expr::Paren(e) => &e.attrs,
+            syn::Expr::Reference(e) => &e.attrs,
+            syn::Expr::Loop(e) => &e.attrs,
+            syn::Expr::ForLoop(e) => &e.attrs,
+            syn::Expr::While(e) => &e.attrs,
+            _ => &[],
+        };
+        if crate::schema::parse::production_enabled(attrs) {
+            syn::visit::visit_expr(self, expr);
+        }
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if crate::schema::parse::production_enabled(&arm.attrs) {
+            syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_stmt_macro(&mut self, stmt: &'ast syn::StmtMacro) {
+        if crate::schema::parse::production_enabled(&stmt.attrs) {
+            syn::visit::visit_stmt_macro(self, stmt);
+        }
+    }
+
     fn visit_local(&mut self, local: &'ast syn::Local) {
         if crate::schema::parse::production_enabled(&local.attrs) {
             syn::visit::visit_local(self, local);
@@ -9641,6 +9676,15 @@ mod tests {
 
         assert!(found(&format!("#[cfg(test)] mod tests {{ {} }}", reg("a"))).is_empty());
         assert!(found(&format!("#[cfg(test)] {}", reg("a"))).is_empty());
+        assert!(
+            found("fn f() { #[cfg(test)] { ModelRegistration::anonymize(\"a\"); } }").is_empty()
+        );
+        assert!(
+            found(
+                "fn f(x: u8) { match x { #[cfg(test)] 0 => { ModelRegistration::anonymize(\"a\"); } _ => {} } }"
+            )
+            .is_empty()
+        );
         assert!(found(&format!("#[cfg(test)] trait T {{ {} }}", reg("a"))).is_empty());
         assert!(found(&format!("#![cfg(test)]\n{}", reg("a"))).is_empty());
         assert!(
