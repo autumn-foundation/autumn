@@ -2370,20 +2370,45 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
 
     fn visit_expr(&mut self, expr: &'ast syn::Expr) {
         let attrs: &[syn::Attribute] = match expr {
-            syn::Expr::Block(e) => &e.attrs,
-            syn::Expr::Unsafe(e) => &e.attrs,
+            syn::Expr::Array(e) => &e.attrs,
+            syn::Expr::Assign(e) => &e.attrs,
             syn::Expr::Async(e) => &e.attrs,
+            syn::Expr::Await(e) => &e.attrs,
+            syn::Expr::Binary(e) => &e.attrs,
+            syn::Expr::Block(e) => &e.attrs,
+            syn::Expr::Break(e) => &e.attrs,
+            syn::Expr::Call(e) => &e.attrs,
+            syn::Expr::Cast(e) => &e.attrs,
             syn::Expr::Closure(e) => &e.attrs,
+            syn::Expr::Const(e) => &e.attrs,
+            syn::Expr::Continue(e) => &e.attrs,
+            syn::Expr::Field(e) => &e.attrs,
+            syn::Expr::ForLoop(e) => &e.attrs,
+            syn::Expr::Group(e) => &e.attrs,
             syn::Expr::If(e) => &e.attrs,
+            syn::Expr::Index(e) => &e.attrs,
+            syn::Expr::Infer(e) => &e.attrs,
+            syn::Expr::Let(e) => &e.attrs,
+            syn::Expr::Lit(e) => &e.attrs,
+            syn::Expr::Loop(e) => &e.attrs,
+            syn::Expr::Macro(e) => &e.attrs,
             syn::Expr::Match(e) => &e.attrs,
             syn::Expr::MethodCall(e) => &e.attrs,
-            syn::Expr::Macro(e) => &e.attrs,
-            syn::Expr::Call(e) => &e.attrs,
             syn::Expr::Paren(e) => &e.attrs,
+            syn::Expr::Path(e) => &e.attrs,
+            syn::Expr::Range(e) => &e.attrs,
+            syn::Expr::RawAddr(e) => &e.attrs,
             syn::Expr::Reference(e) => &e.attrs,
-            syn::Expr::Loop(e) => &e.attrs,
-            syn::Expr::ForLoop(e) => &e.attrs,
+            syn::Expr::Repeat(e) => &e.attrs,
+            syn::Expr::Return(e) => &e.attrs,
+            syn::Expr::Struct(e) => &e.attrs,
+            syn::Expr::Try(e) => &e.attrs,
+            syn::Expr::TryBlock(e) => &e.attrs,
+            syn::Expr::Tuple(e) => &e.attrs,
+            syn::Expr::Unary(e) => &e.attrs,
+            syn::Expr::Unsafe(e) => &e.attrs,
             syn::Expr::While(e) => &e.attrs,
+            syn::Expr::Yield(e) => &e.attrs,
             _ => &[],
         };
         if crate::schema::parse::production_enabled(attrs) {
@@ -2548,6 +2573,9 @@ fn database_endpoint(
     raw: &str,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(Vec<(String, u16)>, String)> {
+    if !raw.contains("://") {
+        return conninfo_endpoint(raw, env);
+    }
     let parsed = url::Url::parse(&without_userinfo(raw)).ok()?;
     let query = |key: &str| {
         parsed
@@ -2592,6 +2620,55 @@ fn database_endpoint(
         .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()).map(|p| vec![p]))
         .unwrap_or_else(|| vec![5432]);
     let endpoints = hosts
+        .enumerate()
+        .map(|(i, host)| {
+            let port = if ports.len() == 1 {
+                ports[0]
+            } else {
+                ports.get(i).copied().unwrap_or(5432)
+            };
+            (host, port)
+        })
+        .collect();
+    Some((endpoints, name))
+}
+
+/// [`database_endpoint`] for the keyword/value form: `host=h port=5432 dbname=d`.
+fn conninfo_endpoint(
+    raw: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(Vec<(String, u16)>, String)> {
+    let mut values: BTreeMap<String, String> = BTreeMap::new();
+    let mut rest = raw.trim();
+    while !rest.is_empty() {
+        let (key, after) = rest.split_once('=')?;
+        let after = after.trim_start();
+        let (value, tail) = if let Some(quoted) = after.strip_prefix('\'') {
+            let end = quoted.find('\'')?;
+            (quoted[..end].to_owned(), &quoted[end + 1..])
+        } else {
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            (after[..end].to_owned(), &after[end..])
+        };
+        values.insert(key.trim().to_owned(), value);
+        rest = tail.trim_start();
+    }
+    let name = values.get("dbname").filter(|n| !n.is_empty())?.clone();
+    let host_list = values
+        .get("host")
+        .or_else(|| values.get("hostaddr"))
+        .cloned()
+        .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
+        .unwrap_or_default();
+    let ports: Vec<u16> = values
+        .get("port")
+        .map(|p| p.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+        .filter(|p: &Vec<u16>| !p.is_empty())
+        .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()).map(|p| vec![p]))
+        .unwrap_or_else(|| vec![5432]);
+    let endpoints = host_list
+        .split(',')
+        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase())
         .enumerate()
         .map(|(i, host)| {
             let port = if ports.len() == 1 {
@@ -3642,7 +3719,11 @@ fn classify_and_apply(
                 unpopulated: &facts.unpopulated_views,
             },
             sampling.as_ref(),
-            (&facts.public_base_tables, &facts.public_columns),
+            (
+                &facts.public_base_tables,
+                &facts.public_columns,
+                &facts.rls_tables,
+            ),
             label,
         )
         .inspect_err(|_| warn_committed(&committed))?;
@@ -4733,7 +4814,7 @@ const PUBLIC_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
 /// Compare `snapshot` with the schema this connection sees now.
 fn live_schema_drift(
     conn: &mut PgConnection,
-    snapshot: (&BTreeSet<String>, &BTreeSet<(String, String)>),
+    snapshot: SchemaSnapshot<'_>,
 ) -> Result<Vec<String>, diesel::result::Error> {
     let tables: BTreeSet<String> = sql_query(PUBLIC_BASE_TABLES)
         .load::<NameRow>(conn)?
@@ -4741,8 +4822,26 @@ fn live_schema_drift(
         .map(|r| r.name)
         .collect();
     let columns = pair_set(sql_query(PUBLIC_COLUMNS).load::<PairRow>(conn)?);
-    Ok(schema_drift(snapshot, (&tables, &columns)))
+    let rls: BTreeSet<String> = sql_query(RLS_RESTRICTED_TABLES)
+        .load::<NameRow>(conn)?
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    let mut drift = schema_drift((snapshot.0, snapshot.1), (&tables, &columns));
+    drift.extend(
+        rls.symmetric_difference(snapshot.2)
+            .map(|t| format!("{t} (row-level security changed)")),
+    );
+    drift.sort();
+    Ok(drift)
 }
+
+/// Tables, columns and RLS-bound tables as the plan saw them.
+type SchemaSnapshot<'a> = (
+    &'a BTreeSet<String>,
+    &'a BTreeSet<(String, String)>,
+    &'a BTreeSet<String>,
+);
 
 /// List the tables and columns that differ between two snapshots, sorted.
 fn schema_drift(
@@ -6535,7 +6634,7 @@ fn execute(
     purges: &[(String, String)],
     views: &ViewRefresh<'_>,
     sampling: Option<&sample::SamplePlan>,
-    snapshot: (&BTreeSet<String>, &BTreeSet<(String, String)>),
+    snapshot: SchemaSnapshot<'_>,
     label: &str,
 ) -> Result<Applied, ScrubError> {
     if plan.tables.is_empty() && purges.is_empty() && views.ordered.is_empty() && sampling.is_none()
@@ -9680,6 +9779,9 @@ mod tests {
             found("fn f() { #[cfg(test)] { ModelRegistration::anonymize(\"a\"); } }").is_empty()
         );
         assert!(
+            found("fn f() { #[cfg(test)] (ModelRegistration::anonymize(\"a\"),); }").is_empty()
+        );
+        assert!(
             found(
                 "fn f(x: u8) { match x { #[cfg(test)] 0 => { ModelRegistration::anonymize(\"a\"); } _ => {} } }"
             )
@@ -9788,7 +9890,7 @@ mod tests {
             ("not(all(test, feature = \"x\"))", true),
             ("any(test, test)", false),
             ("all()", true),
-            ("any()", true),
+            ("any()", false),
         ] {
             assert_eq!(on(cfg), kept, "cfg({cfg})");
         }
@@ -9861,6 +9963,16 @@ mod tests {
         assert!(!same_database_in(
             "postgres:///d?host=a,b&port=5432,6543",
             "postgres://b:5432/d",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod port=5433 dbname=app",
+            "postgres://prod:5433/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host='a' dbname='app' user=u",
+            "postgres://a/app",
             &env
         ));
     }

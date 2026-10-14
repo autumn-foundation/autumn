@@ -392,7 +392,8 @@ fn cfg_value(meta: &syn::Meta) -> Option<bool> {
             } else if list.path.is_ident("any") {
                 if inner.contains(&Some(true)) {
                     Some(true)
-                } else if !inner.is_empty() && inner.iter().all(|v| *v == Some(false)) {
+                } else if inner.iter().all(|v| *v == Some(false)) {
+                    // Includes the empty `any()`, which Rust defines as false.
                     Some(false)
                 } else {
                     None
