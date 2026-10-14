@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use axum::serve::Listener;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
+use hyper_util::server::conn::auto::{Builder, UpgradeableConnection};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::time::Instant;
@@ -266,10 +266,6 @@ fn take_handoff(handoff: Option<&SlotHandoff>) -> Option<Slot> {
 
 /// [`serve`], with the connection slots taken by the listener when
 /// `handoff` is set.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one accept loop with the connection task inline"
-)]
 pub(crate) async fn serve_with_handoff<L, M, S, F>(
     mut listener: L,
     mut make_service: M,
@@ -366,44 +362,18 @@ where
         let connection = async move {
             let _close_timers = CloseOnDrop(timers.clone());
             let conn = builder.serve_connection_with_upgrades(io, hyper_service);
-            let mut conn = std::pin::pin!(conn);
-            let mut signal_closed = std::pin::pin!(signal_tx.closed());
-            // Set by a graceful shutdown. Until then hyper can finish its
-            // GOAWAY sequence and flush the last response bytes.
-            let mut grace_until: Option<Instant> = None;
-            loop {
-                let shutting_down = grace_until.is_some();
-                let deadline = timers.as_ref().and_then(|t| t.deadline(grace_until));
-                // `biased`: read bytes already in the socket before a shutdown acts.
-                tokio::select! {
-                    biased;
-                    _ = conn.as_mut() => break,
-                    () = &mut signal_closed, if !shutting_down => {
-                        let timer = timers.as_ref().and_then(|t| t.deadline(None));
-                        if await_first_request(conn.as_mut(), &first_request, timer).await {
-                            break;
-                        }
-                        grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
-                        conn.as_mut().graceful_shutdown();
-                    }
-                    // The timers also run during a drain, so a slow client
-                    // cannot hold the drain open.
-                    () = sleep_until(deadline), if deadline.is_some() => {
-                        match timers.as_ref().and_then(|t| t.expired()) {
-                            // A slow head: close now. No response is lost.
-                            Some(Expiry::Head) => break,
-                            // Still open after the grace period: close now.
-                            Some(Expiry::Idle) if shutting_down => break,
-                            Some(Expiry::Idle) => {
-                                grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
-                                conn.as_mut().graceful_shutdown();
-                            }
-                            None => {}
-                        }
-                    }
-                    () = changed(timers.as_deref()) => {}
-                }
-            }
+            let conn = std::pin::pin!(conn);
+            let state = ConnState {
+                timers,
+                first_request,
+            };
+            drive_connection(
+                conn,
+                UpgradeableConnection::graceful_shutdown,
+                &signal_tx,
+                &state,
+            )
+            .await;
             drop(close_rx);
         };
         tokio::spawn(connection);
@@ -413,6 +383,63 @@ where
     drop(listener);
     close_tx.closed().await;
     Ok(())
+}
+
+/// What the connection task knows about its connection.
+struct ConnState {
+    timers: Option<Arc<ConnTimers>>,
+    first_request: Arc<FirstRequest>,
+}
+
+/// Run one connection until it closes. After the server signal, `drain` asks
+/// hyper to shut the connection down gracefully (`graceful_shutdown`).
+async fn drive_connection<C: std::future::Future>(
+    mut conn: Pin<&mut C>,
+    drain: impl Fn(Pin<&mut C>),
+    signal_tx: &watch::Sender<()>,
+    state: &ConnState,
+) {
+    let ConnState {
+        timers,
+        first_request,
+    } = state;
+    let mut signal_closed = std::pin::pin!(signal_tx.closed());
+    // Set by a graceful shutdown. Until then hyper can finish its
+    // GOAWAY sequence and flush the last response bytes.
+    let mut grace_until: Option<Instant> = None;
+    loop {
+        let shutting_down = grace_until.is_some();
+        let deadline = timers.as_ref().and_then(|t| t.deadline(grace_until));
+        // `biased`: read bytes already in the socket before a shutdown acts.
+        tokio::select! {
+            biased;
+            _ = conn.as_mut() => break,
+            () = &mut signal_closed, if !shutting_down => {
+                let timer = timers.as_ref().and_then(|t| t.deadline(None));
+                if await_first_request(conn.as_mut(), first_request, timer).await {
+                    break;
+                }
+                grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
+                drain(conn.as_mut());
+            }
+            // The timers also run during a drain, so a slow client
+            // cannot hold the drain open.
+            () = sleep_until(deadline), if deadline.is_some() => {
+                match timers.as_ref().and_then(|t| t.expired()) {
+                    // A slow head: close now. No response is lost.
+                    Some(Expiry::Head) => break,
+                    // Still open after the grace period: close now.
+                    Some(Expiry::Idle) if shutting_down => break,
+                    Some(Expiry::Idle) => {
+                        grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
+                        drain(conn.as_mut());
+                    }
+                    None => {}
+                }
+            }
+            () = changed(timers.as_deref()) => {}
+        }
+    }
 }
 
 /// Closes the timers when the connection task ends, also on abort.
