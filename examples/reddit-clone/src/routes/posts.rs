@@ -1470,7 +1470,8 @@ fn parse_tag_names(raw: &str) -> ParsedTags {
     let mut dropped_no_letter_or_number = 0_usize;
     let mut dropped_too_long = 0_usize;
     for piece in raw.split([',', '\n']) {
-        let name = piece.trim();
+        // The chip adds its own `#`, so a typed one is not part of the name.
+        let name = piece.trim().trim_start_matches('#').trim_start();
         if name.is_empty() {
             continue;
         }
@@ -1802,6 +1803,15 @@ mod tests {
         assert!(out.contains("#日本語"), "{out}");
         assert!(out.contains("#Web Dev"), "{out}");
         assert!(!out.contains("n1a3b86"), "{out}");
+    }
+
+    #[test]
+    fn a_typed_hash_prefix_is_not_stored_in_the_name() {
+        let parsed = parse_tag_names("#rust, ##Web Dev, #");
+        assert_eq!(parsed.slug_order, ["rust", "web-dev"]);
+        assert_eq!(parsed.name_by_slug["rust"], "rust");
+        assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+        assert_eq!(parsed.dropped_no_letter_or_number, 0);
     }
 
     #[test]
