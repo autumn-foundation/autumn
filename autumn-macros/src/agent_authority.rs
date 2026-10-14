@@ -1133,7 +1133,10 @@ impl Analyzer {
     }
 
     fn hide_crate(&mut self, name: &syn::Ident) {
-        self.tokio_imports.remove(&name.to_string());
+        let name = name.to_string();
+        self.tokio_imports.remove(&name);
+        self.diesel_roots.remove(&name);
+        self.shadowed_macros.insert(name);
     }
 
     /// Remove all state of a name except its handle.
@@ -1380,6 +1383,10 @@ impl Analyzer {
             for name in &names {
                 self.tokio_imports.remove(name);
             }
+            for name in &names {
+                self.diesel_roots.remove(name);
+                self.diesel_fns.remove(name);
+            }
             self.shadowed_macros.extend(names);
             tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
             diesel_imports(
@@ -1584,7 +1591,7 @@ impl Analyzer {
             // every target may hold its future.
             (Expr::Tuple(l), _) => {
                 let handle = self.container_handle(right);
-                let unread = self.is_unread_call(right);
+                let unread = self.carries_unread(right);
                 for target in &l.elems {
                     self.assign_handle_to(target, handle.as_ref());
                     self.assign_future_to(target, unread);
@@ -1594,7 +1601,7 @@ impl Analyzer {
             (target, _) => {
                 let handle = self.expr_handle(right);
                 self.assign_handle_to(target, handle.as_ref());
-                let unread = self.is_unread_call(right);
+                let unread = self.carries_unread(right);
                 self.assign_future_to(target, unread);
                 self.assign_callable_to(target, Some(right));
             }
@@ -3218,8 +3225,8 @@ impl Analyzer {
     /// imported from it?
     fn is_diesel_path(&self, path: &syn::Path) -> bool {
         path.segments
-            .iter()
-            .any(|segment| self.diesel_roots.contains(&segment.ident.to_string()))
+            .first()
+            .is_some_and(|segment| self.diesel_roots.contains(&segment.ident.to_string()))
             || path
                 .get_ident()
                 .is_some_and(|ident| self.diesel_fns.contains_key(&ident.to_string()))
@@ -6846,6 +6853,27 @@ mod tests {
             }",
         ),
         (
+            "container future reassigned to another container",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let mut jobs = (start_finance_job(),);
+                jobs = (start_finance_job(),);
+                jobs.0.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "standard macro root shadowed by a local module",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                let _ = std::format!();
+                mod std { pub use crate::evil as format; }
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -7515,6 +7543,35 @@ mod tests {
         );
         assert!(inside.contains("allows_unbounded_write"), "{inside}");
         assert!(!outside.contains("allows_unbounded_write"), "{outside}");
+    }
+
+    #[test]
+    fn only_the_crate_root_named_diesel_is_diesel() {
+        // An unresolved target is refused only for the real crate.
+        let refused = |handler: &str| {
+            error_of(GRANT, handler).is_some_and(|e| e.contains("`diesel::delete`"))
+        };
+        // An interior module named `diesel` is application code.
+        assert!(!refused(
+            r"async fn h(mut db: Db) -> R {
+                crate::jobs::diesel::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }"
+        ));
+        // So is a name a local `use` rebinds.
+        assert!(!refused(
+            r"async fn h(mut db: Db) -> R {
+                use crate::jobs as diesel;
+                diesel::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }"
+        ));
+        assert!(refused(
+            r"async fn h(mut db: Db) -> R {
+                diesel::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }"
+        ));
     }
 
     #[test]
