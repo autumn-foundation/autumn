@@ -1195,18 +1195,6 @@ async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
         return;
     }
 
-    tracing::info!(
-        target: "autumn.audit",
-        dataset = %report.dataset,
-        cutoff = report.cutoff.as_deref().unwrap_or("-"),
-        eligible_rows = report.eligible_rows.unwrap_or(0),
-        rows_removed = report.rows_removed,
-        truncated = report.truncated,
-        skipped = report.skipped.as_deref().unwrap_or(""),
-        error = report.error.as_deref().unwrap_or(""),
-        "retention_sweep"
-    );
-
     let status = if report.error.is_some() {
         crate::audit::AuditStatus::Failure
     } else {
@@ -1246,6 +1234,19 @@ async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
             None => audit_failure,
         });
     }
+
+    // Emitted last, so the fallback trail carries an audit-write failure too.
+    tracing::info!(
+        target: "autumn.audit",
+        dataset = %report.dataset,
+        cutoff = report.cutoff.as_deref().unwrap_or("-"),
+        eligible_rows = report.eligible_rows.unwrap_or(0),
+        rows_removed = report.rows_removed,
+        truncated = report.truncated,
+        skipped = report.skipped.as_deref().unwrap_or(""),
+        error = report.error.as_deref().unwrap_or(""),
+        "retention_sweep"
+    );
 }
 
 // ── Scheduled task (AC #2) ───────────────────────────────────────────────
@@ -1354,6 +1355,45 @@ mod tests {
         assert!(error.contains("audit record"), "{error}");
         assert!(error.contains("disk full"), "{error}");
         assert_eq!(report.rows_removed, 3, "removed rows stay reported");
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buf").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_trace_carries_the_audit_write_failure() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        audit_sweep(&state, &mut report).await;
+        let output = String::from_utf8(buf.0.lock().expect("buf").clone()).expect("utf8");
+        let line = output
+            .lines()
+            .find(|line| line.contains("retention_sweep"))
+            .expect("sweep trace line");
+        assert!(line.contains("audit record not written"), "{line}");
     }
 
     #[tokio::test]
