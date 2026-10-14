@@ -348,11 +348,64 @@ pub fn parse_encrypted_columns(
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
     let file = syn::parse_file(src).map_err(|e| SchemaParseError::from_syn(&e))?;
     let mut scan = EncryptedScan::default();
-    syn::visit::Visit::visit_file(&mut scan, &file);
+    if production_enabled(&file.attrs) {
+        syn::visit::Visit::visit_file(&mut scan, &file);
+    }
     Ok(scan.found)
 }
 
-/// Collects `#[encrypted]` fields from every `#[model]` struct, however deeply
+/// Whether the `#[cfg(...)]` attributes leave an item in a production build.
+///
+/// Only `test` is known to be off, and `not`, `all` and `any` combine it. Other
+/// predicates (a feature, a target) are unknown and count as on. This keeps a
+/// registration the app might have: scrubbing too much is the safe error.
+pub(crate) fn production_enabled(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().filter(|a| a.path().is_ident("cfg")).all(|a| {
+        a.parse_args::<syn::Meta>()
+            .map_or(true, |m| cfg_value(&m) != Some(false))
+    })
+}
+
+/// A `cfg` predicate's value when it is known without the build's settings.
+fn cfg_value(meta: &syn::Meta) -> Option<bool> {
+    use syn::punctuated::Punctuated;
+
+    match meta {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+        syn::Meta::List(list) => {
+            let inner: Vec<Option<bool>> = list
+                .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                .ok()?
+                .iter()
+                .map(cfg_value)
+                .collect();
+            if list.path.is_ident("not") {
+                inner.first().copied().flatten().map(|v| !v)
+            } else if list.path.is_ident("all") {
+                if inner.contains(&Some(false)) {
+                    Some(false)
+                } else if inner.iter().all(|v| *v == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("any") {
+                if inner.contains(&Some(true)) {
+                    Some(true)
+                } else if !inner.is_empty() && inner.iter().all(|v| *v == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Collects `#[encrypted]` fields from every production `#[model]` struct, however deeply
 /// its module is nested.
 #[derive(Default)]
 struct EncryptedScan {
@@ -360,7 +413,16 @@ struct EncryptedScan {
 }
 
 impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        if production_enabled(&module.attrs) {
+            syn::visit::visit_item_mod(self, module);
+        }
+    }
+
     fn visit_item_struct(&mut self, item_struct: &'ast syn::ItemStruct) {
+        if !production_enabled(&item_struct.attrs) {
+            return;
+        }
         if let Some(model_attr) = find_model_attr(&item_struct.attrs)
             && let syn::Fields::Named(named) = &item_struct.fields
         {
@@ -2192,6 +2254,24 @@ mod tests {
         .expect("parse");
         let cols: Vec<&str> = found["items"].keys().map(String::as_str).collect();
         assert_eq!(cols, vec!["tok", "type"]);
+    }
+
+    /// A test-only fixture model must not change a production column's mode.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_fixtures() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }
+            #[cfg(test)]
+            mod tests {
+                #[model]
+                pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }
+            }
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(found["users"]["email"], true, "{found:?}");
     }
 
     /// A model in an inline module, at any depth, is still a model.

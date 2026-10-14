@@ -2308,7 +2308,7 @@ fn scan_anonymize_source(src: &str) -> Result<(BTreeSet<String>, Vec<String>), S
     let file = syn::parse_file(src).map_err(|e| ScrubError::SourceScan {
         detail: e.to_string(),
     })?;
-    if !production_enabled(&file.attrs) {
+    if !crate::schema::parse::production_enabled(&file.attrs) {
         return Ok((BTreeSet::new(), Vec::new()));
     }
     let mut scan = AnonymizeScan::default();
@@ -2317,57 +2317,6 @@ fn scan_anonymize_source(src: &str) -> Result<(BTreeSet<String>, Vec<String>), S
         return Err(ScrubError::UnresolvableAnonymize { detail });
     }
     Ok((scan.tables, scan.disabled_modules))
-}
-
-/// Whether the `#[cfg(...)]` attributes leave an item in a production build.
-///
-/// Only `test` is known to be off, and `not`, `all` and `any` combine it. Other
-/// predicates (a feature, a target) are unknown and count as on. This keeps a
-/// registration the app might have: scrubbing too much is the safe error.
-fn production_enabled(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().filter(|a| a.path().is_ident("cfg")).all(|a| {
-        a.parse_args::<syn::Meta>()
-            .map_or(true, |m| cfg_value(&m) != Some(false))
-    })
-}
-
-/// A `cfg` predicate's value when it is known without the build's settings.
-fn cfg_value(meta: &syn::Meta) -> Option<bool> {
-    use syn::punctuated::Punctuated;
-
-    match meta {
-        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
-        syn::Meta::List(list) => {
-            let inner: Vec<Option<bool>> = list
-                .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
-                .ok()?
-                .iter()
-                .map(cfg_value)
-                .collect();
-            if list.path.is_ident("not") {
-                inner.first().copied().flatten().map(|v| !v)
-            } else if list.path.is_ident("all") {
-                if inner.contains(&Some(false)) {
-                    Some(false)
-                } else if inner.iter().all(|v| *v == Some(true)) {
-                    Some(true)
-                } else {
-                    None
-                }
-            } else if list.path.is_ident("any") {
-                if inner.contains(&Some(true)) {
-                    Some(true)
-                } else if !inner.is_empty() && inner.iter().all(|v| *v == Some(false)) {
-                    Some(false)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
 }
 
 /// `syn` visitor collecting `ModelRegistration::anonymize("<table>")` calls
@@ -2393,7 +2342,7 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
             syn::Item::Static(i) => &i.attrs,
             _ => &[],
         };
-        if !production_enabled(attrs) {
+        if !crate::schema::parse::production_enabled(attrs) {
             if let syn::Item::Mod(module) = item
                 && module.content.is_none()
                 && self.depth == 0
@@ -2414,19 +2363,19 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
             syn::ImplItem::Const(i) => &i.attrs,
             _ => &[],
         };
-        if production_enabled(attrs) {
+        if crate::schema::parse::production_enabled(attrs) {
             syn::visit::visit_impl_item(self, item);
         }
     }
 
     fn visit_local(&mut self, local: &'ast syn::Local) {
-        if production_enabled(&local.attrs) {
+        if crate::schema::parse::production_enabled(&local.attrs) {
             syn::visit::visit_local(self, local);
         }
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if !production_enabled(&node.attrs) {
+        if !crate::schema::parse::production_enabled(&node.attrs) {
             return;
         }
         if let syn::Expr::Path(path) = &*node.func {
@@ -9760,7 +9709,7 @@ mod tests {
     #[test]
     fn cfg_predicates_combine_and_unknown_ones_count_as_on() {
         let on = |cfg: &str| {
-            production_enabled(
+            crate::schema::parse::production_enabled(
                 &syn::parse_str::<syn::ItemFn>(&format!("#[cfg({cfg})] fn f() {{}}"))
                     .unwrap()
                     .attrs,
