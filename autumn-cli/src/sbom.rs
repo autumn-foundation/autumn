@@ -73,8 +73,9 @@ pub enum SbomError {
     #[error("unsupported object file format")]
     UnsupportedObjectFormat,
     #[error(
-        "byte-swapped fat Mach-O header (FAT_CIGAM). Fat headers are always big-endian. \
-         The file is corrupt or is not a universal binary"
+        "file starts with a byte-swapped fat Mach-O magic (FAT_CIGAM). Fat headers are \
+         always big-endian on disk, so no Apple tool writes this. The file is not a \
+         valid fat binary"
     )]
     ByteSwappedFatMachO,
     #[error("truncated or malformed object file")]
@@ -1242,10 +1243,15 @@ fn extract_from_pe(bytes: &[u8]) -> Result<&[u8], SbomError> {
 /// Handles ELF (32/64-bit, either endianness), Mach-O (thin and fat/universal)
 /// and PE — i.e. every target the CLI itself ships binaries for.
 ///
+/// Fat accepts only `ca fe ba be` (`FAT_MAGIC`) and `ca fe ba bf`
+/// (`FAT_MAGIC_64`). Fat headers are always big-endian on disk. `FAT_CIGAM` is
+/// only the value a little-endian reader sees. The swapped bytes get their own
+/// error.
+///
 /// # Errors
 ///
+/// * [`SbomError::ByteSwappedFatMachO`] — a swapped fat magic (Apple tools do not write it).
 /// * [`SbomError::UnsupportedObjectFormat`] — not a recognized object file.
-/// * [`SbomError::ByteSwappedFatMachO`] — `FAT_CIGAM`, which no toolchain writes.
 /// * [`SbomError::NoAuditData`] — a valid object file with no embedded list.
 /// * [`SbomError::MalformedObject`] — truncated or self-inconsistent headers.
 pub fn extract_dep_section(bytes: &[u8]) -> Result<&[u8], SbomError> {
@@ -2761,19 +2767,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_byte_swapped_fat_magic_with_a_specific_error() {
-        // #2394: Apple fat headers are always big-endian, so no toolchain
-        // writes FAT_CIGAM. The error must say so, not "unsupported format".
-        for magic in [[0xbe, 0xba, 0xfe, 0xca], [0xbf, 0xba, 0xfe, 0xca]] {
-            let mut bytes = magic.to_vec();
-            bytes.extend_from_slice(&[0; 32]);
-            let err = extract_dep_section(&bytes).expect_err("must reject");
-            assert!(matches!(err, SbomError::ByteSwappedFatMachO), "{err:?}");
-            assert!(err.to_string().contains("big-endian"), "{err}");
-        }
-    }
-
-    #[test]
     fn rejects_a_file_that_is_not_an_object_file() {
         assert!(matches!(
             extract_dep_section(b"#!/bin/sh\necho hi\n"),
@@ -2938,6 +2931,24 @@ mod tests {
             "expected an ambiguity refusal, got: {err}"
         );
         assert!(err.to_string().contains("lipo"), "{err}");
+    }
+
+    #[test]
+    fn a_byte_swapped_fat_magic_is_refused_with_a_reason() {
+        // FAT_CIGAM / FAT_CIGAM_64 are the values a reader sees, not bytes any
+        // Apple tool writes. Refuse them and say why.
+        for magic in [[0xbe, 0xba, 0xfe, 0xca], [0xbf, 0xba, 0xfe, 0xca]] {
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&[0; 28]);
+            let err = extract_dep_section(&bytes).unwrap_err();
+            assert!(
+                matches!(err, SbomError::ByteSwappedFatMachO),
+                "expected a byte-swapped refusal, got: {err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("byte-swapped"), "{msg}");
+            assert!(msg.contains("big-endian"), "{msg}");
+        }
     }
 
     #[test]

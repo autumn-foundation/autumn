@@ -1465,9 +1465,10 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         // Scoped down for this slice (issue #1358), mirroring retention(...)'s
         // own incompatibility list above: the generated `move_*` methods open
         // their own plain transaction and do not run the tenant/shard/version/
-        // hooks/cascade machinery those options add to the *generated CRUD*
-        // paths, so combining them would silently skip that machinery for a
-        // move rather than actually supporting it.
+        // hooks machinery those options add to the *generated CRUD* paths, so
+        // combining them would silently skip that machinery for a move rather
+        // than actually supporting it. `dependent(...)` is not on that list: a
+        // move never deletes a row, so there is no cascade to skip (#2427).
         if sharded {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
@@ -1491,14 +1492,6 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                 "position(...) does not support versioned = true yet: a move does not write a \
                  version-history entry the way delete_by_id/update do. Remove \
                  `versioned = true`, or treat position moves as unaudited for now",
-            ));
-        }
-        if !dependents.is_empty() {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "position(...) does not support dependent(...) yet: these are independent \
-                 concerns today (a move never deletes a row), but combining them is untested. \
-                 Remove `dependent(...)`, or file a follow-up if you need both",
             ));
         }
     }
@@ -9573,8 +9566,10 @@ fn emit_hooked_mutate_many(
         cc_before_delete_chunk,
     } = *inputs;
     let DependentCascade {
-        delete_many_compiletime_cascade,
-        delete_many_runtime_cascade,
+        delete_many_compiletime_probe,
+        delete_many_runtime_probe,
+        delete_many_compiletime_mutating,
+        delete_many_runtime_mutating,
         delete_many_cascade_tx_bind,
         delete_many_cascade_tx_ok,
         delete_many_cascade_post_publish,
@@ -10323,11 +10318,12 @@ fn emit_hooked_mutate_many(
         // returns the deferred broadcasts). A repository-attribute
         // `dependent(...)` instead emits it once with the compile-time cascade.
         let build_delete_many_body =
-            |delete_many_cascade: &proc_macro2::TokenStream,
+            |delete_many_probe: &proc_macro2::TokenStream,
+             delete_many_mutating: &proc_macro2::TokenStream,
              delete_many_tx_bind: &proc_macro2::TokenStream,
              delete_many_tx_ok: &proc_macro2::TokenStream,
              delete_many_post_publish: &proc_macro2::TokenStream,
-             delete_many_root_skip: &proc_macro2::TokenStream| {
+             delete_many_root_mark: &proc_macro2::TokenStream| {
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -10355,25 +10351,30 @@ fn emit_hooked_mutate_many(
                                 current_rows.extend(chunk_rows);
                             }
 
-                            // #1740: cascade dependent actions for every parent
-                            // before the bulk parent delete, so no child is
-                            // orphaned and the parent delete never trips a
-                            // foreign-key constraint. The cascade runs first, so
-                            // a batch root that is also another root's descendant
-                            // is deleted here and recorded in `__autumn_deleted`,
-                            // firing `before_delete` exactly once. The root hook
-                            // loop below then skips it (`#delete_many_root_skip`)
-                            // and the tolerant bulk `id = ANY` delete no longer
-                            // touches it.
-                            #delete_many_cascade
+                            // #1740 + #2427: the bulk order matches `delete_by_id`.
+                            //
+                            // 1. Probe every `restrict` in the tree. A 409 here
+                            //    fires no hook.
+                            // 2. Fire each root's `before_delete`. A veto here
+                            //    fires no child hook.
+                            // 3. Cascade the mutating dependents, then delete the
+                            //    roots.
+                            //
+                            // A batch root that is also another root's descendant
+                            // is marked in `__autumn_deleted` after its hook runs.
+                            // The cascade then skips that hook and its commit-hook
+                            // enqueue, so both fire exactly once.
+                            #delete_many_probe
 
                             for record in &current_rows {
-                                #delete_many_root_skip
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
                                 #idempotency_setup
                                 self.hooks.before_delete(&mut ctx, record).await?;
                                 #delete_commit_hook_setup
+                                #delete_many_root_mark
                             }
+
+                            #delete_many_mutating
 
                             #delete_execution
 
@@ -10390,13 +10391,14 @@ fn emit_hooked_mutate_many(
                     Ok(())
                 }
             };
-        // Codex round-5-B: in the cascade forms, a batch root already deleted as
-        // another root's cascaded descendant must be skipped by the root hook
-        // loop (its `before_delete`/commit-hook already fired during the cascade).
-        // The plain (no-cascade) form has no `__autumn_deleted` set, so its skip
-        // token is empty and the loop is byte-identical to the prior codegen.
-        let delete_many_cascade_root_skip = quote! {
-            if __autumn_deleted.contains(&(#table_name, record.id)) { continue; }
+        // #2427: in the cascade forms, the root hook loop runs before the cascade.
+        // Mark each root it hooks, under a key the leaf executor reads, so a root
+        // that is also another root's descendant is not hooked a second time.
+        // The mark's table name differs from the plain one, so the root dedup
+        // check (`__autumn_deleted.contains((table, id))`) is unaffected. The
+        // plain (no-cascade) form has no such set, so its token is empty.
+        let delete_many_cascade_root_mark = quote! {
+            __autumn_deleted.insert((::core::concat!(#table_name, "#hooked"), record.id));
         };
         // Codex P1: with no repository-attribute `dependent(...)`, dispatch the
         // bulk cascade at run time via the model's `Model::dependents()` — empty
@@ -10409,16 +10411,18 @@ fn emit_hooked_mutate_many(
             let __plain = build_delete_many_body(
                 &quote! {},
                 &quote! {},
+                &quote! {},
                 &quote! { Ok(()) },
                 &quote! {},
                 &quote! {},
             );
             let __runtime = build_delete_many_body(
-                delete_many_runtime_cascade,
+                delete_many_runtime_probe,
+                delete_many_runtime_mutating,
                 delete_many_cascade_tx_bind,
                 delete_many_cascade_tx_ok,
                 delete_many_cascade_post_publish,
-                &delete_many_cascade_root_skip,
+                &delete_many_cascade_root_mark,
             );
             quote! {
                 use ::autumn_web::repository::AutumnDependents as _;
@@ -10431,11 +10435,12 @@ fn emit_hooked_mutate_many(
             }
         } else {
             build_delete_many_body(
-                delete_many_compiletime_cascade,
+                delete_many_compiletime_probe,
+                delete_many_compiletime_mutating,
                 delete_many_cascade_tx_bind,
                 delete_many_cascade_tx_ok,
                 delete_many_cascade_post_publish,
-                &delete_many_cascade_root_skip,
+                &delete_many_cascade_root_mark,
             )
         }
     };
@@ -13800,8 +13805,15 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
 
 struct DependentCascade {
     dependent_child_helper: TokenStream,
+    /// Probe then mutate, for the hook-free body.
     delete_many_compiletime_cascade: TokenStream,
     delete_many_runtime_cascade: TokenStream,
+    /// The read-only probe pass alone, for the hooked body. Runs before the root hooks.
+    delete_many_compiletime_probe: TokenStream,
+    delete_many_runtime_probe: TokenStream,
+    /// The mutating pass alone, for the hooked body. Runs after the root hooks.
+    delete_many_compiletime_mutating: TokenStream,
+    delete_many_runtime_mutating: TokenStream,
     delete_many_cascade_tx_bind: TokenStream,
     delete_many_cascade_tx_ok: TokenStream,
     delete_many_cascade_post_publish: TokenStream,
@@ -13879,8 +13891,19 @@ fn emit_dependent_cascade(
         // aware), fire `before_delete`, apply the soft/hard delete mutation,
         // record version history, and enqueue the durable commit hook. This is
         // what makes `dependent = destroy` soft-delete-aware and hook-firing.
+        // #2427: a bulk `delete_many` hooks every batch root before it cascades.
+        // It then marks the root in `__deleted` under this key. When the cascade
+        // reaches that root as another root's descendant, the hook and the
+        // commit-hook enqueue already ran, so the leaf must not repeat them.
+        let destroy_already_hooked = quote! {
+            __deleted.contains(&(::core::concat!(#table_name, "#hooked"), __cid))
+        };
         let destroy_before_delete = if config.hooks_type.is_some() {
-            quote! { self.hooks.before_delete(&mut ctx, &__record).await?; }
+            quote! {
+                if !#destroy_already_hooked {
+                    self.hooks.before_delete(&mut ctx, &__record).await?;
+                }
+            }
         } else {
             quote! {}
         };
@@ -13986,17 +14009,19 @@ fn emit_dependent_cascade(
         };
         let destroy_commit_enqueue = if commit_hooks_enabled {
             quote! {
-                let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
-                ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
-                    conn,
-                    Self::__autumn_repository_commit_hook_key(),
-                    "delete",
-                    ctx.idempotency_key.as_deref(),
-                    ::core::option::Option::None,
-                    &ctx,
-                    &__autumn_commit_hook_record,
-                )
-                .await?;
+                if !#destroy_already_hooked {
+                    let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
+                    ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
+                        conn,
+                        Self::__autumn_repository_commit_hook_key(),
+                        "delete",
+                        ctx.idempotency_key.as_deref(),
+                        ::core::option::Option::None,
+                        &ctx,
+                        &__autumn_commit_hook_record,
+                    )
+                    .await?;
+                }
             }
         } else {
             quote! {}
@@ -14190,6 +14215,35 @@ fn emit_dependent_cascade(
                 }
             }
         };
+        // #2427: the read-only twin of `emit_grandchild_call`, for `destroy`
+        // legs. It walks the leg with `Probe`, so a `restrict` at any depth is
+        // found before the first hook fires.
+        let grandchild_probe_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action == DependentAction::Destroy)
+            .map(|dep| {
+                let child_repo = &dep.child_repo;
+                let fk = &dep.fk;
+                quote! {
+                    {
+                        let __autumn_gc_repo = #child_repo::with_pool_untracked(
+                            ::core::clone::Clone::clone(&self.pool)
+                        );
+                        __autumn_gc_repo.__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            __cid,
+                            ::autumn_web::repository::DependentAction::Probe,
+                            #child_soft_for_grandchildren,
+                            __path,
+                            __deleted,
+                            __physical,
+                        ).await?;
+                    }
+                }
+            })
+            .collect();
         let grandchild_restrict_calls: ::std::vec::Vec<_> = config
             .dependents
             .iter()
@@ -14253,6 +14307,23 @@ fn emit_dependent_cascade(
                 );
             }
         };
+        let compiletime_grandchild_probe = quote! {
+            #(#grandchild_probe_calls)*
+        };
+        let runtime_grandchild_probe = quote! {
+            let __autumn_gc_rt_deps = #model_name::dependents();
+            for __autumn_gc_probe in __autumn_gc_rt_deps.iter().filter_map(|__s| __s.probe) {
+                __autumn_gc_probe(
+                    &self.pool,
+                    conn,
+                    __cid,
+                    #child_soft_for_grandchildren,
+                    __path,
+                    __deleted,
+                    __physical,
+                ).await?;
+            }
+        };
         let runtime_grandchild_mutating = quote! {
             let __autumn_gc_rt_deps = #model_name::dependents();
             for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
@@ -14282,6 +14353,11 @@ fn emit_dependent_cascade(
             compiletime_grandchild_restrict
         } else {
             runtime_grandchild_restrict
+        };
+        let grandchild_probe_cascade = if has_dependents {
+            compiletime_grandchild_probe
+        } else {
+            runtime_grandchild_probe
         };
         let grandchild_mutating_cascade = if has_dependents {
             compiletime_grandchild_mutating
@@ -14384,7 +14460,10 @@ fn emit_dependent_cascade(
         // invisible to `has_dependents`, which only sees the repository-attribute
         // route — still gets the recursive cascade it needs; see
         // `destroy_fast_path` below.
-        let destroy_per_row_loop = quote! {
+        // The locked child-id selection, shared by the Probe arm and the Destroy
+        // loop. Both must take the same `FOR UPDATE` lock before any restrict
+        // probe, so no FK insert slips in between probe and delete.
+        let destroy_select_ids = quote! {
             #[derive(::autumn_web::reexports::diesel::QueryableByName)]
             struct __AutumnDepId {
                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
@@ -14414,7 +14493,6 @@ fn emit_dependent_cascade(
             // plain read. `backend_select!` picks the suffix in autumn-web's own
             // compilation, so the Postgres SQL is byte-identical to before and the
             // SQLite form drops the clause.
-            #cc_serialize
             let __for_update: &str = ::autumn_web::backend_select! {
                 pg => { " FOR UPDATE" },
                 sqlite => { "" },
@@ -14429,6 +14507,11 @@ fn emit_dependent_cascade(
                     .load::<__AutumnDepId>(conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
+        };
+
+        let destroy_per_row_loop = quote! {
+            #cc_serialize
+            #destroy_select_ids
             // #1800 case 2, pre-scan pass: probe the `restrict` grandchildren of
             // every selected child id before any child `before_delete` hook fires.
             // Codex round-5-A already ordered a child's own grandchild restrict
@@ -14536,6 +14619,67 @@ fn emit_dependent_cascade(
                 __path.remove(&(#table_name, __cid));
             }
             ::core::result::Result::Ok(#destroy_ret_value)
+        };
+
+        // The probe walk proper: lock the child ids, then probe each child's
+        // `restrict` legs and recurse into its `destroy` legs.
+        //
+        // The counter-cache advisory lock comes first, as in the Destroy loop, so
+        // both passes lock in the same order. A row reached by two paths is probed
+        // once: the walk records it in `__deleted` under a `#probed` key (one per
+        // parent delete kind), or a layered diamond would cost 2^depth reads.
+        let probe_walk = quote! {
+            #destroy_ret_decl
+            #cc_serialize
+            #destroy_select_ids
+            let __probed_table: &'static str = if __parent_soft {
+                ::core::concat!(#table_name, "#probed-soft")
+            } else {
+                ::core::concat!(#table_name, "#probed")
+            };
+            for __row in &__ids {
+                let __cid = __row.id;
+                if __physical.contains(&(#table_name, __cid))
+                    || __deleted.contains(&(__probed_table, __cid))
+                {
+                    continue;
+                }
+                if !__path.insert((#table_name, __cid)) {
+                    continue;
+                }
+                #grandchild_restrict_cascade
+                #grandchild_probe_cascade
+                __path.remove(&(#table_name, __cid));
+                __deleted.insert((__probed_table, __cid));
+            }
+            ::core::result::Result::Ok(#destroy_ret_value)
+        };
+        // A leg with no `restrict` and no `destroy` below it has nothing to probe.
+        // Skip the child-id select (and its row locks) for it: the walk would read
+        // every child row just to run an empty loop.
+        let probe_arm = if has_dependents {
+            let has_probeable_leg = config.dependents.iter().any(|dep| {
+                matches!(
+                    dep.action,
+                    DependentAction::Restrict | DependentAction::Destroy
+                )
+            });
+            if has_probeable_leg {
+                probe_walk
+            } else {
+                quote! { ::core::result::Result::Ok(::std::vec::Vec::new()) }
+            }
+        } else {
+            quote! {
+                if #model_name::dependents().iter().any(|__s| {
+                    __s.action == ::autumn_web::repository::DependentAction::Restrict
+                        || __s.probe.is_some()
+                }) {
+                    #probe_walk
+                } else {
+                    ::core::result::Result::Ok(::std::vec::Vec::new())
+                }
+            }
         };
 
         // Ledger: when `destroy_fast_path_eligible` (no repository-attribute
@@ -14701,6 +14845,13 @@ fn emit_dependent_cascade(
                         .await?;
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
+                    // #2427: read-only walk of a `destroy` leg. The parent runs it
+                    // before any hook, so a `restrict` at any depth returns the 409
+                    // before the first hook fires. It writes nothing; it only
+                    // pushes and pops `__path` to stop cycles.
+                    ::autumn_web::repository::DependentAction::Probe => {
+                        #probe_arm
+                    }
                     ::autumn_web::repository::DependentAction::Destroy => {
                         #dependent_unledgered_guard
                         // Recursive cascade (#1739): each child row's mutation is
@@ -14737,30 +14888,38 @@ fn emit_dependent_cascade(
     } else {
         quote! { false }
     };
-    let emit_delete_many_cascade_call = |dep: &DependentSpec| {
-        let child_repo = &dep.child_repo;
-        let fk = &dep.fk;
-        let action_variant = dep.action.variant_ident();
-        quote! {
-            let __autumn_dep_repo = #child_repo::with_pool_untracked(
-                ::core::clone::Clone::clone(&self.pool)
-            );
-            __autumn_dep_broadcasts.extend(
-                __autumn_dep_repo
-                    .__autumn_apply_dependent_on_conn(
-                        conn,
-                        #fk,
-                        __autumn_pid,
-                        ::autumn_web::repository::DependentAction::#action_variant,
-                        #delete_many_parent_soft_lit,
-                        &mut __autumn_path,
-                        &mut __autumn_deleted,
-                        &mut __autumn_physically_deleted,
-                    )
-                    .await?
-            );
-        }
-    };
+    let emit_delete_many_cascade_call_as =
+        |dep: &DependentSpec, action_variant: proc_macro2::Ident| {
+            let child_repo = &dep.child_repo;
+            let fk = &dep.fk;
+            quote! {
+                let __autumn_dep_repo = #child_repo::with_pool_untracked(
+                    ::core::clone::Clone::clone(&self.pool)
+                );
+                __autumn_dep_broadcasts.extend(
+                    __autumn_dep_repo
+                        .__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            __autumn_pid,
+                            ::autumn_web::repository::DependentAction::#action_variant,
+                            #delete_many_parent_soft_lit,
+                            &mut __autumn_path,
+                            &mut __autumn_deleted,
+                            &mut __autumn_physically_deleted,
+                        )
+                        .await?
+                );
+            }
+        };
+    let emit_delete_many_cascade_call =
+        |dep: &DependentSpec| emit_delete_many_cascade_call_as(dep, dep.action.variant_ident());
+    let delete_many_probe_calls: ::std::vec::Vec<_> = config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action == DependentAction::Destroy)
+        .map(|dep| emit_delete_many_cascade_call_as(dep, format_ident!("Probe")))
+        .collect();
     let delete_many_restrict_calls: ::std::vec::Vec<_> = config
         .dependents
         .iter()
@@ -14848,12 +15007,18 @@ fn emit_dependent_cascade(
     // inside the transaction BEFORE the bulk parent delete. Restrict probes for
     // every parent run first (a 409 rolls the whole transaction back before any
     // mutating action), then the mutating dependents.
-    let delete_many_compiletime_cascade = quote! {
+    let delete_many_compiletime_probe = quote! {
         #delete_many_collect_parents
-        // Phase 1: probe all `restrict` dependents for every parent first.
+        // Phase 1: probe all `restrict` dependents for every parent first, then
+        // walk every `destroy` leg read-only (#2427). A 409 here fires no hook.
         for &__autumn_pid in &__autumn_dep_parent_ids {
             #(#delete_many_restrict_calls)*
+            __autumn_path.insert((#table_name, __autumn_pid));
+            #(#delete_many_probe_calls)*
+            __autumn_path.remove(&(#table_name, __autumn_pid));
         }
+    };
+    let delete_many_compiletime_mutating = quote! {
         // Phase 2: mutating dependents per parent, in declaration order.
         for &__autumn_pid in &__autumn_dep_parent_ids {
             // Codex round-5-B: a root already cascade-deleted as ANOTHER root's
@@ -14871,6 +15036,10 @@ fn emit_dependent_cascade(
             __autumn_path.remove(&(#table_name, __autumn_pid));
         }
     };
+    let delete_many_compiletime_cascade = quote! {
+        #delete_many_compiletime_probe
+        #delete_many_compiletime_mutating
+    };
     // Runtime (model-declared `#[has_many(dependent = ...)]`) bulk cascade
     // (Codex P1). When the repository declares NO `dependent(...)`, `delete_many`
     // must mirror the single-record `delete_by_id` runtime dispatch: walk the
@@ -14878,9 +15047,10 @@ fn emit_dependent_cascade(
     // mutating — reusing the SAME leaf executor / boxed-future recursion /
     // deferred-broadcast buffer as the compile-time path. Requires `__autumn_rt_deps`
     // (the `Model::dependents()` slice) to be bound in the enclosing scope.
-    let delete_many_runtime_cascade = quote! {
+    let delete_many_runtime_probe = quote! {
         #delete_many_collect_parents
-        // Phase 1: probe every parent's `restrict` dependents first.
+        // Phase 1: probe every parent's `restrict` dependents first, then walk
+        // every `destroy` leg read-only (#2427). A 409 here fires no hook.
         for &__autumn_pid in &__autumn_dep_parent_ids {
             for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
                 __s.action == ::autumn_web::repository::DependentAction::Restrict
@@ -14898,7 +15068,23 @@ fn emit_dependent_cascade(
                     .await?
                 );
             }
+            __autumn_path.insert((#table_name, __autumn_pid));
+            for __autumn_probe in __autumn_rt_deps.iter().filter_map(|__s| __s.probe) {
+                __autumn_probe(
+                    &self.pool,
+                    conn,
+                    __autumn_pid,
+                    #delete_many_parent_soft_lit,
+                    &mut __autumn_path,
+                    &mut __autumn_deleted,
+                    &mut __autumn_physically_deleted,
+                )
+                .await?;
+            }
+            __autumn_path.remove(&(#table_name, __autumn_pid));
         }
+    };
+    let delete_many_runtime_mutating = quote! {
         // Phase 2: mutating dependents per parent, in declaration order.
         for &__autumn_pid in &__autumn_dep_parent_ids {
             // Codex round-5-B (mirrors the compile-time block): skip a root already
@@ -14929,6 +15115,10 @@ fn emit_dependent_cascade(
             __autumn_path.remove(&(#table_name, __autumn_pid));
         }
     };
+    let delete_many_runtime_cascade = quote! {
+        #delete_many_runtime_probe
+        #delete_many_runtime_mutating
+    };
     // When a cascade runs, the transaction returns the deferred child broadcasts
     // so they can be published post-commit (a rolled-back cascade publishes
     // nothing). These "cascade" variants of the tx bind / return / publish / tail
@@ -14957,6 +15147,10 @@ fn emit_dependent_cascade(
         dependent_child_helper,
         delete_many_compiletime_cascade,
         delete_many_runtime_cascade,
+        delete_many_compiletime_probe,
+        delete_many_runtime_probe,
+        delete_many_compiletime_mutating,
+        delete_many_runtime_mutating,
         delete_many_cascade_tx_bind,
         delete_many_cascade_tx_ok,
         delete_many_cascade_post_publish,
@@ -19721,6 +19915,20 @@ fn emit_write_bodies(
                         .await?
                     );
                 }
+                // #2427: walk every `destroy` leg read-only, so a deeper
+                // `restrict` blocks here too, before any hook fires.
+                for __autumn_probe in __autumn_rt_deps.iter().filter_map(|__s| __s.probe) {
+                    __autumn_probe(
+                        &self.pool,
+                        conn,
+                        id,
+                        #parent_soft_lit,
+                        &mut __autumn_path,
+                        &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
+                    )
+                    .await?;
+                }
             };
             let runtime_cascade_mutating = quote! {
                 // Phase 2: mutating dependents in declaration order. Reuses the
@@ -19772,10 +19980,9 @@ fn emit_write_bodies(
             // hooks, so a later `restrict` 409 rolls back the DB but cannot retract
             // them. Hoisting the probes ahead of the mutating pass means a blocked
             // delete never touches a child hook.
-            let emit_cascade_call = |dep: &DependentSpec| {
+            let emit_cascade_call_as = |dep: &DependentSpec, action_variant: proc_macro2::Ident| {
                 let child_repo = &dep.child_repo;
                 let fk = &dep.fk;
-                let action_variant = dep.action.variant_ident();
                 quote! {
                     let __autumn_dep_repo = #child_repo::with_pool_untracked(
                         ::core::clone::Clone::clone(&self.pool)
@@ -19798,11 +20005,21 @@ fn emit_write_bodies(
                     );
                 }
             };
+            let emit_cascade_call =
+                |dep: &DependentSpec| emit_cascade_call_as(dep, dep.action.variant_ident());
             let restrict_calls: ::std::vec::Vec<_> = config
                 .dependents
                 .iter()
                 .filter(|dep| dep.action == DependentAction::Restrict)
                 .map(&emit_cascade_call)
+                .collect();
+            // #2427: walk every `destroy` leg read-only too, so a `restrict`
+            // below it blocks the delete before any hook fires.
+            let probe_calls: ::std::vec::Vec<_> = config
+                .dependents
+                .iter()
+                .filter(|dep| dep.action == DependentAction::Destroy)
+                .map(|dep| emit_cascade_call_as(dep, format_ident!("Probe")))
                 .collect();
             let mutating_calls: ::std::vec::Vec<_> = config
                 .dependents
@@ -19854,8 +20071,10 @@ fn emit_write_bodies(
                 __autumn_path.insert((#table_name, id));
                 // #1800 case 3 / Phase 1: probe all `restrict` dependents first —
                 // a 409 here rolls back before the parent `before_delete` hook (and
-                // any mutating action's child hook) fires.
+                // any mutating action's child hook) fires. #2427: then walk every
+                // `destroy` leg read-only, so a deeper `restrict` blocks here too.
                 #(#restrict_calls)*
+                #(#probe_calls)*
             };
             let cascade_mutating_calls = quote! {
                 // Phase 2: mutating dependents in declaration order. Reuses the
@@ -23682,44 +23901,41 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_delete_many_hooked_root_loop_skips_already_deleted_roots() {
-        // Codex round-5-B: for a HOOKED bulk parent, the root `before_delete` loop
-        // must run AFTER the cascade and skip any root already cascade-deleted as
-        // another root's descendant (present in `__autumn_deleted`) — otherwise that
-        // root's `before_delete` would fire twice (once as the cascaded descendant,
-        // once as the batch root). A `destroy` self-reference exercises the case.
+    fn repository_macro_delete_many_hooks_roots_between_probe_and_cascade() {
+        // #2427: a HOOKED bulk parent runs, in order: the read-only probe pass,
+        // each root's `before_delete` (marking the root as hooked), then the
+        // mutating cascade. So a `restrict` 409 fires no hook, a parent veto
+        // fires no child hook, and a root that is also another root's
+        // descendant is hooked once (the leaf skips the marked root's hook).
         let generated = repository_macro(
             quote! { Node, hooks = NodeHooks, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
             quote! { pub trait NodeRepository {} },
         )
         .to_string();
         let section = delete_many_section(&generated);
-        assert!(
-            section.contains(
-                "if __autumn_deleted . contains (& (\"nodes\" , record . id)) { continue ; }"
-            ),
-            "round-5-B: the hooked bulk-root loop must skip a root already \
-             cascade-deleted before firing its before_delete: {section}"
-        );
-        // The skip guard must sit at the TOP of the root loop, before before_delete.
-        let skip_pos = section
-            .find("if __autumn_deleted . contains (& (\"nodes\" , record . id))")
-            .expect("root skip guard present");
+        let probe_pos = section
+            .find("DependentAction :: Probe")
+            .expect("bulk probe pass present");
         let before_delete_pos = section
             .find("before_delete")
             .expect("root loop fires before_delete");
+        let mark_pos = section
+            .find("concat ! (\"nodes\" , \"#hooked\")")
+            .expect("root loop marks each hooked root");
+        let mutating_pos = section
+            .find("DependentAction :: Destroy")
+            .expect("bulk mutating cascade present");
         assert!(
-            skip_pos < before_delete_pos,
-            "round-5-B: the __autumn_deleted skip must precede the root before_delete: {section}"
+            probe_pos < before_delete_pos
+                && before_delete_pos < mark_pos
+                && mark_pos < mutating_pos,
+            "#2427: order must be probe, root hook, root mark, mutating cascade: {section}"
         );
-        // And the cascade must precede that loop so `__autumn_deleted` is populated.
-        let cascade_pos = section
-            .find("__autumn_apply_dependent_on_conn")
-            .expect("cascade present");
+        // The leaf skips the hook and the commit enqueue for a marked root.
+        let destroy_arm = dependent_destroy_arm(&generated);
         assert!(
-            cascade_pos < before_delete_pos,
-            "round-5-B: the cascade must run before the root before_delete loop so a \
-             cascade-deleted root is already recorded: {section}"
+            destroy_arm.contains("concat ! (\"nodes\" , \"#hooked\")"),
+            "#2427: the leaf must skip the hook of a root the bulk loop hooked: {destroy_arm}"
         );
     }
 
@@ -23947,6 +24163,22 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_position_accepts_a_repository_attribute_dependent() {
+        // #2427: `position(...)` once rejected `dependent(...)` as "untested".
+        // A move never deletes a row, so the two do not interact.
+        let generated = repository_macro(
+            quote! { Card, position, dependent(PgNoteRepository, fk = "card_id", on_delete = destroy) },
+            quote! { pub trait CardRepository {} },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("compile_error"),
+            "position(...) plus dependent(...) must expand: {generated}"
+        );
+        assert!(generated.contains("PgNoteRepository"));
+    }
+
+    #[test]
     fn repository_macro_dependent_destroy_positioned_skips_fast_path() {
         // Codex review, PR #2647: a `position(...)` child must keep the
         // per-row loop even though it has none of the other disqualifiers --
@@ -23956,11 +24188,8 @@ mod tests {
         // a time (see this file's `delete_chunk_size` guard, which forces
         // single-row chunks for the identical reason), so a batched delete
         // here would leave the survivors' ranks gapped or duplicated.
-        // `position(...)` does not yet support a repo's OWN `dependent(...)`
-        // (an unrelated, pre-existing restriction), so this checks the
-        // unconditionally-generated Destroy arm on a bare `position` leaf
-        // instead of pairing it with grandchildren like the sibling tests
-        // above do.
+        // This checks the unconditionally-generated Destroy arm on a bare
+        // `position` leaf, with no grandchildren.
         let generated = repository_macro(
             quote! { Comment, position },
             quote! { pub trait CommentRepository {} },
@@ -24395,8 +24624,8 @@ mod tests {
 
     #[test]
     fn repository_macro_bulk_root_skip_uses_all_handled_not_physical_set() {
-        // #1800 case 1: the bulk `delete_many` root dedup guards — the Phase-2 root
-        // skip and the HOOKED root loop skip — must consult the "all handled"
+        // #1800 case 1: the bulk `delete_many` root dedup guard — the Phase-2 root
+        // skip — must consult the "all handled"
         // `__autumn_deleted` set (which records soft AND physical deletes), NOT the
         // physical-only set. Otherwise a soft-deleted descendant that is also a batch
         // root would not be skipped and its `before_delete` would fire twice. The
@@ -24415,10 +24644,11 @@ mod tests {
             "#1800: the bulk Phase-2 root skip must consult the all-handled \
              __autumn_deleted set: {section}"
         );
+        // The hooked root loop no longer needs a skip: it runs before the cascade,
+        // so no root is deleted yet. It marks each root in `__autumn_deleted`.
         assert!(
-            section.contains("__autumn_deleted . contains (& (\"nodes\" , record . id))"),
-            "#1800: the hooked bulk-root hook loop skip must consult the all-handled \
-             __autumn_deleted set: {section}"
+            section.contains("__autumn_deleted . insert"),
+            "#2427: the hooked bulk-root loop must mark each root it hooks: {section}"
         );
         // The physical-only set is threaded into the bulk cascade calls (so the leaf
         // executor's diamond revisit-skip has it) but is NOT what the bulk-root dedup
@@ -24486,6 +24716,122 @@ mod tests {
         assert!(
             destroy_arm.contains("if __physical . contains"),
             "#1800: the Phase-2 diamond revisit-skip must consult __physical: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_legs_are_probed_before_the_parent_hook() {
+        // #2427: every `destroy` leg is walked read-only (`Probe`) in the up-front
+        // pass, before the parent `before_delete` hook and before any mutating leg.
+        // Covers the repository-attribute and the model-declared branch.
+        let repo_attr = repository_macro(
+            quote! { Post, hooks = PostHooks, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&repo_attr);
+        let probe_pos = section
+            .find("DependentAction :: Probe")
+            .expect("the destroy leg must be probed");
+        let hook_pos = section
+            .find("self . hooks . before_delete")
+            .expect("the parent hook must be emitted");
+        let destroy_pos = section
+            .find("DependentAction :: Destroy")
+            .expect("the destroy leg must cascade");
+        assert!(
+            probe_pos < hook_pos && hook_pos < destroy_pos,
+            "#2427 (repo-attribute): probe, then parent hook, then cascade: {section}"
+        );
+
+        let model_side = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&model_side);
+        let runtime = &section[section
+            .find("__autumn_path . insert")
+            .expect("runtime cascade arm present")..];
+        let probe_pos = runtime
+            .find("filter_map (| __s | __s . probe)")
+            .expect("the runtime cascade must probe each leg");
+        let hook_pos = runtime
+            .find("self . hooks . before_delete")
+            .expect("the parent hook must be emitted");
+        assert!(
+            probe_pos < hook_pos,
+            "#2427 (model-declared): probe must precede the parent hook: {runtime}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_probe_arm_is_read_only_and_cycle_safe() {
+        // #2427: the `Probe` arm locks the child ids like the Destroy arm, probes
+        // restricts, recurses into destroy legs, and writes nothing. It guards
+        // cycles with a push/pop on `__path`.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy), dependent(PgGuardRepository, fk = "comment_id", on_delete = restrict) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let helper = dependent_helper_body(&generated);
+        let start = helper
+            .find("DependentAction :: Probe =>")
+            .expect("probe arm present");
+        let arm = &helper[start..];
+        let arm = &arm[..arm
+            .find("DependentAction :: Destroy =>")
+            .unwrap_or(arm.len())];
+        assert!(
+            arm.contains("FOR UPDATE"),
+            "probe must lock child ids: {arm}"
+        );
+        assert!(
+            arm.contains("DependentAction :: Probe") && arm.contains("DependentAction :: Restrict"),
+            "probe must recurse into destroy legs and probe restrict legs: {arm}"
+        );
+        assert!(
+            arm.contains("__path . insert") && arm.contains("__path . remove"),
+            "probe must push and pop the active path: {arm}"
+        );
+        assert!(
+            arm.contains("#probed"),
+            "probe must record probed rows, or a diamond costs 2^depth reads: {arm}"
+        );
+        for write in [
+            "diesel :: delete",
+            "diesel :: update",
+            "before_delete",
+            "__physical . insert",
+        ] {
+            assert!(
+                !arm.contains(write),
+                "probe must not write ({write}): {arm}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_macro_probe_skips_a_leg_with_nothing_below_it() {
+        // #2427: a leaf with no restrict or destroy leg has nothing to probe, so
+        // its probe arm must not read or lock the child rows.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = delete_all) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let helper = dependent_helper_body(&generated);
+        let start = helper
+            .find("DependentAction :: Probe =>")
+            .expect("probe arm present");
+        let arm = &helper[start..];
+        let arm = &arm[..arm
+            .find("DependentAction :: Destroy =>")
+            .unwrap_or(arm.len())];
+        assert!(
+            !arm.contains("FOR UPDATE"),
+            "no select for an empty probe: {arm}"
         );
     }
 

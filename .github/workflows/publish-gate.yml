@@ -17,6 +17,8 @@ name: Publish Gate
 #                   published, app scaffold included (#1600)
 #   sbom          — CycloneDX SBOM generated, re-verified against the source
 #                   tree, and pinned to the version/tag being released (#1615)
+#   cli-binaries  — builds and attests the CLI archives on tag pushes, so the
+#                   provenance names the tag (#2380). `release.yml` uploads them.
 #   sbom-attest   — signs that SBOM on tag pushes. A separate, checkout-free
 #                   job: it is the only one holding signing credentials, and
 #                   this workflow also runs on pull_request.
@@ -385,6 +387,29 @@ jobs:
           subject-path: sbom.cdx.json
 
   # ---------------------------------------------------------------------------
+  # 5d. CLI release archives (tag pushes only)
+  #
+  # Built and attested here, not in release.yml. This workflow is triggered by
+  # the tag push, so the OIDC claims name the tag and the tagged commit.
+  # release.yml is `workflow_run`-triggered and runs in default-branch context
+  # (#2380). It only downloads these archives and uploads them to the release.
+  #
+  # The `if:` is what keeps pull requests unsigned: the called workflow checks
+  # out code, and a skipped job gets no token. Do not move it to a step.
+  # ---------------------------------------------------------------------------
+  cli-binaries:
+    name: CLI binaries
+    if: github.ref_type == 'tag'
+    needs: [semver, release-notes, smoke, examples-e2e]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/cli-release.yml
+    with:
+      tag: ${{ github.ref_name }}
+
+  # ---------------------------------------------------------------------------
   # 6. Downstream smoke test
   # ---------------------------------------------------------------------------
   smoke:
@@ -453,7 +478,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only runs on tag pushes; depends on all gate jobs so artifacts are only
     # produced when every check passes.
-    needs: [semver, release-notes, smoke, examples-e2e, advisories, sbom, sbom-attest]
+    needs: [semver, release-notes, smoke, examples-e2e, advisories, sbom, sbom-attest, cli-binaries]
     if: github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v7
