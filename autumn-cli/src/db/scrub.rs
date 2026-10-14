@@ -9125,6 +9125,11 @@ mod tests {
             "postgres:///app?host=/var/run/postgresql",
             &|_| None
         ));
+        assert!(same_database_with(
+            "postgres:///app?host=/var/run/postgresql",
+            "postgres:///app?host=",
+            &|_| None
+        ));
         assert!(!same_database_with(
             "postgres:///app?host=",
             "postgres://h.example.com/app",
