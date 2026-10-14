@@ -389,8 +389,9 @@ async fn manually_composed_stack_uses_finalized_tenant_after_switch() {
 
 /// Session store whose `save` pauses after persisting, so a test can send a
 /// request while the first response is still in its commit step.
+#[derive(Clone)]
 struct GatedSaveStore {
-    inner: SessionMemoryStore,
+    inner: Arc<SessionMemoryStore>,
     saved: Arc<tokio::sync::Notify>,
     resume: Arc<tokio::sync::Notify>,
 }
@@ -448,7 +449,7 @@ async fn concurrent_retry_during_session_commit_does_not_rerun_handler() {
     let saved = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
     let store = GatedSaveStore {
-        inner,
+        inner: Arc::new(inner),
         saved: Arc::clone(&saved),
         resume: Arc::clone(&resume),
     };
