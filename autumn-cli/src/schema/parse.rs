@@ -347,33 +347,41 @@ pub fn parse_encrypted_columns(
     src: &str,
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
     let file = syn::parse_file(src).map_err(|e| SchemaParseError::from_syn(&e))?;
-    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
-    for item in &file.items {
-        let syn::Item::Struct(item_struct) = item else {
-            continue;
-        };
-        let Some(model_attr) = find_model_attr(&item_struct.attrs) else {
-            continue;
-        };
-        let syn::Fields::Named(named) = &item_struct.fields else {
-            continue;
-        };
-        let model_name = item_struct.ident.to_string();
-        let table = parse_model_args(model_attr)
-            .table
-            .unwrap_or_else(|| naming::pluralize(&naming::pascal_to_snake(&model_name)));
-        for field in &named.named {
-            let Some(ident) = field.ident.as_ref() else {
-                continue;
-            };
-            if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
-                out.entry(table.clone())
-                    .or_default()
-                    .insert(ident.to_string(), is_deterministic_encrypted(attr));
+    let mut scan = EncryptedScan::default();
+    syn::visit::Visit::visit_file(&mut scan, &file);
+    Ok(scan.found)
+}
+
+/// Collects `#[encrypted]` fields from every `#[model]` struct, however deeply
+/// its module is nested.
+#[derive(Default)]
+struct EncryptedScan {
+    found: BTreeMap<String, BTreeMap<String, bool>>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
+    fn visit_item_struct(&mut self, item_struct: &'ast syn::ItemStruct) {
+        if let Some(model_attr) = find_model_attr(&item_struct.attrs)
+            && let syn::Fields::Named(named) = &item_struct.fields
+        {
+            let model_name = item_struct.ident.to_string();
+            let table = parse_model_args(model_attr)
+                .table
+                .unwrap_or_else(|| naming::pluralize(&naming::pascal_to_snake(&model_name)));
+            for field in &named.named {
+                let Some(ident) = field.ident.as_ref() else {
+                    continue;
+                };
+                if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
+                    self.found.entry(table.clone()).or_default().insert(
+                        field_column_name(field, ident),
+                        is_deterministic_encrypted(attr),
+                    );
+                }
             }
         }
+        syn::visit::visit_item_struct(self, item_struct);
     }
-    Ok(out)
 }
 
 /// Read the `#[encrypted]` column set from a models file or directory, using the
@@ -2165,6 +2173,42 @@ mod tests {
             .collect();
         assert!(names.contains(&"type"), "{names:?}");
         assert!(!names.iter().any(|n| n.starts_with("r#")), "{names:?}");
+    }
+
+    /// The encrypted-column map is keyed by the SQL column, so a raw identifier
+    /// and a `column_name` override both name the live column.
+    #[test]
+    fn encrypted_columns_use_the_sql_column_name() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct Item {
+                #[id] pub id: i64,
+                #[encrypted] pub r#type: String,
+                #[encrypted] #[diesel(column_name = "tok")] pub token: String,
+            }
+            "#,
+        )
+        .expect("parse");
+        let cols: Vec<&str> = found["items"].keys().map(String::as_str).collect();
+        assert_eq!(cols, vec!["tok", "type"]);
+    }
+
+    /// A model in an inline module, at any depth, is still a model.
+    #[test]
+    fn encrypted_columns_are_found_in_inline_modules() {
+        let found = parse_encrypted_columns(
+            r#"
+            mod accounts {
+                pub mod inner {
+                    #[model]
+                    pub struct Account { #[id] pub id: i64, #[encrypted] pub token: String }
+                }
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found["accounts"].contains_key("token"), "{found:?}");
     }
 
     /// `#[diesel(column_name = ...)]` names the SQL column. Both spellings.

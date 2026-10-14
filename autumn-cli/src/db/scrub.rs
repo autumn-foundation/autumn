@@ -553,12 +553,12 @@ impl std::fmt::Display for ScrubError {
             ),
             Self::EncryptedMetadataUnavailable => write!(
                 f,
-                "No model source was found, so the scrub cannot tell which columns are \
+                "No `src/` tree was found, so the scrub cannot tell which columns are \
                  #[encrypted].\n  \
                  That matters more than it sounds: an unrecognised encrypted column declared \
                  `safe` keeps its production ciphertext, and one given a plaintext strategy \
                  becomes permanently unreadable. Run the scrub from the project root (where \
-                 `src/models` lives), or name them — with their mode — in {SCRUB_CONFIG_FILE}:\n    \
+                 `src/` lives), or name them — with their mode — in {SCRUB_CONFIG_FILE}:\n    \
                  [tables.users.encrypted]\n    api_token = \"randomized\"\n    \
                  email = \"deterministic\"\n  \
                  An app with no encrypted columns at all still needs one empty \
@@ -2292,15 +2292,18 @@ fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
     Ok(out)
 }
 
-/// Read the `#[encrypted]` column set from the project's models, degrading to an
-/// empty map when the project has no models directory at all.
+/// Read the `#[encrypted]` column set from every production source file under
+/// `src/`, the tree the GDPR scanner walks too. A model may live anywhere; a
+/// column the scan missed would keep its ciphertext or take plaintext.
+/// Degrades to an empty map when the project has no `src/` at all.
 fn encrypted_columns(
     project_root: &Path,
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, ScrubError> {
-    let Some(path) = crate::schema::existing_models_path(project_root) else {
+    let src = project_root.join("src");
+    if !src.is_dir() {
         return Ok(BTreeMap::new());
-    };
-    crate::schema::parse::parse_encrypted_columns_path(&path).map_err(|e| ScrubError::SourceScan {
+    }
+    crate::schema::parse::parse_encrypted_columns_path(&src).map_err(|e| ScrubError::SourceScan {
         detail: e.to_string(),
     })
 }
@@ -2682,7 +2685,7 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
     let config = load_config(args.config.as_deref())?;
     check_purge_list(&config)?;
     let project_root = Path::new(".");
-    let models_path = crate::schema::existing_models_path(project_root);
+    let has_sources = project_root.join("src").is_dir();
     let declared_encrypted = config
         .tables
         .iter()
@@ -2693,7 +2696,7 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
     // `safe` it keeps production ciphertext, given a plaintext strategy it
     // becomes permanently unreadable. So this is a refusal, not a warning —
     // unless the declaration names them (and their mode) itself.
-    if models_path.is_none() && !declared_encrypted {
+    if !has_sources && !declared_encrypted {
         return Err(ScrubError::EncryptedMetadataUnavailable);
     }
 
@@ -9078,6 +9081,29 @@ mod tests {
         assert!(
             restored_targets(targets, &[]).is_empty(),
             "an artifact that restored nothing scrubs nothing"
+        );
+    }
+
+    #[test]
+    fn encrypted_columns_are_read_from_the_whole_src_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("billing")).unwrap();
+        std::fs::write(
+            src.join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub ssn: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("billing").join("card.rs"),
+            "#[model] pub struct Card { #[id] pub id: i64, #[encrypted] pub pan: String }",
+        )
+        .unwrap();
+        let found = encrypted_columns(dir.path()).unwrap();
+        assert!(found["users"].contains_key("ssn"));
+        assert!(
+            found["cards"].contains_key("pan"),
+            "a model outside src/models must not escape the scan"
         );
     }
 

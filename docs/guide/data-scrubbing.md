@@ -77,8 +77,9 @@ Two sources need **no declaration at all**:
   plaintext strategy is refused outright. `null` is accepted on a nullable
   encrypted column. The scrub needs the target's `active_record_encryption`
   credentials for this and refuses before writing anything if they are missing.
-  It also refuses if it cannot tell *which* columns are encrypted — a host with
-  the CLI and `scrub.toml` but no `src/models` must name them, with their mode,
+  The scan reads every file under `src/`, in any module. It also refuses if it
+  cannot tell *which* columns are encrypted — a host with
+  the CLI and `scrub.toml` but no `src/` tree must name them, with their mode,
   under `[tables.<t>.encrypted]`:
 
   ```toml
