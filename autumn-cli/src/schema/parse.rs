@@ -526,6 +526,19 @@ fn collect_disabled_modules(
     out: &mut Vec<std::path::PathBuf>,
 ) {
     let (dir, path_base) = dirs;
+    // A name declared both ways (`#[cfg(test)] mod m;` and `#[cfg(not(test))]
+    // mod m;`) loads its conventional file in production.
+    let enabled_names: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(m)
+                if m.content.is_none() && !parent_disabled && production_enabled(&m.attrs) =>
+            {
+                Some(m.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect();
     for item in items {
         let syn::Item::Mod(module) = item else {
             continue;
@@ -550,9 +563,9 @@ fn collect_disabled_modules(
                     });
                 if let Some(custom) = custom {
                     out.push(path_base.join(custom));
-                } else {
+                } else if !enabled_names.contains(&name) {
                     // The conventional paths only when no `#[path]` moves the
-                    // module: `#[cfg(not(test))] mod models;` may own them.
+                    // module and no enabled twin loads them.
                     out.push(dir.join(format!("{name}.rs")));
                     out.push(dir.join(&name));
                 }
@@ -2473,6 +2486,24 @@ mod tests {
         std::fs::write(
             dir.path().join("fixtures").join("test_models.rs"),
             "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A name declared for test and for production still loads in production.
+    #[test]
+    fn an_enabled_twin_keeps_the_conventional_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod models;\n#[cfg(not(test))] mod models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
         )
         .unwrap();
         let found = parse_encrypted_columns_path(dir.path()).unwrap();

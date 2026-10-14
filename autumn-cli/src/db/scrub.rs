@@ -2573,10 +2573,18 @@ fn database_endpoint(
     raw: &str,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(Vec<(String, u16)>, String)> {
-    if !raw.contains("://") {
+    // The same test tokio-postgres uses: only these prefixes start a URL, so a
+    // keyword string with `password=https://…` is not one.
+    if !(raw.starts_with("postgres://") || raw.starts_with("postgresql://")) {
         return conninfo_endpoint(raw, env);
     }
-    let parsed = url::Url::parse(&without_userinfo(raw)).ok()?;
+    let stripped = without_userinfo(raw);
+    let (scheme, rest) = stripped.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // The authority can list several `host:port` pairs, which `url::Url`
+    // rejects. Read them here and parse the rest behind a placeholder.
+    let listed = authority_endpoints(&rest[..end])?;
+    let parsed = url::Url::parse(&format!("{scheme}://placeholder{}", &rest[end..])).ok()?;
     let query = |key: &str| {
         parsed
             .query_pairs()
@@ -2595,42 +2603,75 @@ fn database_endpoint(
             })
             .filter(|n| !n.is_empty())
     })?;
-    let authority_host = parsed.host_str().filter(|h| !h.is_empty()).map(|h| {
-        percent_encoding::percent_decode_str(h)
-            .decode_utf8_lossy()
-            .into_owned()
-    });
-    let host_list = authority_host
-        .or_else(|| query("host"))
-        .or_else(|| query("hostaddr"))
-        .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
-        .unwrap_or_default();
-    let hosts = host_list
-        .split(',')
-        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase());
+    let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if listed.is_empty() {
+        // `hostaddr` is the network address libpq connects to; `host` is then
+        // only a name.
+        let list = query("hostaddr")
+            .or_else(|| query("host"))
+            .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
+            .unwrap_or_default();
+        let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
+        let none = vec![None; hosts.len()];
+        (hosts, none)
+    } else {
+        listed.into_iter().unzip()
+    };
     // libpq pairs a port list with the host list by position, and one port
     // applies to every host.
-    let ports: Vec<u16> = parsed
-        .port()
-        .map(|p| vec![p])
-        .or_else(|| {
-            query("port").map(|p| p.split(',').filter_map(|v| v.trim().parse().ok()).collect())
-        })
+    let ports: Vec<u16> = query("port")
+        .map(|p| p.split(',').filter_map(|v| v.trim().parse().ok()).collect())
         .filter(|p: &Vec<u16>| !p.is_empty())
         .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()).map(|p| vec![p]))
         .unwrap_or_else(|| vec![5432]);
     let endpoints = hosts
+        .into_iter()
+        .zip(own_ports)
         .enumerate()
-        .map(|(i, host)| {
-            let port = if ports.len() == 1 {
-                ports[0]
-            } else {
-                ports.get(i).copied().unwrap_or(5432)
-            };
+        .map(|(i, (host, own))| {
+            let port = own.unwrap_or_else(|| {
+                if ports.len() == 1 {
+                    ports[0]
+                } else {
+                    ports.get(i).copied().unwrap_or(5432)
+                }
+            });
             (host, port)
         })
         .collect();
     Some((endpoints, name))
+}
+
+fn normalize_host(host: &str) -> String {
+    percent_encoding::percent_decode_str(host.trim())
+        .decode_utf8_lossy()
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+/// The `host[:port]` pairs of a URI authority, comma separated. Empty for an
+/// empty authority; `None` for a port that is not a number.
+fn authority_endpoints(authority: &str) -> Option<Vec<(String, Option<u16>)>> {
+    if authority.is_empty() {
+        return Some(Vec::new());
+    }
+    authority
+        .split(',')
+        .map(|item| {
+            let (host, port) = if let Some(inner) = item.strip_prefix('[') {
+                let (host, after) = inner.split_once(']')?;
+                (host, after.strip_prefix(':'))
+            } else if let Some((host, port)) = item.rsplit_once(':') {
+                (host, Some(port))
+            } else {
+                (item, None)
+            };
+            let port = match port {
+                Some("") | None => None,
+                Some(p) => Some(p.parse().ok()?),
+            };
+            Some((normalize_host(host), port))
+        })
+        .collect()
 }
 
 /// Parse libpq `key = value` pairs the way `autumn/src/pg_conn_str.rs` does:
@@ -10005,6 +10046,31 @@ mod tests {
         assert!(!same_database_in(
             "postgres:///d?host=a,b&port=5432,6543",
             "postgres://b:5432/d",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgresql://a:5432,b:6543/app",
+            "postgres://b:6543/app",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgresql://a:5432,b:6543/app",
+            "postgres://b:5432/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app?host=prod.example&hostaddr=10.0.0.5",
+            "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod dbname=app password=https://issuer",
+            "postgres://prod/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://[::1]:5432/app",
+            "postgres:///app?host=::1",
             &env
         ));
         assert!(same_database_in(
