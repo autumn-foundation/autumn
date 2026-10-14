@@ -408,6 +408,16 @@ fn cfg_attr_keeps_item(attr: &syn::Attribute) -> bool {
         syn::Meta::List(list) if list.path.is_ident("cfg") => list
             .parse_args::<syn::Meta>()
             .map_or(true, |m| cfg_value(&m) != Some(false)),
+        // `cfg_attr` can add another `cfg_attr`.
+        syn::Meta::List(list) if list.path.is_ident("cfg_attr") => {
+            let inner = syn::Attribute {
+                pound_token: attr.pound_token,
+                style: attr.style,
+                bracket_token: attr.bracket_token,
+                meta: syn::Meta::List(list.clone()),
+            };
+            cfg_attr_keeps_item(&inner)
+        }
         _ => true,
     })
 }

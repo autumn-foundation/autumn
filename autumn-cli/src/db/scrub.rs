@@ -2802,6 +2802,12 @@ fn url_user(raw: &str) -> Option<String> {
     })
 }
 
+/// Whether a keyword/value connection string selects a libpq `service`.
+fn uses_libpq_service(raw: &str) -> bool {
+    !(raw.starts_with("postgres://") || raw.starts_with("postgresql://"))
+        && conninfo_pairs(raw).is_some_and(|pairs| pairs.iter().any(|(k, _)| k == "service"))
+}
+
 /// `raw` with any `user:password@` removed. An empty host with credentials
 /// (`postgres://app@/db`) is valid libpq but does not parse as a URL.
 fn without_userinfo(raw: &str) -> String {
@@ -2926,6 +2932,16 @@ fn guard_configured_source(
             .into_iter()
             .chain(shards.into_iter().map(|(_, url)| url))
             .collect();
+        // A libpq `service` names its host and port in a file this guard does
+        // not read. Refuse rather than model it as the default local endpoint.
+        if urls.iter().any(|url| uses_libpq_service(url)) {
+            return Err(ScrubError::SourceScan {
+                detail: format!(
+                    "the {profile:?} profile uses a libpq `service`, whose host the source \
+                     guard cannot resolve; pass --allow-source-overwrite to continue"
+                ),
+            });
+        }
         if !urls.is_empty() {
             declared.push((profile, urls));
         }
@@ -8757,6 +8773,15 @@ mod tests {
     }
 
     #[test]
+    fn a_libpq_service_source_is_not_modelled_as_a_local_endpoint() {
+        assert!(uses_libpq_service(
+            "service=production user=app dbname=mydb"
+        ));
+        assert!(!uses_libpq_service("host=prod dbname=app"));
+        assert!(!uses_libpq_service("postgres://prod/app?service=x"));
+    }
+
+    #[test]
     fn the_generated_column_probe_runs_on_servers_without_attgenerated() {
         assert!(GENERATED_COLUMNS.contains("to_jsonb(att)"));
     }
@@ -9997,6 +10022,13 @@ mod tests {
         assert!(
             found(&format!(
                 "#[cfg_attr(not(test), cfg(test))] mod m {{ {} }}",
+                reg("a")
+            ))
+            .is_empty()
+        );
+        assert!(
+            found(&format!(
+                "#[cfg_attr(not(test), cfg_attr(all(), cfg(test)))] mod m {{ {} }}",
                 reg("a")
             ))
             .is_empty()
