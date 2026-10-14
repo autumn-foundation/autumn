@@ -235,6 +235,40 @@ fn recorded_child_stop_budget() -> Option<Duration> {
     }
 }
 
+/// When the running child was spawned. `None` means "nothing recorded".
+static CHILD_SPAWNED_AT: std::sync::Mutex<Option<std::time::SystemTime>> =
+    std::sync::Mutex::new(None);
+
+/// Record the spawn time of the child about to start.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn record_child_spawn_time() {
+    if let Ok(mut slot) = CHILD_SPAWNED_AT.lock() {
+        *slot = Some(std::time::SystemTime::now());
+    }
+}
+
+/// The recorded spawn time. With none, every ready file counts as fresh.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn recorded_child_spawn_time() -> std::time::SystemTime {
+    CHILD_SPAWNED_AT
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
 /// The budget to stop the running child with, most authoritative first.
 ///
 /// 1. `reported` — what the app itself said its drain budget is. Beats anything
@@ -1313,6 +1347,7 @@ fn start_server(
     #[cfg(not(unix))]
     if let Some(ready) = dev_ready_file_path() {
         let _ = std::fs::remove_file(ready);
+        record_child_spawn_time();
         command.env(SERVE_READY_FILE_ENV, ready);
     }
 
@@ -1383,6 +1418,7 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
         child,
         signal_path,
         dev_ready_file_path(),
+        recorded_child_spawn_time(),
         COOPERATIVE_STOP_BOOT_CAP,
         || {
             let resolved = stop_budget_for_running_child(
@@ -1911,6 +1947,23 @@ enum BootWait {
     TimedOut,
 }
 
+/// Whether the app wrote `ready_file` after `spawned_at`.
+///
+/// A file left by an earlier child, which could not be deleted, is not proof
+/// that this child is up.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn ready_file_is_fresh(ready_file: &Path, spawned_at: std::time::SystemTime) -> bool {
+    std::fs::metadata(ready_file)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|modified| modified >= spawned_at)
+}
+
 /// Wait until the app finishes booting, exits, or `cap` passes.
 ///
 /// The app watches the signal file only after startup. Its ready file marks
@@ -1922,13 +1975,18 @@ enum BootWait {
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-fn wait_until_booted(proc: &mut Child, ready_file: Option<&Path>, cap: Duration) -> BootWait {
+fn wait_until_booted(
+    proc: &mut Child,
+    ready_file: Option<&Path>,
+    spawned_at: std::time::SystemTime,
+    cap: Duration,
+) -> BootWait {
     let Some(ready_file) = ready_file else {
         return BootWait::Ready;
     };
     let start = std::time::Instant::now();
     loop {
-        if ready_file.exists() {
+        if ready_file_is_fresh(ready_file, spawned_at) {
             return BootWait::Ready;
         }
         match proc.try_wait() {
@@ -1959,6 +2017,7 @@ fn stop_child_cooperatively(
     child: &mut Option<Child>,
     signal_path: &Path,
     ready_file: Option<&Path>,
+    spawned_at: std::time::SystemTime,
     boot_cap: Duration,
     budget: impl FnOnce() -> Duration,
 ) -> StopOutcome {
@@ -1969,7 +2028,7 @@ fn stop_child_cooperatively(
     // Ask only once the app is up. A request sent during boot makes the app
     // skip its ready write, so the boot could not be told from a drain.
     // At the cap, assume the app is up: the ready write is best-effort.
-    let outcome = if wait_until_booted(proc, ready_file, boot_cap) == BootWait::Exited {
+    let outcome = if wait_until_booted(proc, ready_file, spawned_at, boot_cap) == BootWait::Exited {
         StopOutcome::Graceful
     } else {
         match request_cooperative_shutdown(signal_path) {
@@ -2257,7 +2316,7 @@ mod tests {
                 .expect("spawn stand-in app"),
         );
 
-        let outcome = stop_child_cooperatively(&mut child, &path, None, BOOT_CAP, || {
+        let outcome = stop_child_cooperatively(&mut child, &path, None, EPOCH, BOOT_CAP, || {
             Duration::from_secs(10)
         });
         assert_eq!(outcome, StopOutcome::Graceful);
@@ -2283,7 +2342,7 @@ mod tests {
                 .expect("spawn unresponsive app"),
         );
 
-        let outcome = stop_child_cooperatively(&mut child, &path, None, BOOT_CAP, || {
+        let outcome = stop_child_cooperatively(&mut child, &path, None, EPOCH, BOOT_CAP, || {
             Duration::from_millis(300)
         });
         assert_eq!(outcome, StopOutcome::Escalated);
@@ -2310,7 +2369,7 @@ mod tests {
                 .spawn()
                 .expect("spawn app"),
         );
-        let outcome = stop_child_cooperatively(&mut child, &path, None, BOOT_CAP, || {
+        let outcome = stop_child_cooperatively(&mut child, &path, None, EPOCH, BOOT_CAP, || {
             Duration::from_millis(200)
         });
         assert_eq!(outcome, StopOutcome::Unreachable);
@@ -2318,6 +2377,7 @@ mod tests {
     }
 
     const BOOT_CAP: Duration = Duration::from_secs(30);
+    const EPOCH: std::time::SystemTime = std::time::UNIX_EPOCH;
 
     // ── A booting app is not yet watching (#2444) ──────────────────────────
     //
@@ -2345,9 +2405,10 @@ mod tests {
                 .spawn()
                 .expect("spawn booting app"),
         );
-        let outcome = stop_child_cooperatively(&mut child, &path, Some(&ready), BOOT_CAP, || {
-            Duration::from_secs(5)
-        });
+        let outcome =
+            stop_child_cooperatively(&mut child, &path, Some(&ready), EPOCH, BOOT_CAP, || {
+                Duration::from_secs(5)
+            });
         assert_eq!(outcome, StopOutcome::Graceful);
     }
 
@@ -2364,9 +2425,10 @@ mod tests {
                 .spawn()
                 .expect("spawn app"),
         );
-        let outcome = stop_child_cooperatively(&mut child, &path, Some(&ready), BOOT_CAP, || {
-            Duration::from_millis(100)
-        });
+        let outcome =
+            stop_child_cooperatively(&mut child, &path, Some(&ready), EPOCH, BOOT_CAP, || {
+                Duration::from_millis(100)
+            });
         assert_eq!(outcome, StopOutcome::Graceful);
     }
 
@@ -2390,6 +2452,7 @@ mod tests {
             &mut child,
             &path,
             Some(&ready),
+            EPOCH,
             Duration::from_millis(300),
             || Duration::from_millis(300),
         );
@@ -2419,6 +2482,7 @@ mod tests {
             &mut child,
             &path,
             Some(&ready),
+            EPOCH,
             Duration::from_millis(200),
             || Duration::from_secs(10),
         );
@@ -2439,10 +2503,22 @@ mod tests {
                 .spawn()
                 .expect("spawn app"),
         );
-        stop_child_cooperatively(&mut child, &path, Some(&ready), BOOT_CAP, || {
+        stop_child_cooperatively(&mut child, &path, Some(&ready), EPOCH, BOOT_CAP, || {
             Duration::from_secs(5)
         });
         assert!(!ready.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ready_file_older_than_the_spawn_is_not_proof_of_boot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ready = tmp.path().join("dev-ready.state");
+        std::fs::write(&ready, "30\n").unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        assert!(!ready_file_is_fresh(&ready, later));
+        assert!(ready_file_is_fresh(&ready, EPOCH));
+        assert!(!ready_file_is_fresh(&tmp.path().join("absent"), EPOCH));
     }
 
     // ── `.env` comes from the selected package (#2444) ─────────────────────
@@ -2481,7 +2557,9 @@ mod tests {
         let path = signal_path(tmp.path());
         let mut child = None;
         assert_eq!(
-            stop_child_cooperatively(&mut child, &path, None, BOOT_CAP, || Duration::from_secs(1)),
+            stop_child_cooperatively(&mut child, &path, None, EPOCH, BOOT_CAP, || {
+                Duration::from_secs(1)
+            }),
             StopOutcome::NotRunning
         );
     }
