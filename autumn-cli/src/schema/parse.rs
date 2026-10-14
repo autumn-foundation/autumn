@@ -467,7 +467,7 @@ pub fn parse_encrypted_columns_path(
     // A file reached only through `#[cfg(test)] mod x;` is test code.
     let disabled: Vec<std::path::PathBuf> = sources
         .iter()
-        .flat_map(|(file, src)| disabled_module_paths(file, &disabled_top_level_modules(src)))
+        .flat_map(|(file, src)| disabled_module_paths(file, src))
         .collect();
     let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
     for (file, src) in &sources {
@@ -481,29 +481,18 @@ pub fn parse_encrypted_columns_path(
     Ok(out)
 }
 
-/// The out-of-line modules (`mod x;`) that `cfg` turns off at a file's top
-/// level. Empty when the source does not parse: the caller reports that.
+/// The file and directory paths that `cfg`-disabled modules in `src` would
+/// load, for the source file `file`.
+///
+/// A `lib`, `main` or `mod` file owns its own directory; any other file owns a
+/// directory named for its stem. A module inside a disabled inline module is
+/// disabled too, and an inline module adds its name to the path. Empty when the
+/// source does not parse: the caller reports that.
 #[must_use]
-pub fn disabled_top_level_modules(src: &str) -> Vec<String> {
-    let Ok(file) = syn::parse_file(src) else {
+pub fn disabled_module_paths(file: &Path, src: &str) -> Vec<std::path::PathBuf> {
+    let Ok(parsed) = syn::parse_file(src) else {
         return Vec::new();
     };
-    file.items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Mod(m) if m.content.is_none() && !production_enabled(&m.attrs) => {
-                Some(m.ident.to_string())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// The file and directory paths that `modules`, declared in `file`, would load.
-/// A `lib`, `main` or `mod` file owns its own directory; any other file owns a
-/// directory named for its stem.
-#[must_use]
-pub fn disabled_module_paths(file: &Path, modules: &[String]) -> Vec<std::path::PathBuf> {
     let stem = file
         .file_stem()
         .and_then(|s| s.to_str())
@@ -514,10 +503,39 @@ pub fn disabled_module_paths(file: &Path, modules: &[String]) -> Vec<std::path::
     } else {
         parent.join(stem)
     };
-    modules
-        .iter()
-        .flat_map(|m| [module_dir.join(format!("{m}.rs")), module_dir.join(m)])
-        .collect()
+    let mut out = Vec::new();
+    collect_disabled_modules(
+        &parsed.items,
+        &module_dir,
+        !production_enabled(&parsed.attrs),
+        &mut out,
+    );
+    out
+}
+
+fn collect_disabled_modules(
+    items: &[syn::Item],
+    dir: &Path,
+    parent_disabled: bool,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let name = module.ident.to_string();
+        let disabled = parent_disabled || !production_enabled(&module.attrs);
+        match &module.content {
+            None if disabled => {
+                out.push(dir.join(format!("{name}.rs")));
+                out.push(dir.join(&name));
+            }
+            None => {}
+            Some((_, nested)) => {
+                collect_disabled_modules(nested, &dir.join(&name), disabled, out);
+            }
+        }
+    }
 }
 
 /// The `.rs` sources a models path expands to: the file itself, or every `*.rs`
@@ -2337,6 +2355,30 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("tests.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A module nested in a disabled inline module is disabled too.
+    #[test]
+    fn encrypted_columns_skip_files_under_a_disabled_inline_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod tests { mod fixtures; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests").join("fixtures.rs"),
             "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
         )
         .unwrap();

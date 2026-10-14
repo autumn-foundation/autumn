@@ -1625,7 +1625,12 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                 }
                 let shape = email_shaped(&column.name);
                 let needed = envelope_len(shape);
-                if let Some(limit) = char_max_len(&column.ty)
+                // `name` holds 63 bytes and truncates silently.
+                let limit = char_max_len(&column.ty).or_else(|| {
+                    matches!(&column.ty, ColumnType::Opaque { pg_type } if pg_type == "name")
+                        .then_some(63)
+                });
+                if let Some(limit) = limit
                     && limit < needed
                 {
                     return Err(ScrubError::EncryptedEnvelopeTooLong {
@@ -2296,27 +2301,25 @@ fn qualified_ident(table: &str) -> String {
 /// [`ScrubError::UnresolvableAnonymize`] for a non-literal table name.
 #[cfg(test)]
 fn extract_anonymize_tables(src: &str) -> Result<BTreeSet<String>, ScrubError> {
-    scan_anonymize_source(src).map(|(tables, _)| tables)
+    scan_anonymize_source(src)
 }
 
-/// [`extract_anonymize_tables`], plus the out-of-line modules the source
-/// disables with `#[cfg(test)]` (`#[cfg(test)] mod tests;`), whose files must
-/// not be scanned either.
-fn scan_anonymize_source(src: &str) -> Result<(BTreeSet<String>, Vec<String>), ScrubError> {
+/// Collect the production anonymize registrations in one source file.
+fn scan_anonymize_source(src: &str) -> Result<BTreeSet<String>, ScrubError> {
     use syn::visit::Visit as _;
 
     let file = syn::parse_file(src).map_err(|e| ScrubError::SourceScan {
         detail: e.to_string(),
     })?;
     if !crate::schema::parse::production_enabled(&file.attrs) {
-        return Ok((BTreeSet::new(), Vec::new()));
+        return Ok(BTreeSet::new());
     }
     let mut scan = AnonymizeScan::default();
     scan.visit_file(&file);
     if let Some(detail) = scan.unresolved.into_iter().next() {
         return Err(ScrubError::UnresolvableAnonymize { detail });
     }
-    Ok((scan.tables, scan.disabled_modules))
+    Ok(scan.tables)
 }
 
 /// `syn` visitor collecting `ModelRegistration::anonymize("<table>")` calls
@@ -2325,11 +2328,6 @@ fn scan_anonymize_source(src: &str) -> Result<(BTreeSet<String>, Vec<String>), S
 struct AnonymizeScan {
     tables: BTreeSet<String>,
     unresolved: Vec<String>,
-    /// Out-of-line modules a `cfg` turns off, declared at the file's top level.
-    /// A nested one lives in a path this scan does not resolve.
-    disabled_modules: Vec<String>,
-    /// How many inline modules enclose the item being visited.
-    depth: usize,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
@@ -2342,19 +2340,9 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
             syn::Item::Static(i) => &i.attrs,
             _ => &[],
         };
-        if !crate::schema::parse::production_enabled(attrs) {
-            if let syn::Item::Mod(module) = item
-                && module.content.is_none()
-                && self.depth == 0
-            {
-                self.disabled_modules.push(module.ident.to_string());
-            }
-            return;
+        if crate::schema::parse::production_enabled(attrs) {
+            syn::visit::visit_item(self, item);
         }
-        let inline = matches!(item, syn::Item::Mod(m) if m.content.is_some());
-        self.depth += usize::from(inline);
-        syn::visit::visit_item(self, item);
-        self.depth -= usize::from(inline);
     }
 
     fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
@@ -2430,9 +2418,7 @@ fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
     for path in files {
         let src = std::fs::read_to_string(&path).map_err(|e| io_err(&path, &e))?;
         let result = scan_anonymize_source(&src);
-        if let Ok((_, modules)) = &result {
-            disabled.extend(crate::schema::parse::disabled_module_paths(&path, modules));
-        }
+        disabled.extend(crate::schema::parse::disabled_module_paths(&path, &src));
         scanned.push((path, result));
     }
 
@@ -2442,7 +2428,7 @@ fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
             continue;
         }
         match result {
-            Ok((tables, _)) => out.extend(tables),
+            Ok(tables) => out.extend(tables),
             Err(ScrubError::SourceScan { detail }) => {
                 return Err(ScrubError::SourceScan {
                     detail: format!("{}: {detail}", path.display()),
@@ -2581,8 +2567,9 @@ fn restored_targets(targets: Vec<(String, String)>, restored: &[String]) -> Vec<
 }
 
 /// Profiles whose config could name the artifact's source: the artifact's own
-/// profile plus every profile with a config overlay, minus the destination
-/// (which is the target, never its own source) and the always-safe `dev`/`test`.
+/// profile plus every profile with a config overlay, minus the always-safe
+/// `dev` and `test`. The destination's own overlay is skipped (it names the
+/// target), but a manifest that names the destination as the source stays.
 fn source_candidates(
     artifact_profile: Option<&str>,
     configured: &[String],
@@ -2592,9 +2579,13 @@ fn source_candidates(
     let mut candidates: Vec<String> = artifact_profile
         .map(str::to_owned)
         .into_iter()
-        .chain(configured.iter().cloned())
+        .chain(
+            configured
+                .iter()
+                .filter(|p| migrate::canonical_profile(p) != destination)
+                .cloned(),
+        )
         .filter(|p| !super::is_safe_destructive_profile(p))
-        .filter(|p| migrate::canonical_profile(p) != destination)
         .collect();
     candidates.sort();
     candidates.dedup();
@@ -9566,9 +9557,14 @@ mod tests {
             vec!["prod".to_owned()]
         );
         assert_eq!(
-            source_candidates(Some("staging"), &["staging".to_owned()], "staging"),
+            source_candidates(Some("prod"), &["prod".to_owned()], "prod"),
+            vec!["prod".to_owned()],
+            "a manifest that names the destination as the source stays protected"
+        );
+        assert_eq!(
+            source_candidates(None, &["staging".to_owned()], "staging"),
             Vec::<String>::new(),
-            "restoring a staging artifact into staging overwrites no other source"
+            "the destination's own overlay names the target, not a source"
         );
     }
 
@@ -9753,6 +9749,32 @@ mod tests {
             "postgres://h/prod",
             &env
         ));
+    }
+
+    #[test]
+    fn an_encrypted_name_column_cannot_hold_the_envelope() {
+        let mut table = users_table();
+        table.columns[3].ty = ColumnType::Opaque {
+            pg_type: "name".to_owned(),
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name"]
+            "#,
+        )
+        .unwrap();
+        let err = plan_for(
+            &[table],
+            &config,
+            &encrypted_columns_of("users", &["bio"]),
+            &no_anonymize(),
+        )
+        .expect_err("`name` holds 63 bytes");
+        assert!(
+            matches!(err, ScrubError::EncryptedEnvelopeTooLong { limit: 63, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
