@@ -33,7 +33,7 @@
 //!
 //! A connection that has received no request is not closed at the drain signal. Its
 //! request can be in flight, and a close would reset it. The server waits up
-//! to [`FRESH_CONN_GRACE`] (2 s) for the first request. Then it starts the drain.
+//! to `FRESH_CONN_GRACE` (2 s) for the first request. Then it starts the drain.
 
 use std::convert::Infallible;
 use std::fmt::Debug;
