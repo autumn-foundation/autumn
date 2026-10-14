@@ -412,6 +412,26 @@ pub struct UngovernedTool {
     pub exposed_by: McpExposedBy,
 }
 
+/// A route that lost its MCP tool name to an earlier route.
+///
+/// The server does not expose it. The manifest still lists it, so the
+/// collision stays visible, with or without an envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedDuplicateTool {
+    /// The shared `operation_id`.
+    pub tool: String,
+    /// The handler function's name.
+    pub handler: String,
+    /// HTTP method.
+    pub method: String,
+    /// Route path template.
+    pub path: String,
+    /// Handler's module path.
+    pub module_path: String,
+    /// Always [`DUPLICATE_OPERATION_ID`].
+    pub caveat: String,
+}
+
 const fn default_exposed_by() -> McpExposedBy {
     McpExposedBy::Attribute
 }
@@ -493,6 +513,10 @@ pub struct AgentAuthorityManifest {
     /// `(module_path, action)`. Empty in any binary built by the macros.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unregistered_authorities: Vec<UnregisteredAuthority>,
+    /// Routes the MCP server skips because an earlier route has the same
+    /// `operation_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_duplicate_tools: Vec<SkippedDuplicateTool>,
     /// Dimensions recorded but not enforced.
     pub excluded: Vec<Excluded>,
 }
@@ -634,6 +658,7 @@ impl AgentAuthorityManifest {
             grants,
             ungoverned_tools,
             unregistered_authorities,
+            skipped_duplicate_tools: skipped_duplicate_tools_of(routes),
             excluded: excluded_dimensions(),
         }
     }
@@ -690,6 +715,19 @@ impl AgentAuthorityManifest {
                     } else {
                         " -- read-only"
                     }
+                );
+            }
+        }
+        if !self.skipped_duplicate_tools.is_empty() {
+            let _ = write!(
+                out,
+                "\n\nRoutes the MCP server skips ({DUPLICATE_OPERATION_ID}):"
+            );
+            for row in &self.skipped_duplicate_tools {
+                let _ = write!(
+                    out,
+                    "\n  {} {} ({}) shares the tool name `{}`",
+                    row.method, row.path, row.handler, row.tool
                 );
             }
         }
@@ -847,6 +885,25 @@ fn ungoverned_tools_of(routes: &[RouteSummary]) -> Vec<UngovernedTool> {
     tools.sort_by(|a, b| (&a.path, &a.method, &a.tool).cmp(&(&b.path, &b.method, &b.tool)));
     tools.dedup();
     tools
+}
+
+/// Routes the MCP server skips for a duplicate `operation_id`.
+fn skipped_duplicate_tools_of(routes: &[RouteSummary]) -> Vec<SkippedDuplicateTool> {
+    let mut rows: Vec<SkippedDuplicateTool> = routes
+        .iter()
+        .filter(|route| route.duplicate_operation_id)
+        .map(|route| SkippedDuplicateTool {
+            tool: route.operation_id.to_string(),
+            handler: route.handler.to_string(),
+            method: route.method.clone(),
+            path: route.path.clone(),
+            module_path: route.module_path.to_string(),
+            caveat: DUPLICATE_OPERATION_ID.to_string(),
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.path, &a.method, &a.tool).cmp(&(&b.path, &b.method, &b.tool)));
+    rows.dedup();
+    rows
 }
 
 /// Routes naming an authority no descriptor registered.
@@ -1308,6 +1365,23 @@ mod tests {
         let skipped = find(&manifest, "edit_note");
         assert_eq!(skipped.exposure, "not-exposed");
         assert_eq!(skipped.caveat.as_deref(), Some(DUPLICATE_OPERATION_ID));
+    }
+
+    #[test]
+    fn a_skipped_ungoverned_duplicate_stays_visible() {
+        let mut routes = vec![
+            route("GET", "/a", "list_a", "m", true, None),
+            route("POST", "/b", "wipe_b", "m", true, None),
+        ];
+        routes[1].operation_id = "list_a";
+        dedupe_mcp_tool_names(&mut routes);
+        let manifest = AgentAuthorityManifest::from_parts(&[], &[], &routes, true);
+        assert_eq!(manifest.skipped_duplicate_tools.len(), 1);
+        let skipped = &manifest.skipped_duplicate_tools[0];
+        assert_eq!(skipped.tool, "list_a");
+        assert_eq!(skipped.handler, "wipe_b");
+        assert_eq!(skipped.path, "/b");
+        assert!(manifest.summary().contains(DUPLICATE_OPERATION_ID));
     }
 
     #[test]

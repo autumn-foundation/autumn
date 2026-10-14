@@ -1215,20 +1215,32 @@ impl Analyzer {
         // A block scopes the names its own `let`s introduce, but not an
         // assignment it makes to an outer name. Restore exactly the declared
         // names.
+        // A `use` in this block ends with it. So does a local `fn`, whose name
+        // covers the whole block, so it hides an import before its own line.
+        let imports = self.tokio_imports.clone();
+        for stmt in &block.stmts {
+            if let Stmt::Item(syn::Item::Fn(item)) = stmt {
+                self.tokio_imports.remove(&item.sig.ident.to_string());
+            }
+        }
+        // Save a name when its `let` is reached, not at block entry: an
+        // assignment made before the shadow belongs to the outer name.
+        let mut outer: Vec<Shadow> = Vec::new();
         let mut declared = HashSet::new();
         for stmt in &block.stmts {
             if let Stmt::Local(local) = stmt {
-                collect_pat_idents(&local.pat, &mut declared);
+                let mut names = HashSet::new();
+                collect_pat_idents(&local.pat, &mut names);
+                for name in names {
+                    if declared.insert(name.clone()) {
+                        outer.push(self.shadow(&name));
+                    }
+                }
             }
-        }
-        let outer: Vec<Shadow> = declared.iter().map(|name| self.shadow(name)).collect();
-        // A `use` in this block ends with it.
-        let imports = self.tokio_imports.clone();
-        for stmt in &block.stmts {
             self.stmt(stmt);
         }
         self.tokio_imports = imports;
-        for saved in outer {
+        for saved in outer.into_iter().rev() {
             self.unshadow(saved);
         }
     }
@@ -1290,6 +1302,12 @@ impl Analyzer {
     /// analysis can see.
     fn nested_item(&mut self, item: &syn::Item) {
         if let syn::Item::Use(import) = item {
+            // Any imported name hides an earlier import of the same name.
+            let mut names = HashSet::new();
+            use_leaf_names(&import.tree, &mut names);
+            for name in &names {
+                self.tokio_imports.remove(name);
+            }
             tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
             return;
         }
@@ -3307,6 +3325,25 @@ const TOKIO_INERT_IMPORTS: &[&str] = &[
     "tokio::time::timeout",
     "tokio::task::yield_now",
 ];
+
+/// Every name a `use` tree binds, whatever its source.
+fn use_leaf_names(tree: &syn::UseTree, out: &mut HashSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) => use_leaf_names(&path.tree, out),
+        syn::UseTree::Name(name) => {
+            out.insert(name.ident.to_string());
+        }
+        syn::UseTree::Rename(rename) => {
+            out.insert(rename.rename.to_string());
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                use_leaf_names(item, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
 
 /// Collect the names a `use` brings in from `tokio::time` / `tokio::task`.
 fn tokio_inert_imports(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut HashSet<String>) {
@@ -6265,6 +6302,40 @@ mod tests {
             r"async fn h(d: Duration) -> R {
                 { use tokio::time::sleep; sleep(d).await; }
                 sleep(d).await;
+                Ok(())
+            }",
+        ),
+        (
+            "future assigned before an inner shadow in the same block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut;
+                { fut = start_finance_job(); let fut = 0; }
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import shadowed by a local function",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                {
+                    async fn sleep(d: Duration) { start_finance_job().await; }
+                    sleep(d).await;
+                }
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import shadowed by another use",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                { use crate::jobs::sleep; sleep(d).await; }
                 Ok(())
             }",
         ),
