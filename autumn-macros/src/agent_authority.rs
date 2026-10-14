@@ -1748,6 +1748,13 @@ impl Analyzer {
     /// Is this a call whose awaited effect the analysis has not read?
     fn is_unread_call(&self, expr: &Expr) -> bool {
         match strip_transparent(expr) {
+            // `(|| start())()` yields what the closure body yields.
+            Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
+                immediately_invoked_closure(&call.func)
+                    .is_some_and(|closure| self.is_unread_call(&closure.body))
+            }
+            // `async { start() }.await` yields what the block's tail yields.
+            Expr::Async(a) => self.block_tail_is_unread(&a.block),
             head @ (Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_) | Expr::Path(_)) => {
                 !self.awaited_is_readable(head)
             }
@@ -1963,9 +1970,7 @@ impl Analyzer {
                     saved.extend(self.enter_binding_scope(param, handle.as_ref()));
                     // The parameter holds what the argument held.
                     self.mark_pattern_unread(param, arg);
-                    if let Pat::Ident(ident) = param {
-                        self.bind_callable(&ident.ident.to_string(), arg);
-                    }
+                    self.bind_pattern_callables(param, arg);
                 }
                 for param in closure.inputs.iter().skip(call.args.len()) {
                     saved.extend(self.enter_binding_scope(param, None));
@@ -7351,6 +7356,35 @@ mod tests {
                 let mut f = std::convert::identity(AllowedJob::enqueue);
                 if c { f = ForbiddenJob::enqueue; }
                 f(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias passed to a destructured closure parameter",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                (|(run,)| run(async {}))((tokio::spawn,));
+                Ok(())
+            }",
+        ),
+        (
+            "unread future yielded by an awaited async block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = async { start_finance_job() }.await;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned by an invoked closure",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = (|| start_finance_job())();
+                fut.await?;
                 Ok(())
             }",
         ),
