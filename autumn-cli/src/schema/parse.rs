@@ -434,6 +434,9 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
                 let Some(ident) = field.ident.as_ref() else {
                     continue;
                 };
+                if !production_enabled(&field.attrs) {
+                    continue;
+                }
                 if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
                     self.found.entry(table.clone()).or_default().insert(
                         field_column_name(field, ident),
@@ -506,19 +509,22 @@ pub fn disabled_module_paths(file: &Path, src: &str) -> Vec<std::path::PathBuf> 
     let mut out = Vec::new();
     collect_disabled_modules(
         &parsed.items,
-        &module_dir,
+        (&module_dir, parent),
         !production_enabled(&parsed.attrs),
         &mut out,
     );
     out
 }
 
+/// `dirs` is the directory that holds module files, and the base a `#[path]`
+/// attribute resolves against.
 fn collect_disabled_modules(
     items: &[syn::Item],
-    dir: &Path,
+    dirs: (&Path, &Path),
     parent_disabled: bool,
     out: &mut Vec<std::path::PathBuf>,
 ) {
+    let (dir, path_base) = dirs;
     for item in items {
         let syn::Item::Mod(module) = item else {
             continue;
@@ -527,12 +533,30 @@ fn collect_disabled_modules(
         let disabled = parent_disabled || !production_enabled(&module.attrs);
         match &module.content {
             None if disabled => {
+                let custom = module
+                    .attrs
+                    .iter()
+                    .filter(|a| a.path().is_ident("path"))
+                    .find_map(|a| match &a.meta {
+                        syn::Meta::NameValue(nv) => match &nv.value {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(path),
+                                ..
+                            }) => Some(path.value()),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                if let Some(custom) = custom {
+                    out.push(path_base.join(custom));
+                }
                 out.push(dir.join(format!("{name}.rs")));
                 out.push(dir.join(&name));
             }
             None => {}
             Some((_, nested)) => {
-                collect_disabled_modules(nested, &dir.join(&name), disabled, out);
+                let nested_dir = dir.join(&name);
+                collect_disabled_modules(nested, (&nested_dir, &nested_dir), disabled, out);
             }
         }
     }
@@ -2379,6 +2403,47 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("tests").join("fixtures.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A `#[cfg]` on a field turns that field off; the other alternative wins.
+    #[test]
+    fn encrypted_columns_ignore_cfg_disabled_fields() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct User {
+                #[id] pub id: i64,
+                #[cfg(not(test))] #[encrypted(deterministic)] pub email: String,
+                #[cfg(test)] #[encrypted] pub email: String,
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// `#[path]` moves a disabled module's file.
+    #[test]
+    fn encrypted_columns_skip_a_path_override_of_a_disabled_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"fixtures/special.rs\"] mod tests;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("special.rs"),
             "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
         )
         .unwrap();

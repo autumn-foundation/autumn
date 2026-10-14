@@ -2338,10 +2338,22 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
             syn::Item::Impl(i) => &i.attrs,
             syn::Item::Const(i) => &i.attrs,
             syn::Item::Static(i) => &i.attrs,
+            syn::Item::Trait(i) => &i.attrs,
             _ => &[],
         };
         if crate::schema::parse::production_enabled(attrs) {
             syn::visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        let attrs: &[syn::Attribute] = match item {
+            syn::TraitItem::Fn(i) => &i.attrs,
+            syn::TraitItem::Const(i) => &i.attrs,
+            _ => &[],
+        };
+        if crate::schema::parse::production_enabled(attrs) {
+            syn::visit::visit_trait_item(self, item);
         }
     }
 
@@ -2485,14 +2497,14 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 /// leaving the profile guard as the enforcement).
 fn same_database_in(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
     match (database_endpoint(a, env), database_endpoint(b, env)) {
-        (Some((hosts_a, port_a, name_a)), Some((hosts_b, port_b, name_b))) => {
-            port_a == port_b && name_a == name_b && hosts_a.iter().any(|h| hosts_b.contains(h))
+        (Some((ends_a, name_a)), Some((ends_b, name_b))) => {
+            name_a == name_b && ends_a.iter().any(|e| ends_b.contains(e))
         }
         _ => false,
     }
 }
 
-/// The hosts, port and database a URL reaches, resolved as libpq does.
+/// The `(host, port)` endpoints and database a URL reaches, resolved as libpq does.
 ///
 /// A hostless URL (`postgres:///db?host=/run/postgresql`) names its host in the
 /// `host` or `hostaddr` query parameter, else in `PGHOST`, else it uses the
@@ -2500,7 +2512,7 @@ fn same_database_in(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> b
 fn database_endpoint(
     raw: &str,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Option<(Vec<String>, u16, String)> {
+) -> Option<(Vec<(String, u16)>, String)> {
     let parsed = url::Url::parse(&without_userinfo(raw)).ok()?;
     let query = |key: &str| {
         parsed
@@ -2530,16 +2542,32 @@ fn database_endpoint(
         .or_else(|| query("hostaddr"))
         .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
         .unwrap_or_default();
-    let hosts: Vec<String> = host_list
+    let hosts = host_list
         .split(',')
-        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase())
-        .collect();
-    let port = parsed
+        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase());
+    // libpq pairs a port list with the host list by position, and one port
+    // applies to every host.
+    let ports: Vec<u16> = parsed
         .port()
-        .or_else(|| query("port").and_then(|p| p.split(',').next()?.parse().ok()))
-        .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()))
-        .unwrap_or(5432);
-    Some((hosts, port, name))
+        .map(|p| vec![p])
+        .or_else(|| {
+            query("port").map(|p| p.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+        })
+        .filter(|p: &Vec<u16>| !p.is_empty())
+        .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()).map(|p| vec![p]))
+        .unwrap_or_else(|| vec![5432]);
+    let endpoints = hosts
+        .enumerate()
+        .map(|(i, host)| {
+            let port = if ports.len() == 1 {
+                ports[0]
+            } else {
+                ports.get(i).copied().unwrap_or(5432)
+            };
+            (host, port)
+        })
+        .collect();
+    Some((endpoints, name))
 }
 
 /// `raw` with any `user:password@` removed. An empty host with credentials
@@ -9613,6 +9641,7 @@ mod tests {
 
         assert!(found(&format!("#[cfg(test)] mod tests {{ {} }}", reg("a"))).is_empty());
         assert!(found(&format!("#[cfg(test)] {}", reg("a"))).is_empty());
+        assert!(found(&format!("#[cfg(test)] trait T {{ {} }}", reg("a"))).is_empty());
         assert!(found(&format!("#![cfg(test)]\n{}", reg("a"))).is_empty());
         assert!(
             found(&format!(
@@ -9775,6 +9804,21 @@ mod tests {
             matches!(err, ScrubError::EncryptedEnvelopeTooLong { limit: 63, .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn libpq_pairs_a_port_list_with_the_host_list() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "postgres:///d?host=a,b&port=5432,6543",
+            "postgres://b:6543/d",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///d?host=a,b&port=5432,6543",
+            "postgres://b:5432/d",
+            &env
+        ));
     }
 
     #[test]
