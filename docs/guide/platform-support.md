@@ -47,9 +47,9 @@ LNK4318: Very long symbol name encountered while producing debug information
 LINK : fatal error LNK4319: A PDB limit was hit while adding public symbols
 ```
 
-It is a linker limit, not a code error. `autumn new` already scaffolds the fix
-in your `Cargo.toml` (default, `--api`, `--daemon`, `--bundled-pg`), for your
-app and for its dependencies:
+It is a linker limit, not a code error. `autumn new` already scaffolds two
+fixes (default, `--api`, `--daemon`, `--bundled-pg`). The first is a dev
+profile in `Cargo.toml`, for your app and for its dependencies:
 
 ```toml
 [profile.dev]
@@ -61,20 +61,23 @@ debug = "line-tables-only"
 
 `line-tables-only` keeps file and line in backtraces. It removes variable
 inspection in a debugger. To get full debug info back, set `debug = true` in
-both tables. If the build still fails, set `debug = 0` in both tables.
+both tables.
 
-Projects made with an older `autumn new` do not have these lines. Add them
-yourself. Autumn's `windows-tier1` CI job builds the scaffold as it is.
-
-Set it in the **manifest**. Do not use `CARGO_PROFILE_DEV_DEBUG`: Autumn's CI
-hit the limit again with that variable set. `[profile.dev.package."*"]` covers
-the dependencies. If you still hit LNK4319, add the linker's own fix:
+The second is the linker's own remedy, in `.cargo/config.toml`. It applies to
+Windows MSVC targets only:
 
 ```toml
-# .cargo/config.toml
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-Clink-arg=/DEBUG:LongSymbolTruncate"]
 ```
+
+Less debug info alone does not clear the limit: the public symbols stay in
+the PDB. Do not rely on `CARGO_PROFILE_DEV_DEBUG`. Autumn's CI hit the limit
+with that variable set. If the build still fails, set `debug = 0` in both
+profile tables.
+
+Projects made with an older `autumn new` do not have these files. Add them
+yourself. Autumn's `windows-tier1` CI job builds the scaffold as it is.
 
 ### Three other Windows details worth knowing
 

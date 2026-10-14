@@ -1,0 +1,7 @@
+# Windows PDB files cap public symbols (LNK4318, LNK4319). The linker
+# suggests this flag itself. It has no effect on other targets.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Clink-arg=/DEBUG:LongSymbolTruncate"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-Clink-arg=/DEBUG:LongSymbolTruncate"]
