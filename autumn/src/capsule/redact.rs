@@ -1457,9 +1457,10 @@ fn strip_leading_whitespace(mut bytes: &[u8]) -> &[u8] {
     loop {
         let width = match bytes.first() {
             Some(byte) if byte.is_ascii_whitespace() => 1,
+            // Decode one code point (4 bytes at most), not the whole suffix.
             Some(_) => match bytes
-                .utf8_chunks()
-                .next()
+                .get(..bytes.len().min(4))
+                .and_then(|window| window.utf8_chunks().next())
                 .and_then(|chunk| chunk.valid().chars().next().filter(|c| c.is_whitespace()))
             {
                 Some(space) => space.len_utf8(),
@@ -3202,6 +3203,23 @@ mod tests {
             &filter_with(&[]),
         );
         assert!(values.contains(b"secretvalue"), "real cookie after junk");
+    }
+
+    /// A long run of Unicode spaces after the scheme is trimmed in linear time.
+    #[test]
+    fn a_long_unicode_separator_run_is_trimmed_in_linear_time() {
+        let mut header = b"Bearer ".to_vec();
+        header.extend("\u{a0}".repeat(100_000).as_bytes());
+        header.extend_from_slice(b"hunter2secret");
+        let mut values = RedactedValues::default();
+        let started = std::time::Instant::now();
+        record_credential_components("authorization", &header, &mut values);
+        assert!(values.contains(b"hunter2secret"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "trimming took {:?}",
+            started.elapsed()
+        );
     }
 
     /// `Set-Cookie` holds one cookie, first. A malformed first segment must not
