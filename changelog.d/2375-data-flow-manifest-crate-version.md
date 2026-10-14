@@ -1,9 +1,10 @@
 ### Breaking Changes
 
-- **Breaking:** `model_path` in the data-flow manifest has the compatible
-  version of the defining crate, for example `shop::Customer@2::Customer`
-  ([migration guide](docs/migrations/next.md)). Make the manifest again, and
-  commit it.
+- **Breaking:** `model_path` in the data-flow manifest now includes the
+  compatible version of the defining crate, for example
+  `shop::Customer@2::Customer`
+  ([migration guide](docs/migrations/next.md)). Make the manifest again. Commit
+  it.
 
 ### Fixed
 

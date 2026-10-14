@@ -193,9 +193,9 @@ listing every sink it is proven reachable to:
 Rows are keyed on `model_path`, not the display name: two crates can each define
 a `Customer` with a classified `email`, and merging them into one row would hide
 one model's column behind the other's. The path has the compatible version of
-the defining crate (`@2` is major 2; `@0.8` is a crate before 1.0). Two
-incompatible versions of one crate can link into one binary, and they get
-separate rows. A patch release does not change the path. The report prints the
+the defining crate. `@2` means major version 2. `@0.8` means version 0.8 (a
+crate before 1.0). Two incompatible versions of one crate can link into one
+binary. They get separate rows. A patch release does not change the path. The report prints the
 short name unless two rows share it.
 
 An **empty `reachable_sinks` means no leak**: nothing in the binary declares a

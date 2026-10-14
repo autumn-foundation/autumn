@@ -5927,23 +5927,25 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
     }
 }
 
-/// The part of a crate version that decides whether two versions can link
-/// into one binary: the major, or `0.minor` before 1.0.
-fn compat_version(major: &str, minor: &str) -> String {
-    if major == "0" {
-        format!("0.{minor}")
-    } else {
-        major.to_string()
+/// The part of a crate version that must match for two versions to be
+/// compatible. It is the major version. Before 1.0 it is `0.minor`. Before 0.1
+/// it is `0.0.patch`.
+fn compat_version(major: &str, minor: &str, patch: &str) -> String {
+    match (major, minor) {
+        ("0", "0") => format!("0.0.{patch}"),
+        ("0", _) => format!("0.{minor}"),
+        _ => major.to_string(),
     }
 }
 
-/// [`compat_version`] of the crate being compiled. Cargo sets these variables
-/// for the defining crate, and the macro runs inside that compilation.
+/// [`compat_version`] of the crate in compilation. Cargo sets these variables
+/// for the defining crate. The macro runs in that compilation.
 fn classified_compat_version() -> String {
     let var = |name| std::env::var(name).unwrap_or_else(|_| "0".to_string());
     compat_version(
         &var("CARGO_PKG_VERSION_MAJOR"),
         &var("CARGO_PKG_VERSION_MINOR"),
+        &var("CARGO_PKG_VERSION_PATCH"),
     )
 }
 
@@ -9092,11 +9094,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 impl ::autumn_web::classify::ClassifiedField for #marker {
                     const MODEL: &'static str = stringify!(#name);
-                    // Module- and version-qualified, because the manifest keys
-                    // on this: two linked crates, or two incompatible versions
-                    // of one crate, can each define a `Customer` with a
-                    // classified `email`. A bare name or path would merge them
-                    // into one row.
+                    // The path has module and crate version. The manifest
+                    // keys on it. Two linked crates, or two incompatible
+                    // versions of one crate, can each define a `Customer`
+                    // with a classified `email`. A bare name or module path
+                    // would merge them into one row.
                     const MODEL_PATH: &'static str =
                         concat!(module_path!(), #compat_suffix, "::", stringify!(#name));
                     const FIELD: &'static str = #col;
@@ -16822,10 +16824,17 @@ mod tests {
         );
         assert!(
             generated.contains("module_path !"),
-            "the manifest identity must be module-qualified so two `Customer`s \
-             in different crates cannot share a row: {generated}"
+            "the manifest identity must have module path and crate version so \
+             two `Customer`s cannot share a row: {generated}"
         );
-        let version = classified_compat_version();
+        // This crate is the defining crate here, so its own version is the oracle.
+        let version = match (
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+        ) {
+            ("0", minor) => format!("0.{minor}"),
+            (major, _) => major.to_string(),
+        };
         assert_eq!(
             generated.matches(&format!("\"@{version}\"")).count(),
             2,
@@ -16839,12 +16848,14 @@ mod tests {
 
     #[test]
     fn compat_version_keeps_only_the_semver_incompatible_part() {
-        // A patch or compatible bump must not churn the manifest key.
-        assert_eq!(compat_version("2", "7"), "2");
-        assert_eq!(compat_version("1", "0"), "1");
+        // A patch or compatible bump must not change the manifest key.
+        assert_eq!(compat_version("2", "7", "3"), "2");
+        assert_eq!(compat_version("1", "0", "9"), "1");
         // Before 1.0 a minor bump is the breaking one.
-        assert_eq!(compat_version("0", "8"), "0.8");
-        assert_eq!(compat_version("0", "0"), "0.0");
+        assert_eq!(compat_version("0", "8", "4"), "0.8");
+        // Before 0.1 each patch release is incompatible.
+        assert_eq!(compat_version("0", "0", "1"), "0.0.1");
+        assert_eq!(compat_version("0", "0", "2"), "0.0.2");
     }
 
     #[test]

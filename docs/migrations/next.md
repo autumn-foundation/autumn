@@ -1292,7 +1292,7 @@ means to leave at their defaults.
 ### Data flow: manifest rows have a crate version in `model_path`
 
 **Why:** Two incompatible versions of one crate can link into one binary. They
-gave the same `model_path`, so `autumn data-flow` merged their rows (issue
+had the same `model_path`, so `autumn data-flow` merged their rows (issue
 #2375).
 
 **Before (`{X.Y}`):**
@@ -1309,7 +1309,7 @@ release does not change it.
 "model_path": "shop::models::customer@2::Customer"
 ```
 
-Make the manifest again, and commit it:
+Make the manifest again. Commit it:
 
 ```sh
 autumn data-flow --manifest data-flow-manifest.json
@@ -1318,6 +1318,9 @@ autumn data-flow --manifest data-flow-manifest.json
 Until you do, `autumn data-flow --check` reports drift for each row. The
 `model` name is not changed. The report shows the full path only when two rows
 have the same `model` name.
+
+The path changes again when the major version of your own crate changes (or the
+minor version, before 1.0). Make the manifest again after such a release.
 
 **Automation:** `manual` - make the manifest again with the command above.
 
