@@ -197,7 +197,7 @@ the defining crate. `@2` means major version 2. `@0.8` means version 0.8 (a
 crate before 1.0). Two incompatible versions of one crate can link into one
 binary. They get separate rows. A patch release does not change the path.
 A crate before 0.1 is the exception: its path has the patch (`@0.0.2`).
-A prerelease tag is also in the path (`@1-alpha.1`). The
+A prerelease has its full version in the path (`@1.0.0-alpha.1`). The
 report prints the short name unless two rows share it.
 
 An **empty `reachable_sinks` means no leak**: nothing in the binary declares a

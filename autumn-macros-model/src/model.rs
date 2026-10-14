@@ -5929,18 +5929,14 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
 
 /// The part of a crate version that must match for two versions to be
 /// compatible. It is the major version. Before 1.0 it is `0.minor`. Before 0.1
-/// it is `0.0.patch`. A prerelease tag is part of it, because Cargo does not
-/// match one prerelease with another.
+/// it is `0.0.patch`. A prerelease matches only the same exact version, so it
+/// is the full version.
 fn compat_version(major: &str, minor: &str, patch: &str, pre: &str) -> String {
-    let base = match (major, minor) {
+    match (major, minor) {
+        _ if !pre.is_empty() => format!("{major}.{minor}.{patch}-{pre}"),
         ("0", "0") => format!("0.0.{patch}"),
         ("0", _) => format!("0.{minor}"),
         _ => major.to_string(),
-    };
-    if pre.is_empty() {
-        base
-    } else {
-        format!("{base}-{pre}")
     }
 }
 
@@ -16864,10 +16860,11 @@ mod tests {
         // Before 0.1 each patch release is incompatible.
         assert_eq!(compat_version("0", "0", "1", ""), "0.0.1");
         assert_eq!(compat_version("0", "0", "2", ""), "0.0.2");
-        // Cargo does not match one prerelease with another.
-        assert_eq!(compat_version("1", "0", "0", "alpha.1"), "1-alpha.1");
-        assert_eq!(compat_version("1", "0", "0", "beta.1"), "1-beta.1");
-        assert_eq!(compat_version("0", "8", "0", "rc.1"), "0.8-rc.1");
+        // Cargo matches a prerelease only with the same exact version.
+        assert_eq!(compat_version("1", "0", "0", "alpha.1"), "1.0.0-alpha.1");
+        assert_eq!(compat_version("1", "0", "0", "beta.1"), "1.0.0-beta.1");
+        assert_eq!(compat_version("1", "1", "0", "alpha.1"), "1.1.0-alpha.1");
+        assert_eq!(compat_version("0", "8", "0", "rc.1"), "0.8.0-rc.1");
     }
 
     #[test]

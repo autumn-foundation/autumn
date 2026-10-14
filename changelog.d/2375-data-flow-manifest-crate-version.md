@@ -11,4 +11,4 @@
 - **data-flow:** two incompatible versions of one crate in one binary no longer
   merge into one manifest row (issue #2375). A patch release does not change
   the key, except for a crate before 0.1
-  and a prerelease tag.
+  and a prerelease.
