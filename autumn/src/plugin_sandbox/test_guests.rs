@@ -3364,9 +3364,9 @@ pub fn empty_iovecs(iovecs: u32, calls: u32) -> String {
 /// A guest that writes `pad` JSON-whitespace bytes, then answers honestly.
 ///
 /// The pad and the frame share one stdout line, so the host parser must scan
-/// every pad byte. Two modules from this function differ in one `i32.const`
-/// (`pad`): guest instruction counts match, so the whole `fuel_used` gap is
-/// host work. `pad` must not exceed 65536 (the size of the data segment).
+/// every pad byte. Two modules that differ only in `pad` run the same guest
+/// instructions. The `fuel_used` gap is therefore host work. `pad` must not
+/// exceed 65536 (the size of the data segment).
 #[must_use]
 pub fn padded_frame(pad: u32) -> String {
     let spaces = " ".repeat(65536);

@@ -14,7 +14,7 @@
 //! | Import | Behaviour |
 //! | --- | --- |
 //! | `fd_read` (fd 0) | the next bytes of the request frame |
-//! | `fd_write` (fd 1) | the response frame, one NDJSON line |
+//! | `fd_write` (fd 1) | the response frame, one NDJSON line (charged per byte parsed) |
 //! | `fd_write` (fd 2) | captured as diagnostics, surfaced in the failure detail |
 //! | `random_get` | a fixed-seed PRNG — entropy is not authority, but it is not ambient either |
 //! | `clock_time_get` | a fixed instant |
@@ -3970,8 +3970,8 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                         charge_bytes(&mut caller, take)?;
                         if fd == 1 {
                             // The line parser inspects each stdout byte, so
-                            // add the per-byte rate to the copy rate. Bytes
-                            // never parsed are over-charged: the safe side.
+                            // add the per-byte rate to the copy rate. The host
+                            // may charge for bytes it never parses. This is safe.
                             charge_units(&mut caller, u64::try_from(take).unwrap_or(u64::MAX))?;
                         }
                         let mut scratch = vec![0u8; take];
@@ -4613,13 +4613,13 @@ path = "/hello/greet"
         // costs the host one step per byte. The copy charge alone is one unit per
         // 64 bytes. The two modules differ in one `i32.const` (the pad length), so
         // the whole `fuel_used` gap is host work. Copy only: about 1,025 units.
-        // Copy plus parse: about 66,561. The bound separates them without pinning
-        // either rate.
+        // Copy plus parse: about 66,561. The bound tells them apart.
+        // It does not fix either rate.
         const PAD: u32 = 65_536;
 
         let padded = host(&guests::padded_frame(PAD)).run(&get("/hello/greet"));
         let plain = host(&guests::padded_frame(0)).run(&get("/hello/greet"));
-        // 200 proves the parser scanned the padding instead of rejecting it.
+        // The padded frame was accepted, so the gap is not an early-exit artifact.
         assert!(padded.result.is_ok(), "{:?}", padded.result);
         assert!(plain.result.is_ok(), "{:?}", plain.result);
 
