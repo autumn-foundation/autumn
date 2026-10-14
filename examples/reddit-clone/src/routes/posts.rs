@@ -597,6 +597,11 @@ fn submit_form_markup(
     }
 }
 
+/// A tag's name without a leading `#`. Older rows kept the `#` the author typed.
+fn tag_label(tag: &Tag) -> &str {
+    tag.name.trim_start_matches('#').trim_start()
+}
+
 /// Render tag chips. Show `name`, the spelling the author typed.
 /// The `slug` is a URL key only. For a name with no Latin text, it is a hash.
 fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
@@ -604,7 +609,7 @@ fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
         div class="flex flex-wrap gap-2 mt-3" {
             @for tag in tags {
                 span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
-                    "#" (tag.name)
+                    "#" (tag_label(tag))
                 }
             }
         }
@@ -615,7 +620,7 @@ fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
 /// A re-save then keeps the author's spelling.
 fn tag_input_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
     tags.into_iter()
-        .map(|tag| tag.name.as_str())
+        .map(tag_label)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1803,6 +1808,15 @@ mod tests {
         assert!(out.contains("#日本語"), "{out}");
         assert!(out.contains("#Web Dev"), "{out}");
         assert!(!out.contains("n1a3b86"), "{out}");
+    }
+
+    #[test]
+    fn a_stored_name_with_a_hash_prefix_shows_one_hash() {
+        // Older rows kept the `#` the author typed.
+        let old = [tag("#rust", "rust")];
+        let out = tag_chips(&old).into_string();
+        assert!(out.contains("#rust") && !out.contains("##"), "{out}");
+        assert_eq!(tag_input_value(&old), "rust");
     }
 
     #[test]
