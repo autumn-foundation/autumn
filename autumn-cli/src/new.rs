@@ -2039,15 +2039,30 @@ mod tests {
         }
     }
 
-    /// Windows PDBs cap public symbols (LNK4319, issue #2448). Every shape
-    /// must scaffold a reduced dev profile in the manifest, for the project
-    /// and for its dependencies.
+    /// Windows PDB files cap public symbols (LNK4319, issue #2448). Every
+    /// starter shape must set a reduced dev profile, for the app and for its
+    /// dependencies.
     #[test]
-    fn every_starter_shape_scaffolds_reduced_dev_debug_info() {
+    fn every_generated_shape_scaffolds_reduced_dev_debug_info() {
         let shapes = [
             ("shape-default", GenerateOptions::default()),
             ("shape-bundled", bundled_pg_opts()),
             ("shape-daemon", daemon_opts()),
+            (
+                "shape-seed",
+                GenerateOptions {
+                    with_seed: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+            (
+                "shape-api-i18n",
+                GenerateOptions {
+                    with_api: true,
+                    with_i18n: true,
+                    ..GenerateOptions::default()
+                },
+            ),
             (
                 "shape-api",
                 GenerateOptions {
@@ -2061,7 +2076,10 @@ mod tests {
             generate_with(name, tmp.path(), opts).unwrap();
             let raw = fs::read_to_string(tmp.path().join(name).join("Cargo.toml")).unwrap();
             let doc: toml::Table = raw.parse().unwrap();
-            let dev = &doc["profile"]["dev"];
+            let dev = doc
+                .get("profile")
+                .and_then(|p| p.get("dev"))
+                .unwrap_or_else(|| panic!("{name}: no [profile.dev]: {raw}"));
             assert_eq!(
                 dev["debug"].as_str(),
                 Some("line-tables-only"),

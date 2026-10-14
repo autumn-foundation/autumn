@@ -25,8 +25,10 @@ embed-assets = ["autumn-web/embed-assets"]
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [profile.dev]
-# Windows PDBs cap public symbols (LNK4319). Keep file/line only, for the app
-# and its dependencies. Set it here: CARGO_PROFILE_DEV_DEBUG was not reliable.
+# Windows PDB files cap public symbols (LNK4319). Keep only file and line
+# info, for the app and for its dependencies. Set it here. The
+# CARGO_PROFILE_DEV_DEBUG variable did not work reliably.
+# Use debug = true for full debug info on Linux or macOS.
 debug = "line-tables-only"
 
 [profile.dev.package."*"]

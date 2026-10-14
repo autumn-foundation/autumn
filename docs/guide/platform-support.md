@@ -48,7 +48,8 @@ LINK : fatal error LNK4319: A PDB limit was hit while adding public symbols
 ```
 
 It is a linker limit, not a code error. `autumn new` already scaffolds the fix
-in your `Cargo.toml`, for your app and for its dependencies:
+in your `Cargo.toml` (default, `--api`, `--daemon`, `--bundled-pg`), for your
+app and for its dependencies:
 
 ```toml
 [profile.dev]
@@ -59,15 +60,13 @@ debug = "line-tables-only"
 ```
 
 `line-tables-only` keeps backtraces useful (file and line, no variable
-inspection) at a fraction of the symbol count. Use `0` if that is still too
-much. If you made your project before this change, add the lines yourself.
-Autumn's own `windows-tier1` CI job builds with `debug = 0` for this reason.
+inspection; use `debug = true` to get it back) at a fraction of the symbol count. Use `0` if that is still too
+much. Projects made with an older `autumn new` do not have these lines. Add them
+yourself. Autumn's `windows-tier1` CI job builds the scaffold as it is.
 
-Set it in the **manifest**, not via `CARGO_PROFILE_DEV_DEBUG`. That environment
-variable does drop debug info, but autumn's CI hit the limit again with it set,
-so the manifest profile — plus `[profile.dev.package."*"]` to cover
-dependencies explicitly — is the reliable spelling. If you still hit LNK4319,
-add the linker's own remedy:
+Set it in the **manifest**. Do not use `CARGO_PROFILE_DEV_DEBUG`: Autumn's CI
+hit the limit again with that variable set. `[profile.dev.package."*"]` covers
+the dependencies. If you still hit LNK4319, add the linker's own fix:
 
 ```toml
 # .cargo/config.toml
