@@ -237,14 +237,21 @@ enum Step<T> {
 }
 
 /// Run `step`, unless `deadline` passes first. A shutdown does not stop it:
-/// the connection is accepted, so its request must be served.
+/// the connection is accepted, so its request must be served. But after a
+/// shutdown, `step` gets only `FRESH_GRACE` more, so a stuck one cannot hang
+/// the drain.
 async fn race_step<T>(
     step: impl std::future::Future<Output = T>,
     deadline: Option<Instant>,
+    shutdown: &watch::Sender<()>,
 ) -> Step<T> {
     tokio::select! {
         value = step => Step::Done(value),
         () = sleep_until(deadline) => Step::TimedOut,
+        () = async {
+            shutdown.closed().await;
+            tokio::time::sleep(FRESH_GRACE).await;
+        } => Step::TimedOut,
     }
 }
 
@@ -319,14 +326,14 @@ where
             .has_timers()
             .then(|| Arc::new(ConnTimers::new(&limits)));
         let head = timers.as_ref().and_then(|t| t.deadline(None));
-        let Step::Done(_) = race_step(make_service.ready(), head).await else {
+        let Step::Done(_) = race_step(make_service.ready(), head, &signal_tx).await else {
             continue;
         };
         let call = make_service.call(IncomingStream {
             io: &io,
             remote_addr,
         });
-        let Step::Done(service) = race_step(call, head).await else {
+        let Step::Done(service) = race_step(call, head, &signal_tx).await else {
             continue;
         };
         let service = service.unwrap_or_else(|err| match err {});
@@ -1717,6 +1724,35 @@ mod tests {
     }
 
     /// A fresh connection that never sends must not hold the drain open.
+    /// A stuck make-service must not hang the drain.
+    #[tokio::test]
+    async fn a_stuck_make_service_does_not_hang_the_drain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let stuck = tower::service_fn(
+            |_: IncomingStream<
+                '_,
+                crate::accept_drain::StopAcceptingOnShutdown<tokio::net::TcpListener>,
+            >| { std::future::pending::<Result<axum::Router, Infallible>>() },
+        );
+        let task = tokio::spawn(serve(
+            crate::accept_drain::StopAcceptingOnShutdown::new(listener, stop.clone()),
+            stuck,
+            HttpLimits::default(),
+            crate::accept_drain::drain_signal(stop.clone()),
+        ));
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        let done = tokio::time::timeout(Duration::from_secs(3), task).await;
+        done.expect("the drain must end")
+            .expect("task")
+            .expect("serve");
+    }
+
     #[tokio::test]
     async fn a_silent_fresh_connection_does_not_hold_the_drain() {
         let (addr, stop, task) = serve_for_test().await;
