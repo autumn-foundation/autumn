@@ -909,6 +909,9 @@ struct Analyzer {
     /// Names a `use` in the handler imported from `tokio::time` / `tokio::task`.
     /// A `use` lasts until the end of its block.
     tokio_imports: HashSet<String>,
+    /// Macro names the handler defines or imports. They are never read as the
+    /// standard macro of that name. The set is handler-wide.
+    shadowed_macros: HashSet<String>,
 }
 
 /// All state of one name except `handles`. A scope saves it when it shadows
@@ -993,6 +996,7 @@ impl Analyzer {
             tables: HashMap::new(),
             // The `tokio` crate is in scope until a name hides it.
             tokio_imports: HashSet::from(["tokio".to_string()]),
+            shadowed_macros: HashSet::new(),
             effects: Vec::new(),
             seen: HashSet::new(),
             effect_free_sites: Vec::new(),
@@ -1120,6 +1124,10 @@ impl Analyzer {
         if name != "tokio" {
             self.tokio_imports.remove(&name.to_string());
         }
+    }
+
+    fn hide_crate(&mut self, name: &syn::Ident) {
+        self.tokio_imports.remove(&name.to_string());
     }
 
     /// Remove all state of a name except its handle.
@@ -1265,6 +1273,13 @@ impl Analyzer {
                 Stmt::Item(syn::Item::Fn(item)) => self.hide_import(&item.sig.ident),
                 Stmt::Item(syn::Item::Const(item)) => self.hide_import(&item.ident),
                 Stmt::Item(syn::Item::Static(item)) => self.hide_import(&item.ident),
+                // A type-namespace item hides the crate path as well.
+                Stmt::Item(syn::Item::Mod(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Struct(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Enum(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Union(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Trait(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Type(item)) => self.hide_crate(&item.ident),
                 // A `use` also covers the whole block, whatever its line.
                 Stmt::Item(item @ syn::Item::Use(_)) => self.nested_item(item),
                 _ => {}
@@ -1355,6 +1370,7 @@ impl Analyzer {
             for name in &names {
                 self.tokio_imports.remove(name);
             }
+            self.shadowed_macros.extend(names);
             tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
             return;
         }
@@ -1363,6 +1379,9 @@ impl Analyzer {
         };
         if !m.mac.path.is_ident("macro_rules") {
             return;
+        }
+        if let Some(name) = &m.ident {
+            self.shadowed_macros.insert(name.to_string());
         }
         if !self.tokens_mention_handle(&m.mac.tokens) {
             return;
@@ -1428,6 +1447,7 @@ impl Analyzer {
             for name in &names {
                 self.forget(name);
             }
+            self.mark_pattern_unread(pat, &init.expr);
         }
         if let Pat::Ident(ident) = pat {
             let name = ident.ident.to_string();
@@ -1627,7 +1647,40 @@ impl Analyzer {
             return Vec::new();
         };
         let handle = self.container_handle(&l.expr);
-        self.enter_binding_scope(&l.pat, handle.as_ref())
+        let saved = self.enter_binding_scope(&l.pat, handle.as_ref());
+        self.mark_pattern_unread(&l.pat, &l.expr);
+        saved
+    }
+
+    /// A pattern bound from an expression that holds an unread future may
+    /// bind that future: `if let Some(fut) = Some(start())`.
+    fn mark_pattern_unread(&mut self, pat: &Pat, source: &Expr) {
+        if !self.carries_unread(source) {
+            return;
+        }
+        let mut names = HashSet::new();
+        collect_pat_idents(pat, &mut names);
+        self.unread_futures.extend(names);
+    }
+
+    /// Does this expression hold an unread future, directly or inside a
+    /// constructor, tuple, array or reference?
+    fn carries_unread(&self, expr: &Expr) -> bool {
+        if self.is_unread_call(expr) {
+            return true;
+        }
+        match strip_transparent(expr) {
+            Expr::Call(call) => call.args.iter().any(|arg| self.carries_unread(arg)),
+            Expr::MethodCall(mc) => {
+                self.carries_unread(&mc.receiver)
+                    || mc.args.iter().any(|arg| self.carries_unread(arg))
+            }
+            Expr::Tuple(t) => t.elems.iter().any(|e| self.carries_unread(e)),
+            Expr::Array(a) => a.elems.iter().any(|e| self.carries_unread(e)),
+            Expr::Reference(r) => self.carries_unread(&r.expr),
+            Expr::Struct(s) => s.fields.iter().any(|f| self.carries_unread(&f.expr)),
+            _ => false,
+        }
     }
 
     fn enter_binding_scope(&mut self, pat: &Pat, handle: Option<&Handle>) -> Vec<Shadow> {
@@ -1760,6 +1813,7 @@ impl Analyzer {
                 let before = self.bindings();
                 let handle = self.container_handle(&f.expr);
                 let saved = self.enter_binding_scope(&f.pat, handle.as_ref());
+                self.mark_pattern_unread(&f.pat, &f.expr);
                 self.block(&f.body);
                 self.leave_binding_scope(saved);
                 self.join_with(before);
@@ -1809,6 +1863,7 @@ impl Analyzer {
                     self.set_bindings(before.clone());
                     let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
                     let saved = self.enter_binding_scope(pat, scrutinee.as_ref());
+                    self.mark_pattern_unread(pat, &m.expr);
                     if let Some(guard) = guard {
                         self.expr(guard);
                     }
@@ -2557,7 +2612,10 @@ impl Analyzer {
     /// Can the analysis read this macro? A macro naming a handle is already refused.
     fn macro_is_readable(&self, mac: &syn::Macro) -> bool {
         let name = mac.path.segments.last().map(|s| s.ident.to_string());
-        let inert = name.is_some_and(|name| INERT_MACROS.contains(&name.as_str()))
+        let inert = name
+            .as_ref()
+            .is_some_and(|name| !self.shadowed_macros.contains(name))
+            && name.is_some_and(|name| INERT_MACROS.contains(&name.as_str()))
             && !tokens_contain_await(&mac.tokens);
         inert || self.tokens_mention_handle(&mac.tokens)
     }
@@ -2565,12 +2623,10 @@ impl Analyzer {
     /// Macros that only build a value. Expression position may use them when
     /// no token awaits or spawns.
     fn expr_macro_is_readable(&self, mac: &syn::Macro) -> bool {
-        let pure = mac
-            .path
-            .segments
-            .last()
-            .is_some_and(|s| PURE_VALUE_MACROS.contains(&s.ident.to_string().as_str()))
-            && !tokens_contain_await(&mac.tokens)
+        let pure = mac.path.segments.last().is_some_and(|s| {
+            let name = s.ident.to_string();
+            PURE_VALUE_MACROS.contains(&name.as_str()) && !self.shadowed_macros.contains(&name)
+        }) && !tokens_contain_await(&mac.tokens)
             && !tokens_contain_spawn(&mac.tokens);
         pure || self.macro_is_readable(mac)
     }
@@ -6606,6 +6662,35 @@ mod tests {
                 db.tx(cb).await?;
                 Ok(())
             }"#,
+        ),
+        (
+            "pure macro name shadowed by a local macro",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                macro_rules! format { () => { tokio::spawn(async {}) }; }
+                let _task = format!();
+                Ok(())
+            }",
+        ),
+        (
+            "unread future bound by an if let pattern",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                if let Some(fut) = Some(start_finance_job()) { fut.await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "tokio path hidden by a local module",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                tokio::time::sleep(d).await;
+                mod tokio { pub mod time { pub async fn sleep(d: Duration) { start_finance_job().await; } } }
+                Ok(())
+            }",
         ),
         (
             "#[agent_effect] with a blank reason",
