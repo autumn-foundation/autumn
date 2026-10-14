@@ -7476,7 +7476,8 @@ pub struct AcmeDoctorConfig {
     /// the server won't boot, but doctor previously `filter_map`ped non-strings
     /// away — keeping the valid names and passing while the server rejects the
     /// config. Recorded here so the grader surfaces it as an `acme_config` FAIL.
-    /// `None` when every entry is a string (or `domains` is absent).
+    /// Also set when `domains` is not a list. `None` when every entry is a
+    /// string (or `domains` is absent).
     pub domains_error: Option<String>,
     /// The rendered invalid `acme.renew_before_days` value when the key is
     /// PRESENT but does not deserialize as a `u32` the way the runtime's typed
@@ -7913,14 +7914,19 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
 /// This grader returns a `Fail` [`CheckResult`] for the first violated rule
 /// (messages mirror the runtime's), or `None` when the ACME config is valid.
 ///
-/// The recorded deserialize errors on `config` — [`domains_error`],
-/// [`directory_error`], [`port_error`] and [`renew_before_days_error`] — are
-/// checked FIRST, because the runtime DESERIALIZES `AcmeConfig` (failing on a
-/// non-string `domains` entry, a bad `directory`, or an out-of-range /
-/// non-integer `http_challenge_port` / `renew_before_days`) before it ever runs
+/// The recorded deserialize errors on `config` — [`section_error`],
+/// [`domains_error`], [`directory_error`], [`port_error`],
+/// [`renew_before_days_error`], [`cache_dir_error`] and [`contact_email_error`] —
+/// are checked FIRST, because the runtime DESERIALIZES `AcmeConfig` (failing on a
+/// non-table `acme`, a non-list or non-string `domains`, a bad `directory`, a
+/// non-string `cache_dir` / `contact_email`, or an out-of-range / non-integer
+/// `http_challenge_port` / `renew_before_days`) before it ever runs
 /// `validate()`. Each one is a rendered invalid value the operator wrote, so the
 /// FAIL can name it.
 ///
+/// [`section_error`]: AcmeDoctorConfig::section_error
+/// [`cache_dir_error`]: AcmeDoctorConfig::cache_dir_error
+/// [`contact_email_error`]: AcmeDoctorConfig::contact_email_error
 /// [`domains_error`]: AcmeDoctorConfig::domains_error
 /// [`directory_error`]: AcmeDoctorConfig::directory_error
 /// [`port_error`]: AcmeDoctorConfig::port_error
