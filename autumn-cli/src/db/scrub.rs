@@ -580,17 +580,17 @@ impl std::fmt::Display for ScrubError {
             ),
             Self::IndexOperandColumn { column, kind } => write!(
                 f,
-                "{column:?} is an operand of {kind}, so no per-row value can be shown to \
-                 keep that constraint satisfied (a value unique on its own can still \
-                 collide once the expression or predicate is applied).\n  \
+                "{column:?} is an operand of {kind}. No per-row value can be shown to keep \
+                 that constraint true: a value that is unique alone can still collide \
+                 after the expression or predicate.\n  \
                  Declare the column `safe` if it holds no free-form PII, or drop the \
                  constraint on the copy before scrubbing."
             ),
             Self::SchemaChanged { entries } => write!(
                 f,
-                "The schema changed while the scrub was running:\n{}\n  \
-                 The plan was built from an earlier snapshot and may not cover every \
-                 column now. Nothing was written. Re-run the command.",
+                "The schema changed while the scrub ran:\n{}\n  \
+                 The plan used an earlier snapshot and may not cover every column. \
+                 Nothing was written. Run the command again.",
                 bullet_list(entries),
             ),
             Self::EncryptionKeyUnavailable { profile, detail } => write!(
@@ -606,7 +606,7 @@ impl std::fmt::Display for ScrubError {
                 f,
                 "No `src/` tree was found, so the scrub cannot tell which columns are \
                  #[encrypted].\n  \
-                 That matters more than it sounds: an unrecognised encrypted column declared \
+                 This matters: an unrecognised encrypted column declared \
                  `safe` keeps its production ciphertext, and one given a plaintext strategy \
                  becomes permanently unreadable. Run the scrub from the project root (where \
                  `src/` lives), or name them — with their mode — in {SCRUB_CONFIG_FILE}:\n    \
@@ -1485,9 +1485,10 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                 || (!anonymized && inputs.config.defaults.safe_columns.contains(&column.name));
 
             let (spec, source) =
-                if is_encrypted && is_key && declared_pii.is_none() && declared_safe {
-                    // A structural column is never rewritten, and re-encrypting it
-                    // is still a write. The declaration says the ciphertext stays.
+                if is_encrypted && is_key && declared_pii.is_none() && declared_safe_here {
+                    // Never rewrite a structural column. Re-encrypting it is a
+                    // write. Only a per-table `safe` entry keeps the ciphertext,
+                    // not a cross-table default.
                     continue;
                 } else if is_encrypted {
                     // An at-rest-encrypted column is never rewritten with a plain
@@ -2320,9 +2321,9 @@ fn scan_anonymize_source(src: &str) -> Result<(BTreeSet<String>, Vec<String>), S
 
 /// Whether the `#[cfg(...)]` attributes leave an item in a production build.
 ///
-/// Only `test` is known to be off. Every other predicate (a feature, a target)
-/// is unknown and counts as on: that keeps a registration the app might really
-/// have, and erring toward scrubbing is the safe direction.
+/// Only `test` is known to be off, and `not`, `all` and `any` combine it. Other
+/// predicates (a feature, a target) are unknown and count as on. This keeps a
+/// registration the app might have: scrubbing too much is the safe error.
 fn production_enabled(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().filter(|a| a.path().is_ident("cfg")).all(|a| {
         a.parse_args::<syn::Meta>()
@@ -2375,8 +2376,11 @@ fn cfg_value(meta: &syn::Meta) -> Option<bool> {
 struct AnonymizeScan {
     tables: BTreeSet<String>,
     unresolved: Vec<String>,
-    /// Out-of-line modules a `cfg` turns off.
+    /// Out-of-line modules a `cfg` turns off, declared at the file's top level.
+    /// A nested one lives in a path this scan does not resolve.
     disabled_modules: Vec<String>,
+    /// How many inline modules enclose the item being visited.
+    depth: usize,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
@@ -2392,12 +2396,16 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
         if !production_enabled(attrs) {
             if let syn::Item::Mod(module) = item
                 && module.content.is_none()
+                && self.depth == 0
             {
                 self.disabled_modules.push(module.ident.to_string());
             }
             return;
         }
+        let inline = matches!(item, syn::Item::Mod(m) if m.content.is_some());
+        self.depth += usize::from(inline);
         syn::visit::visit_item(self, item);
+        self.depth -= usize::from(inline);
     }
 
     fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
@@ -2573,11 +2581,6 @@ fn database_endpoint(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(Vec<String>, u16, String)> {
     let parsed = url::Url::parse(&without_userinfo(raw)).ok()?;
-    let name = parsed
-        .path_segments()
-        .and_then(|mut s| s.next())
-        .map(str::to_owned)
-        .filter(|n| !n.is_empty())?;
     let query = |key: &str| {
         parsed
             .query_pairs()
@@ -2585,6 +2588,17 @@ fn database_endpoint(
             .map(|(_, v)| v.into_owned())
             .filter(|v| !v.is_empty())
     };
+    let name = query("dbname").or_else(|| {
+        parsed
+            .path_segments()
+            .and_then(|mut s| s.next())
+            .map(|n| {
+                percent_encoding::percent_decode_str(n)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+            .filter(|n| !n.is_empty())
+    })?;
     let authority_host = parsed.host_str().filter(|h| !h.is_empty()).map(|h| {
         percent_encoding::percent_decode_str(h)
             .decode_utf8_lossy()
@@ -2706,26 +2720,30 @@ fn guard_configured_source(
         &profiles_with_config(project_root),
         destination_profile,
     );
-    let declared: Vec<(String, Vec<String>)> = candidates
-        .into_iter()
-        .filter_map(|profile| {
-            let table = migrate::read_autumn_toml_table_with_profile(Some(&profile));
-            let control = migrate::resolve_primary_database_url_from_sources(
-                |_| Err(std::env::VarError::NotPresent),
-                table.as_ref(),
-            );
-            let shards = migrate::try_resolve_shard_database_urls_from_sources(
-                |_| Err(std::env::VarError::NotPresent),
-                table.as_ref(),
-            )
-            .unwrap_or_default();
-            let urls: Vec<String> = control
-                .into_iter()
-                .chain(shards.into_iter().map(|(_, url)| url))
-                .collect();
-            (!urls.is_empty()).then_some((profile, urls))
-        })
-        .collect();
+    let mut declared: Vec<(String, Vec<String>)> = Vec::new();
+    for profile in candidates {
+        let table = migrate::read_autumn_toml_table_with_profile(Some(&profile));
+        let control = migrate::resolve_primary_database_url_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            table.as_ref(),
+        );
+        // A shard list that does not resolve cannot be compared. Refuse rather
+        // than treat it as "no shards".
+        let shards = migrate::try_resolve_shard_database_urls_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            table.as_ref(),
+        )
+        .map_err(|detail| ScrubError::SourceScan {
+            detail: format!("the {profile:?} profile's shard config: {detail}"),
+        })?;
+        let urls: Vec<String> = control
+            .into_iter()
+            .chain(shards.into_iter().map(|(_, url)| url))
+            .collect();
+        if !urls.is_empty() {
+            declared.push((profile, urls));
+        }
+    }
     match overwritten_source(&declared, targets, &|key| std::env::var(key).ok()) {
         Some((profile, database)) => {
             Err(ScrubError::OverwritesConfiguredTarget { profile, database })
@@ -2864,6 +2882,11 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         // Scrub only what the restore wrote. A partial artifact leaves the
         // other configured shards live, and they are not ours to anonymize.
         targets = restored_targets(targets, &restored_labels);
+        if targets.is_empty() {
+            return Err(ScrubError::SourceScan {
+                detail: "the restore reported no target it wrote to".to_owned(),
+            });
+        }
         true
     } else {
         false
@@ -4718,8 +4741,7 @@ const PUBLIC_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind IN ('r', 'p', 'f') AND att.attnum > 0 AND NOT att.attisdropped";
 
-/// What changed between two `(tables, columns)` snapshots, sorted.
-/// [`schema_drift`] between `snapshot` and the schema as the connection sees it.
+/// Compare `snapshot` with the schema this connection sees now.
 fn live_schema_drift(
     conn: &mut PgConnection,
     snapshot: (&BTreeSet<String>, &BTreeSet<(String, String)>),
@@ -4733,6 +4755,7 @@ fn live_schema_drift(
     Ok(schema_drift(snapshot, (&tables, &columns)))
 }
 
+/// List the tables and columns that differ between two snapshots, sorted.
 fn schema_drift(
     before: (&BTreeSet<String>, &BTreeSet<(String, String)>),
     after: (&BTreeSet<String>, &BTreeSet<(String, String)>),
@@ -4925,33 +4948,34 @@ fn probe_database_facts(
     //   on `group_id`, but rewriting `active` changes which rows the index
     //   COVERS — pulling previously-excluded duplicates into it.
     //
-    // `pg_depend` records both the expression- and the predicate-referenced
-    // columns, so one query covers them.
+    // Keep these in their own set, not in `unique_columns`. A strategy that is
+    // unique on the column value says nothing about an expression over it, so
+    // no strategy is allowed.
     //
-    // They get their own set, not a place in `unique_columns`: a strategy that
-    // is injective on the column's own value says nothing about an arbitrary
-    // expression over it, so no strategy is permitted on these.
-    //
-    // Plain key columns also appear in `pg_depend`, as `a` (auto); only the
-    // expression and predicate operands are `n` (normal).
+    // `pg_depend` cannot find them: a column that an expression or predicate
+    // reads is an auto dependency, like a plain key column. The stored node
+    // trees name each column as `varattno N`. Match on that, as
+    // `PARTITION_KEY_COLUMNS` does for expression partition keys.
     let unique_expression_columns = pair_set(
         sql_query(
             "SELECT rel.relname AS tbl, att.attname AS col \
              FROM pg_index i \
              JOIN pg_class rel ON rel.oid = i.indrelid \
              JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             JOIN pg_depend d ON d.objid = i.indexrelid AND d.refobjid = i.indrelid \
-             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = d.refobjsubid \
-             WHERE i.indisunique AND d.refobjsubid > 0 AND d.deptype = 'n' \
-             AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)",
+             JOIN pg_attribute att ON att.attrelid = rel.oid \
+               AND att.attnum > 0 AND NOT att.attisdropped \
+             WHERE i.indisunique \
+               AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL) \
+               AND (coalesce(i.indexprs::text, '') || ' ' || coalesce(i.indpred::text, '')) \
+                   ~ ('[^[:alnum:]_]varattno ' || att.attnum || '[^0-9]')",
         )
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
 
-    // An exclusion constraint's backing index is `indisexclusion`, not
-    // `indisunique`, so the probes above never see it. Both its plain columns
-    // (`indkey`) and any expression or predicate operands count.
+    // An exclusion constraint index is `indisexclusion`, not `indisunique`, so
+    // the probes above miss it. Count its plain columns (`indkey`) and its
+    // expression and predicate operands.
     let exclusion_columns = pair_set(
         sql_query(format!(
             "SELECT rel.relname AS tbl, att.attname AS col \
@@ -6694,6 +6718,14 @@ fn execute(
         // `verify_sample_survived_refreshes`.
         if let (Some(settled), Some(plan)) = (outcome.as_ref(), sampling) {
             verify_sample_survived_refreshes(conn, settled, plan)?;
+        }
+        // Again, as the last check before commit: a table the plan does not
+        // lock can change after the first comparison.
+        drift = live_schema_drift(conn, snapshot)?;
+        if !drift.is_empty() {
+            return Err(sample::SampleFailure::Db(
+                diesel::result::Error::RollbackTransaction,
+            ));
         }
         Ok(())
     })
@@ -9628,7 +9660,7 @@ mod tests {
         assert!(found["users"].contains_key("ssn"));
         assert!(
             found["cards"].contains_key("pan"),
-            "a model outside src/models must not escape the scan"
+            "a model outside `src/models` is still found"
         );
     }
 
@@ -9723,6 +9755,64 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn cfg_predicates_combine_and_unknown_ones_count_as_on() {
+        let on = |cfg: &str| {
+            production_enabled(
+                &syn::parse_str::<syn::ItemFn>(&format!("#[cfg({cfg})] fn f() {{}}"))
+                    .unwrap()
+                    .attrs,
+            )
+        };
+        for (cfg, kept) in [
+            ("test", false),
+            ("not(not(test))", false),
+            ("all(unix, test)", false),
+            ("not(all(test, feature = \"x\"))", true),
+            ("any(test, test)", false),
+            ("all()", true),
+            ("any()", true),
+        ] {
+            assert_eq!(on(cfg), kept, "cfg({cfg})");
+        }
+    }
+
+    #[test]
+    fn endpoints_decode_the_database_name_and_honour_dbname() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "postgres://h/prod%5Fdb",
+            "postgres://h/prod_db",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://h?dbname=prod",
+            "postgres://h/prod",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://%2Fvar%2Frun%2Fpostgresql/prod",
+            "postgres:///prod?host=/var/run/postgresql",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://a,b/prod",
+            "postgres://b/prod",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://u:p%40ss@h/prod",
+            "postgres://h/prod",
+            &env
+        ));
+    }
+
+    #[test]
+    fn the_envelope_length_is_exact_for_both_shapes() {
+        assert_eq!(envelope_len(Strategy::Redact), 148);
+        assert_eq!(envelope_len(Strategy::Email), 168);
     }
 
     #[test]
