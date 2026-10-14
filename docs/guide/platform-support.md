@@ -71,6 +71,9 @@ Windows MSVC targets only:
 rustflags = ["-Clink-arg=/DEBUG:LongSymbolTruncate"]
 ```
 
+This is a `link.exe` option, the default MSVC linker. If you use `lld-link`,
+delete the file: `lld-link` rejects the flag.
+
 Less debug info alone does not clear the limit: the public symbols stay in
 the PDB. Do not rely on `CARGO_PROFILE_DEV_DEBUG`. Autumn's CI hit the limit
 with that variable set. If the build still fails, set `debug = 0` in both
