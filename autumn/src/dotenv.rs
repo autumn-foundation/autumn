@@ -426,9 +426,9 @@ pub fn os_env_with_dotenv_for_profile(profile: &str) -> Result<DotenvOsEnv, Dote
 
 /// Like [`os_env_with_dotenv_for_profile`], but reads `.env` from `dir`.
 ///
-/// For a CLI that supervises another package: the app reads `.env` beside its
-/// own manifest, so the CLI must read the same file, not the one in its own
-/// working directory.
+/// Use this when a CLI runs another package. The app reads `.env` next to its
+/// own manifest. The CLI must read that file, not the one in its own working
+/// directory.
 ///
 /// # Errors
 /// Returns a [`DotenvError`] if a `.env` file in `dir` cannot be read or parsed.

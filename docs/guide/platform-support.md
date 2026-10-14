@@ -107,9 +107,14 @@ The wait is your app's **own** budget, not a fixed one: `autumn dev` reads the
 same profile-aware `prestop_grace_secs + shutdown_timeout_secs` that
 `autumn serve stop` uses, and adds 60 seconds of headroom for the `on_shutdown`
 hooks that run after the drain (sized to the managed-Postgres stop ceiling). So
-an app that legitimately takes 35 seconds to drain is not cut off at ten. Only
-once that budget elapses does `autumn dev` force-stop it — **and print a warning
+an app that legitimately takes 35 seconds to drain is not cut off at ten. Once
+that budget elapses, `autumn dev` force-stops the app — **and prints a warning
 saying the hooks may not have run.** Degraded, but never silent.
+
+If the app is still starting, `autumn dev` waits for it to finish. The app reads
+the stop request only after it starts. Startup includes managed Postgres
+`initdb` and migrations. The budget starts when the app is up. If the app is
+still starting after 15 minutes, `autumn dev` kills it and prints a warning.
 
 ## Tier 2 — supported via WSL2
 

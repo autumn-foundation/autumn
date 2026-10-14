@@ -157,12 +157,12 @@ const DEV_READY_FILE_SUFFIX: &str = ".state";
 )]
 const COOPERATIVE_STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
 
-/// How long a stop waits for a still-booting app before it gives up.
+/// The longest a stop waits for an app that is still starting.
 ///
-/// The app watches the signal file only after startup, which includes managed
-/// Postgres `initdb` and migrations. A stop that arrives earlier waits for the
-/// app to finish booting, then starts its normal budget. The CI cold-boot
-/// budget is eight minutes; this leaves room above it.
+/// The app reads the signal file only after it starts. Startup includes
+/// managed Postgres `initdb` and migrations. An early stop waits for the app
+/// to start, then runs its normal budget. The CI cold start budget is eight
+/// minutes. This cap is higher.
 #[cfg_attr(
     unix,
     allow(
@@ -277,19 +277,19 @@ fn resolve_cooperative_stop_budget(package: Option<&str>) -> Duration {
     let base_dir = package
         .and_then(find_manifest_dir)
         .unwrap_or_else(|| PathBuf::from("."));
-    // `autumn dev` is always a debug build, so the build default is `dev`; an
-    // explicit `AUTUMN_ENV`/`AUTUMN_PROFILE` still wins.
+    // `autumn dev` always builds in debug, so the default profile is `dev`.
+    // `AUTUMN_ENV` or `AUTUMN_PROFILE` still wins.
     let profile = crate::serve::effective_profile(None, false);
     stop_budget_in(&base_dir, &profile)
 }
 
 /// The stop budget for the app whose manifest is in `base_dir`.
 ///
-/// Reads `.env` from `base_dir`, as the app does. The CLI never mutates its own
-/// environment, so a plain `std::env` read would miss an `AUTUMN_SERVER__*`
-/// override the app honors, and the parent would force-kill a valid drain.
-/// Real shell variables still win over `.env`. A malformed `.env` falls back to
-/// the plain environment rather than failing the stop.
+/// Reads `.env` from `base_dir`, as the app does. The CLI does not change its
+/// own environment. A plain `std::env` read would miss an `AUTUMN_SERVER__*`
+/// value that is set only in `.env`. Then the CLI would kill an app that is
+/// still draining. Shell variables win over `.env`. If `.env` is bad, use the
+/// plain environment. Do not fail the stop.
 #[cfg_attr(
     unix,
     allow(
@@ -1961,7 +1961,7 @@ fn wait_until_booted(proc: &mut Child, ready_file: Option<&Path>, cap: Duration)
 /// wait for the app to finish booting, then wait up to `budget()` for it to
 /// drain. Force-kill if it does not.
 ///
-/// `budget` runs only after boot, so it sees the budget the app reported.
+/// The caller computes `budget` after boot. It then uses the budget the app wrote.
 ///
 /// This is the Windows stop path, but it is compiled on every platform so Linux
 /// CI exercises it. On Unix `stop_server` keeps using `SIGTERM`, which is the
@@ -2336,10 +2336,9 @@ mod tests {
 
     // ── A booting app is not yet watching (#2444) ──────────────────────────
     //
-    // The app watches the signal file only after startup (managed Postgres
-    // `initdb`, migrations). A stop that arrives earlier must not start its
-    // deadline until the app is up, or it kills a booting app and orphans the
-    // postmaster that boot just started.
+    // The app reads the signal file only after it starts (Postgres `initdb`,
+    // migrations). The stop deadline must start when the app is up. If it
+    // starts earlier, the stop kills the app and leaves the postmaster.
 
     #[cfg(unix)]
     #[test]
