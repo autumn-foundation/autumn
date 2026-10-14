@@ -2327,21 +2327,111 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 /// An unparsable URL never claims a match (the guard errs toward "different",
 /// leaving the profile guard as the enforcement).
 fn same_database(a: &str, b: &str) -> bool {
-    let parts = |raw: &str| -> Option<(String, u16, String)> {
-        let parsed = url::Url::parse(raw).ok()?;
-        let host = parsed.host_str()?.to_ascii_lowercase();
-        let port = parsed.port().unwrap_or(5432);
-        let name = parsed
-            .path_segments()
-            .and_then(|mut s| s.next())
-            .map(str::to_owned)
-            .filter(|n| !n.is_empty())?;
-        Some((host, port, name))
-    };
-    match (parts(a), parts(b)) {
-        (Some(left), Some(right)) => left == right,
+    same_database_in(a, b, &|key| std::env::var(key).ok())
+}
+
+/// [`same_database`] with an explicit environment, for `PGHOST` / `PGPORT`.
+fn same_database_in(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    match (database_endpoint(a, env), database_endpoint(b, env)) {
+        (Some((hosts_a, port_a, name_a)), Some((hosts_b, port_b, name_b))) => {
+            port_a == port_b && name_a == name_b && hosts_a.iter().any(|h| hosts_b.contains(h))
+        }
         _ => false,
     }
+}
+
+/// The hosts, port and database a URL reaches, resolved as libpq does.
+///
+/// A hostless URL (`postgres:///db?host=/run/postgresql`) names its host in the
+/// `host` or `hostaddr` query parameter, else in `PGHOST`, else it uses the
+/// default local socket (an empty host). The port follows the same order.
+fn database_endpoint(
+    raw: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(Vec<String>, u16, String)> {
+    let parsed = url::Url::parse(&without_userinfo(raw)).ok()?;
+    let name = parsed
+        .path_segments()
+        .and_then(|mut s| s.next())
+        .map(str::to_owned)
+        .filter(|n| !n.is_empty())?;
+    let query = |key: &str| {
+        parsed
+            .query_pairs()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.into_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let authority_host = parsed.host_str().filter(|h| !h.is_empty()).map(|h| {
+        percent_encoding::percent_decode_str(h)
+            .decode_utf8_lossy()
+            .into_owned()
+    });
+    let host_list = authority_host
+        .or_else(|| query("host"))
+        .or_else(|| query("hostaddr"))
+        .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
+        .unwrap_or_default();
+    let hosts: Vec<String> = host_list
+        .split(',')
+        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase())
+        .collect();
+    let port = parsed
+        .port()
+        .or_else(|| query("port").and_then(|p| p.split(',').next()?.parse().ok()))
+        .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()))
+        .unwrap_or(5432);
+    Some((hosts, port, name))
+}
+
+/// `raw` with any `user:password@` removed. An empty host with credentials
+/// (`postgres://app@/db`) is valid libpq but does not parse as a URL.
+fn without_userinfo(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return raw.to_owned();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => raw.to_owned(),
+    }
+}
+
+/// Profiles whose config could name the artifact's source: the artifact's own
+/// profile plus every profile with a config overlay, minus the destination
+/// (which is the target, never its own source) and the always-safe `dev`/`test`.
+fn source_candidates(
+    artifact_profile: Option<&str>,
+    configured: &[String],
+    destination: &str,
+) -> Vec<String> {
+    let destination = migrate::canonical_profile(destination);
+    let mut candidates: Vec<String> = artifact_profile
+        .map(str::to_owned)
+        .into_iter()
+        .chain(configured.iter().cloned())
+        .filter(|p| !super::is_safe_destructive_profile(p))
+        .filter(|p| migrate::canonical_profile(p) != destination)
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// The first `(profile, database)` where a declared URL is a write target.
+fn overwritten_source(
+    declared: &[(String, Vec<String>)],
+    targets: &[(String, String)],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, String)> {
+    declared.iter().find_map(|(profile, urls)| {
+        urls.iter().find_map(|declared_url| {
+            targets
+                .iter()
+                .find(|(_, url)| same_database_in(declared_url, url, env))
+                .map(|(_, url)| (profile.clone(), parsed_db_name(url)))
+        })
+    })
 }
 
 /// Refuse to scrub a database that a **config file** declares for a
@@ -2352,11 +2442,16 @@ fn same_database(a: &str, b: &str) -> bool {
 /// checked, not just the one an artifact's manifest names. A bare `.dump`/`.sql`
 /// artifact carries no manifest at all, so keying the guard off known provenance
 /// would silently skip it in exactly the case where the operator knows least
-/// about what they are restoring.
+/// about what they are restoring. The destination profile is not a source: its
+/// own overlay names the target by definition.
+///
+/// A profile's control URL and every shard URL are compared, because a restore
+/// writes control plus every shard.
 ///
 /// Deliberately reads only `autumn.toml` / `autumn-<profile>.toml`, never the
-/// environment: an env-provided `DATABASE_URL` is shared by every profile
-/// resolution, so consulting it would make this guard fire on legitimate scrubs.
+/// environment for URLs: an env-provided `DATABASE_URL` is shared by every
+/// profile resolution, so consulting it would make this guard fire on
+/// legitimate scrubs.
 ///
 /// It has its own waiver (`--allow-source-overwrite`) rather than riding on
 /// `--force`: the documented staging drill ALWAYS passes `--force` (staging is
@@ -2364,6 +2459,7 @@ fn same_database(a: &str, b: &str) -> bool {
 /// the workflow it exists for.
 fn guard_configured_source(
     artifact_profile: Option<&str>,
+    destination_profile: &str,
     project_root: &Path,
     targets: &[(String, String)],
     allowed: bool,
@@ -2371,33 +2467,37 @@ fn guard_configured_source(
     if allowed {
         return Ok(());
     }
-    let mut candidates: Vec<String> = artifact_profile
-        .map(str::to_owned)
+    let candidates = source_candidates(
+        artifact_profile,
+        &profiles_with_config(project_root),
+        destination_profile,
+    );
+    let declared: Vec<(String, Vec<String>)> = candidates
         .into_iter()
-        .chain(profiles_with_config(project_root))
-        .filter(|p| !super::is_safe_destructive_profile(p))
+        .filter_map(|profile| {
+            let table = migrate::read_autumn_toml_table_with_profile(Some(&profile));
+            let control = migrate::resolve_primary_database_url_from_sources(
+                |_| Err(std::env::VarError::NotPresent),
+                table.as_ref(),
+            );
+            let shards = migrate::try_resolve_shard_database_urls_from_sources(
+                |_| Err(std::env::VarError::NotPresent),
+                table.as_ref(),
+            )
+            .unwrap_or_default();
+            let urls: Vec<String> = control
+                .into_iter()
+                .chain(shards.into_iter().map(|(_, url)| url))
+                .collect();
+            (!urls.is_empty()).then_some((profile, urls))
+        })
         .collect();
-    candidates.sort();
-    candidates.dedup();
-
-    for profile in candidates {
-        let table = migrate::read_autumn_toml_table_with_profile(Some(&profile));
-        let Some(declared) = migrate::resolve_primary_database_url_from_sources(
-            |_| Err(std::env::VarError::NotPresent),
-            table.as_ref(),
-        ) else {
-            continue;
-        };
-        for (_, url) in targets {
-            if same_database(&declared, url) {
-                return Err(ScrubError::OverwritesConfiguredTarget {
-                    profile,
-                    database: parsed_db_name(url),
-                });
-            }
+    match overwritten_source(&declared, targets, &|key| std::env::var(key).ok()) {
+        Some((profile, database)) => {
+            Err(ScrubError::OverwritesConfiguredTarget { profile, database })
         }
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Profile names that have an `autumn-<profile>.toml` overlay in the project.
@@ -2511,6 +2611,7 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         );
         guard_configured_source(
             artifact_profile.as_deref(),
+            &profile,
             Path::new("."),
             &targets,
             args.allow_source_overwrite,
@@ -8843,6 +8944,114 @@ mod tests {
         assert!(!same_database("not a url", "not a url"));
     }
 
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn hostless_urls_naming_one_socket_are_the_same_database() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "postgres:///prod?host=/var/run/postgresql",
+            "postgres://app:pw@/prod?host=/var/run/postgresql",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///prod?host=/var/run/postgresql",
+            "postgres:///prod?host=/tmp",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///prod?host=/tmp",
+            "postgres:///staging?host=/tmp",
+            &env
+        ));
+    }
+
+    #[test]
+    fn a_hostless_url_resolves_its_host_and_port_like_libpq() {
+        let env = env_of(&[("PGHOST", "db.example.com"), ("PGPORT", "6543")]);
+        assert!(same_database_in(
+            "postgres:///prod",
+            "postgres://db.example.com:6543/prod",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///prod",
+            "postgres://db.example.com:5432/prod",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://u@/prod?hostaddr=10.0.0.5&port=5433",
+            "postgres://10.0.0.5:5433/prod",
+            &env
+        ));
+    }
+
+    #[test]
+    fn two_bare_urls_share_the_default_socket() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "postgres:///prod",
+            "postgres:///prod",
+            &env
+        ));
+    }
+
+    #[test]
+    fn a_shard_url_of_a_source_profile_is_a_protected_source() {
+        let env = env_of(&[]);
+        let declared = vec![(
+            "prod".to_owned(),
+            vec![
+                "postgres://app@prod-control/ctl".to_owned(),
+                "postgres://app@prod-shard-a/orders".to_owned(),
+            ],
+        )];
+        let targets = vec![
+            (
+                "control".to_owned(),
+                "postgres://app@staging-control/ctl".to_owned(),
+            ),
+            (
+                "shard:a".to_owned(),
+                "postgres://app@prod-shard-a:5432/orders".to_owned(),
+            ),
+        ];
+        assert_eq!(
+            overwritten_source(&declared, &targets, &env),
+            Some(("prod".to_owned(), "orders".to_owned()))
+        );
+        let clean = vec![(
+            "control".to_owned(),
+            "postgres://app@staging-control/ctl".to_owned(),
+        )];
+        assert_eq!(overwritten_source(&declared, &clean, &env), None);
+    }
+
+    #[test]
+    fn the_destination_profile_is_never_its_own_source() {
+        let configured = vec!["prod".to_owned(), "staging".to_owned(), "dev".to_owned()];
+        assert_eq!(
+            source_candidates(Some("prod"), &configured, "staging"),
+            vec!["prod".to_owned()],
+            "staging is the destination; dev is safe by definition"
+        );
+        assert_eq!(
+            source_candidates(None, &configured, "staging"),
+            vec!["prod".to_owned()]
+        );
+        assert_eq!(
+            source_candidates(Some("staging"), &["staging".to_owned()], "staging"),
+            Vec::<String>::new(),
+            "restoring a staging artifact into staging overwrites no other source"
+        );
+    }
+
     #[test]
     fn a_bare_artifact_with_no_manifest_still_gets_the_source_guard() {
         // `autumn-prod.toml` declares the very database the scrub would write.
@@ -8877,11 +9086,11 @@ mod tests {
         )];
         let empty = tempfile::tempdir().unwrap();
         assert!(
-            guard_configured_source(Some("prod"), empty.path(), &targets, false).is_ok(),
+            guard_configured_source(Some("prod"), "staging", empty.path(), &targets, false).is_ok(),
             "no config overlay means nothing to compare against"
         );
         assert!(
-            guard_configured_source(Some("prod"), empty.path(), &targets, true).is_ok(),
+            guard_configured_source(Some("prod"), "staging", empty.path(), &targets, true).is_ok(),
             "--allow-source-overwrite is the waiver"
         );
     }
