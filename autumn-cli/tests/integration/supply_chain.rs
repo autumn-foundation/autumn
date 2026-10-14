@@ -820,7 +820,10 @@ fn release_workflow_uploads_the_gate_built_archives() {
         "gh release upload",
         "--clobber",
     ] {
-        assert!(body.contains(needle), "`binaries` must use `{needle}`:\n{body}");
+        assert!(
+            body.contains(needle),
+            "`binaries` must use `{needle}`:\n{body}"
+        );
     }
     assert!(
         body.contains("actions: read"),
