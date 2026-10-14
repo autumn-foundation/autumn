@@ -325,7 +325,8 @@ enum StopOutcome {
 enum ShutdownSupport {
     /// The child's ready file carries the capability marker.
     Supported,
-    /// The child wrote a ready file without the marker: an older `autumn-web`.
+    /// The child wrote a budget-only ready file: an `autumn-web` that predates
+    /// the signal file.
     Unsupported,
     /// No report yet. A slow boot looks the same as an old child, so the caller
     /// keeps the cooperative wait.
@@ -334,8 +335,10 @@ enum ShutdownSupport {
 
 /// Read the child's shutdown support from its ready-file contents.
 ///
-/// Only a non-blank file that lacks the marker proves an old child. The app
-/// writes the file atomically, so a blank one is not its work.
+/// The marker proves support. Without it, only a budget-only file proves an old
+/// child: the signal file shipped in the same release as the endpoint line, so
+/// a file with an endpoint line is an app that drains, only one that predates
+/// the marker. Anything else is `Unknown`, which keeps the safe cooperative wait.
 #[cfg_attr(
     unix,
     allow(
@@ -344,13 +347,19 @@ enum ShutdownSupport {
     )
 )]
 fn shutdown_support_from_ready(contents: Option<&str>) -> ShutdownSupport {
-    match contents {
-        None => ShutdownSupport::Unknown,
-        Some(text) if text.trim().is_empty() => ShutdownSupport::Unknown,
-        Some(text) if autumn_web::app::serve_ready_advertises_shutdown_signal(text) => {
-            ShutdownSupport::Supported
-        }
-        Some(_) => ShutdownSupport::Unsupported,
+    let Some(text) = contents else {
+        return ShutdownSupport::Unknown;
+    };
+    if autumn_web::app::serve_ready_advertises_shutdown_signal(text) {
+        return ShutdownSupport::Supported;
+    }
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let budget_only =
+        lines.next().is_some_and(|l| l.parse::<u64>().is_ok()) && lines.next().is_none();
+    if budget_only {
+        ShutdownSupport::Unsupported
+    } else {
+        ShutdownSupport::Unknown
     }
 }
 
@@ -1406,19 +1415,14 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
         *child = None;
         return;
     };
-    if dev_ready_file_path().map(child_shutdown_support) == Some(ShutdownSupport::Unsupported) {
-        if stop_unsupported_child(child, signal_path) == StopOutcome::Unsupported {
-            eprintln!("{}", unsupported_warning());
-        }
-        return;
-    }
+    let support = dev_ready_file_path().map_or(ShutdownSupport::Unknown, child_shutdown_support);
     let budget = stop_budget_for_running_child(
         dev_ready_file_path().and_then(child_reported_stop_budget),
         recorded_child_stop_budget(),
         || resolve_cooperative_stop_budget(package),
     );
-    match stop_child_cooperatively(child, signal_path, budget) {
-        StopOutcome::Unsupported => {}
+    match stop_with_support(child, signal_path, support, budget) {
+        StopOutcome::Unsupported => eprintln!("{}", unsupported_warning()),
         StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget)),
         StopOutcome::Unreachable => eprintln!(
             "{}",
@@ -1928,9 +1932,9 @@ fn unreachable_warning(error: &str) -> String {
 )]
 fn unsupported_warning() -> String {
     "  Warning: this app's autumn-web is older than the CLI and cannot drain on \
-     request, so it was force-stopped. Its shutdown hooks did not run, so a \
-     managed Postgres cluster may still be running; the next start recovers it \
-     through crash recovery. Run `cargo update -p autumn-web` to fix this."
+     request, so it was force-stopped. Its shutdown hooks did not run. A managed \
+     Postgres cluster may still be running. The next start recovers it through \
+     crash recovery. To fix this, run `cargo update -p autumn-web`."
         .to_owned()
 }
 
@@ -1952,6 +1956,29 @@ fn stop_unsupported_child(child: &mut Option<Child>, signal_path: &Path) -> Stop
     clear_cooperative_shutdown(signal_path);
     *child = None;
     StopOutcome::Unsupported
+}
+
+/// Stop `child` the way its `support` allows: at once when it cannot drain on
+/// request, otherwise through the signal file.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_with_support(
+    child: &mut Option<Child>,
+    signal_path: &Path,
+    support: ShutdownSupport,
+    budget: Duration,
+) -> StopOutcome {
+    match support {
+        ShutdownSupport::Unsupported => stop_unsupported_child(child, signal_path),
+        ShutdownSupport::Supported | ShutdownSupport::Unknown => {
+            stop_child_cooperatively(child, signal_path, budget)
+        }
+    }
 }
 
 /// Stop `child` cooperatively: request a graceful shutdown via the signal file,
@@ -2583,12 +2610,33 @@ mod tests {
     }
 
     #[test]
-    fn a_ready_file_without_the_marker_means_the_child_cannot_drain() {
-        for old in ["1", "1\n", "1\ntcp 127.0.0.1:3000"] {
+    fn a_budget_only_ready_file_means_the_child_cannot_drain() {
+        for old in ["1", "1\n", " 1 \n\n"] {
             assert_eq!(
                 shutdown_support_from_ready(Some(old)),
                 ShutdownSupport::Unsupported,
                 "{old:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_with_an_endpoint_line_but_no_marker_still_drains() {
+        // 0.8.0 watches the signal file and reports an endpoint, but has no
+        // marker. Killing it would skip its hooks and orphan Postgres.
+        assert_eq!(
+            shutdown_support_from_ready(Some("1\ntcp 127.0.0.1:3000")),
+            ShutdownSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ready_file_is_not_proof_of_an_old_child() {
+        for junk in ["garbage", "x\ny", "1 2"] {
+            assert_eq!(
+                shutdown_support_from_ready(Some(junk)),
+                ShutdownSupport::Unknown,
+                "{junk:?}"
             );
         }
     }
@@ -2601,7 +2649,7 @@ mod tests {
 
     #[test]
     fn a_blank_ready_file_is_not_proof_of_an_old_child() {
-        // The app writes the file atomically, so blank means a foreign writer.
+        // The app writes the file atomically, so a blank file is not its work.
         assert_eq!(
             shutdown_support_from_ready(Some("  \n")),
             ShutdownSupport::Unknown
@@ -2640,6 +2688,73 @@ mod tests {
             !path.exists(),
             "no request is sent to a child that ignores it"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsupported_child_is_never_sent_a_request() {
+        // A path under a regular file cannot be created. A request would turn
+        // the outcome into `Unreachable`, so `Unsupported` proves none was made.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("nested").join("stop.signal");
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .expect("spawn old app"),
+        );
+        assert_eq!(
+            stop_unsupported_child(&mut child, &path),
+            StopOutcome::Unsupported
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stop_plan_kills_an_unsupported_child_without_waiting_out_the_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM; sleep 30")
+                .spawn()
+                .expect("spawn old app"),
+        );
+        let start = std::time::Instant::now();
+        let outcome = stop_with_support(
+            &mut child,
+            &path,
+            ShutdownSupport::Unsupported,
+            Duration::from_secs(300),
+        );
+        assert_eq!(outcome, StopOutcome::Unsupported);
+        assert!(start.elapsed() < Duration::from_secs(10), "must not wait");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stop_plan_keeps_the_cooperative_wait_when_support_is_unknown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let script = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; exit 0",
+            path.display()
+        );
+        for support in [ShutdownSupport::Unknown, ShutdownSupport::Supported] {
+            let mut child = Some(
+                Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(&script)
+                    .spawn()
+                    .expect("spawn app"),
+            );
+            let outcome = stop_with_support(&mut child, &path, support, Duration::from_secs(10));
+            assert_eq!(outcome, StopOutcome::Graceful, "{support:?}");
+        }
     }
 
     #[test]

@@ -11764,8 +11764,9 @@ fn dialable_endpoint(addr: &str) -> String {
 /// endpoint is `<transport> <address>` split on the FIRST space only, so a Unix
 /// socket path containing spaces survives the round trip. An empty endpoint
 /// emits no second line at all, rather than a blank one a reader could mistake
-/// for an address. A last `capability shutdown-signal` line says the app watches
-/// the shutdown-signal file; see [`serve_ready_advertises_shutdown_signal`].
+/// for an address. The last line, `capability shutdown-signal`, shows that the
+/// app watches the shutdown-signal file; see
+/// [`serve_ready_advertises_shutdown_signal`].
 ///
 /// Public because it *is* the wire format between the app and its supervisor:
 /// `autumn-cli`'s `parse_ready_payload` round-trips against this exact function,
@@ -11783,8 +11784,10 @@ pub fn serve_ready_payload(drain_budget_secs: u64, bound_endpoint: &str) -> Stri
 /// The ready-file line that says this app watches `AUTUMN_SHUTDOWN_SIGNAL_FILE`.
 ///
 /// Written only after the watcher is armed. A supervisor that finds a ready file
-/// without it knows the app predates the signal file (#2458). An older supervisor
-/// reads `capability` as an unknown transport and ignores the line.
+/// without it and without an endpoint line knows the app predates the signal
+/// file (#2458). An older supervisor reads `capability` as an unknown transport
+/// and ignores the line. Only `autumn dev` on non-Unix reads it; elsewhere the
+/// line is harmless.
 const SHUTDOWN_SIGNAL_CAPABILITY_LINE: &str = "capability shutdown-signal";
 
 /// Whether a ready file says the app drains when asked through the signal file.
@@ -16889,8 +16892,8 @@ mod tests {
 
     #[test]
     fn serve_ready_payload_never_emits_a_bare_newline_for_an_unknown_endpoint() {
-        // An empty endpoint must not leave a blank second line a reader could
-        // mistake for an address.
+        // An empty endpoint must not leave a blank line a reader could mistake
+        // for an address. The capability line fills line two.
         let payload = serve_ready_payload(7, "");
         assert!(payload.lines().all(|l| !l.trim().is_empty()), "{payload:?}");
         assert_eq!(

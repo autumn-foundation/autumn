@@ -2265,6 +2265,16 @@ mod tests {
     }
 
     #[test]
+    fn ready_payload_with_no_endpoint_still_yields_the_budget_and_no_endpoint() {
+        // The capability line sits where the endpoint would. It must not parse
+        // as one.
+        let written = autumn_web::app::serve_ready_payload(35, "");
+        let (budget, endpoint) = parse_ready_payload(&written);
+        assert_eq!(budget, Some(35));
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
     fn ready_payload_reads_a_budget_only_file_from_an_older_app() {
         // An app built before the address line still reports its drain budget,
         // and `stop` must keep honouring it rather than fall back to guessing.
