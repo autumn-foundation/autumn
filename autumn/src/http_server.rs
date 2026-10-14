@@ -39,6 +39,7 @@ use std::convert::Infallible;
 use std::fmt::Debug;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -259,7 +260,7 @@ fn take_handoff(handoff: Option<&SlotHandoff>) -> Option<Slot> {
 /// `handoff` is set.
 #[allow(
     clippy::too_many_lines,
-    reason = "one accept loop; the connection task cannot be named apart"
+    reason = "one accept loop with the connection task inline"
 )]
 pub(crate) async fn serve_with_handoff<L, M, S, F>(
     mut listener: L,
@@ -430,13 +431,13 @@ const FRESH_GRACE: Duration = Duration::from_millis(500);
 /// Whether the connection has read its first byte.
 #[derive(Default)]
 struct FirstByte {
-    seen: std::sync::atomic::AtomicBool,
+    seen: AtomicBool,
     arrived: Notify,
 }
 
 impl FirstByte {
     fn mark(&self) {
-        if !self.seen.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if !self.seen.swap(true, Ordering::Relaxed) {
             self.arrived.notify_waiters();
         }
     }
@@ -446,19 +447,19 @@ impl FirstByte {
         let arrived = self.arrived.notified();
         tokio::pin!(arrived);
         arrived.as_mut().enable();
-        if !self.seen.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.seen.load(Ordering::Relaxed) {
             arrived.await;
         }
     }
 
     fn is_seen(&self) -> bool {
-        self.seen.load(std::sync::atomic::Ordering::Relaxed)
+        self.seen.load(Ordering::Relaxed)
     }
 }
 
 /// Keep reading a fresh connection until its first byte or `FRESH_GRACE`.
 /// hyper closes an idle connection at once, and a fresh one may have its
-/// request in the socket. Returns `true` if the connection ended meanwhile.
+/// request in the socket. Returns `true` when the connection already closed.
 async fn await_first_byte(
     mut conn: Pin<&mut impl std::future::Future>,
     first_byte: &FirstByte,
@@ -884,7 +885,7 @@ impl PhaseState {
 struct ConnTimers {
     /// Set when the connection task ends. After an upgrade the IO lives on
     /// (a WebSocket), but no timer applies, so reads skip the scan.
-    closed: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
     state: Mutex<PhaseState>,
     changed: Notify,
     header_read_timeout: Option<Duration>,
@@ -894,7 +895,7 @@ struct ConnTimers {
 impl ConnTimers {
     fn new(limits: &HttpLimits) -> Self {
         Self {
-            closed: std::sync::atomic::AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             state: Mutex::new(PhaseState {
                 phase: Phase::Head {
                     since: Instant::now(),
@@ -922,7 +923,7 @@ impl ConnTimers {
     /// Bytes arrived. On HTTP/1, the first byte after an idle period starts
     /// the head timer. On HTTP/2, an open header block starts it.
     fn on_read(&self, bytes: &[u8]) {
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.closed.load(Ordering::Relaxed) {
             return;
         }
         let mut state = self
@@ -940,8 +941,7 @@ impl ConnTimers {
 
     /// The connection task ended. Stop scanning reads.
     fn close(&self) {
-        self.closed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.closed.store(true, Ordering::Relaxed);
     }
 
     fn request_started(&self) {
@@ -1724,6 +1724,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         stop.cancel();
         let done = tokio::time::timeout(Duration::from_secs(3), task).await;
-        assert!(done.is_ok(), "the drain must end after FRESH_GRACE");
+        let served = done.expect("the drain must end after FRESH_GRACE");
+        served.expect("server task").expect("serve");
     }
 }

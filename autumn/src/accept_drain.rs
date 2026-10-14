@@ -23,6 +23,9 @@
 //! upgrade the successor shares the socket, so connections arriving in that
 //! window go to the successor; on a plain shutdown they wait in the kernel
 //! queue exactly as they would have once `accept()` stopped anyway.
+//!
+//! The serve loop adds a second layer. See "Shutdown" in `http_server.rs`.
+//! It waits for the first byte of a connection that has read nothing yet.
 
 use std::time::Duration;
 

@@ -179,8 +179,8 @@ fn is_connection_refused(error: &std::io::Error) -> bool {
 /// the narrow window between "accepting connections" and "finished
 /// `on_startup` hooks". That is not a connection failure — this test's own
 /// header documents "zero refused connections", not "zero 503s" — so it is
-/// retried rather than failing the run outright. A defect that left the successor perpetually unready must still fail the
-/// test, hence the bound rather than an unbounded retry loop.
+/// retried rather than failing the run outright. A successor that never
+/// becomes ready must still fail the test. So the retry has a bound.
 const MAX_STARTUP_BARRIER_RETRIES: u32 = 20;
 
 /// Whether `observation` is the startup barrier's own response, not
@@ -282,8 +282,8 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         //
         // This weakens nothing. `wait_for_exit` still caps the wait at 30s, so
         // a predecessor that genuinely fails to drain still fails the
-        // assertion, and the connection guarantees below — `refused == 0`,
-        // and `hard == 0` — are untouched by it.
+        // assertion, and the connection guarantees below — `refused == 0`
+        // and `dropped == 0` — are untouched by it.
         .env("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "30")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -327,7 +327,7 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     // A refused connection means nothing was listening. Any other error is a
     // connection dropped mid-flight. Both break zero downtime. No retry.
     let refused_errors = Arc::new(AtomicU64::new(0));
-    let hard_failures = Arc::new(AtomicU64::new(0));
+    let dropped_connections = Arc::new(AtomicU64::new(0));
     let startup_barrier_hits = Arc::new(AtomicU64::new(0));
 
     let mut load = Vec::new();
@@ -337,7 +337,7 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         let reads = Arc::clone(&reads);
         let writes = Arc::clone(&writes);
         let refused_errors = Arc::clone(&refused_errors);
-        let hard_failures = Arc::clone(&hard_failures);
+        let dropped_connections = Arc::clone(&dropped_connections);
         let startup_barrier_hits = Arc::clone(&startup_barrier_hits);
         let successor_pid = Arc::clone(&successor_pid);
         // Six readers and two writers: reads must never fail, writes may be
@@ -363,7 +363,7 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
                         if is_connection_refused(&error) {
                             refused_errors.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            hard_failures.fetch_add(1, Ordering::Relaxed);
+                            dropped_connections.fetch_add(1, Ordering::Relaxed);
                         }
                         eprintln!("connection error against {addr}{path}: {error}");
                     }
@@ -435,25 +435,20 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     let writes = std::mem::take(&mut *writes.lock().expect("writes"));
 
     let refused = refused_errors.load(Ordering::Relaxed);
-    let hard = hard_failures.load(Ordering::Relaxed);
+    let dropped = dropped_connections.load(Ordering::Relaxed);
     let startup_barrier = startup_barrier_hits.load(Ordering::Relaxed);
     println!(
-        "connection failures across cutover: refused={refused} dropped={hard} startup_barrier_hits_retried={startup_barrier}"
+        "connection failures across cutover: refused={refused} dropped={dropped} startup_barrier_hits_retried={startup_barrier}"
     );
-    // A startup-barrier hit is *expected* to
-    // scale with how long the successor's own `on_startup` hooks take —
-    // dozens of hits across 8 polling tasks during a slow (contended)
-    // startup is normal, not evidence of a defect. `with_startup_barrier_retry`
-    // already bounds each individual request to `MAX_STARTUP_BARRIER_RETRIES`
-    // attempts, and if the barrier genuinely never clears, the resulting
-    // still-503 observation still fails the `failed.is_empty()` assertion
-    // below — that is the real safety net for "this never recovered".
+    // A startup-barrier hit is normal. Its count grows with the time the
+    // successor's `on_startup` hooks take. If the barrier never clears, the
+    // 503 responses fail the `failed.is_empty()` assertion below.
     assert_eq!(
         refused, 0,
         "no connection may be refused across the cutover; logs:\n{logged}"
     );
     assert_eq!(
-        hard, 0,
+        dropped, 0,
         "a connection was dropped across the cutover (ECONNRESET and the \
          like); logs:\n{logged}"
     );
