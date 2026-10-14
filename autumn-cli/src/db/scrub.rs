@@ -2431,21 +2431,7 @@ fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
         let src = std::fs::read_to_string(&path).map_err(|e| io_err(&path, &e))?;
         let result = scan_anonymize_source(&src);
         if let Ok((_, modules)) = &result {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let parent = path.parent().unwrap_or(root);
-            let module_dir = if matches!(stem, "lib" | "main" | "mod") {
-                parent.to_path_buf()
-            } else {
-                parent.join(stem)
-            };
-            disabled.extend(
-                modules
-                    .iter()
-                    .flat_map(|m| [module_dir.join(format!("{m}.rs")), module_dir.join(m)]),
-            );
+            disabled.extend(crate::schema::parse::disabled_module_paths(&path, modules));
         }
         scanned.push((path, result));
     }
@@ -4923,8 +4909,9 @@ fn probe_database_facts(
     );
 
     // An exclusion constraint index is `indisexclusion`, not `indisunique`, so
-    // the probes above miss it. Count its plain columns (`indkey`) and its
-    // expression and predicate operands.
+    // the probes above miss it. Count its plain columns (`indkey`) and the
+    // columns its expressions and predicate read (`pg_depend` and the node
+    // trees, as for the unique probe above).
     let exclusion_columns = pair_set(
         sql_query(format!(
             "SELECT rel.relname AS tbl, att.attname AS col \
@@ -4941,7 +4928,17 @@ fn probe_database_facts(
              JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
              JOIN pg_depend d ON d.objid = i.indexrelid AND d.refobjid = i.indrelid \
              JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = d.refobjsubid \
-             WHERE i.indisexclusion AND d.refobjsubid > 0"
+             WHERE i.indisexclusion AND d.refobjsubid > 0 \
+             UNION \
+             SELECT rel.relname, att.attname \
+             FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             JOIN pg_attribute att ON att.attrelid = rel.oid \
+               AND att.attnum > 0 AND NOT att.attisdropped \
+             WHERE i.indisexclusion \
+               AND (coalesce(i.indexprs::text, '') || ' ' || coalesce(i.indpred::text, '')) \
+                   ~ ('[^[:alnum:]_]varattno ' || att.attnum || '[^0-9]')"
         ))
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,

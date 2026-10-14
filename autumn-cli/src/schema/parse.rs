@@ -456,17 +456,68 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
 pub fn parse_encrypted_columns_path(
     path: &Path,
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
-    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+    let mut sources = Vec::new();
     for file in model_source_files(path)? {
         let src = std::fs::read_to_string(&file).map_err(|source| SchemaParseError::Io {
             path: file.display().to_string(),
             source,
         })?;
-        for (table, columns) in parse_encrypted_columns(&src)? {
+        sources.push((file, src));
+    }
+    // A file reached only through `#[cfg(test)] mod x;` is test code.
+    let disabled: Vec<std::path::PathBuf> = sources
+        .iter()
+        .flat_map(|(file, src)| disabled_module_paths(file, &disabled_top_level_modules(src)))
+        .collect();
+    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+    for (file, src) in &sources {
+        if disabled.iter().any(|d| file.starts_with(d)) {
+            continue;
+        }
+        for (table, columns) in parse_encrypted_columns(src)? {
             out.entry(table).or_default().extend(columns);
         }
     }
     Ok(out)
+}
+
+/// The out-of-line modules (`mod x;`) that `cfg` turns off at a file's top
+/// level. Empty when the source does not parse: the caller reports that.
+#[must_use]
+pub fn disabled_top_level_modules(src: &str) -> Vec<String> {
+    let Ok(file) = syn::parse_file(src) else {
+        return Vec::new();
+    };
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(m) if m.content.is_none() && !production_enabled(&m.attrs) => {
+                Some(m.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The file and directory paths that `modules`, declared in `file`, would load.
+/// A `lib`, `main` or `mod` file owns its own directory; any other file owns a
+/// directory named for its stem.
+#[must_use]
+pub fn disabled_module_paths(file: &Path, modules: &[String]) -> Vec<std::path::PathBuf> {
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let parent = file.parent().unwrap_or_else(|| Path::new(""));
+    let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+        parent.to_path_buf()
+    } else {
+        parent.join(stem)
+    };
+    modules
+        .iter()
+        .flat_map(|m| [module_dir.join(format!("{m}.rs")), module_dir.join(m)])
+        .collect()
 }
 
 /// The `.rs` sources a models path expands to: the file itself, or every `*.rs`
@@ -2271,6 +2322,25 @@ mod tests {
             "#,
         )
         .expect("parse");
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A file reached only through `#[cfg(test)] mod x;` is test code.
+    #[test]
+    fn encrypted_columns_skip_out_of_line_cfg_test_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "#[cfg(test)] mod tests;\n").unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
         assert!(found["users"]["email"], "{found:?}");
     }
 
