@@ -1154,6 +1154,7 @@ fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) 
     let diagnostics = parse_build_diagnostics(buffer.as_bytes());
     match child.wait() {
         Ok(status) if status.success() => {
+            crate::built_artifact::record(&crate::built_artifact::parse_executables(&buffer));
             eprintln!("  \u{2713} Build succeeded");
             (true, diagnostics)
         }
@@ -1195,7 +1196,7 @@ pub fn cargo_build(package: Option<&str>, release: bool) -> bool {
     let mut cmd = build_cargo_command(package, release);
 
     eprintln!("  Compiling...");
-    match cmd.status() {
+    match crate::built_artifact::run_build(&mut cmd) {
         Ok(status) if status.success() => {
             eprintln!("  \u{2713} Build succeeded");
             true
@@ -2075,10 +2076,11 @@ pub fn find_binary(package: Option<&str>, release: bool) -> PathBuf {
         if let (Some(target_dir), Some(bin)) =
             (path.parent().and_then(Path::parent), path.file_name())
         {
-            return target_dir.join("release").join(bin);
+            return crate::built_artifact::prefer_built(target_dir.join("release").join(bin));
         }
     }
-    path
+    // `build.target` moves the artifact under `<triple>/`; use Cargo's own path.
+    crate::built_artifact::prefer_built(path)
 }
 
 #[cfg(test)]
