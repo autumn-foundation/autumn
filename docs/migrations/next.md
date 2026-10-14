@@ -1302,8 +1302,8 @@ had the same `model_path`, so `autumn data-flow` merged their rows (issue
 ```
 
 **After (`{(X+1).0}`):** the path has the compatible version of the defining
-crate. This is the major version, or `0.minor` for a crate before 1.0. A patch
-release does not change it.
+crate. This is the major version. For a crate before 1.0 it is `0.minor`. For a
+crate before 0.1 it is `0.0.patch`. Other patch releases do not change it.
 
 ```json
 "model_path": "shop::models::customer@2::Customer"
