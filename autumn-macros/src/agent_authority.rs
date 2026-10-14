@@ -951,7 +951,23 @@ impl Bindings {
         self.spawn_aliases.extend(other.spawn_aliases);
         self.unread_futures.extend(other.unread_futures);
         for (name, closure) in other.closures {
-            self.closures.entry(name).or_insert(closure);
+            match self.closures.get(&name) {
+                None => {
+                    self.closures.insert(name, closure);
+                }
+                // Two bodies on two paths: keep both, so a transaction walks
+                // the one that enqueues.
+                Some(kept)
+                    if kept.to_token_stream().to_string()
+                        != closure.to_token_stream().to_string() =>
+                {
+                    let (left, right) = (kept.body.clone(), closure.body);
+                    let mut merged = kept.clone();
+                    merged.body = syn::parse_quote!({ #left; #right });
+                    self.closures.insert(name, merged);
+                }
+                Some(_) => {}
+            }
         }
         // Keep a name only when both paths bind the same value. Autumn drops
         // any other name, so a later use is refused.
@@ -1098,6 +1114,14 @@ impl Analyzer {
         };
     }
 
+    /// A value item hides an imported function. It cannot hide the `tokio`
+    /// crate, which lives in the type namespace.
+    fn hide_import(&mut self, name: &syn::Ident) {
+        if name != "tokio" {
+            self.tokio_imports.remove(&name.to_string());
+        }
+    }
+
     /// Remove all state of a name except its handle.
     fn forget(&mut self, name: &str) {
         self.closures.remove(name);
@@ -1105,7 +1129,10 @@ impl Analyzer {
         self.fn_aliases.remove(name);
         self.unread_futures.remove(name);
         self.tables.remove(name);
-        self.tokio_imports.remove(name);
+        // `tokio` stays: a value binding cannot hide a crate path.
+        if name != "tokio" {
+            self.tokio_imports.remove(name);
+        }
         // A rebound name is no longer the typed parameter.
         self.inert_roots.remove(name);
     }
@@ -1235,15 +1262,9 @@ impl Analyzer {
         let imports = self.tokio_imports.clone();
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Item(syn::Item::Fn(item)) => {
-                    self.tokio_imports.remove(&item.sig.ident.to_string());
-                }
-                Stmt::Item(syn::Item::Const(item)) => {
-                    self.tokio_imports.remove(&item.ident.to_string());
-                }
-                Stmt::Item(syn::Item::Static(item)) => {
-                    self.tokio_imports.remove(&item.ident.to_string());
-                }
+                Stmt::Item(syn::Item::Fn(item)) => self.hide_import(&item.sig.ident),
+                Stmt::Item(syn::Item::Const(item)) => self.hide_import(&item.ident),
+                Stmt::Item(syn::Item::Static(item)) => self.hide_import(&item.ident),
                 // A `use` also covers the whole block, whatever its line.
                 Stmt::Item(item @ syn::Item::Use(_)) => self.nested_item(item),
                 _ => {}
@@ -3567,7 +3588,7 @@ fn classify_sql(sql: &str) -> Option<SqlStatement> {
             .filter(|(at, word)| {
                 let upper = word.to_ascii_uppercase();
                 SQL_WRITE_STATEMENTS.contains(&upper.as_str())
-                    && !(upper == "UPDATE" && is_lock_or_upsert_update(&words, *at))
+                    && !is_lock_upsert_or_merge_action(&words, *at)
             })
             .map(|(at, _)| at)
             .collect::<Vec<_>>()
@@ -3600,18 +3621,24 @@ fn classify_sql(sql: &str) -> Option<SqlStatement> {
     None
 }
 
-/// Is this `UPDATE` part of `ON CONFLICT DO UPDATE`, `FOR UPDATE` or
-/// `FOR NO KEY UPDATE`? Those name no table. A column called `key` or `share`
-/// before a real `UPDATE` must not match.
-fn is_lock_or_upsert_update(words: &[String], at: usize) -> bool {
+/// Is this keyword part of `ON CONFLICT DO UPDATE`, `FOR UPDATE`,
+/// `FOR NO KEY UPDATE` or a `MERGE` action (`WHEN MATCHED THEN UPDATE`)?
+/// Those name no table. A column called `key` or `share` before a real
+/// `UPDATE` must not match.
+fn is_lock_upsert_or_merge_action(words: &[String], at: usize) -> bool {
     let word = |back: usize| {
         at.checked_sub(back)
             .and_then(|i| words.get(i))
             .map(|w| w.to_ascii_uppercase())
     };
     match word(1).as_deref() {
-        Some("DO" | "FOR") => true,
-        Some("KEY") => word(2).as_deref() == Some("NO") && word(3).as_deref() == Some("FOR"),
+        Some("THEN") => true,
+        Some("DO" | "FOR") => words[at].eq_ignore_ascii_case("UPDATE"),
+        Some("KEY") => {
+            words[at].eq_ignore_ascii_case("UPDATE")
+                && word(2).as_deref() == Some("NO")
+                && word(3).as_deref() == Some("FOR")
+        }
         _ => false,
     }
 }
@@ -6570,6 +6597,17 @@ mod tests {
             }",
         ),
         (
+            "callback that differs between branches",
+            ExpectedKind::Rejected,
+            "enqueue",
+            r#"async fn h(mut db: Db, c: bool) -> R {
+                let mut cb = |conn| async move { Ok(()) };
+                if c { cb = |conn| async move { autumn_web::job::enqueue("x", p).await?; Ok(()) }; }
+                db.tx(cb).await?;
+                Ok(())
+            }"#,
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -6925,6 +6963,14 @@ mod tests {
             }"#,
         ),
         (
+            "a let named tokio does not hide the crate path",
+            r"async fn h(d: Duration) -> R {
+                let tokio = 1;
+                tokio::time::sleep(d).await;
+                Ok(tokio)
+            }",
+        ),
+        (
             "no handles at all",
             r"async fn h() -> R { Ok(render_static()) }",
         ),
@@ -7175,6 +7221,22 @@ mod tests {
             expansion.contains("EffectProvenance :: Declared")
                 && !expansion.contains("EffectProvenance :: Syntactic"),
             "a proof must not demote a declaration: {expansion}"
+        );
+    }
+
+    #[test]
+    fn a_merge_action_names_no_second_table() {
+        let expansion = expand(
+            GRANT,
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("WITH s AS (SELECT 1 AS id) MERGE INTO payouts p USING s ON p.id = s.id WHEN MATCHED THEN UPDATE SET x = 1 WHEN NOT MATCHED THEN INSERT (id) VALUES (1)")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        );
+        assert!(
+            expansion.contains("\"payouts\"") && !expansion.contains("\"SET\""),
+            "a MERGE action was read as a second table: {expansion}"
         );
     }
 
