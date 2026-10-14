@@ -1161,18 +1161,16 @@ pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mu
     // with the same set but produces the static message, would call that a
     // mismatch.
     if is_cookie && trimmed.contains(&b'=') {
-        let limit = if name == "set-cookie" {
-            1
-        } else {
-            MAX_COOKIE_PAIRS
-        };
+        // `Set-Cookie` holds one cookie, first: later segments are attributes.
+        let segments = if name == "set-cookie" { 1 } else { usize::MAX };
         // Count only segments with a cookie name. Handlers skip the others, so
         // they must not use up the cap and hide a real cookie behind them.
         let cookie_values = trimmed
             .split(|byte| *byte == b';')
+            .take(segments)
             .filter_map(|pair| split_once_byte(pair, b'='))
             .filter(|(cookie_name, _)| !trim_ows(cookie_name).is_empty())
-            .take(limit);
+            .take(MAX_COOKIE_PAIRS);
         for (_, cookie_value) in cookie_values {
             let spelled = trim_ows(cookie_value);
             let unquoted = trim_matches_byte(spelled, b'"');
@@ -3204,6 +3202,18 @@ mod tests {
             &filter_with(&[]),
         );
         assert!(values.contains(b"secretvalue"), "real cookie after junk");
+    }
+
+    /// `Set-Cookie` holds one cookie, first. A malformed first segment must not
+    /// promote an attribute to a cookie.
+    #[test]
+    fn a_set_cookie_attribute_is_never_read_as_the_cookie() {
+        let (_request, values) = redact(
+            Request::get("/").header("set-cookie", "junk; Path=/admin"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(!values.contains(b"/admin"));
     }
 
     /// A Unicode separator is found even when the credential is not UTF-8.
