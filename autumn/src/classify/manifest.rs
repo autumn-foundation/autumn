@@ -429,6 +429,40 @@ mod tests {
     }
 
     #[test]
+    fn two_versions_of_one_crate_stay_separate_rows() {
+        let manifest = DataFlowManifest::build(
+            &[
+                field_in("mycrate::Customer@1", "Customer", "email"),
+                field_in("mycrate::Customer@2", "Customer", "email"),
+            ],
+            &[],
+        );
+        assert_eq!(manifest.fields.len(), 2, "{manifest:?}");
+        let summary = manifest.summary();
+        assert!(summary.contains("mycrate::Customer@1.email"), "{summary}");
+        assert!(summary.contains("mycrate::Customer@2.email"), "{summary}");
+    }
+
+    #[test]
+    fn a_boundary_for_one_version_does_not_apply_to_the_other() {
+        let mut v2 = release("Customer", "email", "support_lookup");
+        v2.model_path = "mycrate::Customer@2";
+        let manifest = DataFlowManifest::build(
+            &[
+                field_in("mycrate::Customer@1", "Customer", "email"),
+                field_in("mycrate::Customer@2", "Customer", "email"),
+            ],
+            &[v2],
+        );
+        let v1_row = manifest
+            .fields
+            .iter()
+            .find(|f| f.model_path == "mycrate::Customer@1")
+            .expect("v1 row");
+        assert!(v1_row.reachable_sinks.is_empty(), "{manifest:?}");
+    }
+
+    #[test]
     fn identical_boundaries_are_deduplicated() {
         let manifest = DataFlowManifest::build(
             &[field("User", "email")],

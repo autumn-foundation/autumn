@@ -77,7 +77,17 @@ fn classified_field_marker_carries_model_field_and_tier() {
     // Module-qualified: the manifest keys on this, so two crates that each
     // define a `Customer` with a classified `email` stay separate rows.
     assert!(
-        CustomerEmailClassified::MODEL_PATH.ends_with("::data_classification::Customer"),
+        CustomerEmailClassified::MODEL_PATH.contains("::data_classification@"),
+        "{}",
+        CustomerEmailClassified::MODEL_PATH
+    );
+    // Version-qualified: two semver-incompatible versions of one crate can
+    // link into one binary and expand `module_path!()` the same way.
+    let (_, tail) = CustomerEmailClassified::MODEL_PATH
+        .split_once('@')
+        .expect("version marker");
+    assert!(
+        tail.starts_with(|c: char| c.is_ascii_digit()) && tail.ends_with("::Customer"),
         "{}",
         CustomerEmailClassified::MODEL_PATH
     );

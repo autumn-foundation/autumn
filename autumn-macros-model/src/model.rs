@@ -5927,6 +5927,26 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
     }
 }
 
+/// The part of a crate version that decides whether two versions can link
+/// into one binary: the major, or `0.minor` before 1.0.
+fn compat_version(major: &str, minor: &str) -> String {
+    if major == "0" {
+        format!("0.{minor}")
+    } else {
+        major.to_string()
+    }
+}
+
+/// [`compat_version`] of the crate being compiled. Cargo sets these variables
+/// for the defining crate, and the macro runs inside that compilation.
+fn classified_compat_version() -> String {
+    let var = |name| std::env::var(name).unwrap_or_else(|_| "0".to_string());
+    compat_version(
+        &var("CARGO_PKG_VERSION_MAJOR"),
+        &var("CARGO_PKG_VERSION_MINOR"),
+    )
+}
+
 /// An identifier's name with any raw-identifier prefix removed (`r#type` ->
 /// `type`), matching the DB column and the key callers pass to the
 /// field-name-driven accessors.
@@ -9054,6 +9074,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // One zero-sized marker per classified column. It names the field inside the
     // compiler diagnostic when a leak is attempted, keys a `declassify!` boundary
     // to exactly one column, and publishes the manifest row.
+    let compat_suffix = format!("@{}", classified_compat_version());
     let classified_items: Vec<TokenStream> = classified_columns
         .iter()
         .map(|(ident, col, marker)| {
@@ -9071,12 +9092,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 impl ::autumn_web::classify::ClassifiedField for #marker {
                     const MODEL: &'static str = stringify!(#name);
-                    // Module-qualified, because the manifest keys on this: two
-                    // linked crates can each define a `Customer` with a
-                    // classified `email`, and the bare name would merge them
+                    // Module- and version-qualified, because the manifest keys
+                    // on this: two linked crates, or two incompatible versions
+                    // of one crate, can each define a `Customer` with a
+                    // classified `email`. A bare name or path would merge them
                     // into one row.
                     const MODEL_PATH: &'static str =
-                        concat!(module_path!(), "::", stringify!(#name));
+                        concat!(module_path!(), #compat_suffix, "::", stringify!(#name));
                     const FIELD: &'static str = #col;
                     const CLASSIFICATION: ::autumn_web::classify::Classification =
                         ::autumn_web::classify::Classification::PersonalData;
@@ -9085,7 +9107,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::inventory::submit! {
                     ::autumn_web::classify::manifest::ClassifiedFieldDescriptor {
                         model: stringify!(#name),
-                        model_path: concat!(module_path!(), "::", stringify!(#name)),
+                        model_path: concat!(module_path!(), #compat_suffix, "::", stringify!(#name)),
                         field: #col,
                         classification: ::autumn_web::classify::Classification::PersonalData,
                     }
@@ -16803,10 +16825,26 @@ mod tests {
             "the manifest identity must be module-qualified so two `Customer`s \
              in different crates cannot share a row: {generated}"
         );
+        let version = classified_compat_version();
+        assert_eq!(
+            generated.matches(&format!("\"@{version}\"")).count(),
+            2,
+            "marker and descriptor must both carry the crate version: {generated}"
+        );
         assert!(
             generated.contains("Classification :: PersonalData"),
             "{generated}"
         );
+    }
+
+    #[test]
+    fn compat_version_keeps_only_the_semver_incompatible_part() {
+        // A patch or compatible bump must not churn the manifest key.
+        assert_eq!(compat_version("2", "7"), "2");
+        assert_eq!(compat_version("1", "0"), "1");
+        // Before 1.0 a minor bump is the breaking one.
+        assert_eq!(compat_version("0", "8"), "0.8");
+        assert_eq!(compat_version("0", "0"), "0.0");
     }
 
     #[test]
