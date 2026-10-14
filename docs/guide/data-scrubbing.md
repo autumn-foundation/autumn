@@ -713,10 +713,10 @@ apply-time error.
   `--allow-source-overwrite`, rather than riding on `--force`: the staging drill
   always passes `--force`, so a guard `--force` waived would be inert in exactly
   the workflow it exists for. The guard compares the control URL and every
-  `[[database.shards]]` URL of each profile. It skips the profile you scrub:
-  that profile is the destination. It resolves a hostless URL
-  (`postgres:///db?host=/run/postgresql`) through its `host` parameter, then
-  `PGHOST`.
+  `[[database.shards]]` URL of each protected profile. It skips the profile you
+  scrub, because that profile is the destination. A hostless URL
+  (`postgres:///db?host=/run/postgresql`) takes its host from the `hostaddr`
+  or `host` parameter. If both are missing, it uses `PGHOST`.
 - **A refusal writes nothing.** Classification completes before a single row is
   touched. The one exception is `--artifact`: the restore has to run before the
   scrub can read the schema it created, so a refusal *after* a restore leaves

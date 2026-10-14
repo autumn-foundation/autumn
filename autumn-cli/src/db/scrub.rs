@@ -2331,12 +2331,18 @@ fn same_database(a: &str, b: &str) -> bool {
     same_database_with(a, b, pghost.as_deref())
 }
 
-/// [`same_database`] with `PGHOST` passed in, so tests need no process env.
+/// Like [`same_database`], but the caller passes `PGHOST`.
+/// Tests then do not set process environment variables.
 ///
-/// A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host from
-/// the `host` / `hostaddr` query parameter, then from `pghost`. An unresolved
-/// host is empty: libpq then uses its default socket.
+/// A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host
+/// from the `hostaddr` parameter, then `host`, then `pghost`.
+/// If no host is found, the host is empty and libpq uses its default socket.
 fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
+    let decode = |raw: &str| {
+        percent_encoding::percent_decode_str(raw)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
     let parts = |raw: &str| -> Option<(String, u16, String)> {
         let parsed = url::Url::parse(raw).ok()?;
         let query = |key: &str| {
@@ -2347,23 +2353,31 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
         };
         let host = parsed
             .host_str()
-            .map(str::to_owned)
+            .map(decode)
             .or_else(|| query("hostaddr"))
             .or_else(|| query("host"))
             .or_else(|| pghost.filter(|h| !h.is_empty()).map(str::to_owned))
             .unwrap_or_default()
+            .trim_end_matches('.')
             .to_ascii_lowercase();
-        let port = parsed.port().unwrap_or(5432);
-        let name = parsed
-            .path_segments()
-            .and_then(|mut s| s.next())
-            .map(str::to_owned)
+        let port = parsed
+            .port()
+            .or_else(|| query("port").and_then(|p| p.parse().ok()))
+            .unwrap_or(5432);
+        let name = query("dbname")
+            .or_else(|| {
+                parsed
+                    .path_segments()
+                    .and_then(|mut s| s.next())
+                    .map(decode)
+            })
             .filter(|n| !n.is_empty())?;
         Some((host, port, name))
     };
     match (parts(a), parts(b)) {
         (Some(left), Some(right)) => left == right,
-        _ => false,
+        // A URL this parser cannot read matches only an identical string.
+        _ => a.contains("://") && a == b,
     }
 }
 
@@ -2385,6 +2399,8 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
 /// `--force`: the documented staging drill ALWAYS passes `--force` (staging is
 /// not `dev`/`test`), so a guard that `--force` waived would be inert in exactly
 /// the workflow it exists for.
+/// The guard skips the config overlay of `destination_profile`. That overlay
+/// names the database you scrub. The artifact profile is always checked.
 fn guard_configured_source(
     artifact_profile: Option<&str>,
     destination_profile: &str,
@@ -2398,29 +2414,34 @@ fn guard_configured_source(
     let mut candidates: Vec<String> = artifact_profile
         .map(str::to_owned)
         .into_iter()
-        .chain(profiles_with_config(project_root))
-        .filter(|p| !super::is_safe_destructive_profile(p) && p != destination_profile)
+        .chain(
+            profiles_with_config(project_root)
+                .into_iter()
+                .filter(|p| p != destination_profile),
+        )
+        .filter(|p| !super::is_safe_destructive_profile(p))
         .collect();
     candidates.sort();
     candidates.dedup();
 
     for profile in candidates {
         let table = migrate::read_autumn_toml_table_with_profile_in(project_root, Some(&profile));
-        // Control plus every shard: a restore writes all of them.
+        // Control plus every shard: a restore writes all of them. A bad shard
+        // entry refuses: skipping it would skip the check.
+        let shards = migrate::try_resolve_shard_database_urls_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            table.as_ref(),
+        )
+        .map_err(|detail| ScrubError::Config {
+            path: format!("autumn-{profile}.toml"),
+            detail,
+        })?;
         let declared: Vec<String> = migrate::resolve_primary_database_url_from_sources(
             |_| Err(std::env::VarError::NotPresent),
             table.as_ref(),
         )
         .into_iter()
-        .chain(
-            migrate::try_resolve_shard_database_urls_from_sources(
-                |_| Err(std::env::VarError::NotPresent),
-                table.as_ref(),
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, url)| url),
-        )
+        .chain(shards.into_iter().map(|(_, url)| url))
         .collect();
         for (_, url) in targets {
             if declared.iter().any(|d| same_database(d, url)) {
@@ -8878,8 +8899,7 @@ mod tests {
 
     #[test]
     fn the_destination_profile_is_not_a_protected_source() {
-        // Issue #2366 (18): the documented drill scrubs `staging` with an
-        // `autumn-staging.toml` present. That overlay names the destination.
+        // Issue #2366: the drill scrubs `staging` while `autumn-staging.toml` exists.
         let dir = tempfile::tempdir().unwrap();
         let url = "postgres://app:pw@stg.example.com:5432/myapp";
         overlay(
@@ -8912,7 +8932,7 @@ mod tests {
 
     #[test]
     fn a_protected_shard_url_is_compared_too() {
-        // Issue #2366 (9): a source shard is a protected database.
+        // Issue #2366: a shard of a protected profile is a protected database.
         let dir = tempfile::tempdir().unwrap();
         overlay(
             dir.path(),
@@ -8938,7 +8958,7 @@ mod tests {
 
     #[test]
     fn hostless_urls_name_the_same_database() {
-        // Issue #2366 (8): no URL authority, so the host comes from libpq.
+        // Issue #2366: a URL without a host takes its host from libpq settings.
         assert!(same_database_with(
             "postgres:///prod?user=app&host=/var/run/postgresql",
             "postgres:///prod?host=/var/run/postgresql",
@@ -8966,6 +8986,69 @@ mod tests {
             "postgres:///other?host=/tmp",
             None
         ));
+    }
+
+    #[test]
+    fn the_artifact_source_profile_is_protected_even_as_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "postgres://a@prod.example.com/app";
+        overlay(
+            dir.path(),
+            "prod",
+            &format!("[database]\nprimary_url = \"{url}\"\n"),
+        );
+        assert!(
+            guard_configured_source(
+                Some("prod"),
+                "prod",
+                dir.path(),
+                &control_target(url),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_malformed_shard_entry_refuses_instead_of_skipping_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        overlay(
+            dir.path(),
+            "prod",
+            "[database]\nprimary_url = \"postgres://a@prod.example.com/ctl\"\n\n\
+             [[database.shards]]\nprimary_url = \"postgres://a@prod.example.com/s1\"\n",
+        );
+        let targets = control_target("postgres://a@stg.example.com/ctl");
+        assert!(matches!(
+            guard_configured_source(Some("prod"), "staging", dir.path(), &targets, false),
+            Err(ScrubError::Config { .. })
+        ));
+    }
+
+    #[test]
+    fn libpq_query_overrides_and_encoding_are_normalised() {
+        let same = |a, b| same_database_with(a, b, None);
+        assert!(same("postgres://h/ctl", "postgres://h/stg?dbname=ctl"));
+        assert!(same("postgres://h?dbname=prod", "postgres://h/prod"));
+        assert!(same(
+            "postgres://h:6432/prod",
+            "postgres://h/prod?port=6432"
+        ));
+        assert!(same("postgres://h/pr%6Fd", "postgres://h/prod"));
+        assert!(same(
+            "postgres://prod.example.com./app",
+            "postgres://prod.example.com/app"
+        ));
+        assert!(same(
+            "postgres://%2Fvar%2Frun%2Fpostgresql/prod",
+            "postgres:///prod?host=/var/run/postgresql"
+        ));
+        // A URL that does not parse still matches itself.
+        assert!(same(
+            "postgres://h1:1,h2:2/prod",
+            "postgres://h1:1,h2:2/prod"
+        ));
+        assert!(!same("postgres://h/prod", "postgres://h/other"));
     }
 
     #[test]
