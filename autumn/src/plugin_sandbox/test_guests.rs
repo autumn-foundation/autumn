@@ -3361,6 +3361,46 @@ pub fn empty_iovecs(iovecs: u32, calls: u32) -> String {
     )
 }
 
+/// A guest that writes `pad` JSON-whitespace bytes, then answers honestly.
+///
+/// The pad and the frame share one stdout line, so the host parser must scan
+/// every pad byte. Two modules from this function differ in one `i32.const`
+/// (`pad`): guest instruction counts match, so the whole `fuel_used` gap is
+/// host work. `pad` must not exceed 65536 (the size of the data segment).
+#[must_use]
+pub fn padded_frame(pad: u32) -> String {
+    let spaces = " ".repeat(65536);
+    format!(
+        r#"(module
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2 4)
+  (data (i32.const 128) "{{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}}\0a\00")
+  (data (i32.const 65536) "{spaces}")
+
+  ;; Length of the NUL-terminated string at $p.
+  (func $strlen (param $p i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $l)))
+    (local.get $n))
+
+  (func (export "_start")
+    ;; The pad: whitespace the parser must skip.
+    (i32.store (i32.const 0) (i32.const 65536))
+    (i32.store (i32.const 4) (i32.const {pad}))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16)))
+    ;; The frame.
+    (i32.store (i32.const 0) (i32.const 128))
+    (i32.store (i32.const 4) (call $strlen (i32.const 128)))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16))))
+)
+"#
+    )
+}
+
 /// A guest whose single `fd_write` carries a complete `kv-set` frame and then
 /// a line that never ends, long enough to overrun the stdout budget.
 ///
