@@ -386,3 +386,113 @@ async fn manually_composed_stack_uses_finalized_tenant_after_switch() {
          tenancy_middleware + IdempotencyLayer stack too, not just AppBuilder's"
     );
 }
+
+/// Session store whose `save` pauses after persisting, so a test can send a
+/// request while the first response is still in its commit step.
+struct GatedSaveStore {
+    inner: SessionMemoryStore,
+    saved: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+impl SessionStore for GatedSaveStore {
+    async fn load(
+        &self,
+        id: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>, autumn_web::session::SessionStoreError>
+    {
+        self.inner.load(id).await
+    }
+
+    async fn save(
+        &self,
+        id: &str,
+        data: std::collections::HashMap<String, String>,
+    ) -> Result<(), autumn_web::session::SessionStoreError> {
+        self.inner.save(id, data).await?;
+        self.saved.notify_one();
+        self.resume.notified().await;
+        Ok(())
+    }
+
+    async fn destroy(&self, id: &str) -> Result<(), autumn_web::session::SessionStoreError> {
+        self.inner.destroy(id).await
+    }
+}
+
+static GATED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+async fn gated_switch_handler(session: Session) -> String {
+    let calls = GATED_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    session.insert("tenant_id", "org-b").await;
+    format!("switched-{calls}")
+}
+
+/// Issue #2455: between `store.save` and the idempotency commit, a request
+/// with the same unrotated cookie resolves the new tenant. Nothing locked that
+/// alias key, so the handler ran twice.
+#[tokio::test]
+async fn concurrent_retry_during_session_commit_does_not_rerun_handler() {
+    GATED_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    "session".clone_into(&mut config.tenancy.source);
+    let state = AppState::for_test();
+    state.insert_extension(config);
+
+    let inner = SessionMemoryStore::new();
+    let mut seed = std::collections::HashMap::new();
+    seed.insert("tenant_id".to_owned(), "org-a".to_owned());
+    inner.save("gated-session", seed).await.expect("seed");
+    let saved = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let store = GatedSaveStore {
+        inner,
+        saved: Arc::clone(&saved),
+        resume: Arc::clone(&resume),
+    };
+
+    let idempotency_store: Arc<dyn IdempotencyStore> = Arc::new(MemoryIdempotencyStore::new(
+        std::time::Duration::from_secs(60),
+    ));
+    let app = axum::Router::new()
+        .route("/switch-org", axum::routing::post(gated_switch_handler))
+        .layer(IdempotencyLayer::new(idempotency_store))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tenancy_middleware,
+        ))
+        .layer(
+            SessionLayer::new(store, SessionConfig::default())
+                .with_tenancy_session_key(Some(Arc::from("tenant_id"))),
+        );
+    let request = || {
+        axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/switch-org")
+            .header("idempotency-key", "gated-key")
+            .header("cookie", "autumn.sid=gated-session")
+            .body(Body::empty())
+            .expect("request must build")
+    };
+
+    let first = tokio::spawn(app.clone().oneshot(request()));
+    saved.notified().await;
+
+    let second = app.oneshot(request()).await.unwrap();
+    resume.notify_one();
+    let first = first.await.unwrap().unwrap();
+
+    assert_eq!(first.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        second.status(),
+        axum::http::StatusCode::CONFLICT,
+        "a request during the commit must wait, not run"
+    );
+    assert_eq!(
+        GATED_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "the handler must run once"
+    );
+}
