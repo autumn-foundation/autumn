@@ -2813,7 +2813,12 @@ fn classify_and_apply(
 
         report_plan(label, &plan);
         report_framework_tables(&facts.framework_tables, &sources.config);
-        report_triggers(&plan, sampling.as_ref(), &facts);
+        report_triggers(
+            &plan,
+            &purge_statements(&facts.framework_tables, &sources.config),
+            sampling.as_ref(),
+            &facts,
+        );
         if let Some(sampling) = &sampling {
             report_sample_plan(label, sampling);
         }
@@ -3696,29 +3701,46 @@ fn human_bytes(bytes: i64) -> String {
     }
 }
 
-/// Warn when a table the scrub rewrites carries user-defined triggers.
+/// Tables this run writes to that carry a user-defined trigger or rule.
 ///
-/// An audit/history trigger copies the pre-scrub `OLD` row into another table as
-/// the `UPDATE` runs — so a table scrubbed earlier in the same transaction can be
-/// re-populated with real values behind the scrub's back.
-fn report_triggers(plan: &ScrubPlan, sampling: Option<&sample::SamplePlan>, facts: &DatabaseFacts) {
-    // A sample DELETEs from tables the column plan never names — a pure join
-    // table has no PII column at all — and an `AFTER DELETE` audit trigger
-    // copies the row it removed somewhere else, which is the same hazard from
-    // the other side.
-    let mut triggered: Vec<&str> = plan
+/// Covers all three classes of write: the column plan, the `[framework] purge`
+/// targets (framework tables are not in `plan.tables`), and the sample.
+fn triggered_write_targets(
+    plan: &ScrubPlan,
+    purges: &[(String, String)],
+    sampling: Option<&sample::SamplePlan>,
+    facts: &DatabaseFacts,
+) -> Vec<String> {
+    let mut triggered: Vec<String> = plan
         .tables
         .iter()
         .map(|t| t.table.as_str())
+        .chain(purges.iter().map(|(table, _)| table.as_str()))
         .chain(
             sampling
                 .into_iter()
                 .flat_map(sample::SamplePlan::subsetted_tables),
         )
         .filter(|t| facts.triggered_tables.contains(*t))
+        .map(str::to_owned)
         .collect();
     triggered.sort_unstable();
     triggered.dedup();
+    triggered
+}
+
+/// Warn when a table the scrub rewrites carries user-defined triggers.
+///
+/// An audit/history trigger copies the pre-scrub `OLD` row into another table as
+/// the `UPDATE` runs — so a table scrubbed earlier in the same transaction can be
+/// re-populated with real values behind the scrub's back.
+fn report_triggers(
+    plan: &ScrubPlan,
+    purges: &[(String, String)],
+    sampling: Option<&sample::SamplePlan>,
+    facts: &DatabaseFacts,
+) {
+    let triggered = triggered_write_targets(plan, purges, sampling, facts);
     if triggered.is_empty() {
         return;
     }
@@ -7730,6 +7752,37 @@ mod tests {
         assert!(
             facts.rls_tables.contains(&purges[0].0),
             "a purge target under RLS must reach the refusal"
+        );
+    }
+
+    #[test]
+    fn a_purge_target_with_a_trigger_is_reported_like_any_other_write() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name", "bio"]
+            [framework]
+            purge = ["autumn_jobs"]
+            "#,
+        )
+        .unwrap();
+        let facts = DatabaseFacts {
+            framework_tables: vec!["autumn_jobs".to_owned()],
+            triggered_tables: BTreeSet::from(["autumn_jobs".to_owned()]),
+            ..DatabaseFacts::default()
+        };
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .unwrap();
+        let purges = purge_statements(&facts.framework_tables, &config);
+        assert_eq!(
+            triggered_write_targets(&plan, &purges, None, &facts),
+            vec!["autumn_jobs".to_owned()]
         );
     }
 
