@@ -140,14 +140,11 @@ const DEV_READY_FILE_PREFIX: &str = "dev-ready.";
 )]
 const DEV_READY_FILE_SUFFIX: &str = ".state";
 
-/// Headroom added to the app's own drain budget before `autumn dev` escalates
-/// to a hard kill.
+/// Longest time a managed-Postgres stop can take.
 ///
-/// `on_shutdown` hooks run **after** the drain completes, so this — not the
-/// drain budget — is what has to cover them. Sized to the managed-Postgres stop
-/// ceiling (`STARTUP_TIMEOUT` in `autumn_web::managed_pg`, 60s, which
-/// `postgresql_embedded` applies to `pg_ctl stop` as well as start): that hook
-/// is the one this whole mechanism exists to let run.
+/// This value equals `STARTUP_TIMEOUT` in `autumn_web::managed_pg`.
+/// `postgresql_embedded` uses that limit for `pg_ctl stop` too.
+/// The CLI cannot import the constant. A test checks that both values match.
 #[cfg_attr(
     unix,
     allow(
@@ -155,7 +152,36 @@ const DEV_READY_FILE_SUFFIX: &str = ".state";
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-const COOPERATIVE_STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
+const MANAGED_PG_STOP_CEILING: Duration = Duration::from_secs(60);
+
+/// Extra time on top of the stop ceiling.
+///
+/// The app polls for the stop signal every 100 ms. The app must also exit
+/// after the stop ends. A busy machine adds more delay.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DELIVERY_AND_EXIT_MARGIN: Duration = Duration::from_secs(15);
+
+/// Extra time added to the app's drain budget before `autumn dev` kills the app.
+///
+/// The `on_shutdown` hooks run inside the drain budget.
+/// `emergency_stop_async` runs after the drain and has no time limit.
+/// Its worst case is a full managed-Postgres stop.
+/// The headroom is that stop limit plus a margin. A slow stop can then finish.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const COOPERATIVE_STOP_HOOK_HEADROOM: Duration =
+    MANAGED_PG_STOP_CEILING.saturating_add(DELIVERY_AND_EXIT_MARGIN);
 
 /// The cooperative-stop budget for an app whose configured graceful-drain
 /// budget is `drain_secs` (`prestop_grace_secs + shutdown_timeout_secs`).
@@ -1732,8 +1758,8 @@ fn dev_ready_file_path() -> Option<&'static Path> {
 /// The stop budget the running child reported for itself, if it has booted.
 ///
 /// The app writes its resolved *drain* budget (`prestop_grace_secs +
-/// shutdown_timeout_secs`) to this file at startup-complete; hooks run after the
-/// drain, so the same headroom still applies. A missing, blank, or unparseable
+/// shutdown_timeout_secs`) to this file at startup-complete. The same headroom
+/// still applies after the drain. A missing, blank, or unparseable
 /// file means "no report" — never a zero budget, which would hard-kill instantly.
 #[cfg_attr(
     unix,
@@ -2251,9 +2277,8 @@ mod tests {
 
     #[test]
     fn the_stop_budget_covers_the_managed_postgres_stop_ceiling() {
-        // `on_shutdown` hooks run AFTER the drain, so the headroom — not the
-        // drain budget — is what has to cover a `pg_ctl stop`. autumn-web's
-        // provider gives that operation a 60s ceiling.
+        // After the drain, `emergency_stop_async` can run a full `pg_ctl stop`.
+        // The headroom must cover it. The provider limit for that stop is 60s.
         assert!(
             cooperative_stop_budget(0) >= Duration::from_secs(60),
             "the headroom must cover a managed-Postgres stop"
@@ -2324,9 +2349,8 @@ mod tests {
 
     #[test]
     fn the_reported_budget_gets_the_same_hook_headroom() {
-        // The app reports its DRAIN budget (prestop + shutdown). Hooks run after
-        // the drain, so the headroom still applies — otherwise honouring the
-        // report would reintroduce the very orphan it prevents.
+        // The app reports its drain budget (prestop + shutdown). The headroom
+        // still applies. Without it, a slow Postgres stop is killed.
         let tmp = tempfile::TempDir::new().unwrap();
         let ready = tmp.path().join("dev-ready.state");
         std::fs::write(&ready, "300\n").unwrap();
@@ -2410,6 +2434,34 @@ mod tests {
         // Resolving against a directory with no `autumn.toml` must still yield a
         // budget that outlasts a managed-Postgres teardown, not zero.
         assert!(resolve_cooperative_stop_budget(None) >= COOPERATIVE_STOP_HOOK_HEADROOM);
+    }
+
+    /// Reads `STARTUP_TIMEOUT` from the framework source.
+    /// The CLI does not enable `managed-pg`. It cannot import the constant.
+    fn managed_pg_stop_ceiling_from_source() -> Duration {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../autumn/src/managed_pg.rs");
+        let source = std::fs::read_to_string(&path).expect("read managed_pg.rs");
+        let secs = source
+            .lines()
+            .find(|l| l.contains("const STARTUP_TIMEOUT: Duration"))
+            .and_then(|l| l.split("from_secs(").nth(1))
+            .and_then(|l| l.split(')').next())
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .expect("parse STARTUP_TIMEOUT");
+        Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_ceiling_constant_matches_the_framework() {
+        assert_eq!(
+            MANAGED_PG_STOP_CEILING,
+            managed_pg_stop_ceiling_from_source()
+        );
+    }
+
+    #[test]
+    fn the_headroom_exceeds_the_managed_pg_stop_ceiling() {
+        assert!(COOPERATIVE_STOP_HOOK_HEADROOM > managed_pg_stop_ceiling_from_source());
     }
 
     #[test]
