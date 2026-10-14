@@ -60,7 +60,7 @@ debug = "line-tables-only"
 ```
 
 `line-tables-only` keeps backtraces useful (file and line, no variable
-inspection; use `debug = true` to get it back) at a fraction of the symbol count. Use `0` if that is still too
+inspection; set `debug = true` in both tables to get it back) at a fraction of the symbol count. Use `0` if that is still too
 much. Projects made with an older `autumn new` do not have these lines. Add them
 yourself. Autumn's `windows-tier1` CI job builds the scaffold as it is.
 
