@@ -376,9 +376,39 @@ pub fn parse_encrypted_columns(
 /// predicates (a feature, a target) are unknown and count as on. This keeps a
 /// registration the app might have: scrubbing too much is the safe error.
 pub fn production_enabled(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().filter(|a| a.path().is_ident("cfg")).all(|a| {
-        a.parse_args::<syn::Meta>()
-            .map_or(true, |m| cfg_value(&m) != Some(false))
+    attrs.iter().all(|a| {
+        if a.path().is_ident("cfg") {
+            a.parse_args::<syn::Meta>()
+                .map_or(true, |m| cfg_value(&m) != Some(false))
+        } else if a.path().is_ident("cfg_attr") {
+            cfg_attr_keeps_item(a)
+        } else {
+            true
+        }
+    })
+}
+
+/// `#[cfg_attr(pred, cfg(...))]` adds a `cfg` when `pred` holds. It disables the
+/// item only when `pred` is known true and an added `cfg` is known false.
+fn cfg_attr_keeps_item(attr: &syn::Attribute) -> bool {
+    use syn::punctuated::Punctuated;
+
+    let Ok(args) = attr.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+    else {
+        return true;
+    };
+    let mut args = args.into_iter();
+    let Some(predicate) = args.next() else {
+        return true;
+    };
+    if cfg_value(&predicate) != Some(true) {
+        return true;
+    }
+    args.all(|meta| match &meta {
+        syn::Meta::List(list) if list.path.is_ident("cfg") => list
+            .parse_args::<syn::Meta>()
+            .map_or(true, |m| cfg_value(&m) != Some(false)),
+        _ => true,
     })
 }
 

@@ -4949,6 +4949,17 @@ const TRIGGER_IDENTITIES: &str = "SELECT rel.relname || ':trigger:' || t.tgname 
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE r.rulename <> '_RETURN'";
 
+/// Generated and `GENERATED ALWAYS` identity columns, read through `to_jsonb` so
+/// the same text runs on servers that lack `attgenerated` (before 12). A column
+/// that stops being generated mid-run is an ordinary column holding real values.
+const GENERATED_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
+     FROM pg_attribute att \
+     JOIN pg_class rel ON rel.oid = att.attrelid \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE att.attnum > 0 AND NOT att.attisdropped \
+       AND (coalesce(to_jsonb(att)->>'attgenerated', '') <> '' \
+            OR to_jsonb(att)->>'attidentity' = 'a')";
+
 /// Every materialized view in `public`, by name, OID and population state. The
 /// refresh list is drawn from the probe. A view created, or dropped and
 /// recreated under the same name (new OID), would keep stale rows.
@@ -4987,6 +4998,12 @@ fn live_schema_drift(
     let mut drift = schema_drift(
         (&facts.public_base_tables, &facts.public_columns),
         (&tables, &columns),
+    );
+    let generated = pair_set(sql_query(GENERATED_COLUMNS).load::<PairRow>(conn)?);
+    drift.extend(
+        generated
+            .symmetric_difference(&facts.generated_columns)
+            .map(|(t, c)| format!("{t}.{c} (generated state changed)")),
     );
     let mut triggered = names(conn, &triggers_reaching(""))?;
     triggered.extend(names(conn, &rules_reaching(""))?);
@@ -8740,6 +8757,11 @@ mod tests {
     }
 
     #[test]
+    fn the_generated_column_probe_runs_on_servers_without_attgenerated() {
+        assert!(GENERATED_COLUMNS.contains("to_jsonb(att)"));
+    }
+
+    #[test]
     fn the_matview_snapshot_changes_when_a_view_is_recreated() {
         assert!(PUBLIC_MATVIEWS.contains("rel.oid"));
     }
@@ -9971,6 +9993,21 @@ mod tests {
         );
         assert!(
             found("fn f() { #[cfg(test)] (ModelRegistration::anonymize(\"a\"),); }").is_empty()
+        );
+        assert!(
+            found(&format!(
+                "#[cfg_attr(not(test), cfg(test))] mod m {{ {} }}",
+                reg("a")
+            ))
+            .is_empty()
+        );
+        // An unknown predicate may or may not add the `cfg`: keep the item.
+        assert_eq!(
+            found(&format!(
+                "#[cfg_attr(feature = \"x\", cfg(test))] mod m {{ {} }}",
+                reg("a")
+            )),
+            BTreeSet::from(["a".to_owned()])
         );
         assert!(
             found(
