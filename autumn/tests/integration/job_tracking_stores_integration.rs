@@ -1,13 +1,12 @@
 //! Docker-gated integration tests for the Redis/Postgres tracked-job stores
-//! (issue #1373): prove `enqueue_tracked` actually persists through the
-//! backend selected by `jobs.backend`, not silently through the in-memory
-//! fallback, and that the configured TTL expires records on each backend.
+//! (issue #1373): prove `enqueue_tracked` persists through the backend that
+//! `jobs.backend` selects, not the in-memory fallback, and that the TTL
+//! expires records on each backend.
 //!
-//! Both tests require Docker and are marked `#[ignore]`. Run them explicitly
-//! with:
+//! The tests need Docker and are `#[ignore]`. Run them with:
 //!
 //! ```text
-//! cargo test -p autumn-web --features redis,db --test job_tracking_stores_integration -- --ignored
+//! cargo test -p autumn-web --features redis,db --test integration_tests job_tracking_stores -- --ignored
 //! ```
 
 use std::future::Future;
@@ -339,8 +338,8 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
     job::clear_global_job_client();
 }
 
-/// Clock skew between replicas (#2875): the database clock alone decides
-/// expiry, so a writer's own clock must not change a record's TTL.
+/// Clock skew between replicas (#2875). Only the database clock decides
+/// expiry. A writer's clock must not change a record's TTL.
 #[cfg(feature = "db")]
 mod pg_clock_skew {
     use std::sync::Arc;
@@ -432,7 +431,7 @@ mod pg_clock_skew {
         store
             .create("forever", TrackedJobOwner::Anonymous)
             .await
-            .expect("an extreme TTL must clamp, not overflow the database timestamp");
+            .expect("an extreme TTL must clamp");
         assert!(store.get("forever").await.expect("get").is_some());
     }
 }

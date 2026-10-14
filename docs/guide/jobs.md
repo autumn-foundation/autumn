@@ -972,9 +972,9 @@ job forever: the in-memory store sweeps them out opportunistically (amortized
 across `create` calls), the Postgres and SQLite background sweeps run every 5
 minutes to `DELETE` expired rows, and Redis expires keys natively via `EX`.
 
-The Postgres store takes "now" from the database clock only. Web and worker
-replicas can have different clocks, but a record always lives for exactly
-`ttl_secs` of database time. A TTL above 100 years is clamped to 100 years.
+The Postgres store uses the database clock only. It sets and checks
+`expires_at` with `NOW()`. Replica clocks can differ, but this does not change
+`jobs.tracking.ttl_secs`. The store clamps a TTL above 100 years to 100 years.
 
 ### Async CSV export, end to end
 

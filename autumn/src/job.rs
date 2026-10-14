@@ -21911,8 +21911,8 @@ mod tests {
             }
             drop(conn);
 
-            // A zero TTL puts `expires_at` at the database `NOW()` of the
-            // write, so the row is already expired at the next statement.
+            // A zero TTL sets `expires_at` to the write's `NOW()`. The next
+            // read sees the row as expired.
             let expired_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 0);
             expired_store
                 .create(

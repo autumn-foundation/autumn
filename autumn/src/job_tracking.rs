@@ -1918,7 +1918,7 @@ pub(crate) fn build_redis_tracking_store(
 
 // ── Postgres store ───────────────────────────────────────────────────────────
 
-/// Longest TTL the Postgres store keeps: 100 years, well inside `timestamptz`.
+/// Maximum TTL in seconds (100 years). A larger value could overflow `timestamptz`.
 #[cfg(feature = "db")]
 const MAX_PG_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 
@@ -1928,8 +1928,8 @@ const MAX_PG_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 /// token hash, with lazy expiry (reads filter on `expires_at`; writes refresh
 /// it). See the `create_job_tracking` framework migration.
 ///
-/// Only the database clock (`NOW()`) sets and checks `expires_at`. Replica
-/// clocks can differ, so a host clock never decides expiry (#2875).
+/// The database clock (`NOW()`) sets and checks `expires_at`. Host clocks can
+/// differ, so the store never uses them for expiry (#2875).
 #[cfg(feature = "db")]
 #[derive(Clone)]
 pub struct PgJobTrackingStore {
@@ -1961,17 +1961,16 @@ impl PgJobTrackingStore {
         }
     }
 
-    /// Replace the clock that stamps each record's `updated_at`.
+    /// Replace the clock that sets `updated_at`.
     ///
-    /// Expiry ignores this clock: the database clock decides it.
-    /// Defaults to [`SystemClock`].
+    /// Expiry does not use this clock. Default: [`SystemClock`].
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
         self.clock = clock;
         self
     }
 
-    /// The TTL in seconds, clamped so `NOW() + ttl` stays a valid timestamp.
+    /// The TTL in seconds, limited to `MAX_PG_TTL_SECS` so `NOW() + ttl` stays valid.
     fn ttl_secs_clamped(&self) -> i64 {
         i64::try_from(self.ttl_secs).map_or(MAX_PG_TTL_SECS, |secs| secs.min(MAX_PG_TTL_SECS))
     }
@@ -2023,7 +2022,8 @@ impl PgJobTrackingStore {
 
         diesel::sql_query(
             "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, \
-             expires_at = NOW() + make_interval(secs => $4::FLOAT8) WHERE key = $1",
+             expires_at = NOW() + make_interval(secs => $4::FLOAT8) \
+             WHERE key = $1 AND expires_at > NOW()",
         )
         .bind::<diesel::sql_types::Text, _>(key)
         .bind::<diesel::sql_types::Text, _>(&payload)
