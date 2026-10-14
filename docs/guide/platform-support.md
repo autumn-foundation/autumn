@@ -59,9 +59,11 @@ debug = "line-tables-only"
 debug = "line-tables-only"
 ```
 
-`line-tables-only` keeps backtraces useful (file and line, no variable
-inspection; set `debug = true` in both tables to get it back) at a fraction of the symbol count. Use `0` if that is still too
-much. Projects made with an older `autumn new` do not have these lines. Add them
+`line-tables-only` keeps file and line in backtraces. It removes variable
+inspection in a debugger. To get full debug info back, set `debug = true` in
+both tables. If the build still fails, set `debug = 0` in both tables.
+
+Projects made with an older `autumn new` do not have these lines. Add them
 yourself. Autumn's `windows-tier1` CI job builds the scaffold as it is.
 
 Set it in the **manifest**. Do not use `CARGO_PROFILE_DEV_DEBUG`: Autumn's CI
