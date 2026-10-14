@@ -4411,10 +4411,11 @@ fn build_load_shed_layer(
     // falling back to the profile default (never to a lower ceiling) on every
     // contract problem, so a stale or missing lockfile can never shed every
     // request on the way up.
-    let resolved = crate::capacity::resolve_configured_admission_limit_with_default(
+    let resolved = crate::capacity::resolve_configured_admission_limit_for_profile(
         config.server.max_concurrent_requests,
         config.server.capacity_contract.as_deref(),
         config.profile_admission_default(),
+        config.profile.as_deref(),
     );
     let admission = &config.server.admission;
     let shares = admission.partition_shares().unwrap_or_else(|error| {
