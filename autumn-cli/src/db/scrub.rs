@@ -2347,38 +2347,50 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
     };
     let parts = |raw: &str| -> Option<(String, u16, String)> {
         let parsed = url::Url::parse(raw).ok()?;
-        // libpq applies query parameters after the authority, and the last
-        // repeat of a parameter wins.
-        let query = |key: &str| {
-            parsed
-                .query_pairs()
-                .filter(|(k, v)| k == key && !v.is_empty())
-                .last()
-                .map(|(_, v)| v.into_owned())
-        };
-        let host = query("hostaddr")
-            .or_else(|| query("host"))
-            .or_else(|| parsed.host_str().map(decode))
+        // libpq applies query parameters after the authority. The last repeat
+        // wins, even when empty. Values use percent-decoding only: `+` is a
+        // literal, not a space.
+        let mut params: BTreeMap<&str, String> = BTreeMap::new();
+        for pair in parsed.query().unwrap_or_default().split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                params.insert(key, decode(value));
+            }
+        }
+        let host = params
+            .get("hostaddr")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .or_else(|| match params.get("host") {
+                Some(v) => Some(v.clone()),
+                None => parsed.host_str().map(decode),
+            })
+            .filter(|h| !h.is_empty())
             .or_else(|| pghost.filter(|h| !h.is_empty()).map(str::to_owned))
             .unwrap_or_default();
-        // A socket directory is case-sensitive. A DNS name is not.
+        // A socket directory is case-sensitive. A DNS name is not. An IPv6
+        // address has no brackets.
         let host = if host.starts_with(['/', '@']) {
             host
         } else {
-            host.trim_end_matches('.').to_ascii_lowercase()
+            host.trim_matches(['[', ']'])
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
         };
-        let port = query("port")
-            .and_then(|p| p.parse().ok())
-            .or_else(|| parsed.port())
-            .unwrap_or(5432);
-        let name = query("dbname")
-            .or_else(|| {
-                parsed
-                    .path_segments()
-                    .and_then(|mut s| s.next())
-                    .map(decode)
-            })
-            .filter(|n| !n.is_empty())?;
+        let port = match params.get("port") {
+            Some(v) => v.parse().unwrap_or(5432),
+            None => parsed.port().unwrap_or(5432),
+        };
+        let name = match params.get("dbname") {
+            Some(v) => v.clone(),
+            None => parsed
+                .path_segments()
+                .and_then(|mut s| s.next())
+                .map(decode)
+                .unwrap_or_default(),
+        };
+        if name.is_empty() {
+            return None;
+        }
         Some((host, port, name))
     };
     match (parts(a), parts(b)) {
@@ -9087,6 +9099,21 @@ mod tests {
             "postgres://Prod.Example.com/db",
             "postgres://prod.example.com/db"
         ));
+        // `+` is a literal in libpq query values. An empty final value resets.
+        assert!(same(
+            "postgres://h/db?dbname=foo+bar",
+            "postgres://h/foo+bar"
+        ));
+        assert!(same(
+            "postgres://prod:6543/app?port=",
+            "postgres://prod:5432/app"
+        ));
+        assert!(same(
+            "postgres://h/db?port=6543&port=5432",
+            "postgres://h/db"
+        ));
+        // An IPv6 address matches with or without brackets.
+        assert!(same("postgres:///app?hostaddr=::1", "postgres://[::1]/app"));
         // A URL that does not parse still matches itself.
         assert!(same(
             "postgres://h1:1,h2:2/prod",
