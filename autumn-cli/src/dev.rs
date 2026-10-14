@@ -140,14 +140,11 @@ const DEV_READY_FILE_PREFIX: &str = "dev-ready.";
 )]
 const DEV_READY_FILE_SUFFIX: &str = ".state";
 
-/// Headroom added to the app's own drain budget before `autumn dev` escalates
-/// to a hard kill.
+/// Longest time a managed-Postgres stop can take.
 ///
-/// `on_shutdown` hooks run **after** the drain completes, so this — not the
-/// drain budget — is what has to cover them. Sized to the managed-Postgres stop
-/// ceiling (`STARTUP_TIMEOUT` in `autumn_web::managed_pg`, 60s, which
-/// `postgresql_embedded` applies to `pg_ctl stop` as well as start): that hook
-/// is the one this whole mechanism exists to let run.
+/// Equals `STARTUP_TIMEOUT` in `autumn_web::managed_pg`, which
+/// `postgresql_embedded` also applies to `pg_ctl stop`. The CLI cannot import
+/// it, so a test pins the two values together.
 #[cfg_attr(
     unix,
     allow(
@@ -155,7 +152,36 @@ const DEV_READY_FILE_SUFFIX: &str = ".state";
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-const COOPERATIVE_STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
+const MANAGED_PG_STOP_CEILING: Duration = Duration::from_secs(60);
+
+/// Time the parent measures that the stop ceiling does not cover: the app
+/// polls for the stop signal every 100 ms, then must exit after the stop
+/// returns, and a loaded machine adds delay.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DELIVERY_AND_EXIT_MARGIN: Duration = Duration::from_secs(15);
+
+/// Headroom added to the app's own drain budget before `autumn dev` escalates
+/// to a hard kill.
+///
+/// `on_shutdown` hooks share the drain budget. The headroom covers the
+/// unbudgeted `emergency_stop_async` that runs after it: its worst case is a
+/// full managed-Postgres stop. The margin goes on top of that ceiling, so a
+/// slow but correct stop is not killed.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const COOPERATIVE_STOP_HOOK_HEADROOM: Duration =
+    MANAGED_PG_STOP_CEILING.saturating_add(DELIVERY_AND_EXIT_MARGIN);
 
 /// The cooperative-stop budget for an app whose configured graceful-drain
 /// budget is `drain_secs` (`prestop_grace_secs + shutdown_timeout_secs`).
@@ -2410,6 +2436,48 @@ mod tests {
         // Resolving against a directory with no `autumn.toml` must still yield a
         // budget that outlasts a managed-Postgres teardown, not zero.
         assert!(resolve_cooperative_stop_budget(None) >= COOPERATIVE_STOP_HOOK_HEADROOM);
+    }
+
+    /// Reads `STARTUP_TIMEOUT` from the framework source. The CLI does not
+    /// enable `managed-pg`, so it cannot import the constant.
+    fn managed_pg_stop_ceiling_from_source() -> Duration {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../autumn/src/managed_pg.rs");
+        let source = std::fs::read_to_string(&path).expect("read managed_pg.rs");
+        let secs = source
+            .lines()
+            .find(|l| l.contains("const STARTUP_TIMEOUT: Duration"))
+            .and_then(|l| l.split("from_secs(").nth(1))
+            .and_then(|l| l.split(')').next())
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .expect("parse STARTUP_TIMEOUT");
+        Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_ceiling_constant_matches_the_framework() {
+        assert_eq!(
+            MANAGED_PG_STOP_CEILING,
+            managed_pg_stop_ceiling_from_source()
+        );
+    }
+
+    #[test]
+    fn the_headroom_exceeds_the_managed_pg_stop_ceiling() {
+        assert!(COOPERATIVE_STOP_HOOK_HEADROOM > managed_pg_stop_ceiling_from_source());
+    }
+
+    #[test]
+    fn the_headroom_is_the_ceiling_plus_the_margin() {
+        assert_eq!(
+            COOPERATIVE_STOP_HOOK_HEADROOM,
+            MANAGED_PG_STOP_CEILING + DELIVERY_AND_EXIT_MARGIN
+        );
+    }
+
+    #[test]
+    fn the_margin_covers_signal_polling_with_room_to_spare() {
+        // The app polls the stop file every 100 ms.
+        assert!(DELIVERY_AND_EXIT_MARGIN >= Duration::from_secs(10));
     }
 
     #[test]
