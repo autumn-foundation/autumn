@@ -550,9 +550,12 @@ fn collect_disabled_modules(
                     });
                 if let Some(custom) = custom {
                     out.push(path_base.join(custom));
+                } else {
+                    // The conventional paths only when no `#[path]` moves the
+                    // module: `#[cfg(not(test))] mod models;` may own them.
+                    out.push(dir.join(format!("{name}.rs")));
+                    out.push(dir.join(&name));
                 }
-                out.push(dir.join(format!("{name}.rs")));
-                out.push(dir.join(&name));
             }
             None => {}
             Some((_, nested)) => {
@@ -2445,6 +2448,30 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("fixtures").join("special.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Exclusive declarations: the `#[path]` one is test code, the plain one is not.
+    #[test]
+    fn a_path_override_does_not_disable_the_conventional_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"fixtures/test_models.rs\"] mod models;\n#[cfg(not(test))] mod models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("test_models.rs"),
             "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
         )
         .unwrap();

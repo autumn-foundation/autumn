@@ -2633,26 +2633,68 @@ fn database_endpoint(
     Some((endpoints, name))
 }
 
+/// Parse libpq `key = value` pairs the way `autumn/src/pg_conn_str.rs` does:
+/// whitespace around `=`, single-quoted values, and `\` escaping the next
+/// character inside and outside quotes. `None` for a string it rejects.
+fn conninfo_pairs(s: &str) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    let mut it = s.chars().peekable();
+    loop {
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut key = String::new();
+        while let Some(&c) = it.peek() {
+            if c.is_whitespace() || c == '=' {
+                break;
+            }
+            key.push(c);
+            it.next();
+        }
+        if key.is_empty() {
+            return Some(pairs);
+        }
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        if it.next() != Some('=') {
+            return None;
+        }
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut value = String::new();
+        if it.next_if_eq(&'\'').is_some() {
+            loop {
+                match it.next()? {
+                    '\'' => break,
+                    '\\' => value.push(it.next()?),
+                    c => value.push(c),
+                }
+            }
+        } else {
+            while let Some(&c) = it.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                it.next();
+                if c == '\\' {
+                    match it.next() {
+                        Some(escaped) => value.push(escaped),
+                        None => break,
+                    }
+                } else {
+                    value.push(c);
+                }
+            }
+            if value.is_empty() {
+                return None;
+            }
+        }
+        pairs.push((key, value));
+    }
+}
+
 /// [`database_endpoint`] for the keyword/value form: `host=h port=5432 dbname=d`.
 fn conninfo_endpoint(
     raw: &str,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(Vec<(String, u16)>, String)> {
-    let mut values: BTreeMap<String, String> = BTreeMap::new();
-    let mut rest = raw.trim();
-    while !rest.is_empty() {
-        let (key, after) = rest.split_once('=')?;
-        let after = after.trim_start();
-        let (value, tail) = if let Some(quoted) = after.strip_prefix('\'') {
-            let end = quoted.find('\'')?;
-            (quoted[..end].to_owned(), &quoted[end + 1..])
-        } else {
-            let end = after.find(char::is_whitespace).unwrap_or(after.len());
-            (after[..end].to_owned(), &after[end..])
-        };
-        values.insert(key.trim().to_owned(), value);
-        rest = tail.trim_start();
-    }
+    let values: BTreeMap<String, String> = conninfo_pairs(raw)?.into_iter().collect();
     let name = values.get("dbname").filter(|n| !n.is_empty())?.clone();
     let host_list = values
         .get("host")
@@ -9973,6 +10015,11 @@ mod tests {
         assert!(same_database_in(
             "host='a' dbname='app' user=u",
             "postgres://a/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=/tmp/postgres\\ socket dbname=app",
+            "postgres:///app?host=/tmp/postgres%20socket",
             &env
         ));
     }
