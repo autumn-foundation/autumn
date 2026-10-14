@@ -303,8 +303,12 @@ fn stop_budget_for_running_child(
 /// The directory the app reads its config from: the selected package, else
 /// `AUTUMN_MANIFEST_DIR`, else `.`. This is the order the app itself uses.
 fn package_dir(package: Option<&str>) -> PathBuf {
-    package
-        .and_then(find_manifest_dir)
+    package_dir_from(package.and_then(find_manifest_dir))
+}
+
+/// [`package_dir`] for a member directory that is already resolved.
+fn package_dir_from(member_dir: Option<PathBuf>) -> PathBuf {
+    member_dir
         .or_else(|| {
             std::env::var_os("AUTUMN_MANIFEST_DIR")
                 .filter(|dir| !dir.is_empty())
@@ -1312,6 +1316,7 @@ fn start_server(
 ) -> Option<Child> {
     eprintln!("  Starting server...\n");
 
+    let member_dir = package.and_then(find_manifest_dir);
     // Read `.env` from the selected package, as the app and the stop budget do.
     // Resolve `.env` fresh right before each spawn so a hot-reload restart
     // picks up an edited `.env`. Values are injected explicitly into the child
@@ -1320,7 +1325,9 @@ fn start_server(
     // makes a bare `DATABASE_URL` visible to the child. A malformed `.env`
     // fails loudly. Applied BEFORE the explicit `.env(...)` calls below so those
     // win on any key overlap.
-    let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv_in(&package_dir(package)) {
+    let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv_in(&package_dir_from(
+        member_dir.clone(),
+    )) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("  \u{274C} .env: {e}");
@@ -1330,6 +1337,11 @@ fn start_server(
 
     let mut command = Command::new(binary);
     command.envs(dotenv_vars);
+    // The app reads its config from the selected package. An inherited
+    // `AUTUMN_MANIFEST_DIR` would win over the app's own manifest directory.
+    if let Some(dir) = &member_dir {
+        command.env("AUTUMN_MANIFEST_DIR", dir);
+    }
     // See `serve::base_command`: these one-shot modes are dispatched before the
     // server starts, so an inherited flag would turn every hot-reload restart
     // into a manifest dump that exits cleanly and never serves.
