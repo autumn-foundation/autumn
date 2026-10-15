@@ -697,7 +697,12 @@ fn evicts_lazily(dataset: RetentionDataset, config: &AutumnConfig) -> bool {
         RetentionDataset::WebhookReplay => {
             config.security.webhooks.replay.backend == crate::webhook::WebhookReplayBackend::Memory
         }
-        RetentionDataset::JobTracking => config.jobs.backend == "local",
+        // An unknown backend falls back to the local runtime and its
+        // in-memory tracking store.
+        RetentionDataset::JobTracking => !matches!(
+            config.jobs.backend.as_str(),
+            "postgres" | "redis" | "sqlite"
+        ),
         _ => false,
     }
 }
@@ -1543,6 +1548,15 @@ mod tests {
         config.idempotency.backend = crate::config::IdempotencyBackend::Database;
         assert!(!evicts_lazily(RetentionDataset::Idempotency, &config));
         config.jobs.backend = "sqlite".to_owned();
+        assert!(!evicts_lazily(RetentionDataset::JobTracking, &config));
+    }
+
+    #[test]
+    fn an_unknown_jobs_backend_warns_because_it_falls_back_to_memory() {
+        let mut config = AutumnConfig::default();
+        config.jobs.backend = "postgresql".to_owned();
+        assert!(evicts_lazily(RetentionDataset::JobTracking, &config));
+        config.jobs.backend = "redis".to_owned();
         assert!(!evicts_lazily(RetentionDataset::JobTracking, &config));
     }
 
