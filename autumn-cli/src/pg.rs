@@ -272,7 +272,7 @@ fn filter_ssl_params(
 /// `'...'`-quoted string, both supporting `\`-escapes. Returns `None` if
 /// `s` doesn't parse as this grammar at all — callers fall back to passing
 /// `s` through unchanged so `tokio_postgres` can produce its own error.
-fn parse_keyword_value_pairs(s: &str) -> Option<Vec<(String, String)>> {
+pub fn parse_keyword_value_pairs(s: &str) -> Option<Vec<(String, String)>> {
     let mut pairs = Vec::new();
     let mut chars = s.char_indices().peekable();
 

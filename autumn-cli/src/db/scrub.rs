@@ -2337,6 +2337,15 @@ fn hosts_match(left: &str, right: &str) -> bool {
     left == right || (left.is_empty() && is_socket(right)) || (right.is_empty() && is_socket(left))
 }
 
+/// The pieces of a connection string, read from a URL or from the keyword form.
+struct Raw {
+    params: BTreeMap<String, String>,
+    authority_host: Option<String>,
+    authority_port: Option<u16>,
+    user: String,
+    path_db: String,
+}
+
 /// Like [`same_database`], but the caller passes the environment lookup.
 /// Tests then do not set process environment variables.
 ///
@@ -2351,18 +2360,42 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
             .decode_utf8_lossy()
             .into_owned()
     };
-    let parts = |raw: &str| -> Option<(String, u16, String)> {
-        let parsed = url::Url::parse(raw).ok()?;
+    let read = |raw: &str| -> Option<Raw> {
+        let Ok(parsed) = url::Url::parse(raw) else {
+            // The keyword form `host=... dbname=...`. The last repeat wins.
+            let pairs = crate::pg::parse_keyword_value_pairs(raw)?;
+            return Some(Raw {
+                params: pairs.into_iter().collect(),
+                authority_host: None,
+                authority_port: None,
+                user: String::new(),
+                path_db: String::new(),
+            });
+        };
         if !matches!(parsed.scheme(), "postgres" | "postgresql") {
             return None;
         }
         // libpq applies query parameters after the authority. The last repeat
         // wins, even when empty. Values use percent-decoding only: `+` is a
         // literal, not a space.
-        let mut params: BTreeMap<String, String> = BTreeMap::new();
-        for (key, value) in crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or_default()) {
-            params.insert(key, value);
-        }
+        Some(Raw {
+            params: crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or_default())
+                .into_iter()
+                .collect(),
+            authority_host: parsed.host_str().map(decode),
+            authority_port: parsed.port(),
+            user: decode(parsed.username()),
+            path_db: decode(parsed.path().strip_prefix('/').unwrap_or_default()),
+        })
+    };
+    let parts = |raw: &str| -> Option<(String, u16, String)> {
+        let Raw {
+            params,
+            authority_host,
+            authority_port,
+            user,
+            path_db,
+        } = read(raw)?;
         // `host` and `hostaddr` are presence-based: an explicit empty value
         // means the default, and it does not fall back to the environment.
         let hostaddr = params
@@ -2372,7 +2405,7 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
             .filter(|v| !v.is_empty());
         let host = hostaddr
             .or_else(|| params.get("host").cloned())
-            .or_else(|| parsed.host_str().map(decode))
+            .or(authority_host)
             .or_else(|| env("PGHOST"))
             .unwrap_or_default();
         // A socket directory is case-sensitive. A DNS name is not. An IPv6
@@ -2391,8 +2424,7 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
         // An omitted port defaults to `PGPORT`, then to 5432.
         let port = params.get("port").map_or_else(
             || {
-                parsed
-                    .port()
+                authority_port
                     .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()))
                     .unwrap_or(5432)
             },
@@ -2400,10 +2432,7 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
         );
         // `dbname` is presence-based. An empty name defaults to `PGDATABASE`,
         // then to the user name, then to the OS login, as in libpq.
-        let name = params
-            .get("dbname")
-            .cloned()
-            .unwrap_or_else(|| decode(parsed.path().strip_prefix('/').unwrap_or_default()));
+        let name = params.get("dbname").cloned().unwrap_or(path_db);
         let name = if name.is_empty() {
             env("PGDATABASE")
                 .filter(|v| !v.is_empty())
@@ -2412,7 +2441,7 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
                         .get("user")
                         .cloned()
                         .filter(|v| !v.is_empty())
-                        .or_else(|| Some(decode(parsed.username())).filter(|v| !v.is_empty()))
+                        .or_else(|| Some(user).filter(|v| !v.is_empty()))
                         .or_else(|| env("PGUSER").filter(|v| !v.is_empty()))
                         .unwrap_or_else(crate::pg::current_os_user)
                 })
@@ -9072,6 +9101,27 @@ mod tests {
             "postgres://prod/x?dbname=",
             "postgres://prod/db1",
             &|k| (k == "PGDATABASE").then(|| "db1".to_owned())
+        ));
+        // The keyword form `host=... dbname=...` names a database as well.
+        assert!(same_database_with(
+            "host=prod.example.com dbname=app",
+            "postgres://prod.example.com/app",
+            &|_| None
+        ));
+        assert!(same_database_with(
+            "host=prod.example.com port=6543 dbname='app'",
+            "postgres://prod.example.com:6543/app",
+            &|_| None
+        ));
+        assert!(same_database_with(
+            "host=prod.example.com dbname=app user=a",
+            "host=prod.example.com dbname=app user=b",
+            &|_| None
+        ));
+        assert!(!same_database_with(
+            "host=prod.example.com dbname=app",
+            "postgres://prod.example.com/other",
+            &|_| None
         ));
         // A non-Postgres scheme never names a Postgres database.
         assert!(!same_database_with(
