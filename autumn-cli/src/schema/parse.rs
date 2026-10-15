@@ -382,6 +382,7 @@ pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
         syn::Item::Enum(i) => &i.attrs,
         syn::Item::Type(i) => &i.attrs,
         syn::Item::Union(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
         _ => &[],
     }
 }

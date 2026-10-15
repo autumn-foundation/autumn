@@ -2609,6 +2609,9 @@ fn database_endpoint(
         let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
         let ports = if listed.len() == hosts.len() {
             listed.iter().map(|(_, p)| *p).collect()
+        } else if let [(_, port)] = listed.as_slice() {
+            // One port applies to every host.
+            vec![*port; hosts.len()]
         } else {
             vec![None; hosts.len()]
         };
@@ -8963,6 +8966,10 @@ mod tests {
             struct S { #[cfg(test)] f: [(); { ModelRegistration::anonymize("users"); 0 }] }
         "#;
         assert!(extract_anonymize_tables(decl).unwrap().is_empty());
+        let item = r#"
+            #[cfg(test)] struct F { f: [(); { ModelRegistration::anonymize("users"); 0 }] }
+        "#;
+        assert!(extract_anonymize_tables(item).unwrap().is_empty());
     }
 
     #[test]
@@ -10511,6 +10518,11 @@ mod tests {
         assert!(same_database_in(
             "postgres://a,b/app?hostaddr=,10.0.0.5",
             "postgres://a/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://a:6543/app?host=b,c",
+            "postgres://b:6543/app",
             &env
         ));
         assert_eq!(merge_hosts(None, Some("h".into())), Some("h".into()));
