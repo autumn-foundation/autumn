@@ -2019,8 +2019,8 @@ fn effective_pin_from(
 }
 
 /// Resolve `(prestop_grace_secs, shutdown_timeout_secs)` with the app's layering
-/// for the given active `profile`. Defaults match the prod/dev profile
-/// smart-defaults for these keys.
+/// for the given active `profile`. Defaults come from the runtime's profile
+/// smart defaults.
 pub fn resolve_shutdown_budget(base_dir: &Path, profile: Option<&str>) -> (u64, u64) {
     resolve_shutdown_budget_from(base_dir, profile, &|key| std::env::var(key).ok())
 }
@@ -2041,8 +2041,8 @@ pub fn resolve_shutdown_budget_from(
     profile: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> (u64, u64) {
-    let mut prestop = 5u64;
-    let mut shutdown = 30u64;
+    let (mut prestop, mut shutdown) =
+        autumn_web::config::profile_shutdown_defaults(profile.unwrap_or_default());
 
     // Base autumn.toml [server], then inline [profile.<name>].server overrides.
     if let Ok(contents) = std::fs::read_to_string(base_dir.join("autumn.toml"))
@@ -2772,6 +2772,51 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         temp_env::with_vars(clear_shutdown_env(), || {
             assert_eq!(resolve_shutdown_budget(dir.path(), None), (5, 30));
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_dev_profile_uses_dev_smart_defaults() {
+        // #2442: dev uses 0 s prestop and 1 s shutdown.
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("dev")), (0, 1));
+            assert_eq!(
+                resolve_shutdown_budget(dir.path(), Some("development")),
+                (0, 1)
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_prod_profile_matches_runtime_smart_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("prod")), (5, 35));
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_custom_profile_keeps_struct_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(
+                resolve_shutdown_budget(dir.path(), Some("staging")),
+                (5, 30)
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_dev_toml_override_beats_smart_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nshutdown_timeout_secs = 20\n",
+        )
+        .expect("write");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("dev")), (0, 20));
         });
     }
 
