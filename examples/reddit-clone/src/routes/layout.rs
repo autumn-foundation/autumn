@@ -305,10 +305,10 @@ pub fn analytics_snippet(consent: &autumn_web::consent::Consent) -> Markup {
 
 /// Error summary for a rejected form (#2441).
 ///
-/// `autofocus` on a `tabindex="-1"` block moves focus here on page load, so a
-/// screen reader reads the problems first. No script is needed. Each message
-/// links to its field. `fields` gives the order and the link text; an error on
-/// any other field is not listed. Empty when the form has no errors.
+/// The block takes focus on page load, so a screen reader reads it first.
+/// Each message links to its field. `fields` sets the order and the link text.
+/// Errors on other fields are not listed. A valid form gives empty markup.
+/// The framework `widgets::error_summary` has no field links and no focus.
 pub fn form_error_summary<T>(
     form: &autumn_web::form::ChangesetForm<T>,
     fields: &[(&str, &str)],
@@ -325,7 +325,7 @@ pub fn form_error_summary<T>(
         return html! {};
     }
     html! {
-        div id="error-summary" tabindex="-1" autofocus
+        section id="error-summary" tabindex="-1" autofocus
             aria-labelledby="error-summary-title"
             class="mb-4 rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700" {
             h2 id="error-summary-title" class="font-semibold mb-1" {
@@ -389,7 +389,8 @@ mod tests {
         let out = super::form_error_summary(&rejected(), FIELDS).into_string();
         assert!(out.contains(r#"id="error-summary""#), "{out}");
         assert!(out.contains(r#"tabindex="-1""#), "{out}");
-        assert!(out.contains("autofocus"), "{out}");
+        assert!(out.contains(" autofocus"), "{out}");
+        assert!(out.contains("<section"), "{out}");
     }
 
     #[test]

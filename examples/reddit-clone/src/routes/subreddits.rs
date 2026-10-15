@@ -117,6 +117,9 @@ pub struct CreateSubredditForm {
     pub description: String,
 }
 
+/// Summary order and link text for the create form.
+const CREATE_FIELDS: &[(&str, &str)] = &[("name", "Community Name")];
+
 /// Render one field's validation messages, in the element its control points
 /// at with `aria-describedby`. Same shape as `posts::field_errors`.
 fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
@@ -155,7 +158,7 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
         div class="max-w-lg mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Create a Community" }
             (form.form_tag(&paths::create(), "post", html! {
-                (form_error_summary(form, &[("name", "Community name")]))
+                (form_error_summary(form, CREATE_FIELDS))
                 div {
                     label for="name" class="block text-sm font-medium text-gray-700 mb-1" {
                         "Community Name"

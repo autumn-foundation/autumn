@@ -501,7 +501,7 @@ fn submit_form_markup(
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { (heading) }
             (form.form_tag(&paths::submit(), "post", html! {
-                (form_error_summary(form, SUBMIT_FIELDS))
+                (form_error_summary(form, if fixed_sub.is_some() { &SUBMIT_FIELDS[1..] } else { SUBMIT_FIELDS }))
                 @if let Some(sub) = fixed_sub {
                     input type="hidden" name="subreddit_id" value=(sub.id);
                 } @else {
@@ -593,6 +593,7 @@ fn submit_form_markup(
 }
 
 /// Summary order and link text for the submit form.
+/// The first entry has no field when the community is fixed.
 const SUBMIT_FIELDS: &[(&str, &str)] = &[
     ("subreddit_id", "Community"),
     ("title", "Title"),
@@ -1152,7 +1153,7 @@ pub async fn show(
                             div class="flex flex-wrap gap-2 mt-3" {
                                 @for tag in &post_tags {
                                     span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
-                                        "#" (tag_label(tag))
+                                        "#" (tag.name)
                                     }
                                 }
                             }
@@ -1173,7 +1174,7 @@ pub async fn show(
                                 input type="hidden" name="_csrf" value=(csrf.token());
                                 input type="text" name="tags"
                                       aria-label="Post tags"
-                                      value=(tag_names_value(post_tags.iter().map(|t| -> &Tag { t })))
+                                      value=(tag_names_value(post_tags.iter().map(|t| t.name.as_str())))
                                       placeholder="tags, comma separated"
                                       class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
                                              focus:outline-none focus:ring-2 focus:ring-orange-400" {}
@@ -1467,17 +1468,9 @@ struct ParsedTags {
     dropped_too_long: usize,
 }
 
-/// Tag text shown to the author. The slug is a URL key, not a label (#2441).
-fn tag_label(tag: &Tag) -> &str {
-    &tag.name
-}
-
-/// Value for the manage-tags input. Names, so a save keeps what the author typed.
-fn tag_names_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
-    tags.into_iter()
-        .map(tag_label)
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Join tag names for the tags input. A save then keeps the names.
+fn tag_names_value<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    names.into_iter().collect::<Vec<_>>().join(", ")
 }
 
 /// Split raw tag input into slugs (first-seen order) and their display names.
@@ -1925,16 +1918,9 @@ mod tests {
     }
 
     #[test]
-    fn tag_label_is_the_name() {
-        for name in ["日本語", "Web Dev", "rust"] {
-            assert_eq!(tag_label(&tag(name)), name);
-        }
-    }
-
-    #[test]
     fn tag_input_value_round_trips_to_the_same_slugs() {
         let tags = [tag("日本語"), tag("Web Dev")];
-        let value = tag_names_value(&tags);
+        let value = tag_names_value(tags.iter().map(|t| t.name.as_str()));
         assert_eq!(value, "日本語, Web Dev");
         let parsed = parse_tag_names(&value);
         assert_eq!(
@@ -1944,6 +1930,47 @@ mod tests {
     }
 
     // ── #2441: rejected forms lead with a focused summary ───────
+
+    /// Every summary link must point at an element that exists.
+    fn assert_links_resolve(out: &str) {
+        for part in out.split(r##"href="#"##).skip(1) {
+            let id = part.split('"').next().unwrap();
+            assert!(out.contains(&format!(r#"id="{id}""#)), "no #{id} in {out}");
+        }
+    }
+
+    #[test]
+    fn fixed_community_summary_has_no_dead_link() {
+        let sub = Subreddit {
+            id: 7,
+            name: "a".to_owned(),
+            slug: "a".to_owned(),
+            description: String::new(),
+            creator_id: 1,
+            subscriber_count: 0,
+            comment_count: 0,
+            created_at: chrono::NaiveDateTime::default(),
+        };
+        let out = submit_form_markup(&rejected_submit_form(), &[], Some(&sub)).into_string();
+        assert!(out.contains(r#"id="error-summary""#), "{out}");
+        assert!(!out.contains("#subreddit_id"), "{out}");
+        assert_links_resolve(&out);
+    }
+
+    #[test]
+    fn every_summary_link_resolves_on_the_submit_and_edit_forms() {
+        let out = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
+        assert!(
+            out.contains(r##"href="#url""##) && out.contains(r##"href="#subreddit_id""##),
+            "{out}"
+        );
+        assert_links_resolve(&out);
+        let edit = validated_edit(EditPostForm {
+            title: "***".to_owned(),
+            body: String::new(),
+        });
+        assert_links_resolve(&edit_form_markup(&edit, "s", "p").into_string());
+    }
 
     #[test]
     fn rejected_submit_form_has_a_summary() {
