@@ -1290,6 +1290,26 @@ autumn-plugin-live-feed = "0.3.1"
         assert!(removed.contains(&Wire::Dependency), "{removed:?}");
     }
 
+    /// `./src/main.rs` is the same target as `src/main.rs`.
+    #[test]
+    fn a_dot_slash_main_target_does_not_retain_the_mount_being_removed() {
+        let cargo =
+            format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"./src/main.rs\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            removed,
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(dependency_retained.is_none(), "{dependency_retained:?}");
+        assert!(removed.contains(&Wire::Dependency), "{removed:?}");
+    }
+
     /// A second use of the crate in the post-removal `main.rs` keeps it.
     #[test]
     fn an_explicit_main_target_that_still_uses_the_plugin_retains_it() {
