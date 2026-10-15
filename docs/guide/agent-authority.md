@@ -421,6 +421,11 @@ authority under a manifest that says otherwise.
 - **Branches** — Autumn joins the paths of an `if`, `match` or loop. A handle
   cleared on one path stays a handle on the other. Two kinds of handle on one
   name are refused where used.
+- **A macro or import defined outside the handler** — Autumn reads only what
+  the handler body itself defines. It takes `format!`, `vec!`, `println!` and
+  the like to be the standard macros of those names. A `macro_rules!` at module
+  scope that reuses one of those names is invisible to it, so do not shadow a
+  standard macro name with a macro that does anything but build a value.
 - **A data-changing CTE** — every table it writes, and the main statement's
   table, counts as an unbounded write.
 - **A detached task** — `tokio::spawn` and its relatives, as above.
