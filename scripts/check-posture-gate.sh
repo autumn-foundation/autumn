@@ -54,6 +54,13 @@ cd "$root"
 # with care.
 EXAMPLES=("hello" "flock" "invoice" "todo-app")
 
+# The binary to audit, for an example with more than one.
+example_bin() {
+  case "$1" in
+    todo-app) echo "--bin todo-app" ;;
+  esac
+}
+
 # The build to audit (issue #2472). A deployment ships a release build, and a
 # route behind `#[cfg(not(debug_assertions))]` is only in that build. The
 # examples have no non-default features to ship.
@@ -130,9 +137,10 @@ for example in "${EXAMPLES[@]}"; do
   echo "── $example ────────────────────────────────────────────────"
 
   # Also the #1604 default-deny gate: an unclassified route fails right here.
-  "$CLI" routes audit -p "$example" "${AUDIT_FLAGS[@]}" --manifest "$fresh" >/dev/null \
+  # shellcheck disable=SC2046  # the bin flag is two words, or none
+  "$CLI" routes audit -p "$example" $(example_bin "$example") "${AUDIT_FLAGS[@]}" --manifest "$fresh" >/dev/null \
     || die "$example: \`autumn routes audit\` failed — see the output above"
-  ok "$example: every route carries a proven classification"
+  ok "$example: every route carries a classification"
 
   if [ "$UPDATE" = "1" ]; then
     cp "$fresh" "$baseline"
@@ -186,7 +194,7 @@ for example in "${EXAMPLES[@]}"; do
       # fresh to a later head build, which then uses base code.
       (cd "$work/base-tree" \
         && CARGO_TARGET_DIR="$work/base-target" \
-          "$CLI" routes audit -p "$example" "${AUDIT_FLAGS[@]}" --manifest "$accepted" >/dev/null) \
+          "$CLI" routes audit -p "$example" $(example_bin "$example") "${AUDIT_FLAGS[@]}" --manifest "$accepted" >/dev/null) \
         || die "$example: \`autumn routes audit\` failed on $POSTURE_BASE_REF"
     fi
   fi

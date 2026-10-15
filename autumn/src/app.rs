@@ -1268,7 +1268,7 @@ impl AppBuilder {
     /// # }
     /// ```
     #[must_use]
-pub fn scoped<L>(self, prefix: &str, layer: L, routes: Vec<Route>) -> Self
+    pub fn scoped<L>(self, prefix: &str, layer: L, routes: Vec<Route>) -> Self
     where
         L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
         L::Service: tower::Service<
