@@ -41,6 +41,7 @@ use crate::config::{AutumnConfig, RetentionConfig};
 use crate::gdpr::{ErasureStrategy, GdprRegistry};
 use crate::state::AppState;
 use crate::task::{Schedule, TaskCoordination, TaskInfo};
+use std::fmt::Write as _;
 
 /// The scheduled-task name the framework sweep registers under.
 ///
@@ -628,6 +629,7 @@ async fn run_one_dataset(
                 dataset,
                 config,
                 effective.window.map_or(0, |window| window.as_secs()),
+                registry.as_deref(),
             ));
         }
         RetentionEnforcement::ArchiveRewrite => {
@@ -649,7 +651,12 @@ async fn run_one_dataset(
 /// in-memory session store records no expiry at all, so claiming plain
 /// "enforced by the backend" would present an unenforced policy as an
 /// enforced one. Each caveat is named rather than left to the guide.
-fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_secs: u64) -> String {
+fn backend_ttl_note(
+    dataset: RetentionDataset,
+    config: &AutumnConfig,
+    window_secs: u64,
+    registry: Option<&GdprRegistry>,
+) -> String {
     // `session.backend = "memory"` is the default, and `MemoryStore` is a
     // plain `HashMap` with no expiry: capping `session.max_age_secs` shortens
     // only the browser cookie while the server-side record lives as long as
@@ -671,7 +678,18 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
          the backend, not deleted by this sweep. Records written before this window was set \
          keep their original TTL until it elapses"
     );
-    if evicts_lazily(dataset, config) {
+    // The database store skips its own cleanup while its table is held.
+    let held = (dataset == RetentionDataset::Idempotency
+        && config.idempotency.backend == crate::config::IdempotencyBackend::Database)
+        .then(|| table_legal_hold("autumn_idempotency_keys", registry))
+        .flatten();
+    if let Some(reason) = held {
+        let _ = write!(
+            note,
+            ". NOT removed: autumn_idempotency_keys is under legal hold: {reason}. The \
+             store keeps expired rows until the hold ends"
+        );
+    } else if evicts_lazily(dataset, config) {
         note.push_str(
             ". With the built-in store, expired records are not served. The store \
              removes them only on later writes. A quiet process can keep them past the \
@@ -1509,7 +1527,7 @@ mod tests {
             RetentionDataset::WebhookReplay,
             RetentionDataset::JobTracking,
         ] {
-            let note = backend_ttl_note(dataset, &config, 60);
+            let note = backend_ttl_note(dataset, &config, 60, None);
             assert!(note.contains("built-in store"), "{dataset}: {note}");
             assert!(note.contains("quiet process"), "{dataset}: {note}");
         }
@@ -1526,7 +1544,7 @@ mod tests {
             RetentionDataset::WebhookReplay,
             RetentionDataset::JobTracking,
         ] {
-            let note = backend_ttl_note(dataset, &config, 60);
+            let note = backend_ttl_note(dataset, &config, 60, None);
             assert!(!note.contains("quiet process"), "{dataset}: {note}");
         }
     }
@@ -1537,7 +1555,8 @@ mod tests {
         config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
         config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
         config.jobs.backend = "redis".to_owned();
-        let warns = |dataset| backend_ttl_note(dataset, &config, 60).contains("quiet process");
+        let warns =
+            |dataset| backend_ttl_note(dataset, &config, 60, None).contains("quiet process");
         assert!(warns(RetentionDataset::Idempotency));
         assert!(!warns(RetentionDataset::WebhookReplay));
         assert!(!warns(RetentionDataset::JobTracking));
@@ -1562,10 +1581,23 @@ mod tests {
     }
 
     #[test]
+    fn a_held_database_idempotency_table_is_not_described_as_swept() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Database;
+        let registry = GdprRegistry::new().register(crate::gdpr::ModelRegistration::retain(
+            "autumn_idempotency_keys",
+            "litigation",
+        ));
+        let note = backend_ttl_note(RetentionDataset::Idempotency, &config, 60, Some(&registry));
+        assert!(note.contains("legal hold: litigation"), "{note}");
+        assert!(!note.contains("quiet process"), "{note}");
+    }
+
+    #[test]
     fn the_memory_session_note_keeps_its_own_verdict() {
         let mut config = AutumnConfig::default();
         config.session.backend = crate::session::SessionBackend::Memory;
-        let note = backend_ttl_note(RetentionDataset::Sessions, &config, 60);
+        let note = backend_ttl_note(RetentionDataset::Sessions, &config, 60, None);
         assert!(note.starts_with("NOT enforced"), "{note}");
         assert!(!note.contains("quiet process"), "{note}");
     }
