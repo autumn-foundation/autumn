@@ -8,9 +8,10 @@
 //! `Authorization: Basic` header would carry and which the capsule masks.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_web::capsule::load_capsule;
+use autumn_web::capsule::{DivergenceLog, ReplayFixtures, Verdict, execute, load_capsule};
 use autumn_web::config::AutumnConfig;
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
@@ -90,4 +91,43 @@ async fn outbound_url_userinfo_credential_is_masked_in_the_capsule() {
             .map(|e| &e.url)
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn a_capsule_with_masked_userinfo_still_replays_from_the_tape() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = TestApp::new()
+        .config(capture_config(dir.path()))
+        .routes(routes![userinfo_charge]);
+    let _mock = app
+        .http_mock("payments")
+        .get("/charge")
+        .respond_with(502, serde_json::json!({"error": "upstream down"}));
+    let client = app.build();
+    client
+        .get("/userinfo-charge")
+        .send()
+        .await
+        .assert_status(500);
+    let path = await_one_capsule(dir.path()).await;
+    let capsule = load_capsule(&path).expect("the capsule loads");
+
+    let fixtures = ReplayFixtures::from_capsule(&capsule);
+    let router = TestApp::new()
+        .config(AutumnConfig {
+            profile: Some("test".into()),
+            ..AutumnConfig::default()
+        })
+        .routes(routes![userinfo_charge])
+        .with_clock(fixtures.clock())
+        .with_entropy(fixtures.entropy())
+        .build()
+        .into_router();
+    let outcome = execute(router, &capsule, Arc::new(DivergenceLog::new()), &fixtures).await;
+    assert!(
+        outcome.effect_divergences.is_empty(),
+        "the masked userinfo URL must match the live one on replay: {:?}",
+        outcome.effect_divergences
+    );
+    assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");
 }

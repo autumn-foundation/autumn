@@ -2236,6 +2236,29 @@ mod tests {
         }
 
         #[test]
+        fn url_userinfo_is_found_in_the_authority_only() {
+            assert_eq!(url_userinfo("https://a:b@h/p"), Some("a:b"));
+            assert_eq!(url_userinfo("https://h/p?x=a@b"), None);
+            assert_eq!(url_userinfo("https://@h/p"), None);
+            assert_eq!(url_userinfo("no-scheme"), None);
+        }
+
+        #[test]
+        fn url_userinfo_retains_user_password_and_decoded_forms() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc%40x:p%20w", &mut values);
+            for expected in [
+                &b"svc%40x:p%20w"[..],
+                b"svc%40x",
+                b"p%20w",
+                b"svc@x",
+                b"p w",
+            ] {
+                assert!(values.contains(expected), "{expected:?}");
+            }
+        }
+
+        #[test]
         fn url_userinfo_retains_the_decoded_bytes_of_a_non_utf8_credential() {
             let mut values = RedactedValues::default();
             record_userinfo_components("svc:%FFsecret", &mut values);
