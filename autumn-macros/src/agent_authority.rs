@@ -2677,16 +2677,7 @@ impl Analyzer {
                 _ => Provenance::Syntactic,
             };
             self.record(kind, model.clone(), provenance, method.method.span());
-            if CASCADING_METHODS.contains(&name.as_str())
-                && let Subject::ModelIdent(path, human) = &model
-                && !self
-                    .cascades
-                    .iter()
-                    .any(|(seen, ..)| path_string(seen) == path_string(path))
-            {
-                self.cascades
-                    .push((path.clone(), human.clone(), method.method.span()));
-            }
+            self.note_cascade(&name, &model, method.method.span());
         }
     }
 
@@ -3592,8 +3583,23 @@ impl Analyzer {
             Subject::ModelIdent(..) => Provenance::TypeResolved,
             _ => Provenance::Syntactic,
         };
-        self.record(kind, model, provenance, span);
+        self.record(kind, model.clone(), provenance, span);
+        self.note_cascade(name, &model, span);
         true
+    }
+
+    /// A delete that runs the `dependent(...)` cascade also writes the models
+    /// the cascade names. Remember the repository once, for the grant check.
+    fn note_cascade(&mut self, method: &str, model: &Subject, span: Span) {
+        if CASCADING_METHODS.contains(&method)
+            && let Subject::ModelIdent(path, human) = model
+            && !self
+                .cascades
+                .iter()
+                .any(|(seen, ..)| path_string(seen) == path_string(path))
+        {
+            self.cascades.push((path.clone(), human.clone(), span));
+        }
     }
 
     /// Record a job effect, or refuse a job whose name is not compile-known.
@@ -9275,6 +9281,22 @@ mod tests {
             );
             assert!(
                 expansion.contains("allows_writes_all"),
+                "{call}: {expansion}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ufcs_delete_is_checked_against_its_cascade() {
+        for call in [
+            "PgRefundRepository::delete_by_id(&repo, 1)",
+            "PgRefundRepository::delete_many(&repo, &ids)",
+        ] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            let expansion = expand(GRANT, &handler);
+            assert!(
+                expansion.contains("PgRefundRepository :: __AUTUMN_CASCADE_3 . models"),
                 "{call}: {expansion}"
             );
         }
