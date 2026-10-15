@@ -303,6 +303,43 @@ pub fn analytics_snippet(consent: &autumn_web::consent::Consent) -> Markup {
     }
 }
 
+/// Error summary for a rejected form (#2441).
+///
+/// `autofocus` on a `tabindex="-1"` block moves focus here on page load, so a
+/// screen reader reads the problems first. No script is needed. Each message
+/// links to its field. `fields` gives the order and the link text; an error on
+/// any other field is not listed. Empty when the form has no errors.
+pub fn form_error_summary<T>(
+    form: &autumn_web::form::ChangesetForm<T>,
+    fields: &[(&str, &str)],
+) -> Markup {
+    let items: Vec<(&str, &str, &str)> = fields
+        .iter()
+        .flat_map(|&(field, label)| {
+            form.errors_for(field)
+                .iter()
+                .map(move |message| (field, label, message.as_str()))
+        })
+        .collect();
+    if items.is_empty() {
+        return html! {};
+    }
+    html! {
+        div id="error-summary" tabindex="-1" autofocus
+            aria-labelledby="error-summary-title"
+            class="mb-4 rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700" {
+            h2 id="error-summary-title" class="font-semibold mb-1" {
+                "Fix these problems to continue"
+            }
+            ul class="list-disc pl-5" {
+                @for (field, label, message) in items {
+                    li { a href=(format!("#{field}")) class="underline" { (label) ": " (message) } }
+                }
+            }
+        }
+    }
+}
+
 /// Timestamp display helper.
 pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
     let now = chrono::Utc::now().naive_utc();
@@ -329,6 +366,52 @@ mod tests {
     use autumn_web::seo::SeoMeta;
 
     use super::{layout, layout_with_seo};
+
+    // ── #2441: error summary ────────────────────────────────────
+
+    fn rejected() -> autumn_web::form::ChangesetForm<()> {
+        let mut form = autumn_web::form::ChangesetForm::without_csrf(());
+        form.changeset.add_error("body", "Body is bad <b>");
+        form.changeset.add_error("title", "Title is bad");
+        form
+    }
+
+    const FIELDS: &[(&str, &str)] = &[("title", "Title"), ("body", "Text")];
+
+    #[test]
+    fn error_summary_is_empty_for_a_valid_form() {
+        let form = autumn_web::form::ChangesetForm::without_csrf(());
+        assert_eq!(super::form_error_summary(&form, FIELDS).into_string(), "");
+    }
+
+    #[test]
+    fn error_summary_takes_focus_on_page_load() {
+        let out = super::form_error_summary(&rejected(), FIELDS).into_string();
+        assert!(out.contains(r#"id="error-summary""#), "{out}");
+        assert!(out.contains(r#"tabindex="-1""#), "{out}");
+        assert!(out.contains("autofocus"), "{out}");
+    }
+
+    #[test]
+    fn error_summary_links_each_message_to_its_field_in_form_order() {
+        let out = super::form_error_summary(&rejected(), FIELDS).into_string();
+        let title = out.find(r##"href="#title""##).expect("title link");
+        let body = out.find(r##"href="#body""##).expect("body link");
+        assert!(title < body, "{out}");
+        assert!(out.contains("Title is bad"), "{out}");
+    }
+
+    #[test]
+    fn error_summary_escapes_messages() {
+        let out = super::form_error_summary(&rejected(), FIELDS).into_string();
+        assert!(out.contains("Body is bad &lt;b&gt;"), "{out}");
+    }
+
+    #[test]
+    fn error_summary_skips_fields_it_was_not_told_about() {
+        let out = super::form_error_summary(&rejected(), &[("title", "Title")]).into_string();
+        assert!(!out.contains("Body is bad"), "{out}");
+    }
 
     #[test]
     fn layout_still_renders_the_site_title_suffix() {

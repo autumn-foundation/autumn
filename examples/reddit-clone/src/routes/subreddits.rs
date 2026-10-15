@@ -17,7 +17,7 @@ use crate::schema::users;
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 use autumn_web::{contains_letter_or_number, slugify};
 
-use super::layout::{layout, layout_with_seo, time_ago};
+use super::layout::{form_error_summary, layout, layout_with_seo, time_ago};
 
 // ── List all communities ───────────────────────────────────────
 
@@ -155,6 +155,7 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
         div class="max-w-lg mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Create a Community" }
             (form.form_tag(&paths::create(), "post", html! {
+                (form_error_summary(form, &[("name", "Community name")]))
                 div {
                     label for="name" class="block text-sm font-medium text-gray-700 mb-1" {
                         "Community Name"
@@ -588,6 +589,30 @@ autumn_web::paths![list, create_form, create, show];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_create_form_has_a_summary() {
+        let form = ChangesetForm::from_changeset(
+            CreateSubredditForm {
+                name: "***".to_owned(),
+                description: String::new(),
+            }
+            .into_changeset(),
+        );
+        let out = create_form_markup(&form).into_string();
+        assert!(out.contains(r#"id="error-summary""#), "{out}");
+        assert!(out.contains(r##"href="#name""##), "{out}");
+    }
+
+    #[test]
+    fn blank_create_form_has_no_summary() {
+        let form = ChangesetForm::without_csrf(CreateSubredditForm::default());
+        assert!(
+            !create_form_markup(&form)
+                .into_string()
+                .contains("error-summary")
+        );
+    }
 
     #[test]
     fn a_community_name_with_no_letter_or_number_is_rejected() {

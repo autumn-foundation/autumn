@@ -52,7 +52,7 @@ fn posts_per_page() -> i64 {
         .unwrap_or(25)
 }
 
-use super::layout::{layout, layout_with_seo, time_ago, vote_controls};
+use super::layout::{form_error_summary, layout, layout_with_seo, time_ago, vote_controls};
 
 // ── Front page — hot posts across all subreddits ───────────────
 
@@ -501,6 +501,7 @@ fn submit_form_markup(
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { (heading) }
             (form.form_tag(&paths::submit(), "post", html! {
+                (form_error_summary(form, SUBMIT_FIELDS))
                 @if let Some(sub) = fixed_sub {
                     input type="hidden" name="subreddit_id" value=(sub.id);
                 } @else {
@@ -590,6 +591,17 @@ fn submit_form_markup(
         }
     }
 }
+
+/// Summary order and link text for the submit form.
+const SUBMIT_FIELDS: &[(&str, &str)] = &[
+    ("subreddit_id", "Community"),
+    ("title", "Title"),
+    ("url", "Link URL"),
+    ("body", "Text"),
+];
+
+/// Summary order and link text for the edit form.
+const EDIT_FIELDS: &[(&str, &str)] = &[("title", "Title"), ("body", "Text")];
 
 /// Render one field's validation messages, in the element its control points
 /// at with `aria-describedby`.
@@ -1140,7 +1152,7 @@ pub async fn show(
                             div class="flex flex-wrap gap-2 mt-3" {
                                 @for tag in &post_tags {
                                     span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
-                                        "#" (tag.slug)
+                                        "#" (tag_label(tag))
                                     }
                                 }
                             }
@@ -1161,7 +1173,7 @@ pub async fn show(
                                 input type="hidden" name="_csrf" value=(csrf.token());
                                 input type="text" name="tags"
                                       aria-label="Post tags"
-                                      value=(post_tags.iter().map(|t| t.slug.clone()).collect::<Vec<_>>().join(", "))
+                                      value=(tag_names_value(post_tags.iter().map(|t| -> &Tag { t })))
                                       placeholder="tags, comma separated"
                                       class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
                                              focus:outline-none focus:ring-2 focus:ring-orange-400" {}
@@ -1280,6 +1292,7 @@ fn edit_form_markup(form: &ChangesetForm<EditPostForm>, sub_slug: &str, post_slu
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Edit Post" }
             (form.form_tag(&paths::update(sub_slug, post_slug), "post", html! {
+                (form_error_summary(form, EDIT_FIELDS))
                 div {
                     (field_errors("title", form))
                     (autumn_web::a11y::TextField::new("title")
@@ -1452,6 +1465,19 @@ struct ParsedTags {
     /// counted and reported rather than silently persisted uncapped or
     /// silently truncated.
     dropped_too_long: usize,
+}
+
+/// Tag text shown to the author. The slug is a URL key, not a label (#2441).
+fn tag_label(tag: &Tag) -> &str {
+    &tag.name
+}
+
+/// Value for the manage-tags input. Names, so a save keeps what the author typed.
+fn tag_names_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
+    tags.into_iter()
+        .map(tag_label)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Split raw tag input into slugs (first-seen order) and their display names.
@@ -1886,6 +1912,60 @@ mod tests {
             url: "javascript:alert(1)".to_owned(),
             body: "kept".to_owned(),
         })
+    }
+
+    // ── #2441: tags show their name, not their slug ─────────────
+
+    fn tag(name: &str) -> Tag {
+        Tag {
+            id: 1,
+            name: name.to_owned(),
+            slug: slugify(name),
+        }
+    }
+
+    #[test]
+    fn tag_label_is_the_name() {
+        for name in ["日本語", "Web Dev", "rust"] {
+            assert_eq!(tag_label(&tag(name)), name);
+        }
+    }
+
+    #[test]
+    fn tag_input_value_round_trips_to_the_same_slugs() {
+        let tags = [tag("日本語"), tag("Web Dev")];
+        let value = tag_names_value(&tags);
+        assert_eq!(value, "日本語, Web Dev");
+        let parsed = parse_tag_names(&value);
+        assert_eq!(
+            parsed.slug_order,
+            [tags[0].slug.clone(), tags[1].slug.clone()]
+        );
+    }
+
+    // ── #2441: rejected forms lead with a focused summary ───────
+
+    #[test]
+    fn rejected_submit_form_has_a_summary() {
+        let out = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
+        assert!(out.contains(r#"id="error-summary""#), "{out}");
+        assert!(out.contains(r##"href="#title""##), "{out}");
+    }
+
+    #[test]
+    fn blank_submit_form_has_no_summary() {
+        let out = submit_form_markup(&blank_submit_form(), &[], None).into_string();
+        assert!(!out.contains("error-summary"), "{out}");
+    }
+
+    #[test]
+    fn rejected_edit_form_has_a_summary() {
+        let form = validated_edit(EditPostForm {
+            title: "***".to_owned(),
+            body: String::new(),
+        });
+        let out = edit_form_markup(&form, "s", "p").into_string();
+        assert!(out.contains(r#"id="error-summary""#), "{out}");
     }
 
     #[test]
