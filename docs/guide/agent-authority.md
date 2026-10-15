@@ -701,8 +701,9 @@ runtime-resolved host and whatever the job itself goes on to do are not),
 `cascading_deletes` and `generated_repository_tools` (both `provable` with a
 caveat — a `dependent(...)` cascade is not folded into the write set, so
 deleting a parent may write child models the grant does not list; and
-`#[repository(api, mcp)]` / `expose_all_as_mcp` tools have no annotation site,
-so they surface under `ungoverned_tools` rather than being gated).
+`#[repository(api, mcp)]` tools are governed only with `grant = X`; without it,
+and for `expose_all_as_mcp` tools, they surface under `ungoverned_tools`
+rather than being gated).
 
 ### `ungoverned_tools`, and the CI gate
 
@@ -950,6 +951,19 @@ required before any of this runs, and put a rate limit in front of it. See
 
 ---
 
+## Generated repository tools
+
+`#[repository(Post, api = "/api/posts", mcp, grant = PostEditor)]` governs the
+generated MCP tools with grant `PostEditor`. `grant` needs `mcp`.
+
+- Each tool carries the grant and shows under `actions`, not
+  `ungoverned_tools`.
+- Create, update and delete write the repository's model. The build fails if
+  the grant does not list it in `writes`.
+- With `mcp = "read"` only list and get exist. They have no effects, so the
+  grant is not checked for writes.
+- The write set of a delete does not yet include `dependent(...)` children.
+
 ## Scope of the first slice
 
 Deliberately out of scope for now:
@@ -959,10 +973,10 @@ Deliberately out of scope for now:
   enforced by the MCP dispatcher, per process, not across instances. Rate
   limiting is still
   [`[rate_limit]`](rate-limiting.md)'s job.
-- **Generated repository CRUD tools.** `#[repository(api, mcp)]` and
-  `expose_all_as_mcp` generate tools with no annotation site, so they surface
-  in `ungoverned_tools` rather than being gated. A `#[repository(.., grant = X)]`
-  key is the follow-up.
+- **Generated repository CRUD tools without a grant.** `#[repository(.., mcp,
+  grant = X)]` governs the generated tools (see below). Without `grant`, and
+  for `expose_all_as_mcp` tools, there is no annotation site, so they surface
+  in `ungoverned_tools` rather than being gated.
 - **Cascading deletes.** A `dependent(...)` cascade is not folded into the
   write set: `writes: [Post]` does not imply the comments the delete takes with
   it. Named in `excluded`.

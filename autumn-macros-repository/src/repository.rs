@@ -177,6 +177,9 @@ pub(crate) struct RepoConfig {
     /// Expose the generated CRUD routes as MCP tools (`mcp` / `mcp = "read"`).
     /// `None` = not opted in. Requires `api = "/path"`.
     pub(crate) mcp_expose: Option<McpExpose>,
+    /// The `authority_grant!` that governs the generated MCP tools
+    /// (`grant = Path`). Requires `mcp`.
+    pub(crate) grant: Option<syn::Path>,
     pub(crate) policy_type: Option<Ident>,
     pub(crate) scope_type: Option<Ident>,
     pub(crate) cursor_key: Option<String>,
@@ -855,6 +858,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut commit_hooks = false;
     let mut api_path: Option<String> = None;
     let mut mcp_expose: Option<McpExpose> = None;
+    let mut grant: Option<syn::Path> = None;
     let mut mcp_span: Option<proc_macro2::Span> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
@@ -990,6 +994,12 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             } else {
                 mcp_expose = Some(McpExpose::All);
             }
+            Ok(())
+        } else if meta.path.is_ident("grant") {
+            if grant.is_some() {
+                return Err(meta.error("duplicate `grant` key: a repository has one grant"));
+            }
+            grant = Some(meta.value()?.parse()?);
             Ok(())
         } else if meta.path.is_ident("policy") {
             let value: Ident = meta.value()?.parse()?;
@@ -1301,6 +1311,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "commit_hooks = true requires hooks = Type",
         ));
     }
+    if let Some(path) = &grant
+        && mcp_expose.is_none()
+    {
+        return Err(syn::Error::new_spanned(
+            path,
+            "grant requires mcp: a grant governs the generated MCP tools, and no `mcp` key \
+             exposes any",
+        ));
+    }
     if mcp_expose.is_some() && api_path.is_none() {
         return Err(syn::Error::new(
             mcp_span.unwrap_or_else(proc_macro2::Span::call_site),
@@ -1552,6 +1571,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         commit_hooks,
         api_path,
         mcp_expose,
+        grant,
         policy_type,
         scope_type,
         cursor_key,
@@ -23244,6 +23264,94 @@ mod tests {
             err.to_string().contains("api"),
             "error must point at the missing api key: {err}"
         );
+    }
+
+    #[test]
+    fn parse_repo_args_with_grant() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp, grant = crate::grants::PostEditor"#
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let grant = config.grant.expect("grant is parsed");
+        assert_eq!(
+            quote! { #grant }.to_string(),
+            "crate :: grants :: PostEditor"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_grant_without_mcp() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", grant = PostEditor"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("a grant with no MCP tools governs nothing and must be rejected");
+        };
+        assert!(err.to_string().contains("mcp"), "{err}");
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_a_duplicate_grant() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp, grant = A, grant = B"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("two grants must be rejected");
+        };
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn a_granted_repository_governs_every_mcp_tool_it_generates() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp, grant = PostEditor },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated
+                .matches("agent_authority : :: core :: option :: Option :: Some (&")
+                .count(),
+            5,
+            "list/get/create/update/delete each carry the authority"
+        );
+        assert_eq!(
+            generated.matches("AgentAuthorityDescriptor").count(),
+            5,
+            "each authority is registered for the manifest"
+        );
+        assert_eq!(
+            generated.matches("PostEditor . allows_write (").count(),
+            1,
+            "the writes are const-checked against the grant, once"
+        );
+        assert!(
+            generated
+                .contains("PostEditor . allows_write (PgPostRepository :: __AUTUMN_MODEL_IDENT)"),
+            "the write subject is the model ident: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_granted_read_only_repository_has_no_write_assertion() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp = "read", grant = PostEditor },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(generated.matches("AgentAuthorityDescriptor").count(), 2);
+        assert_eq!(generated.matches("allows_write").count(), 0);
+    }
+
+    #[test]
+    fn an_ungranted_repository_emits_no_authority() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(generated.matches("AgentAuthority").count(), 0);
     }
 
     #[test]
