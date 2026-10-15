@@ -902,14 +902,16 @@ fn split_userinfo(url: &str) -> Option<(String, String, String)> {
 /// turn the destination into a wildcard replay would then match against any
 /// host.
 fn mask_url_echoes(url: &str, redacted: &RedactedValues) -> String {
-    let url = parser_view(url);
-    match authority_bounds(&url) {
+    // Deliberately not read through `parser_view`: a URL without credentials is
+    // recorded verbatim (replay matches it against the live string), and one
+    // with credentials was already normalised when its userinfo was masked.
+    match authority_bounds(url) {
         Some((_, end)) => format!(
             "{}{}",
             url.get(..end).unwrap_or_default(),
             mask_echoes(url.get(end..).unwrap_or_default(), redacted)
         ),
-        None => mask_echoes(&url, redacted),
+        None => mask_echoes(url, redacted),
     }
 }
 
@@ -2391,6 +2393,19 @@ mod tests {
             record_userinfo_components("svc:p w", &mut values);
             assert!(values.contains(b"p w"));
             assert!(values.contains(b"p%20w"));
+        }
+
+        #[test]
+        fn a_url_without_credentials_is_recorded_verbatim_even_with_control_characters() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://host/a\tb?x=1")],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            assert_eq!(
+                effects.http.first().expect("one exchange").url,
+                "https://host/a\tb?x=1"
+            );
         }
 
         #[test]
