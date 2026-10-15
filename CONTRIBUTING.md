@@ -821,14 +821,13 @@ RustSec advisory sits in the tree being published. Run it locally exactly as CI
 does:
 
 ```bash
-./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
+./scripts/check-advisories.sh              # workspace, sqlite, generated apps, fuzz, island-flock graphs
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
-It audits a third graph beyond the two above: `autumn-web` under the `deny.toml`
-that `autumn new` writes into a generated app (`autumn-cli/src/templates/deny.toml.tmpl`),
-so an advisory the scaffold's shipped waiver set does not cover fails here
-rather than in a user's first CI run. Its advisory-database fetch retries and
+The third graph is every `autumn new` flavor, generated and audited with its
+own shipped `deny.toml` (`autumn-cli/src/templates/deny.toml.tmpl`). An advisory
+the waiver set does not cover fails here, not in a user's first CI run. Its advisory-database fetch retries and
 **fails closed**; the audits then run `--offline`, so a failure always names an
 advisory rather than a network blip. `--self-test` audits a throwaway crate with
 a deliberately injected known-vulnerable dependency and requires the gate to

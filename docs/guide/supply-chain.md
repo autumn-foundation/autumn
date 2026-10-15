@@ -485,21 +485,17 @@ both PR CI and the **Publish Gate**, so a release cannot be tagged while an
 unwaived advisory sits in the tree being published:
 
 ```bash
-./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
+./scripts/check-advisories.sh              # workspace, sqlite, generated apps, fuzz, island-flock graphs
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
 Five graphs, because "the dependency tree" means five different things here.
-The scaffold graph is the interesting one of the first three: it audits
-`autumn-web`'s dependency tree against the `deny.toml` that `autumn new`
-writes, with every feature any scaffold flavor can enable turned on — so "your
-day-one CI is green" is a checked property of every release rather than a
-hope. Being precise about what that covers: it is the autumn-web half of your
-tree, audited generously (a superset of what your app compiles from
-autumn-web), resolved against Autumn's own lockfile. Your app's own direct
-dependencies, and the exact versions your lockfile resolves, are what *your*
-CI audits — which is why the gate ships with your app rather than only living
-here.
+The third pass generates every `autumn new` flavor with the CLI in this
+checkout. It then runs `cargo deny check advisories` inside each app, against
+the `deny.toml` that app ships. That is what your first CI run does: the same
+root manifest, the same dev-dependencies, and a fresh lockfile from crates.io.
+One difference: `autumn-web` is patched to the checkout, so the gate covers the
+release in flight. Cost: one `cargo fetch` per flavor.
 
 The other two are satellite graphs *inside this repo*, not your app's
 concern: `fuzz/` and `examples/island-flock/` are each their own excluded
