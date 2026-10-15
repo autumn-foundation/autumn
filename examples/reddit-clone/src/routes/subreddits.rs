@@ -17,7 +17,7 @@ use crate::schema::users;
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 use autumn_web::{contains_letter_or_number, slugify};
 
-use super::layout::{layout, layout_with_seo, time_ago};
+use super::layout::{error_summary, layout, layout_with_seo, time_ago};
 
 // ── List all communities ───────────────────────────────────────
 
@@ -154,6 +154,7 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
     html! {
         div class="max-w-lg mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Create a Community" }
+            (error_summary(form, &[("name", "Community name")]))
             (form.form_tag(&paths::create(), "post", html! {
                 div {
                     label for="name" class="block text-sm font-medium text-gray-700 mb-1" {
@@ -588,6 +589,32 @@ autumn_web::paths![list, create_form, create, show];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #2454: a rejected form opens with a focused error summary ──
+
+    #[test]
+    fn a_rejected_community_opens_with_an_error_summary() {
+        use autumn_web::form::IntoChangeset as _;
+        let mut changeset = CreateSubredditForm {
+            name: "***".to_owned(),
+            description: String::new(),
+        }
+        .into_changeset();
+        changeset.add_error("name", "Community name already taken");
+        let rendered = create_form_markup(&ChangesetForm::from_changeset(changeset)).into_string();
+
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        assert!(rendered.contains(r##"href="#name""##), "{rendered}");
+    }
+
+    #[test]
+    fn a_blank_community_form_has_no_error_summary() {
+        let blank = ChangesetForm::without_csrf(CreateSubredditForm::default());
+
+        let rendered = create_form_markup(&blank).into_string();
+
+        assert!(!rendered.contains("error-summary"), "{rendered}");
+    }
 
     #[test]
     fn a_community_name_with_no_letter_or_number_is_rejected() {

@@ -218,6 +218,14 @@ respectively. `autumn-cli/tests/integration/repo_hygiene.rs`'s
 generator-conformance.yml half for the tests #1945 added; extend its list
 when adding another.
 
+##### `examples/reddit-clone` is swept too
+
+The same step runs `cargo test -p reddit-clone --lib --tests -- --ignored
+--test-threads=1`. A new `#[ignore]`d Docker test in that app runs in CI with no
+workflow edit. Run it serial, because the suites share one job runtime. A
+browser test must stay behind `system-tests`.
+`examples/reddit-clone/tests/docker_sweep_ci.rs` fails if the step is removed.
+
 ##### The sweep guarantee stops at `tests/` binaries
 
 Both sweeps run a `--test <binary>` target. A `#[ignore]`d Docker test written

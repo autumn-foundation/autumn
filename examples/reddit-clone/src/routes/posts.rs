@@ -52,7 +52,7 @@ fn posts_per_page() -> i64 {
         .unwrap_or(25)
 }
 
-use super::layout::{layout, layout_with_seo, time_ago, vote_controls};
+use super::layout::{error_summary, layout, layout_with_seo, time_ago, vote_controls};
 
 // ── Front page — hot posts across all subreddits ───────────────
 
@@ -500,6 +500,12 @@ fn submit_form_markup(
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { (heading) }
+            (error_summary(form, &[
+                ("subreddit_id", "Community"),
+                ("title", "Title"),
+                ("url", "Link URL"),
+                ("body", "Text"),
+            ]))
             (form.form_tag(&paths::submit(), "post", html! {
                 @if let Some(sub) = fixed_sub {
                     input type="hidden" name="subreddit_id" value=(sub.id);
@@ -606,6 +612,30 @@ fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
             }
         }
     }
+}
+
+/// Tag chips for a post. Shows `Tag::name`, the author's own spelling.
+fn tag_chips_markup<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
+    let tags: Vec<&Tag> = tags.into_iter().collect();
+    html! {
+        @if !tags.is_empty() {
+            div class="flex flex-wrap gap-2 mt-3" {
+                @for tag in tags {
+                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
+                        "#" (tag.name)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The manage-tags input value. Uses names, so a re-save keeps the spelling.
+fn tags_field_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
+    tags.into_iter()
+        .map(|tag| tag.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The submit form's shape.
@@ -1136,15 +1166,7 @@ pub async fn show(
                         // Preloaded many-to-many tags (#1324): `post.tags()`
                         // reads the batched `post_tags` join loaded above, no
                         // per-tag query.
-                        @if !post_tags.is_empty() {
-                            div class="flex flex-wrap gap-2 mt-3" {
-                                @for tag in &post_tags {
-                                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
-                                        "#" (tag.slug)
-                                    }
-                                }
-                            }
-                        }
+                        (tag_chips_markup(post_tags.iter().map(|t| -> &Tag { t })))
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
                                 a href=(paths::edit_form(&sub.slug, &post.slug))
@@ -1161,7 +1183,7 @@ pub async fn show(
                                 input type="hidden" name="_csrf" value=(csrf.token());
                                 input type="text" name="tags"
                                       aria-label="Post tags"
-                                      value=(post_tags.iter().map(|t| t.slug.clone()).collect::<Vec<_>>().join(", "))
+                                      value=(tags_field_value(post_tags.iter().map(|t| -> &Tag { t })))
                                       placeholder="tags, comma separated"
                                       class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
                                              focus:outline-none focus:ring-2 focus:ring-orange-400" {}
@@ -1279,6 +1301,7 @@ fn edit_form_markup(form: &ChangesetForm<EditPostForm>, sub_slug: &str, post_slu
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Edit Post" }
+            (error_summary(form, &[("title", "Title"), ("body", "Text")]))
             (form.form_tag(&paths::update(sub_slug, post_slug), "post", html! {
                 div {
                     (field_errors("title", form))
@@ -1799,6 +1822,55 @@ mod tests {
         );
     }
 
+    // ── #2454: tags show the author's spelling, not the slug ───────
+
+    fn tag(name: &str) -> Tag {
+        Tag {
+            id: 1,
+            name: name.to_owned(),
+            slug: slugify(name),
+        }
+    }
+
+    #[test]
+    fn tag_chips_show_the_name_not_the_slug() {
+        let rendered = tag_chips_markup(&[tag("Web Dev")]).into_string();
+
+        assert!(rendered.contains("#Web Dev"), "rendered: {rendered}");
+        assert!(!rendered.contains("web-dev"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn a_non_latin_tag_shows_its_own_script() {
+        let tags = [tag("日本語")];
+        let rendered = tag_chips_markup(&tags).into_string();
+
+        assert!(rendered.contains("#日本語"), "rendered: {rendered}");
+        assert!(!rendered.contains(&tags[0].slug), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn tag_names_are_escaped() {
+        let rendered = tag_chips_markup(&[tag("<b>x</b>")]).into_string();
+
+        assert!(!rendered.contains("<b>x"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn no_tags_render_no_chip_row() {
+        assert!(tag_chips_markup(&[]).into_string().is_empty());
+    }
+
+    #[test]
+    fn the_tags_field_round_trips_names() {
+        let field = tags_field_value(&[tag("Web Dev"), tag("日本語")]);
+
+        assert_eq!(field, "Web Dev, 日本語");
+        let parsed = parse_tag_names(&field);
+        assert_eq!(parsed.name_by_slug[&slugify("Web Dev")], "Web Dev");
+        assert_eq!(parsed.name_by_slug[&slugify("日本語")], "日本語");
+    }
+
     // ── #2423: a NUL byte is an inline field error, not a 500 ──────
 
     /// The reported repro, on the reported form: `body=before%00after` used to
@@ -1846,6 +1918,37 @@ mod tests {
             !rendered.contains('\u{0}'),
             "a raw NUL must never be echoed back into the HTML"
         );
+    }
+
+    // ── #2454: a rejected form opens with a focused error summary ──
+
+    #[test]
+    fn a_rejected_submission_opens_with_an_error_summary() {
+        let rendered = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
+
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        assert!(rendered.contains(r##"href="#title""##), "{rendered}");
+    }
+
+    #[test]
+    fn a_blank_submission_has_no_error_summary() {
+        let rendered = submit_form_markup(&blank_submit_form(), &[], None).into_string();
+
+        assert!(!rendered.contains("error-summary"), "{rendered}");
+    }
+
+    #[test]
+    fn a_rejected_edit_opens_with_an_error_summary() {
+        let form = EditPostForm {
+            title: String::new(),
+            body: String::new(),
+        };
+        let rejected = ChangesetForm::from_changeset(form.into_changeset());
+
+        let rendered = edit_form_markup(&rejected, "rust", "post").into_string();
+
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        assert!(rendered.contains(r##"href="#title""##), "{rendered}");
     }
 
     // ── Typed a11y form primitives (#1706) ─────────────────────────

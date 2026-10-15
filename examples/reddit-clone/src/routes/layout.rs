@@ -1,5 +1,6 @@
 //! Shared layout and UI components used across all routes.
 
+use autumn_web::form::ChangesetForm;
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
 use autumn_web::seo::SeoMeta;
@@ -105,6 +106,46 @@ pub fn layout(
     )
 }
 
+/// Error summary for the top of a rejected form.
+///
+/// A full-page 422 moves no focus, and a `role="alert"` region present at load
+/// is usually not announced. So the summary takes focus itself: `tabindex="-1"`
+/// makes the `div` focusable, `autofocus` focuses it on load. Each entry links
+/// to its field by id. `fields` pairs a field name with its label, in form
+/// order. Renders nothing when no listed field has an error.
+pub fn error_summary<T>(form: &ChangesetForm<T>, fields: &[(&str, &str)]) -> Markup {
+    let entries: Vec<(&str, &str, &str)> = fields
+        .iter()
+        .flat_map(|&(field, label)| {
+            form.errors_for(field)
+                .iter()
+                .map(move |message| (field, label, message.as_str()))
+        })
+        .collect();
+    let count = entries.len();
+    html! {
+        @if count > 0 {
+            div id="error-summary" tabindex="-1" autofocus
+                aria-labelledby="error-summary-title"
+                class="mb-4 rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700" {
+                h2 id="error-summary-title" class="font-semibold mb-1" {
+                    @if count == 1 { "1 problem needs fixing" }
+                    @else { (count) " problems need fixing" }
+                }
+                ul class="list-disc pl-5" {
+                    @for (field, label, message) in entries {
+                        li {
+                            a href=(format!("#{field}")) class="underline" {
+                                (label) ": " (message)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Base HTML layout that takes an explicit [`SeoMeta`] builder.
 ///
 /// [`SeoMeta::render`] writes the `<title>` tag, so `seo` must carry a title.
@@ -127,6 +168,9 @@ pub fn layout_with_seo(
 ) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
+        // `lang="en"` describes the page chrome, which is English. User
+        // content may use any script; it stays under this tag because no
+        // detector tags it per element.
         html lang="en" {
             head {
                 meta charset="utf-8";
@@ -325,10 +369,78 @@ pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    use autumn_web::form::ChangesetForm;
     use autumn_web::html;
     use autumn_web::seo::SeoMeta;
 
-    use super::{layout, layout_with_seo};
+    use super::{error_summary, layout, layout_with_seo};
+
+    #[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
+    struct Probe {
+        title: String,
+        body: String,
+    }
+
+    fn rejected(errors: &[(&str, &str)]) -> ChangesetForm<Probe> {
+        let mut form = ChangesetForm::without_csrf(Probe::default());
+        for (field, message) in errors {
+            form.changeset.add_error(*field, *message);
+        }
+        form
+    }
+
+    #[test]
+    fn a_valid_form_has_no_error_summary() {
+        let form = rejected(&[]);
+
+        let rendered = error_summary(&form, &[("title", "Title")]).into_string();
+
+        assert!(rendered.is_empty(), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn the_error_summary_takes_focus_on_render() {
+        let form = rejected(&[("title", "Title is required")]);
+
+        let rendered = error_summary(&form, &[("title", "Title")]).into_string();
+
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        assert!(rendered.contains(r#"tabindex="-1""#), "{rendered}");
+        assert!(rendered.contains("autofocus"), "{rendered}");
+    }
+
+    #[test]
+    fn each_summary_entry_links_to_its_field() {
+        let form = rejected(&[("title", "Title is required"), ("body", "Body is bad")]);
+
+        let rendered = error_summary(&form, &[("title", "Title"), ("body", "Text")]).into_string();
+
+        assert!(rendered.contains(r##"href="#title""##), "{rendered}");
+        assert!(rendered.contains("Title is required"), "{rendered}");
+        assert!(rendered.contains(r##"href="#body""##), "{rendered}");
+        assert!(rendered.contains("Body is bad"), "{rendered}");
+        assert!(rendered.contains("2 problems"), "{rendered}");
+    }
+
+    #[test]
+    fn the_summary_skips_fields_without_errors() {
+        let form = rejected(&[("body", "Body is bad")]);
+
+        let rendered = error_summary(&form, &[("title", "Title"), ("body", "Text")]).into_string();
+
+        assert!(!rendered.contains(r##"href="#title""##), "{rendered}");
+        assert!(rendered.contains("1 problem"), "{rendered}");
+        assert!(!rendered.contains("1 problems"), "{rendered}");
+    }
+
+    #[test]
+    fn summary_messages_are_escaped() {
+        let form = rejected(&[("title", "<script>x</script>")]);
+
+        let rendered = error_summary(&form, &[("title", "Title")]).into_string();
+
+        assert!(!rendered.contains("<script>"), "{rendered}");
+    }
 
     #[test]
     fn layout_still_renders_the_site_title_suffix() {

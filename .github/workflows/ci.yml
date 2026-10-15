@@ -1776,6 +1776,20 @@ jobs:
           # not just the crate's own generic suite above. Testcontainer-
           # managed, so no `services:` block is needed.
           cargo test -p wiki --test search_plugin_integration -- --ignored
+          # examples/reddit-clone (#2454): every `#[ignore]`d Postgres, MinIO and
+          # live-event suite in its `tests/` binaries and `--lib`. A bare
+          # `--ignored` sweep, so a new suite needs no workflow edit. `--lib
+          # --tests` skips doc tests, whose `ignore` blocks are not Docker
+          # tests. Serial: the suites share one global job runtime. Browser
+          # tests stay out: they sit behind `system-tests`. The pass-count
+          # check is there because `cargo test` exits 0 when nothing matches.
+          (
+            set -o pipefail
+            cargo test -p reddit-clone --lib --tests -- --ignored --test-threads=1 \
+              | tee "${RUNNER_TEMP}/reddit-clone-docker-sweep.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/reddit-clone-docker-sweep.log" \
+            || { echo "::error::no reddit-clone Docker tests ran — the ci.yml sweep no longer matches"; exit 1; }
           # autumn-billing (#1190): the Postgres `DbBillingStore` contract suite
           # is testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-billing --test mirror_db -- --ignored

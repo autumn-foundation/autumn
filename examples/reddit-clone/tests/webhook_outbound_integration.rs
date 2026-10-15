@@ -62,8 +62,21 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     };
     store.create_subscription(sub).await.unwrap();
 
-    // 3. Build the TestApp
+    // 3. Build the TestApp. `register` takes a `CsrfToken`, which only exists
+    // when the CSRF layer runs. `TestApp` turns it off, so turn it on and
+    // exempt the one path this test posts to.
+    let mut config = autumn_web::config::AutumnConfig {
+        profile: Some("test".into()),
+        ..Default::default()
+    };
+    config.security.csrf.enabled = true;
+    config
+        .security
+        .csrf
+        .exempt_paths
+        .push("/register".to_owned());
     let mut app_builder = TestApp::new()
+        .config(config)
         .plugin(plugin)
         .routes(routes![reddit_clone::routes::auth::register])
         .with_db(db.pool());
@@ -98,6 +111,13 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     });
     job::start_runtime(jobs, state, &shutdown, &config, true).unwrap();
 
+    // `register` reads `registration_open` from the global runtime-config
+    // service, which loads once. Without a database URL it dials the dev
+    // profile's port, fails, and reads as "closed". Load it against the test
+    // database.
+    temp_env::with_var("AUTUMN_DATABASE__URL", Some(db.url()), || {
+        reddit_clone::config_svc();
+    });
     // 5. Fire a POST request to /register to trigger the user.created webhook event
     let response = app
         .post("/register")
