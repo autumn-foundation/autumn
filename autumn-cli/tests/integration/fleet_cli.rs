@@ -721,6 +721,24 @@ mod sqlite {
     }
 
     #[test]
+    fn fleet_restore_refuses_two_replica_destinations() {
+        for enabled in [true, false] {
+            let app = App::new(&format!(
+                "[replication]\nenabled = {enabled}\npath = \"replicas\"\n\n\
+                 [replication.s3]\nbucket = \"b\"\naccess_key_id_env = \"K\"\n\
+                 secret_access_key_env = \"S\"\n"
+            ));
+            app.provision(&app.fleet(), &["acme"], 1);
+            let stderr = run_err(&app.dir, &["fleet", "restore", "tenant:acme", "--force"]);
+            assert!(
+                stderr.contains("both `s3` and `path`"),
+                "{enabled}: {stderr}"
+            );
+            assert_eq!(count_notes(&app.path("acme")), 1, "nothing was restored");
+        }
+    }
+
+    #[test]
     fn fleet_restore_needs_replication() {
         let app = App::new("");
         app.provision(&app.fleet(), &["acme"], 1);

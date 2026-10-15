@@ -652,6 +652,28 @@ mod imp {
         let at = replica::parse_timestamp(timestamp).map_err(|e| e.to_string())?;
         let loaded = replica::Loaded::new(target.profile.clone(), target.config.clone())
             .map_err(|e| e.to_string())?;
+        // The check boot makes, and one more: a restore must not guess
+        // between two destinations, whether replication is on or not.
+        let mut errors = loaded.replication.validation_errors();
+        if loaded.replication.s3.is_some()
+            && loaded
+                .replication
+                .path
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+            && errors.is_empty()
+        {
+            errors.push(
+                "[replication] configures both `s3` and `path`; pick exactly one destination"
+                    .to_owned(),
+            );
+        }
+        if !errors.is_empty() {
+            return Err(format!(
+                "Invalid [replication] configuration: {}",
+                errors.join("; ")
+            ));
+        }
         let fleet = target.build(None)?;
         let key = parse_key(&fleet, key)?;
         let destination = loaded.destination().map_err(|e| e.to_string())?;
