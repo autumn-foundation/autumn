@@ -547,7 +547,11 @@ impl PostureManifest {
             let roles: Vec<String> = r.role_set().into_iter().collect();
             let scopes: Vec<String> = r.scope_set().into_iter().collect();
             // Only a declared guard, so a manifest without one keeps its digest.
-            let declared = if r.is_declared() { "\tprov=declared" } else { "" };
+            let declared = if r.is_declared() {
+                "\tprov=declared"
+            } else {
+                ""
+            };
             lines.push(format!(
                 "route\t{}\t{}\t{}\troles={}\tscopes={}\tpolicy={}{declared}",
                 escape_field(&normalize_captures(&r.path)),

@@ -2521,8 +2521,10 @@ mod tests {
 
     /// `route` with a chosen provenance.
     fn route_prov(path: &str, classification: &str, provenance: &str) -> String {
-        route(path, "GET", classification, &[], &[], false)
-            .replace(r#""provenance":"provable""#, &format!(r#""provenance":"{provenance}""#))
+        route(path, "GET", classification, &[], &[], false).replace(
+            r#""provenance":"provable""#,
+            &format!(r#""provenance":"{provenance}""#),
+        )
     }
 
     /// A proven guard that becomes a layer claim is a weaker guard (#2468).
@@ -2565,7 +2567,9 @@ mod tests {
     #[test]
     fn a_provable_manifest_keeps_its_digest() {
         let provable = routes_only(&route_prov("/a", "gated", "provable"));
-        let absent = routes_only(&route_prov("/a", "gated", "provable").replace(r#","provenance":"provable""#, ""));
+        let absent = routes_only(
+            &route_prov("/a", "gated", "provable").replace(r#","provenance":"provable""#, ""),
+        );
         assert_eq!(provable.posture_digest(), absent.posture_digest());
     }
 
