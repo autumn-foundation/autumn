@@ -21,6 +21,17 @@ use std::time::Duration;
 
 const REDDIT_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
+/// Read the value of the hidden `_csrf` input from a rendered form.
+fn csrf_token_from(html: &str) -> String {
+    let marker = r#"name="_csrf" value=""#;
+    let start = html
+        .find(marker)
+        .unwrap_or_else(|| panic!("no CSRF input in the form:\n{html}"))
+        + marker.len();
+    let end = html[start..].find('"').expect("the value is quoted");
+    html[start..start + end].to_owned()
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn test_reddit_registration_triggers_outbound_webhook() {
@@ -47,6 +58,13 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     db.execute_sql("TRUNCATE TABLE users CASCADE").await;
     db.execute_sql("TRUNCATE TABLE autumn_jobs CASCADE").await;
 
+    // The handler reads `registration_open` from the app's runtime config.
+    // Its dev-profile default is a Postgres URL nothing listens on, so build
+    // the config service against the test database.
+    temp_env::with_vars([("AUTUMN_DATABASE__URL", Some(db.url()))], || {
+        reddit_clone::init_config();
+    });
+
     // 2. Setup the Webhook Outbound Plugin with a process-local InMemory store
     let store = Arc::new(InMemoryOutboundWebhookStore::new());
     let plugin = OutboundWebhookPlugin::new(store.clone()).with_initial_backoff_ms(1);
@@ -63,9 +81,17 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     store.create_subscription(sub).await.unwrap();
 
     // 3. Build the TestApp
+    // `register` extracts `CsrfToken`, which needs the CSRF layer. `TestApp`
+    // turns it off by default, so turn it on and post a real token below.
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.security.csrf.enabled = true;
     let mut app_builder = TestApp::new()
         .plugin(plugin)
-        .routes(routes![reddit_clone::routes::auth::register])
+        .config(config)
+        .routes(routes![
+            reddit_clone::routes::auth::register_form,
+            reddit_clone::routes::auth::register
+        ])
         .with_db(db.pool());
 
     // Register HTTP mock for the outbound signed webhook target
@@ -99,9 +125,15 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     job::start_runtime(jobs, state, &shutdown, &config, true).unwrap();
 
     // 5. Fire a POST request to /register to trigger the user.created webhook event
+    // The client keeps cookies, so the token from the form matches its session.
+    let page = app.get("/register").send().await.assert_ok().text();
+    let token = csrf_token_from(&page);
     let response = app
         .post("/register")
-        .form("username=webhook_user&email=webhook_user@example.com&password=supersecurepassword")
+        .form(&format!(
+            "username=webhook_user&email=webhook_user@example.com\
+             &password=supersecurepassword&_csrf={token}"
+        ))
         .send()
         .await;
 

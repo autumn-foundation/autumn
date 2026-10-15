@@ -127,6 +127,8 @@ pub fn layout_with_seo(
 ) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
+        // The page chrome is English. User content may be in any script, so
+        // `lang` states the chrome only.
         html lang="en" {
             head {
                 meta charset="utf-8";
@@ -303,37 +305,50 @@ pub fn analytics_snippet(consent: &autumn_web::consent::Consent) -> Markup {
     }
 }
 
-/// Error summary for a rejected form (#2441).
+/// Render one field's validation messages, in the element its control points
+/// at with `aria-describedby`.
 ///
-/// The block takes focus on page load, so a screen reader reads it first.
-/// Each message links to its field. `fields` sets the order and the link text.
-/// Errors on other fields are not listed. A valid form gives empty markup.
-/// The framework `widgets::error_summary` has no field links and no focus.
-pub fn form_error_summary<T>(
-    form: &autumn_web::form::ChangesetForm<T>,
-    fields: &[(&str, &str)],
-) -> Markup {
-    let items: Vec<(&str, &str, &str)> = fields
-        .iter()
-        .flat_map(|&(field, label)| {
-            form.errors_for(field)
-                .iter()
-                .map(move |message| (field, label, message.as_str()))
-        })
-        .collect();
-    if items.is_empty() {
-        return html! {};
-    }
+/// `role="alert"` makes the message announced when it appears after an htmx
+/// swap; the stable `{field}-error` id is what makes it announced on focus for
+/// a full-page 422 too.
+pub fn field_errors<T>(field: &str, form: &autumn_web::form::ChangesetForm<T>) -> Markup {
+    let errors = form.errors_for(field);
     html! {
-        section id="error-summary" tabindex="-1" autofocus
-            aria-labelledby="error-summary-title"
-            class="mb-4 rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700" {
-            h2 id="error-summary-title" class="font-semibold mb-1" {
-                "Fix these problems to continue"
+        div id=(format!("{field}-error")) {
+            @for message in errors {
+                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
             }
-            ul class="list-disc pl-5" {
-                @for (field, label, message) in items {
-                    li { a href=(format!("#{field}")) class="underline" { (label) ": " (message) } }
+        }
+    }
+}
+
+/// Render an error summary for the top of a re-rendered form.
+///
+/// Screen readers do not announce an alert that is on the page at load. A
+/// full-page 422 also moves no focus. So this summary takes focus at load.
+/// Each message links to its field. The framework `widgets::error_summary`
+/// has no focus target and no field links.
+///
+/// `fields` lists the fields that have an `id`, in page order. Nothing
+/// renders when none of them has an error.
+pub fn form_error_summary<T>(form: &autumn_web::form::ChangesetForm<T>, fields: &[&str]) -> Markup {
+    let has_errors = fields
+        .iter()
+        .any(|field| !form.errors_for(field).is_empty());
+    html! {
+        @if has_errors {
+            div id="error-summary" tabindex="-1" autofocus
+                aria-labelledby="error-summary-title"
+                class="mb-4 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-700" {
+                h2 id="error-summary-title" class="font-semibold mb-1" {
+                    "Please fix the following errors"
+                }
+                ul class="list-disc pl-5" {
+                    @for field in fields {
+                        @for message in form.errors_for(field) {
+                            li { a href=(format!("#{field}")) class="underline" { (message) } }
+                        }
+                    }
                 }
             }
         }
@@ -365,53 +380,62 @@ mod tests {
     use autumn_web::html;
     use autumn_web::seo::SeoMeta;
 
-    use super::{layout, layout_with_seo};
+    use autumn_web::IntoChangeset as _;
+    use autumn_web::form::ChangesetForm;
+    use validator::Validate;
 
-    // ── #2441: error summary ────────────────────────────────────
+    use super::{form_error_summary, layout, layout_with_seo};
 
-    fn rejected() -> autumn_web::form::ChangesetForm<()> {
-        let mut form = autumn_web::form::ChangesetForm::without_csrf(());
-        form.changeset.add_error("body", "Body is bad <b>");
-        form.changeset.add_error("title", "Title is bad");
-        form
-    }
-
-    const FIELDS: &[(&str, &str)] = &[("title", "Title"), ("body", "Text")];
-
-    #[test]
-    fn error_summary_is_empty_for_a_valid_form() {
-        let form = autumn_web::form::ChangesetForm::without_csrf(());
-        assert_eq!(super::form_error_summary(&form, FIELDS).into_string(), "");
+    #[derive(serde::Serialize, serde::Deserialize, Validate, Clone, Default)]
+    struct Probe {
+        #[validate(length(min = 1, message = "Title is required"))]
+        title: String,
     }
 
     #[test]
-    fn error_summary_takes_focus_on_page_load() {
-        let out = super::form_error_summary(&rejected(), FIELDS).into_string();
+    fn a_valid_form_has_no_error_summary() {
+        let form = ChangesetForm::from_changeset(
+            Probe {
+                title: "ok".to_owned(),
+            }
+            .into_changeset(),
+        );
+        assert!(
+            form_error_summary(&form, &["title"])
+                .into_string()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_summary_follows_the_order_of_the_page() {
+        #[derive(serde::Serialize, serde::Deserialize, Validate, Clone, Default)]
+        struct Two {
+            #[validate(length(min = 1, message = "A missing"))]
+            alpha: String,
+            #[validate(length(min = 1, message = "B missing"))]
+            beta: String,
+        }
+        let form = ChangesetForm::from_changeset(Two::default().into_changeset());
+        let out = form_error_summary(&form, &["beta", "alpha"]).into_string();
+        assert!(out.find("B missing") < out.find("A missing"), "{out}");
+    }
+
+    #[test]
+    fn a_field_missing_from_the_list_gets_no_link() {
+        let form = ChangesetForm::from_changeset(Probe::default().into_changeset());
+        assert!(form_error_summary(&form, &[]).into_string().is_empty());
+    }
+
+    #[test]
+    fn an_invalid_form_gets_a_focused_summary_that_links_each_field() {
+        let form = ChangesetForm::from_changeset(Probe::default().into_changeset());
+        let out = form_error_summary(&form, &["title"]).into_string();
         assert!(out.contains(r#"id="error-summary""#), "{out}");
         assert!(out.contains(r#"tabindex="-1""#), "{out}");
-        assert!(out.contains(" autofocus"), "{out}");
-        assert!(out.contains("<section"), "{out}");
-    }
-
-    #[test]
-    fn error_summary_links_each_message_to_its_field_in_form_order() {
-        let out = super::form_error_summary(&rejected(), FIELDS).into_string();
-        let title = out.find(r##"href="#title""##).expect("title link");
-        let body = out.find(r##"href="#body""##).expect("body link");
-        assert!(title < body, "{out}");
-        assert!(out.contains("Title is bad"), "{out}");
-    }
-
-    #[test]
-    fn error_summary_escapes_messages() {
-        let out = super::form_error_summary(&rejected(), FIELDS).into_string();
-        assert!(out.contains("Body is bad &lt;b&gt;"), "{out}");
-    }
-
-    #[test]
-    fn error_summary_skips_fields_it_was_not_told_about() {
-        let out = super::form_error_summary(&rejected(), &[("title", "Title")]).into_string();
-        assert!(!out.contains("Body is bad"), "{out}");
+        assert!(out.contains("autofocus"), "{out}");
+        assert!(out.contains(r##"href="#title""##), "{out}");
+        assert!(out.contains("Title is required"), "{out}");
     }
 
     #[test]

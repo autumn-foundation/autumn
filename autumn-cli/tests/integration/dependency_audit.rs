@@ -602,40 +602,42 @@ fn the_advisory_gate_rejects_an_injected_known_vulnerable_dependency() {
     );
 }
 
-/// AC2, enforced rather than asserted once: the scaffold's own policy must be
-/// clean against the autumn-web graph a generated app pins, so "day-one CI is
-/// green" cannot quietly stop being true between releases.
+/// AC2, enforced rather than asserted once (#2466): the gate audits real
+/// generated apps, not autumn-web's graph as a proxy. A real app has its own
+/// root manifest, its own fresh lockfile and its dev-dependencies.
 #[test]
-fn the_gate_checks_the_scaffolds_day_one_dependency_tree() {
-    let script = read_repo_file("scripts/check-advisories.sh");
+fn the_gate_audits_real_generated_apps() {
+    let script = code_only(&read_repo_file("scripts/check-advisories.sh"));
     assert!(
-        script.contains("autumn-cli/src/templates/deny.toml.tmpl"),
-        "the gate must audit the scaffold's shipped policy against autumn-web's graph:\n{script}"
+        script.contains("new \"${name}\"") && script.contains("cargo fetch"),
+        "the gate must generate each flavor and fetch its own lockfile:\n{script}"
+    );
+    assert!(
+        script.contains("cargo deny --offline check advisories"),
+        "the gate must run cargo-deny from inside the generated app:\n{script}"
+    );
+    assert!(
+        !script.contains("--exclude-dev") && !script.contains("--manifest-path autumn/"),
+        "the gate must not audit autumn-web's own tree as a proxy:\n{script}"
+    );
+    assert!(
+        script.contains("[patch.crates-io]"),
+        "the gate must audit the autumn-web in flight, not the last release:\n{script}"
     );
 }
 
-/// Every `autumn-web` feature any scaffold flavor can turn on has to be inside
-/// the graph the release gate audits. Otherwise a flavor ships a waiver set
-/// that does not cover its own dependency tree and its day-one CI is red —
-/// which is exactly what `--bundled-pg` did, whose `managed-pg-bundled` feature
-/// drags in `instant` (RUSTSEC-2024-0384).
+/// The gate must audit every flavor in `scaffold_flavors()`. Add a new
+/// flavor to both lists.
 #[test]
-fn the_gate_audits_every_feature_a_scaffold_flavor_can_enable() {
-    let audited = gate_audited_features();
-    let defaults = autumn_web_default_features();
-
+fn the_gate_audits_every_scaffold_flavor() {
+    let audited = gate_generated_flavors();
     for flags in scaffold_flavors() {
-        let name = format!("features-{}-app", flavor_slug(flags));
-        let (_tmp, project) = scaffold(&name, flags);
-        for feature in scaffold_autumn_web_features(&read_project_file(&project, "Cargo.toml")) {
-            assert!(
-                audited.contains(&feature) || defaults.contains(&feature),
-                "`autumn new {}` enables autumn-web/{feature}, which the release gate never \
-                 audits — that flavor's shipped waivers are unverified. Add it to the \
-                 --features list in scripts/check-advisories.sh.\naudited: {audited:?}",
-                flags.join(" "),
-            );
-        }
+        assert!(
+            audited.iter().any(|f| f == &flags.join(" ")),
+            "`autumn new {}` is not in GENERATED_FLAVORS in scripts/check-advisories.sh.\n\
+             audited: {audited:?}",
+            flags.join(" "),
+        );
     }
 }
 
@@ -649,6 +651,10 @@ fn scaffold_flavors() -> Vec<&'static [&'static str]> {
         &["--bundled-pg"],
         &["--with-i18n", "--with-seed"],
         &["--api", "--with-i18n"],
+        &["--api", "--with-seed"],
+        &["--api", "--with-i18n", "--with-seed"],
+        &["--daemon", "--with-i18n"],
+        &["--bundled-pg", "--with-i18n"],
     ]
 }
 
@@ -660,71 +666,23 @@ fn flavor_slug(flags: &[&str]) -> String {
     }
 }
 
-/// The `--features` list `scripts/check-advisories.sh` audits the scaffold with.
-fn gate_audited_features() -> Vec<String> {
+/// The flavors `scripts/check-advisories.sh` generates and audits: the
+/// `GENERATED_FLAVORS` entries, one flag set per line.
+fn gate_generated_flavors() -> Vec<String> {
     let script = read_repo_file("scripts/check-advisories.sh");
-    let line = script
-        .lines()
-        .find(|line| line.starts_with("SCAFFOLD_FEATURES="))
-        .unwrap_or_else(|| panic!("the gate must audit an explicit feature set:\n{script}"));
-    line.trim_start_matches("SCAFFOLD_FEATURES=")
-        .trim_matches('"')
-        .split(',')
-        .map(|feature| feature.trim().to_owned())
-        .filter(|feature| !feature.is_empty())
-        .collect()
-}
-
-/// autumn-web's own default features — on unless a flavor opts out, and every
-/// opt-out flavor names a subset of them.
-fn autumn_web_default_features() -> Vec<String> {
-    let manifest = read_repo_file("autumn/Cargo.toml");
-    let line = manifest
-        .lines()
-        .find(|line| line.starts_with("default = ["))
-        .expect("autumn/Cargo.toml must declare a default feature list");
-    line.trim_start_matches("default = [")
-        .trim_end_matches(']')
-        .split(',')
-        .map(|feature| feature.trim().trim_matches('"').to_owned())
-        .filter(|feature| !feature.is_empty())
-        .collect()
-}
-
-/// Every autumn-web feature a generated `Cargo.toml` can switch on: those named
-/// on the dependency line, and those the app's own features forward.
-fn scaffold_autumn_web_features(cargo_toml: &str) -> Vec<String> {
-    let mut features: Vec<String> = cargo_toml
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .flat_map(|line| {
-            line.match_indices("autumn-web/")
-                .map(|(at, _)| {
-                    line[at + "autumn-web/".len()..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
+    let body = script
+        .split("GENERATED_FLAVORS=(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n)").next())
+        .unwrap_or_else(|| panic!("the gate must declare GENERATED_FLAVORS:\n{script}"));
+    body.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('"'))
+        .map(|line| {
+            let end = line[1..].find('"').map_or(line.len(), |at| at + 1);
+            line[1..end].to_owned()
         })
-        .collect();
-
-    if let Some(line) = cargo_toml
-        .lines()
-        .find(|line| line.starts_with("autumn-web = "))
-        && let Some(at) = line.find("features = [")
-    {
-        let list = &line[at + "features = [".len()..];
-        let list = &list[..list.find(']').unwrap_or(list.len())];
-        features.extend(
-            list.split(',')
-                .map(|feature| feature.trim().trim_matches('"').to_owned())
-                .filter(|feature| !feature.is_empty()),
-        );
-    }
-    features.sort();
-    features.dedup();
-    features
+        .collect()
 }
 
 /// The `--bundled-pg` flavor's tree carries an advisory the default flavor's
@@ -845,8 +803,8 @@ fn the_gate_script_retries_the_fetch_and_audits_offline() {
         "the fetch must stay retryable:\n{code}"
     );
     assert!(
-        code.contains("audit_scaffold_graph"),
-        "the gate must audit the scaffold's day-one graph, not only the workspace:\n{code}"
+        code.contains("audit_generated_apps"),
+        "the gate must audit generated apps, not only the workspace:\n{code}"
     );
 }
 

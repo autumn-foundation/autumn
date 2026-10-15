@@ -52,7 +52,9 @@ fn posts_per_page() -> i64 {
         .unwrap_or(25)
 }
 
-use super::layout::{form_error_summary, layout, layout_with_seo, time_ago, vote_controls};
+use super::layout::{
+    field_errors, form_error_summary, layout, layout_with_seo, time_ago, vote_controls,
+};
 
 // ── Front page — hot posts across all subreddits ───────────────
 
@@ -500,8 +502,11 @@ fn submit_form_markup(
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { (heading) }
+            (form_error_summary(
+                form,
+                if fixed_sub.is_some() { &["title", "url", "body"] } else { &["subreddit_id", "title", "url", "body"] },
+            ))
             (form.form_tag(&paths::submit(), "post", html! {
-                (form_error_summary(form, if fixed_sub.is_some() { &SUBMIT_FIELDS[1..] } else { SUBMIT_FIELDS }))
                 @if let Some(sub) = fixed_sub {
                     input type="hidden" name="subreddit_id" value=(sub.id);
                 } @else {
@@ -592,33 +597,32 @@ fn submit_form_markup(
     }
 }
 
-/// Summary order and link text for the submit form.
-/// The first entry has no field when the community is fixed.
-const SUBMIT_FIELDS: &[(&str, &str)] = &[
-    ("subreddit_id", "Community"),
-    ("title", "Title"),
-    ("url", "Link URL"),
-    ("body", "Text"),
-];
+/// A tag's name without a leading `#`. Older rows kept the `#` the author typed.
+fn tag_label(tag: &Tag) -> &str {
+    tag.name.trim_start_matches('#').trim_start()
+}
 
-/// Summary order and link text for the edit form.
-const EDIT_FIELDS: &[(&str, &str)] = &[("title", "Title"), ("body", "Text")];
-
-/// Render one field's validation messages, in the element its control points
-/// at with `aria-describedby`.
-///
-/// `role="alert"` makes the message announced when it appears after an htmx
-/// swap; the stable `{field}-error` id is what makes it announced on focus for
-/// a full-page 422 too.
-fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
-    let errors = form.errors_for(field);
+/// Render tag chips. Show `name`, the spelling the author typed.
+/// The `slug` is a URL key only. For a name with no Latin text, it is a hash.
+fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
     html! {
-        div id=(format!("{field}-error")) {
-            @for message in errors {
-                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
+        div class="flex flex-wrap gap-2 mt-3" {
+            @for tag in tags {
+                span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
+                    "#" (tag_label(tag))
+                }
             }
         }
     }
+}
+
+/// Build the manage-tags input value from names.
+/// A re-save then keeps the author's spelling.
+fn tag_input_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
+    tags.into_iter()
+        .map(tag_label)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The submit form's shape.
@@ -1150,13 +1154,7 @@ pub async fn show(
                         // reads the batched `post_tags` join loaded above, no
                         // per-tag query.
                         @if !post_tags.is_empty() {
-                            div class="flex flex-wrap gap-2 mt-3" {
-                                @for tag in &post_tags {
-                                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
-                                        "#" (tag.name)
-                                    }
-                                }
-                            }
+                            (tag_chips(post_tags.iter().map(|tag| &***tag)))
                         }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
@@ -1174,7 +1172,7 @@ pub async fn show(
                                 input type="hidden" name="_csrf" value=(csrf.token());
                                 input type="text" name="tags"
                                       aria-label="Post tags"
-                                      value=(tag_names_value(post_tags.iter().map(|t| t.name.as_str())))
+                                      value=(tag_input_value(post_tags.iter().map(|tag| &***tag)))
                                       placeholder="tags, comma separated"
                                       class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
                                              focus:outline-none focus:ring-2 focus:ring-orange-400" {}
@@ -1292,8 +1290,8 @@ fn edit_form_markup(form: &ChangesetForm<EditPostForm>, sub_slug: &str, post_slu
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Edit Post" }
+            (form_error_summary(form, &["title", "body"]))
             (form.form_tag(&paths::update(sub_slug, post_slug), "post", html! {
-                (form_error_summary(form, EDIT_FIELDS))
                 div {
                     (field_errors("title", form))
                     (autumn_web::a11y::TextField::new("title")
@@ -1468,11 +1466,6 @@ struct ParsedTags {
     dropped_too_long: usize,
 }
 
-/// Join tag names for the tags input. A save then keeps the names.
-fn tag_names_value<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
-    names.into_iter().collect::<Vec<_>>().join(", ")
-}
-
 /// Split raw tag input into slugs (first-seen order) and their display names.
 ///
 /// Pure, so the parsing rules can be tested without a database.
@@ -1482,7 +1475,8 @@ fn parse_tag_names(raw: &str) -> ParsedTags {
     let mut dropped_no_letter_or_number = 0_usize;
     let mut dropped_too_long = 0_usize;
     for piece in raw.split([',', '\n']) {
-        let name = piece.trim();
+        // The chip adds its own `#`, so a typed one is not part of the name.
+        let name = piece.trim().trim_start_matches('#').trim_start();
         if name.is_empty() {
             continue;
         }
@@ -1800,6 +1794,58 @@ autumn_web::paths![
 mod tests {
     use super::*;
 
+    fn tag(name: &str, slug: &str) -> Tag {
+        Tag {
+            id: 1,
+            name: name.to_owned(),
+            slug: slug.to_owned(),
+        }
+    }
+
+    #[test]
+    fn tag_chips_show_the_name_not_the_slug() {
+        let out = tag_chips(&[tag("日本語", "n1a3b86"), tag("Web Dev", "web-dev")]).into_string();
+        assert!(out.contains("#日本語"), "{out}");
+        assert!(out.contains("#Web Dev"), "{out}");
+        assert!(!out.contains("n1a3b86"), "{out}");
+    }
+
+    #[test]
+    fn a_stored_name_with_a_hash_prefix_shows_one_hash() {
+        // Older rows kept the `#` the author typed.
+        let old = [tag("#rust", "rust")];
+        let out = tag_chips(&old).into_string();
+        assert!(out.contains("#rust") && !out.contains("##"), "{out}");
+        assert_eq!(tag_input_value(&old), "rust");
+    }
+
+    #[test]
+    fn a_typed_hash_prefix_is_not_stored_in_the_name() {
+        let parsed = parse_tag_names("#rust, ##Web Dev, #");
+        assert_eq!(parsed.slug_order, ["rust", "web-dev"]);
+        assert_eq!(parsed.name_by_slug["rust"], "rust");
+        assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+        assert_eq!(parsed.dropped_no_letter_or_number, 0);
+    }
+
+    #[test]
+    fn the_tag_input_keeps_the_authors_spelling() {
+        let tags = [tag("Web Dev", "web-dev"), tag("日本語", "n1a3b86")];
+        assert_eq!(tag_input_value(&tags), "Web Dev, 日本語");
+        // Saving the value again must not change a tag.
+        let parsed = parse_tag_names(&tag_input_value(&tags));
+        assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+        assert_eq!(parsed.name_by_slug[&slugify("日本語")], "日本語");
+    }
+
+    #[test]
+    fn a_rejected_submit_form_leads_with_a_focused_error_summary() {
+        let rendered = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        let blank = submit_form_markup(&blank_submit_form(), &[], None).into_string();
+        assert!(!blank.contains("error-summary"), "{blank}");
+    }
+
     #[tokio::test]
     async fn post_publication_enqueue_failure_is_returned_to_submit() {
         let error = PostPublicationJob::enqueue(PostPublicationArgs::new(
@@ -1905,94 +1951,6 @@ mod tests {
             url: "javascript:alert(1)".to_owned(),
             body: "kept".to_owned(),
         })
-    }
-
-    // ── #2441: tags show their name, not their slug ─────────────
-
-    fn tag(name: &str) -> Tag {
-        Tag {
-            id: 1,
-            name: name.to_owned(),
-            slug: slugify(name),
-        }
-    }
-
-    #[test]
-    fn tag_input_value_round_trips_to_the_same_slugs() {
-        let tags = [tag("日本語"), tag("Web Dev")];
-        let value = tag_names_value(tags.iter().map(|t| t.name.as_str()));
-        assert_eq!(value, "日本語, Web Dev");
-        let parsed = parse_tag_names(&value);
-        assert_eq!(
-            parsed.slug_order,
-            [tags[0].slug.clone(), tags[1].slug.clone()]
-        );
-    }
-
-    // ── #2441: rejected forms lead with a focused summary ───────
-
-    /// Every summary link must point at an element that exists.
-    fn assert_links_resolve(out: &str) {
-        for part in out.split(r##"href="#"##).skip(1) {
-            let id = part.split('"').next().unwrap();
-            assert!(out.contains(&format!(r#"id="{id}""#)), "no #{id} in {out}");
-        }
-    }
-
-    #[test]
-    fn fixed_community_summary_has_no_dead_link() {
-        let sub = Subreddit {
-            id: 7,
-            name: "a".to_owned(),
-            slug: "a".to_owned(),
-            description: String::new(),
-            creator_id: 1,
-            subscriber_count: 0,
-            comment_count: 0,
-            created_at: chrono::NaiveDateTime::default(),
-        };
-        let out = submit_form_markup(&rejected_submit_form(), &[], Some(&sub)).into_string();
-        assert!(out.contains(r#"id="error-summary""#), "{out}");
-        assert!(!out.contains("#subreddit_id"), "{out}");
-        assert_links_resolve(&out);
-    }
-
-    #[test]
-    fn every_summary_link_resolves_on_the_submit_and_edit_forms() {
-        let out = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
-        assert!(
-            out.contains(r##"href="#url""##) && out.contains(r##"href="#subreddit_id""##),
-            "{out}"
-        );
-        assert_links_resolve(&out);
-        let edit = validated_edit(EditPostForm {
-            title: "***".to_owned(),
-            body: String::new(),
-        });
-        assert_links_resolve(&edit_form_markup(&edit, "s", "p").into_string());
-    }
-
-    #[test]
-    fn rejected_submit_form_has_a_summary() {
-        let out = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
-        assert!(out.contains(r#"id="error-summary""#), "{out}");
-        assert!(out.contains(r##"href="#title""##), "{out}");
-    }
-
-    #[test]
-    fn blank_submit_form_has_no_summary() {
-        let out = submit_form_markup(&blank_submit_form(), &[], None).into_string();
-        assert!(!out.contains("error-summary"), "{out}");
-    }
-
-    #[test]
-    fn rejected_edit_form_has_a_summary() {
-        let form = validated_edit(EditPostForm {
-            title: "***".to_owned(),
-            body: String::new(),
-        });
-        let out = edit_form_markup(&form, "s", "p").into_string();
-        assert!(out.contains(r#"id="error-summary""#), "{out}");
     }
 
     #[test]

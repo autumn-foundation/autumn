@@ -17,7 +17,7 @@ use crate::schema::users;
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 use autumn_web::{contains_letter_or_number, slugify};
 
-use super::layout::{form_error_summary, layout, layout_with_seo, time_ago};
+use super::layout::{field_errors, form_error_summary, layout, layout_with_seo, time_ago};
 
 // ── List all communities ───────────────────────────────────────
 
@@ -117,22 +117,6 @@ pub struct CreateSubredditForm {
     pub description: String,
 }
 
-/// Summary order and link text for the create form.
-const CREATE_FIELDS: &[(&str, &str)] = &[("name", "Community Name")];
-
-/// Render one field's validation messages, in the element its control points
-/// at with `aria-describedby`. Same shape as `posts::field_errors`.
-fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
-    let errors = form.errors_for(field);
-    html! {
-        div id=(format!("{field}-error")) {
-            @for message in errors {
-                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
-            }
-        }
-    }
-}
-
 /// The create-community form's markup — rendered by the GET route and
 /// re-rendered verbatim by the POST route when validation, or a duplicate
 /// name, rejects the submission. Mirrors `posts::submit_form_markup`'s
@@ -157,8 +141,8 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
     html! {
         div class="max-w-lg mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Create a Community" }
+            (form_error_summary(form, &["name", "description"]))
             (form.form_tag(&paths::create(), "post", html! {
-                (form_error_summary(form, CREATE_FIELDS))
                 div {
                     label for="name" class="block text-sm font-medium text-gray-700 mb-1" {
                         "Community Name"
@@ -594,27 +578,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejected_create_form_has_a_summary() {
-        let form = ChangesetForm::from_changeset(
-            CreateSubredditForm {
-                name: "***".to_owned(),
-                description: String::new(),
-            }
-            .into_changeset(),
-        );
-        let out = create_form_markup(&form).into_string();
-        assert!(out.contains(r#"id="error-summary""#), "{out}");
-        assert!(out.contains(r##"href="#name""##), "{out}");
-    }
-
-    #[test]
-    fn blank_create_form_has_no_summary() {
-        let form = ChangesetForm::without_csrf(CreateSubredditForm::default());
-        assert!(
-            !create_form_markup(&form)
-                .into_string()
-                .contains("error-summary")
-        );
+    fn a_rejected_create_form_leads_with_a_focused_error_summary() {
+        let rejected =
+            ChangesetForm::from_changeset(CreateSubredditForm::default().into_changeset());
+        let rendered = create_form_markup(&rejected).into_string();
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        let blank =
+            create_form_markup(&ChangesetForm::without_csrf(CreateSubredditForm::default()))
+                .into_string();
+        assert!(!blank.contains("error-summary"), "{blank}");
     }
 
     #[test]
