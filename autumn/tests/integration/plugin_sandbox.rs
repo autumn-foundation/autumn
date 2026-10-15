@@ -100,16 +100,20 @@ async fn a_packaged_artifact_installs_from_disk_and_serves_under_its_prefix() {
     assert_eq!(body, "hello from the sandbox");
 }
 
+// ── #2481: a route the consent screen lists must be reachable ────────────
+
 /// Package the hello guest with the route path swapped for `path`.
 fn pack_with_route(path: &str) -> Result<SandboxArtifact, String> {
-    let toml = manifest_toml(&ResourceLimits::default())
-        .replace(r#"path = "/hello/greet""#, &format!(r#"path = "{path}""#));
+    let base = manifest_toml(&ResourceLimits::default());
+    assert!(
+        base.contains(r#"path = "/hello/greet""#),
+        "fixture route moved"
+    );
+    let toml = base.replace(r#"path = "/hello/greet""#, &format!(r#"path = "{path}""#));
     let manifest = SandboxManifest::parse(&toml).map_err(|err| err.to_string())?;
     let module = wat::parse_str(guests::HELLO).expect("valid WAT");
     SandboxArtifact::seal(manifest, module).map_err(|err| err.to_string())
 }
-
-// ── #2481: a route the consent screen lists must be reachable ────────────
 
 #[tokio::test]
 async fn an_encoded_non_ascii_route_is_reachable_and_matches_the_consent_text() {
@@ -132,7 +136,10 @@ async fn an_encoded_non_ascii_route_is_reachable_and_matches_the_consent_text() 
 #[test]
 fn a_literal_non_ascii_route_is_refused_with_the_encoded_spelling() {
     let err = pack_with_route("/hello/café").expect_err("literal non-ASCII is refused");
-    assert!(err.contains("caf%C3%A9"), "{err}");
+    assert!(
+        err.contains("must be ASCII") && err.contains("caf%C3%A9"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
