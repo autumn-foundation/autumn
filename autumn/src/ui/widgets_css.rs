@@ -103,25 +103,40 @@ mod tests {
     }
 
     /// Wayfinder audit (keyboard walkthrough, tier 1): four widget rules
-    /// (`.autumn-field__input`, `.autumn-submit:focus`, `.autumn-search__input`,
-    /// `.autumn-autocomplete__input`) set `outline: none` and signalled focus
-    /// with `border-color` + `box-shadow` only. Forced-colors mode (Windows
-    /// High Contrast) strips `box-shadow`, so keyboard users lost the focus
-    /// indicator on every form field, the submit button, search and
-    /// autocomplete (WCAG 2.4.7). A transparent outline is repainted in the
-    /// system focus colour under forced-colors and is invisible otherwise.
+    /// set `outline: none` and signalled focus with `border-color` +
+    /// `box-shadow` only. Forced-colors mode (Windows High Contrast) strips
+    /// `box-shadow`, so keyboard users lost the focus indicator (WCAG 2.4.7).
+    /// A transparent outline is repainted in the system focus colour under
+    /// forced-colors and is invisible otherwise — but only on the `:focus`
+    /// state: on the base selector every unfocused field would be outlined
+    /// too, and focus would be indistinguishable.
     #[test]
-    fn no_widget_rule_drops_the_outline_outright() {
-        let offenders: Vec<usize> = WIDGETS_COMPONENT_CSS
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| l.trim() == "outline: none;")
-            .map(|(i, _)| i + 1)
-            .collect();
+    fn widget_focus_states_keep_an_outline_and_base_rules_have_none() {
         assert!(
-            offenders.is_empty(),
-            "`outline: none` at widgets.css lines {offenders:?} leaves no focus \
-             indicator under forced-colors mode; use `outline: 2px solid transparent`"
+            !WIDGETS_COMPONENT_CSS.contains("outline: none"),
+            "`outline: none` leaves no focus indicator under forced-colors mode"
+        );
+        for selector in [
+            ".autumn-field__input:focus {",
+            ".autumn-submit:focus {",
+            ".autumn-search__input:focus {",
+            ".autumn-autocomplete__input:focus {",
+        ] {
+            let start = WIDGETS_COMPONENT_CSS
+                .find(selector)
+                .unwrap_or_else(|| panic!("missing `{selector}` rule"));
+            let end = WIDGETS_COMPONENT_CSS[start..].find('}').unwrap() + start;
+            assert!(
+                WIDGETS_COMPONENT_CSS[start..end].contains("outline: 2px solid transparent;"),
+                "`{selector}` must declare a transparent outline"
+            );
+        }
+        assert_eq!(
+            WIDGETS_COMPONENT_CSS
+                .matches("outline: 2px solid transparent;")
+                .count(),
+            4,
+            "the transparent outline belongs on the four :focus rules only"
         );
     }
 }
