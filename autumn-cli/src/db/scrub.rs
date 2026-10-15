@@ -2622,7 +2622,8 @@ fn database_endpoint(
         .or_else(|| env("PGDATABASE").filter(|n| !n.is_empty()))
         .or_else(|| query("user"))
         .or(user)
-        .or_else(|| env("PGUSER").filter(|n| !n.is_empty()))?;
+        .or_else(|| env("PGUSER").filter(|n| !n.is_empty()))
+        .or_else(|| os_user(env))?;
     // Named query parameters apply after the authority, so they win. `hostaddr`
     // is the network address libpq connects to; `host` is then only a name.
     let named = query("hostaddr")
@@ -2793,7 +2794,8 @@ fn conninfo_endpoint(
         .cloned()
         .or_else(|| env("PGDATABASE"))
         .or_else(|| values.get("user").cloned())
-        .or_else(|| env("PGUSER"))?;
+        .or_else(|| env("PGUSER"))
+        .or_else(|| os_user(&env))?;
     // `hostaddr` is the network address libpq connects to.
     let host_list = values
         .get("hostaddr")
@@ -2806,6 +2808,14 @@ fn conninfo_endpoint(
     let own = vec![None; hosts.len()];
     let endpoints = pair_endpoints(hosts, own, values.get("port").cloned(), &env);
     Some((endpoints, name))
+}
+
+/// The operating-system user, which libpq uses when no user is given. Read
+/// from `USER` or `LOGNAME`; a process that sets neither stays unresolved.
+fn os_user(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    ["USER", "LOGNAME"]
+        .into_iter()
+        .find_map(|k| env(k).filter(|v| !v.is_empty()))
 }
 
 /// The user name of a URL, percent-decoded. The database defaults to it.
@@ -10425,6 +10435,17 @@ mod tests {
             "host=prod hostaddr=10.0.0.5 hostaddr='' dbname=app",
             "host=10.0.0.5 dbname=app",
             &env
+        ));
+        let alice = env_of(&[("USER", "alice")]);
+        assert!(same_database_in(
+            "host=prod",
+            "host=prod user=alice dbname=alice",
+            &alice
+        ));
+        assert!(same_database_in(
+            "postgres://prod",
+            "postgres://alice@prod/alice",
+            &alice
         ));
         let empty_db = env_of(&[("PGDATABASE", "")]);
         assert!(same_database_in(
