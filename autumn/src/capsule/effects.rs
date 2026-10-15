@@ -572,6 +572,7 @@ impl ReplayEffects {
     #[must_use]
     pub(crate) fn next_http(&self, request: &OutboundRequest<'_>) -> Option<HttpEffect> {
         let (method, url) = (request.method, request.url);
+        self.observe_live_userinfo(url);
         let Ok(mut seam) = self.http.lock() else {
             return None;
         };
@@ -1318,11 +1319,18 @@ impl ReplayEffects {
     /// userinfo the way capture retained it (user, password, decoded forms).
     fn observe_url(&self, recorded: &str, actual: &str) {
         self.observe_text(recorded, actual);
-        if crate::capsule::redact::url_userinfo(recorded) == Some("[FILTERED]")
-            && let Some(userinfo) = crate::capsule::redact::url_userinfo(actual)
+        if crate::capsule::redact::url_userinfo(recorded).as_deref() == Some("[FILTERED]") {
+            self.observe_live_userinfo(actual);
+        }
+    }
+
+    /// Keep the live URL's userinfo, so an outcome that quotes it is scrubbed
+    /// even when the call diverges before the recorded URL is compared.
+    fn observe_live_userinfo(&self, url: &str) {
+        if let Some(userinfo) = crate::capsule::redact::url_userinfo(url)
             && let Ok(mut observed) = self.observed.lock()
         {
-            crate::capsule::redact::record_userinfo_components(userinfo, &mut observed);
+            crate::capsule::redact::record_userinfo_components(&userinfo, &mut observed);
         }
     }
 

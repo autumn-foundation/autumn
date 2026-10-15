@@ -816,7 +816,7 @@ fn mask_url_userinfo(
         return url.to_owned();
     };
     keys.insert(format!("{location}:userinfo"));
-    record_userinfo_components(userinfo, values);
+    record_userinfo_components(&userinfo, values);
     format!("{head}{FILTERED_PLACEHOLDER}@{host}")
 }
 
@@ -861,10 +861,26 @@ fn authority_bounds(url: &str) -> Option<(usize, usize)> {
     Some((start, start.checked_add(len)?))
 }
 
+/// `url` as the URL parser reads it: ASCII tab and newline characters are
+/// removed wherever they appear, so `https:\t//user:secret@host` is the
+/// credentialed URL it looks like. Text this returns is what gets recorded.
+fn parser_view(url: &str) -> Cow<'_, str> {
+    if url.contains(['\t', '\n', '\r']) {
+        Cow::Owned(
+            url.chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(url)
+    }
+}
+
 /// Split an absolute URL into what precedes its userinfo, the userinfo, and
-/// the rest (`host…`).
-fn split_userinfo(url: &str) -> Option<(&str, &str, &str)> {
-    let (start, end) = authority_bounds(url)?;
+/// the rest (`host…`), read through [`parser_view`].
+fn split_userinfo(url: &str) -> Option<(String, String, String)> {
+    let url = parser_view(url);
+    let (start, end) = authority_bounds(&url)?;
     let authority = url.get(start..end)?;
     let (userinfo, _) = authority.rsplit_once('@')?;
     if userinfo.is_empty() {
@@ -872,7 +888,11 @@ fn split_userinfo(url: &str) -> Option<(&str, &str, &str)> {
     }
     let head = url.get(..start)?;
     let host_and_tail = url.get(start.checked_add(userinfo.len())?.checked_add(1)?..)?;
-    Some((head, userinfo, host_and_tail))
+    Some((
+        head.to_owned(),
+        userinfo.to_owned(),
+        host_and_tail.to_owned(),
+    ))
 }
 
 /// [`mask_echoes`] over everything after a URL's authority.
@@ -882,18 +902,19 @@ fn split_userinfo(url: &str) -> Option<(&str, &str, &str)> {
 /// turn the destination into a wildcard replay would then match against any
 /// host.
 fn mask_url_echoes(url: &str, redacted: &RedactedValues) -> String {
-    match authority_bounds(url) {
+    let url = parser_view(url);
+    match authority_bounds(&url) {
         Some((_, end)) => format!(
             "{}{}",
             url.get(..end).unwrap_or_default(),
             mask_echoes(url.get(end..).unwrap_or_default(), redacted)
         ),
-        None => mask_echoes(url, redacted),
+        None => mask_echoes(&url, redacted),
     }
 }
 
 /// The `user:password` of an absolute URL's authority, if it has one.
-pub(crate) fn url_userinfo(url: &str) -> Option<&str> {
+pub(crate) fn url_userinfo(url: &str) -> Option<String> {
     split_userinfo(url).map(|(_, userinfo, _)| userinfo)
 }
 
@@ -2306,16 +2327,20 @@ mod tests {
 
         #[test]
         fn url_userinfo_is_found_in_the_authority_only() {
-            assert_eq!(url_userinfo("https://a:b@h/p"), Some("a:b"));
+            assert_eq!(
+                hide_url_userinfo("https:\t//a:b@h/p"),
+                "https://[FILTERED]@h/p"
+            );
+            assert_eq!(url_userinfo("https://a:b@h/p"), Some("a:b".to_owned()));
             assert_eq!(url_userinfo("https://h/p?x=a@b"), None);
             assert_eq!(url_userinfo("https://@h/p"), None);
             assert_eq!(url_userinfo("no-scheme"), None);
             // Spellings the HTTP client's URL parser also accepts.
-            assert_eq!(url_userinfo("https:a:b@h/p"), Some("a:b"));
-            assert_eq!(url_userinfo("HTTPS:/a:b@h/p"), Some("a:b"));
-            assert_eq!(url_userinfo("https:\\\\a:b@h\\p"), Some("a:b"));
+            assert_eq!(url_userinfo("https:a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("HTTPS:/a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("https:\\\\a:b@h\\p"), Some("a:b".to_owned()));
             assert_eq!(url_userinfo("mailto:a@b"), None);
-            assert_eq!(url_userinfo("postgres://a:b@h/db"), Some("a:b"));
+            assert_eq!(url_userinfo("postgres://a:b@h/db"), Some("a:b".to_owned()));
             assert_eq!(
                 hide_url_userinfo("https:a:b@h/p?q=1"),
                 "https:[FILTERED]@h/p?q=1"
@@ -2350,11 +2375,8 @@ mod tests {
 
         #[test]
         fn userinfo_behind_leading_control_characters_is_still_found() {
-            assert_eq!(url_userinfo("\n https://a:b@h/p"), Some("a:b"));
-            assert_eq!(
-                hide_url_userinfo("\nhttps:a:b@h/p"),
-                "\nhttps:[FILTERED]@h/p"
-            );
+            assert_eq!(url_userinfo("\n https://a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(hide_url_userinfo("\nhttps:a:b@h/p"), "https:[FILTERED]@h/p");
         }
 
         #[test]
