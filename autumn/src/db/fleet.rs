@@ -3016,6 +3016,11 @@ mod tests {
         count.n == 1
     }
 
+    /// How long a test waits for a call that must not hang. A stranded drain
+    /// hangs for ever, so a long bound still catches it. A short one fails on
+    /// a slow runner: a database create takes seconds on Windows CI.
+    const NOT_STUCK: Duration = Duration::from_secs(60);
+
     async fn settle(fleet: &DatabaseFleet) {
         for _ in 0..500 {
             if fleet.stats().draining == 0 {
@@ -4125,10 +4130,10 @@ mod tests {
         }
     }
 
-    /// How long a test waits before it calls a drain stranded. A stranded
-    /// drain never ends, so a long limit finds it too. A short one fails on a
-    /// slow runner, where a fresh open creates and migrates a file.
-    const STRANDED_DRAIN_LIMIT: Duration = Duration::from_secs(30);
+    /// Bound for "is not stuck" checks. A real hang still trips it. A slow
+    /// Windows runner, which builds a database and runs its migrations in
+    /// this time, does not.
+    const NOT_STUCK: Duration = Duration::from_secs(30);
 
     /// Cancel `call` after `after`, as a request timeout does.
     async fn cancelled<T>(after: Duration, call: impl Future<Output = T>) {
@@ -4177,13 +4182,13 @@ mod tests {
         assert!(!fleet.exists(&key), "the delete ran to the end");
         assert_eq!(fleet.stats().deleted_total, 1);
         // A slot fleet creates on demand: the key opens again, empty.
-        let fresh = tokio::time::timeout(STRANDED_DRAIN_LIMIT, fleet.open(&key))
+        let fresh = tokio::time::timeout(NOT_STUCK, fleet.open(&key))
             .await
             .expect("open is not stuck on a stranded drain")
             .unwrap();
         assert!(!table_exists(&fresh, "notes").await);
         drop(fresh);
-        tokio::time::timeout(STRANDED_DRAIN_LIMIT, fleet.close_all())
+        tokio::time::timeout(NOT_STUCK, fleet.close_all())
             .await
             .expect("close_all does not wait on a stranded drain");
     }
@@ -4202,11 +4207,11 @@ mod tests {
         drop(db);
         settle(&fleet).await;
         assert_eq!(recorder.closed.load(Ordering::SeqCst), 1);
-        tokio::time::timeout(STRANDED_DRAIN_LIMIT, fleet.open(&key))
+        tokio::time::timeout(NOT_STUCK, fleet.open(&key))
             .await
             .expect("open is not stuck on a stranded drain")
             .unwrap();
-        tokio::time::timeout(STRANDED_DRAIN_LIMIT, fleet.close_all())
+        tokio::time::timeout(NOT_STUCK, fleet.close_all())
             .await
             .expect("close_all returns");
     }
