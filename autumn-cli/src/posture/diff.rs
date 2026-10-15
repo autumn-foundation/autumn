@@ -4578,12 +4578,12 @@ mod tests {
         );
     }
 
-    /// The exact digest re-asks after **any** later change to the route's
-    /// posture, narrowing included.
+    /// The exact digest asks again after **any** later change to the route,
+    /// narrowing included.
     ///
-    /// A digest compared for equality cannot tell a constraint that appeared
-    /// from one that vanished, so it errs safe. A marker with a ceiling (#2497,
-    /// see `ceiling.rs`) is the way to allow narrowing.
+    /// A digest must be equal, so it cannot show if a constraint was added or
+    /// removed. It blocks to stay safe. A ceiling marker (#2497, see
+    /// `ceiling.rs`) allows narrowing.
     #[test]
     fn any_later_posture_change_re_asks_for_the_acknowledgment() {
         let base = routes_only(&route("/admin", "GET", "gated", &["admin"], &[], false));

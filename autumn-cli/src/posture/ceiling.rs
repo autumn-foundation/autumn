@@ -1,21 +1,22 @@
 //! The ceiling: an acknowledgment that says "no wider than this".
 //!
-//! A bare digest is compared for equality, so it cannot tell a constraint that
-//! appeared after the acknowledgment from one that vanished (#2497). A marker
-//! with a ceiling carries the approved posture of each widened route instead.
-//! Verification then asks one question: is the route, now, no wider than that?
+//! A bare digest must equal the current digest. It cannot show if a constraint
+//! was added or removed (#2497). A ceiling marker holds the approved posture of
+//! each widened route. The check asks one question: is the route no wider than
+//! this?
 //!
 //! ```text
 //! /ack-posture 3f2a91c0d47b5e6a ceiling=GET|/admin|public|0:|0:|0|on|0:|0  reason
 //! ```
 //!
-//! Narrowing passes. Dropping a constraint re-blocks. Findings that name no
-//! single route at head keep the exact digest.
+//! A narrower route passes. A removed constraint blocks. A finding with no
+//! single route at head uses the exact digest.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
+use super::ack::{CEILING_KEY, short};
 use super::diff::{Finding, authz_index, checks_at, csrf_index, mtls_index, route_index};
 use super::model::{PostureManifest, RouteKey, hex_digest, is_open, normalize_captures};
 use super::verify::marker_matches;
@@ -43,8 +44,8 @@ enum Csrf {
 impl RoutePosture {
     /// Whether `self` admits no caller that `ceiling` refuses.
     ///
-    /// Uses the differ's widening rules: roles OR-ed, scopes AND-ed, an open
-    /// classification widest, the rest booleans.
+    /// Uses the differ's widening rules. Roles are OR-ed. Scopes are AND-ed. An
+    /// open classification is widest.
     #[must_use]
     pub fn no_wider_than(&self, ceiling: &Self) -> bool {
         let (open, ceiling_open) = (
@@ -66,7 +67,7 @@ impl RoutePosture {
             && implies(ceiling.mtls, self.mtls)
     }
 
-    /// No role list admits everyone authenticated, so it is the widest.
+    /// An empty role list admits all signed-in callers. It is the widest.
     fn roles_within(&self, ceiling: &Self) -> bool {
         ceiling.roles.is_empty() || (!self.roles.is_empty() && self.roles.is_subset(&ceiling.roles))
     }
@@ -129,6 +130,15 @@ const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'{')
     .remove(b'}');
+
+/// Whether `payload` uses only the characters [`Ceiling::encode`] writes.
+#[must_use]
+pub fn is_payload(payload: &str) -> bool {
+    !payload.is_empty()
+        && payload
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~/{}%|,;:".contains(c))
+}
 
 fn enc(value: &str) -> String {
     utf8_percent_encode(value, UNRESERVED).to_string()
@@ -229,7 +239,7 @@ impl Ceiling {
 pub struct Cover {
     /// Postures at head of the routes that widened.
     pub ceiling: Ceiling,
-    /// Digest of the findings, route findings reduced to kind and route.
+    /// Digest of the findings the ceiling does not cover.
     identity: String,
 }
 
@@ -262,11 +272,9 @@ pub fn cover(widening: &[&Finding], head: &PostureManifest) -> Cover {
                 checks: checks_at(&key, &bindings).into_iter().collect(),
                 mtls: mtls.contains(&key),
             };
-        // What the finding says about *how far* the route moved is the
-        // ceiling's job now; the identity keeps only which route and which kind.
-        let mut bare = (*finding).clone();
-        bare.fingerprint.clear();
-        lines.push(format!("ceiling\t{}", bare.canonical()));
+        // The ceiling alone bounds a route finding. Its kind can change when
+        // the route narrows, and one route can leave the set, so neither is
+        // part of the identity.
         ceiling.routes.insert(key, posture);
     }
     lines.sort();
@@ -278,14 +286,28 @@ pub fn cover(widening: &[&Finding], head: &PostureManifest) -> Cover {
 }
 
 impl Cover {
+    /// The text after the phrase in the line a reviewer pastes: a ceiling
+    /// marker when a route widened, else the short exact digest.
+    #[must_use]
+    pub fn marker(&self, exact: &str) -> String {
+        if self.ceiling.is_empty() {
+            return short(exact);
+        }
+        format!(
+            "{} {CEILING_KEY}{}",
+            short(&self.seal()),
+            self.ceiling.encode()
+        )
+    }
+
     fn seal_of(&self, payload: &str) -> String {
         hex_digest(format!("ceiling-v1\n{}\n{payload}", self.identity).as_bytes())
     }
 
     /// The digest a ceiling marker carries for the current head.
     ///
-    /// It covers the payload too, so a truncated or mistyped paste fails
-    /// instead of being read as a smaller ceiling.
+    /// It also covers the payload. A cut or wrong paste fails. It is not read
+    /// as a smaller ceiling.
     #[must_use]
     pub fn seal(&self) -> String {
         self.seal_of(&self.ceiling.encode())

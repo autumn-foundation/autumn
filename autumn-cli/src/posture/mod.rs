@@ -64,10 +64,9 @@ pub struct DiffOptions<'a> {
 #[derive(Debug)]
 pub struct Evaluation {
     pub findings: Vec<Finding>,
-    /// Digest over the widening subset — what an acknowledgment must carry.
+    /// Digest of the widening findings. A bare marker must carry it.
     pub ack_digest: String,
-    /// What follows the phrase in the line to paste. A ceiling marker when a
-    /// route widened, else the short digest.
+    /// The text after the phrase in the line to paste.
     pub marker: String,
     /// Posture digest of the head manifest.
     pub head_posture_digest: String,
@@ -125,18 +124,7 @@ pub fn evaluate(
     } else {
         ack::matching(acks, &ack_digest, &cover).cloned()
     };
-    // Route widenings are bound by what they may not exceed; the rest, and a
-    // run with none, by the exact digest.
-    let marker = if cover.ceiling.is_empty() {
-        ack::short(&ack_digest)
-    } else {
-        format!(
-            "{} {}{}",
-            ack::short(&cover.seal()),
-            ack::CEILING_KEY,
-            cover.ceiling.encode()
-        )
-    };
+    let marker = cover.marker(&ack_digest);
     Evaluation {
         findings,
         ack_digest,
@@ -265,7 +253,7 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
         eprintln!(
             "\n\u{2717} security posture widened and is not acknowledged.\n  \
              Acknowledge it with this line \u{2014} as a pull-request comment, or \
-             locally as `--ack <digest>`:\n\n      {} {}\n",
+             locally as `--ack '<text after the phrase>'`:\n\n      {} {}\n",
             ack::ACK_PHRASE,
             evaluation.marker
         );
@@ -824,8 +812,7 @@ mod tests {
         assert!(evaluate(Some(&base), &second, &acks).blocked());
     }
 
-    /// The payload is not authenticated by the digest alone: widening it by
-    /// hand must not buy a pass.
+    /// The digest covers the payload. A hand-widened payload must fail.
     #[test]
     fn a_hand_widened_ceiling_is_refused() {
         let base = admin_base();
@@ -875,5 +862,53 @@ mod tests {
             blocked.marker
         );
         assert!(!evaluate(Some(&base), &head, &pasted(&blocked)).blocked());
+    }
+
+    /// One of two acknowledged routes goes back to its base posture. The set of
+    /// findings shrinks, and every route left is within its ceiling.
+    #[test]
+    fn an_acknowledgment_survives_the_widening_set_shrinking() {
+        let base = manifest(&format!(
+            "{},{}",
+            route("/a", "gated", &["admin"]),
+            route("/b", "gated", &["admin"])
+        ));
+        let both = manifest(&format!(
+            "{},{}",
+            route("/a", "public", &[]),
+            route("/b", "public", &[])
+        ));
+        let acks = pasted(&evaluate(Some(&base), &both, &[]));
+        let one_back = manifest(&format!(
+            "{},{}",
+            route("/a", "gated", &["admin"]),
+            route("/b", "public", &[])
+        ));
+        assert!(!evaluate(Some(&base), &one_back, &acks).blocked());
+    }
+
+    /// Narrowing can change the kind of finding: `roles_cleared` becomes
+    /// `roles_widened`. The route is still within its ceiling.
+    #[test]
+    fn an_acknowledgment_survives_a_narrowing_that_changes_the_finding_kind() {
+        let base = manifest(&route("/a", "gated", &["admin"]));
+        let cleared = manifest(&route("/a", "gated", &[]));
+        let acks = pasted(&evaluate(Some(&base), &cleared, &[]));
+        let some = manifest(&route("/a", "gated", &["admin", "editor"]));
+        let e = evaluate(Some(&base), &some, &acks);
+        assert!(!diff::widening(&e.findings).is_empty());
+        assert!(!e.blocked());
+    }
+
+    #[test]
+    fn the_report_names_the_strict_digest_beside_a_ceiling_marker() {
+        let base = admin_base();
+        let head = manifest(&route("/admin", "public", &[]));
+        let e = evaluate(Some(&base), &head, &[]);
+        let md = render(&e, "markdown").unwrap();
+        let strict = format!("{} {}", ack::ACK_PHRASE, ack::short(&e.ack_digest));
+        assert!(md.contains(&strict), "{md}");
+        let strict_acks = ack::parse_acks(&strict);
+        assert!(!evaluate(Some(&base), &head, &strict_acks).blocked());
     }
 }

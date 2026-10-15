@@ -271,7 +271,7 @@ Two checks find a wrong build:
 Comment on the pull request with the line the report prints:
 
 ```
-/ack-posture 4f8a1c0d9e2b7a35  intentional: public status page for launch week
+/ack-posture 4f8a1c0d9e2b7a35 ceiling=GET|/status|public|0:|0:|0|absent|0:|0  intentional: public status page for launch week
 ```
 
 Rules worth knowing:
@@ -306,14 +306,14 @@ Rules worth knowing:
   - The marker digest covers the ceiling text. A truncated or edited paste does
     not match.
 
-  Rules use the same widening rules as the diff: roles are OR-ed, scopes are
-  AND-ed, an open classification is the widest. A finding that names no single
+  The gate uses the same rules as the diff: roles are OR-ed, scopes are
+  AND-ed, an open classification is widest. A finding that names no single
   route at head (a build change, a header, a CSRF exemption prefix) has no
   posture to order, so it stays bound to the exact set.
 
-  For a strict marker, paste the bare digest without `ceiling=`
-  (`/ack-posture 4f8a1c0d9e2b7a35`). A bare digest means "exactly this": any
-  later change to the route, narrowing included, asks again.
+  For an exact match, paste the second line of the report instead. It has the
+  exact digest and no `ceiling=`. A different digest from the first line is
+  normal. Any later change to the route, narrowing included, asks again.
 - **One file per comment.** The workflow writes each comment to its own file
   and passes the directory as `--ack-dir`. The diff parses each file alone, so
   an unclosed code fence in one comment cannot change another, and no comment
@@ -322,7 +322,7 @@ Rules worth knowing:
   inside fenced code blocks never acknowledge anything, so quoting a colleague
   — which GitHub's reply button does for you — cannot approve a widening by
   accident.
-- **Anything after the digest is the reason.** It is echoed back into the
+- **Text after the digest and the `ceiling=` token is the reason.** It is echoed back into the
   comment the gate posts, so the record reads as a decision, not a checksum.
 
 ### When the tool is wrong

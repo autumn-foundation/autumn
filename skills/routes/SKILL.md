@@ -164,8 +164,8 @@ A widening is acknowledged with one pull-request comment carrying the marker
 the report prints — `/ack-posture <digest> ceiling=<posture> <reason>`. It
 means "no wider than this": it stays valid across unrelated pushes and
 narrowing, and stops matching when something new widens or a constraint is
-removed. A bare digest means "exactly this". That is
-also the only escape hatch for a false positive: nothing disables the gate.
+removed. A bare digest means "exactly this". The marker is also the only
+escape hatch for a false positive. Nothing disables the gate.
 
 `autumn new` scaffolds `.github/workflows/posture-gate.yml`; existing apps
 adopt it with `autumn upgrade --apply`. See `docs/guide/posture-gate.md`.

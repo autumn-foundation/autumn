@@ -12,9 +12,9 @@
 //! new digest, and no comment carries it yet.
 //!
 //! A widened route also gets a `ceiling=` token. It holds the approved posture
-//! of that route (see [`super::ceiling`]), so the marker means "no wider than
-//! this": narrowing keeps it valid, and removing a constraint re-blocks. A bare
-//! digest still means "exactly this".
+//! of the route (see [`super::ceiling`]). The marker means "no wider than
+//! this". Narrowing keeps it valid. A removed constraint blocks again. A bare
+//! digest means "exactly this".
 //!
 //! Everything parsed here came from a pull-request comment, which is to say
 //! from anyone who can type. Two lines of defense: this parser is strict about
@@ -478,13 +478,13 @@ fn parse_marker(line: &str) -> Option<Acknowledgment> {
     if !is_digest(&digest) {
         return None;
     }
-    // An optional `ceiling=` token. One that is present but malformed voids the
-    // marker: reading it as a bare digest would turn "no wider than" into
-    // "exactly this" without telling anyone.
+    // Optional `ceiling=` token. Reject the marker if the token is bad. A
+    // bare-digest reading would silently change "no wider than" to "exactly
+    // this".
     let rest = rest.trim_start();
     let (next, after) = split_token(rest);
     let (ceiling, reason) = match next.strip_prefix(CEILING_KEY) {
-        Some(payload) if is_payload(payload) => (Some(payload.to_owned()), after),
+        Some(payload) if super::ceiling::is_payload(payload) => (Some(payload.to_owned()), after),
         Some(_) => return None,
         None => (None, rest),
     };
@@ -502,14 +502,6 @@ fn split_token(text: &str) -> (&str, &str) {
         .map_or((text, ""), |i| (&text[..i], &text[i..]))
 }
 
-/// Whether `payload` uses only the characters a ceiling is encoded with.
-fn is_payload(payload: &str) -> bool {
-    !payload.is_empty()
-        && payload
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-._~/{}%|,;:".contains(c))
-}
-
 /// Whether `candidate` is a plausible digest: hex, and long enough to be worth
 /// parsing at all. Whether it is long enough to *match* is
 /// [`crate::posture::verify::digest_matches`]'s call.
@@ -519,9 +511,9 @@ fn is_digest(candidate: &str) -> bool {
 
 /// Whether any harvested acknowledgment approves the current widening.
 ///
-/// A bare marker must match the `exact` digest, short form or full. A marker
-/// with a ceiling is judged by `cover`: same findings, and no route wider than
-/// the ceiling.
+/// A bare marker must match the `exact` digest (short or full). A ceiling
+/// marker must match the same findings, and no route may be wider than the
+/// ceiling.
 #[must_use]
 pub fn matching<'a>(
     acks: &'a [Acknowledgment],

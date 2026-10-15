@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use super::ack::{ACK_PHRASE, Acknowledgment};
+use super::ack::{ACK_PHRASE, Acknowledgment, CEILING_KEY, short};
 use super::diff::{Finding, Severity};
 
 /// HTML marker the workflow greps for so it can *update* its comment instead of
@@ -27,7 +27,7 @@ pub const MAX_ROWS: usize = 25;
 #[derive(Debug)]
 pub struct Report<'a> {
     pub findings: &'a [Finding],
-    /// Digest of the widening subset; the number the acknowledgment carries.
+    /// Digest of the widening findings. A bare marker carries it.
     pub ack_digest: String,
     /// What follows the phrase in the line a reviewer pastes.
     pub marker: String,
@@ -154,13 +154,27 @@ pub fn markdown(report: &Report<'_>) -> String {
     if !widening.is_empty() && report.acknowledged.is_none() {
         let _ = write!(
             out,
-            "To acknowledge these exact changes, comment on this pull request with:\n\n\
-             ```\n{ACK_PHRASE} {}\n```\n\n\
-             It approves these findings, and no wider posture on these routes. Unrelated \
-             pushes and narrowing keep it valid. A new or wider widening needs a new \
-             acknowledgment.\n\n",
+            "To acknowledge these changes, comment on this pull request with:\n\n\
+             ```\n{ACK_PHRASE} {}\n```\n\n",
             report.marker
         );
+        if report.marker.contains(CEILING_KEY) {
+            let _ = write!(
+                out,
+                "This comment approves these findings. It also approves any narrower posture \
+                 on these routes. Unrelated pushes keep it valid. A new widening, or a wider \
+                 route, needs a new comment.\n\n\
+                 For an exact match, use this line instead. Any later change asks again:\n\n\
+                 ```\n{ACK_PHRASE} {}\n```\n\n",
+                short(&report.ack_digest)
+            );
+        } else {
+            let _ = write!(
+                out,
+                "The digest names this set of widenings. Unrelated pushes keep it valid. A new \
+                 widening needs a new acknowledgment.\n\n"
+            );
+        }
     }
 
     let _ = write!(
@@ -339,7 +353,6 @@ pub fn json(report: &Report<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::posture::ack::short;
 
     fn finding(kind: &'static str, severity: Severity, path: &str) -> Finding {
         Finding {
