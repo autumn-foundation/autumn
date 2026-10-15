@@ -165,6 +165,12 @@ pub struct MutationDescriptor {
     pub acknowledged_stale: Option<&'static str>,
     /// `file:line` of the declaration.
     pub location: &'static str,
+    /// For a cascade write: the child repository trait name, and whether the
+    /// cascade runs the child's own cascade.
+    ///
+    /// The flag is `true` only for `destroy`. `nullify` and `delete_all` write
+    /// one table. [`close_cascades`] uses both to find grandchild writes.
+    pub cascades_into: Option<(&'static str, bool)>,
 }
 
 inventory::collect!(MutationDescriptor);
@@ -209,6 +215,12 @@ pub struct Mutation {
     pub acknowledged_stale: Option<String>,
     /// `file:line` of the declaration.
     pub location: String,
+    /// For a cascade write: the child repository it writes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascades_into: Option<String>,
+    /// Whether the cascade runs the child's own cascade.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cascade_recurses: bool,
 }
 
 impl Mutation {
@@ -281,6 +293,68 @@ pub fn models_match(a: &str, b: &str) -> bool {
         return a == b;
     }
     model_key(a) == model_key(b)
+}
+
+// ── Cascade closure ──────────────────────────────────────────────────
+
+/// Add the writes a `destroy` cascade makes below its direct child.
+///
+/// A repository names only its own `dependent(...)` children. Only the full
+/// set of descriptors names the grandchildren. This function follows
+/// `cascades_into` through that set. It adds one write per model it reaches.
+///
+/// An added write keeps the root's method, edges, acknowledgement and
+/// location. So the root must declare an edge for each model it reaches.
+/// The walk visits each repository once, so a cycle ends. A second call adds
+/// nothing.
+#[must_use]
+pub fn close_cascades(mutations: &[Mutation]) -> Vec<Mutation> {
+    let mut closed = mutations.to_vec();
+    // The location keeps two same-named roots apart: each owes its own edge.
+    let key = |m: &Mutation, model: &str| {
+        (
+            m.repository.clone(),
+            m.method.clone(),
+            model.to_string(),
+            m.location.clone(),
+        )
+    };
+    let mut seen: std::collections::HashSet<(String, String, String, String)> =
+        mutations.iter().map(|m| key(m, &m.model)).collect();
+    let mut by_repo: std::collections::HashMap<&str, Vec<&Mutation>> =
+        std::collections::HashMap::new();
+    for m in mutations.iter().filter(|m| m.cascades_into.is_some()) {
+        by_repo.entry(m.repository.as_str()).or_default().push(m);
+    }
+    for root in mutations.iter().filter(|m| m.cascades_into.is_some()) {
+        // Not seeded with the root: a child may share its parent's trait name.
+        let mut visited = std::collections::HashSet::new();
+        let mut queue: Vec<&str> = root
+            .cascades_into
+            .as_deref()
+            .filter(|_| root.cascade_recurses)
+            .into_iter()
+            .collect();
+        while let Some(repo) = queue.pop() {
+            if !visited.insert(repo) {
+                continue;
+            }
+            for hop in by_repo.get(repo).into_iter().flatten() {
+                if hop.cascade_recurses {
+                    queue.extend(hop.cascades_into.as_deref());
+                }
+                if seen.insert(key(root, &hop.model)) {
+                    closed.push(Mutation {
+                        model: hop.model.clone(),
+                        table: String::new(),
+                        cascades_into: None,
+                        ..root.clone()
+                    });
+                }
+            }
+        }
+    }
+    closed
 }
 
 // ── The rule ─────────────────────────────────────────────────────────
@@ -603,6 +677,7 @@ impl CoherenceManifest {
     /// Assemble the manifest from the app's registered reads and mutations.
     #[must_use]
     pub fn build(reads: &[CachedRead], mutations: &[Mutation]) -> Self {
+        let mutations = &close_cascades(mutations);
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             dimensions: Dimensions {
@@ -833,9 +908,10 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
                      `#[has_many(Child, dependent = destroy)]` means the parent's delete writes \
                      the child's table with no descriptor for it. A cascade declared on the \
                      REPOSITORY — `#[repository(..., dependent(...))]` — IS registered against \
-                     the child model it deletes or nullifies, resolved from that child \
-                     repository's own published model; `on_delete = restrict` is excluded \
-                     because it only probes and never writes"
+                     the child model it deletes or nullifies. So is each model further \
+                     down a chain of `destroy` cascades. The audit links the chain by \
+                     repository trait name. `on_delete = restrict` is excluded because it \
+                     only probes and never writes"
                 .to_string(),
         },
         ExcludedDimension {
@@ -1570,7 +1646,7 @@ pub fn registered_reads() -> Vec<CachedRead> {
 /// Every repository mutation registered in this binary, as owned values.
 #[must_use]
 pub fn registered_mutations() -> Vec<Mutation> {
-    inventory::iter::<MutationDescriptor>()
+    let direct: Vec<Mutation> = inventory::iter::<MutationDescriptor>()
         .map(|d| Mutation {
             repository: d.repository.to_string(),
             method: d.method.to_string(),
@@ -1579,8 +1655,11 @@ pub fn registered_mutations() -> Vec<Mutation> {
             invalidates: d.invalidates.iter().map(|s| (*s).to_string()).collect(),
             acknowledged_stale: d.acknowledged_stale.map(ToString::to_string),
             location: d.location.to_string(),
+            cascades_into: d.cascades_into.map(|(name, _)| name.to_string()),
+            cascade_recurses: d.cascades_into.is_some_and(|(_, recurses)| recurses),
         })
-        .collect()
+        .collect();
+    close_cascades(&direct)
 }
 
 /// Prove cache coherence over everything this binary registers.
@@ -1649,7 +1728,238 @@ mod tests {
             invalidates: Vec::new(),
             acknowledged_stale: None,
             location: "src/repositories.rs:20".to_string(),
+            cascades_into: None,
+            cascade_recurses: false,
         }
+    }
+
+    // ── Cascade closure (#2364) ──────────────────────────────────────
+
+    fn cascade(repo: &str, method: &str, model: &str, into: &str) -> Mutation {
+        Mutation {
+            cascades_into: Some(into.to_string()),
+            cascade_recurses: true,
+            ..mutation(repo, method, model)
+        }
+    }
+
+    /// Post -> Comment -> Like, `destroy` at each step.
+    fn post_comment_like() -> Vec<Mutation> {
+        vec![
+            mutation("PostRepository", "delete_by_id", "app::Post"),
+            cascade(
+                "PostRepository",
+                "delete_by_id",
+                "app::Comment",
+                "CommentRepository",
+            ),
+            mutation("CommentRepository", "delete_by_id", "app::Comment"),
+            cascade(
+                "CommentRepository",
+                "delete_by_id",
+                "app::Like",
+                "LikeRepository",
+            ),
+            mutation("LikeRepository", "delete_by_id", "app::Like"),
+        ]
+    }
+
+    fn models_of(mutations: &[Mutation], repo: &str, method: &str) -> Vec<String> {
+        let mut models: Vec<String> = mutations
+            .iter()
+            .filter(|m| m.repository == repo && m.method == method)
+            .map(|m| m.model.clone())
+            .collect();
+        models.sort();
+        models
+    }
+
+    #[test]
+    fn a_nested_cascade_mutates_the_grandchild_model() {
+        let closed = close_cascades(&post_comment_like());
+        assert_eq!(
+            models_of(&closed, "PostRepository", "delete_by_id"),
+            ["app::Comment", "app::Like", "app::Post"]
+        );
+    }
+
+    #[test]
+    fn a_grandchild_read_without_a_root_edge_is_flagged() {
+        let reads = vec![read("app::likes", &["app::Like"])];
+        let mut muts = post_comment_like();
+        // The edge sits on the child, not on the root.
+        for m in muts
+            .iter_mut()
+            .filter(|m| m.repository == "CommentRepository")
+        {
+            m.invalidates = vec!["app::likes".to_string()];
+        }
+        let findings = check(&reads, &close_cascades(&muts));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.mutation == "PostRepository::delete_by_id"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_edge_covers_the_grandchild_read() {
+        let reads = vec![read("app::likes", &["app::Like"])];
+        let mut muts = post_comment_like();
+        for m in muts.iter_mut().filter(|m| m.repository == "PostRepository") {
+            m.invalidates = vec!["app::likes".to_string()];
+        }
+        let closed = close_cascades(&muts);
+        let like_writes = closed
+            .iter()
+            .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
+            .count();
+        assert_eq!(like_writes, 1, "{closed:?}");
+        assert!(
+            check(&reads, &closed)
+                .iter()
+                .all(|f| f.mutation != "PostRepository::delete_by_id"),
+            "{closed:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_acknowledgement_carries_to_the_grandchild() {
+        let mut muts = post_comment_like();
+        muts[1].acknowledged_stale = Some("reason".to_string());
+        let closed = close_cascades(&muts);
+        assert!(
+            closed
+                .iter()
+                .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
+                .all(|m| m.acknowledged_stale.is_some())
+        );
+    }
+
+    #[test]
+    fn a_restrict_step_adds_no_mutation() {
+        // `restrict` registers no cascade descriptor, so the chain stops.
+        let mut muts = post_comment_like();
+        muts.retain(|m| m.cascades_into.as_deref() != Some("LikeRepository"));
+        let closed = close_cascades(&muts);
+        assert_eq!(
+            models_of(&closed, "PostRepository", "delete_by_id"),
+            ["app::Comment", "app::Post"]
+        );
+    }
+
+    #[test]
+    fn a_nullify_step_is_written_but_not_followed() {
+        // Post -destroy-> Comment -nullify-> Like -destroy-> Reaction.
+        // The `nullify` leg writes `Like` only. It never reaches `Reaction`.
+        let mut muts = post_comment_like();
+        muts[3].cascade_recurses = false;
+        muts.push(cascade(
+            "LikeRepository",
+            "delete_by_id",
+            "app::Reaction",
+            "ReactionRepository",
+        ));
+        let closed = close_cascades(&muts);
+        assert_eq!(
+            models_of(&closed, "PostRepository", "delete_by_id"),
+            ["app::Comment", "app::Like", "app::Post"]
+        );
+    }
+
+    #[test]
+    fn a_cascade_link_round_trips_through_json() {
+        let m = cascade(
+            "PostRepository",
+            "delete_by_id",
+            "app::Comment",
+            "CommentRepository",
+        );
+        let back: Mutation = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let plain = serde_json::to_string(&mutation("A", "save", "app::A")).unwrap();
+        assert!(!plain.contains("cascade"), "{plain}");
+    }
+
+    #[test]
+    fn a_cascade_cycle_terminates() {
+        let muts = vec![
+            cascade("ARepository", "delete_by_id", "app::B", "BRepository"),
+            cascade("BRepository", "delete_by_id", "app::A", "ARepository"),
+            cascade("CRepository", "delete_by_id", "app::C", "CRepository"),
+        ];
+        let closed = close_cascades(&muts);
+        assert_eq!(
+            models_of(&closed, "ARepository", "delete_by_id"),
+            ["app::A", "app::B"]
+        );
+        assert_eq!(
+            models_of(&closed, "CRepository", "delete_by_id"),
+            ["app::C"]
+        );
+    }
+
+    #[test]
+    fn two_same_named_roots_keep_their_own_edges() {
+        let mut a = post_comment_like();
+        let mut b = post_comment_like();
+        for m in &mut b {
+            m.location = "src/other.rs:1".to_string();
+        }
+        a.extend(b);
+        let like_rows = close_cascades(&a)
+            .iter()
+            .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
+            .count();
+        assert_eq!(like_rows, 2);
+    }
+
+    #[test]
+    fn a_child_may_share_its_parents_trait_name() {
+        // `admin::CommentRepository` destroys into `blog::CommentRepository`.
+        let muts = vec![
+            cascade(
+                "CommentRepository",
+                "delete_by_id",
+                "app::Comment",
+                "CommentRepository",
+            ),
+            Mutation {
+                location: "src/blog.rs:1".to_string(),
+                ..cascade(
+                    "CommentRepository",
+                    "delete_by_id",
+                    "app::Like",
+                    "LikeRepository",
+                )
+            },
+        ];
+        let closed = close_cascades(&muts);
+        let root_like = closed
+            .iter()
+            .filter(|m| m.model == "app::Like" && m.location == "src/repositories.rs:20")
+            .count();
+        assert_eq!(root_like, 1, "{closed:?}");
+    }
+
+    #[test]
+    fn closing_twice_changes_nothing() {
+        let once = close_cascades(&post_comment_like());
+        assert_eq!(close_cascades(&once), once);
+    }
+
+    #[test]
+    fn the_manifest_lists_the_closed_mutations() {
+        let manifest = CoherenceManifest::build(&[], &post_comment_like());
+        assert!(
+            manifest
+                .dimensions
+                .mutations
+                .entries
+                .iter()
+                .any(|m| m.name == "PostRepository::delete_by_id" && m.model == "app::Like")
+        );
     }
 
     // ── The rule ─────────────────────────────────────────────────────

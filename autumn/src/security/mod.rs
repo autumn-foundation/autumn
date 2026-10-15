@@ -168,6 +168,7 @@ pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use config::{SigningSecretError, validate_signing_secret};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
+#[allow(deprecated)]
 pub use proxy::TrustedProxy;
 #[doc(hidden)]
 pub use rate_limit::{__check_throttle, __throttle_registry_reset, TEST_LOCK};
