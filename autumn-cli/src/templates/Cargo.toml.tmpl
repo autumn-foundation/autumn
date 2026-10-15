@@ -22,4 +22,14 @@ embed-assets = ["autumn-web/embed-assets"]
 # tokio runtime macros are needed for #[tokio::test] in integration tests.
 tokio = { version = "1", features = ["rt", "macros"] }
 
+[profile.dev]
+# Windows PDB files cap public symbols (LNK4319). Keep only file and line
+# info, for the app and for its dependencies. Set it here. The
+# CARGO_PROFILE_DEV_DEBUG variable did not work reliably.
+# For full debug info on Linux or macOS, set debug = true in both tables.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [workspace]
