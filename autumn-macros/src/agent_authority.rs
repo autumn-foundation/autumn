@@ -1317,6 +1317,9 @@ impl Analyzer {
         let spawn_before = self.spawn_aliases.clone();
         let macros = self.shadowed_macros.clone();
         let diesel = (self.diesel_roots.clone(), self.diesel_fns.clone());
+        // Every item in a block is in scope for the whole block, so the names
+        // items hide are settled before a `use` reads the roots they hide.
+        let mut uses: Vec<&syn::Item> = Vec::new();
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Item(syn::Item::Fn(item)) => self.hide_import(&item.sig.ident),
@@ -1338,9 +1341,12 @@ impl Analyzer {
                     }
                 }
                 // A `use` also covers the whole block, whatever its line.
-                Stmt::Item(item @ syn::Item::Use(_)) => self.nested_item(item),
+                Stmt::Item(item @ syn::Item::Use(_)) => uses.push(item),
                 _ => {}
             }
+        }
+        for item in uses {
+            self.nested_item(item);
         }
         // Save a name when its `let` is reached, not at block entry: an
         // assignment made before the shadow belongs to the outer name.
@@ -1453,7 +1459,10 @@ impl Analyzer {
                 self.diesel_fns.remove(name);
             }
             self.shadowed_macros.extend(names);
-            tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
+            // Only a `tokio` that still means the crate can lend its names.
+            if self.tokio_imports.contains("tokio") {
+                tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
+            }
             spawn_renames(&import.tree, &mut self.spawn_aliases);
             diesel_imports(
                 &import.tree,
@@ -1713,8 +1722,9 @@ impl Analyzer {
                 }
             }
             Expr::Call(call) => self.bind_container_callables(name, call.args.iter()),
-            // `&tokio::spawn` is the same function item.
+            // `&tokio::spawn` and `tokio::spawn as fn(..)` are the same item.
             Expr::Reference(r) => self.bind_callable(name, &r.expr),
+            Expr::Cast(c) => self.bind_callable(name, &c.expr),
             // A block, `if` or `match` is whatever its tails are.
             Expr::Block(_) | Expr::If(_) | Expr::Match(_) | Expr::Unsafe(_) | Expr::Loop(_) => {
                 self.bind_container_callables(name, value_tails(init));
@@ -1926,7 +1936,7 @@ impl Analyzer {
                 self.tail_unread
                     .get(&(std::ptr::from_ref(&*arm.body) as usize))
                     .copied()
-                    .unwrap_or_else(|| self.is_unread_call(&arm.body))
+                    .unwrap_or_else(|| self.carries_unread(&arm.body))
             }),
             _ => false,
         }
@@ -1965,7 +1975,7 @@ impl Analyzer {
     }
 
     fn compute_tail_unread(&self, block: &Block) -> bool {
-        matches!(block.stmts.last(), Some(Stmt::Expr(tail, None)) if self.is_unread_call(tail))
+        matches!(block.stmts.last(), Some(Stmt::Expr(tail, None)) if self.carries_unread(tail))
     }
 
     /// `fut = start();` moves a future into a name, as a `let` does.
@@ -2280,7 +2290,7 @@ impl Analyzer {
                         self.expr(&arm.body);
                     }
                     // Judge the arm's value while its own bindings exist.
-                    let yields = self.is_unread_call(&arm.body);
+                    let yields = self.carries_unread(&arm.body);
                     self.tail_unread
                         .insert(std::ptr::from_ref(&*arm.body) as usize, yields);
                     self.leave_binding_scope(saved);
@@ -8019,6 +8029,37 @@ mod tests {
             r"async fn h() -> R {
                 let fut = async { return start_finance_job(); }.await;
                 fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import through a shadowing local module",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                mod tokio { pub mod time { pub async fn sleep(d: Duration) {} } }
+                sleep(d).await;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias coerced by a cast",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = tokio::spawn as fn(F) -> H;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future inside a tuple at a block tail",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let pair = { (start_finance_job(), 0) };
+                pair.0.await?;
                 Ok(())
             }",
         ),
