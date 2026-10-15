@@ -278,7 +278,7 @@ impl Loaded {
 }
 
 /// Create an unpredictable, owner-only scratch directory under `base`.
-fn create_private_dir(base: &std::path::Path) -> Result<PathBuf, ReplicaError> {
+pub fn create_private_dir(base: &std::path::Path, tag: &str) -> Result<PathBuf, ReplicaError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -287,7 +287,7 @@ fn create_private_dir(base: &std::path::Path) -> Result<PathBuf, ReplicaError> {
         builder.mode(0o700);
     }
     for _ in 0..8 {
-        let candidate = base.join(format!(".autumn-replica-verify-{:016x}", fastrand_u64()));
+        let candidate = base.join(format!(".autumn-{tag}-{:016x}", fastrand_u64()));
         match builder.create(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -459,7 +459,7 @@ fn run_verify(profile: Option<&str>) -> Result<(), ReplicaError> {
         .and_then(|db| db.parent().map(std::path::Path::to_path_buf))
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from("."));
-    let scratch = create_private_dir(&base)?;
+    let scratch = create_private_dir(&base, "replica-verify")?;
     let result = restore::restore(remote.as_ref(), &root, None, &scratch.join("verified.db"));
     let _ = std::fs::remove_dir_all(&scratch);
 

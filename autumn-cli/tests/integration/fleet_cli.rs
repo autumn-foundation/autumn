@@ -428,6 +428,39 @@ mod sqlite {
         );
         assert!(stderr.contains("already exists"), "{stderr}");
 
+        // A file or a dangling symlink another user put at the path is never
+        // written through.
+        let planted = app.dir.join("planted.db");
+        std::fs::write(&planted, b"").unwrap();
+        let stderr = run_err(
+            &app.dir,
+            &["fleet", "backup", "tenant:acme", planted.to_str().unwrap()],
+        );
+        assert!(stderr.contains("already exists"), "{stderr}");
+        assert_eq!(std::fs::metadata(&planted).unwrap().len(), 0);
+        #[cfg(unix)]
+        {
+            let link = app.dir.join("link.db");
+            let target = app.dir.join("target.db");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let stderr = run_err(
+                &app.dir,
+                &["fleet", "backup", "tenant:acme", link.to_str().unwrap()],
+            );
+            assert!(stderr.contains("already exists"), "{stderr}");
+            assert!(!target.exists(), "the link was not followed");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&app.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".autumn-fleet-backup")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "the staging directory is removed");
+
         let other = app.dir.join("missing.db");
         let stderr = run_err(
             &app.dir,

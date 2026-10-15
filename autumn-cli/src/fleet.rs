@@ -466,23 +466,45 @@ mod imp {
     fn backup(target: &Target, key: &str, dest: &Path) -> Result<(), String> {
         let fleet = target.build(None)?;
         let key = parse_key(&fleet, key)?;
-        if dest.exists() {
-            return Err(format!(
+        let taken = || {
+            format!(
                 "{} already exists.\n  Choose a new path: a backup never replaces a file.",
                 dest.display()
-            ));
+            )
+        };
+        // `symlink_metadata`: a dangling symlink is taken too.
+        if dest.symlink_metadata().is_ok() {
+            return Err(taken());
         }
-        // The copy holds tenant data: only the owner can read it, from its
-        // first byte.
+        // The copy holds tenant data. It is written in a new directory that
+        // only this user can open, then linked to `dest`. A link never
+        // replaces or follows a file another user put at `dest`.
         #[cfg(unix)]
         nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let staging =
+            replica::create_private_dir(parent, "fleet-backup").map_err(|e| e.to_string())?;
+        let staged = staging.join("backup.db");
         let rt = runtime()?;
-        let result = rt.block_on(async {
-            let result = fleet.backup(&key, dest).await;
+        let copied = rt.block_on(async {
+            let result = fleet.backup(&key, &staged).await;
             fleet.close_all().await;
             result
         });
-        result.map_err(|e| e.to_string())?;
+        let published = copied.map_err(|e| e.to_string()).and_then(|()| {
+            std::fs::hard_link(&staged, dest).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    taken()
+                } else {
+                    format!("could not write {}: {e}", dest.display())
+                }
+            })
+        });
+        let _ = std::fs::remove_dir_all(&staging);
+        published?;
         eprintln!(
             "\u{2713} Copied {key} to {} ({} byte(s)).",
             dest.display(),
