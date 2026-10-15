@@ -381,6 +381,8 @@ mod repository_commit_hooks_claim_ack_profile;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy;
 #[cfg(feature = "db")]
+mod repository_dependent_ordering;
+#[cfg(feature = "db")]
 mod repository_nul_field;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
