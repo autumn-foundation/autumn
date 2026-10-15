@@ -387,6 +387,15 @@ pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     }
 }
 
+/// The attributes of a `syn::GenericParam`.
+pub fn generic_param_attrs(param: &syn::GenericParam) -> &[syn::Attribute] {
+    match param {
+        syn::GenericParam::Lifetime(p) => &p.attrs,
+        syn::GenericParam::Type(p) => &p.attrs,
+        syn::GenericParam::Const(p) => &p.attrs,
+    }
+}
+
 /// The attributes of a `syn::FnArg`.
 pub fn fn_arg_attrs(arg: &syn::FnArg) -> &[syn::Attribute] {
     match arg {
@@ -604,6 +613,12 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
         if production_enabled(&arm.attrs) {
             syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_generic_param(&mut self, param: &'ast syn::GenericParam) {
+        if production_enabled(generic_param_attrs(param)) {
+            syn::visit::visit_generic_param(self, param);
         }
     }
 
@@ -2682,6 +2697,7 @@ mod tests {
             }
             enum EV { #[cfg(test)] V = { #[model] struct H { #[id] id: i64, #[encrypted] n: String } 0 } }
             fn param(#[cfg(test)] x: [(); { #[model] struct M { #[id] id: i64, #[encrypted] q: String } 0 }]) {}
+            struct GP<#[cfg(test)] T = [(); { #[model] struct N { #[id] id: i64, #[encrypted] r: String } 0 }]>(T);
             struct TY;
             impl TY { #[cfg(test)] type A = [(); { #[model] struct J { #[id] id: i64, #[encrypted] o: String } 0 }]; }
             trait TT2 { #[cfg(test)] type B = [(); { #[model] struct K { #[id] id: i64, #[encrypted] p: String } 0 }]; }
