@@ -143,8 +143,11 @@ audit_generated_apps() {
   local root work flags name autumn_bin="" index=0
   root="$(pwd)"
   if [ -n "${AUTUMN_BIN:-}" ]; then
-    # Absolute, because the CLI runs from a temp dir.
-    autumn_bin="$(cd "$(dirname "${AUTUMN_BIN}")" && pwd)/$(basename "${AUTUMN_BIN}")"
+    # Absolute, because the CLI runs from a temp dir. A bare name uses PATH.
+    case "${AUTUMN_BIN}" in
+      */*) autumn_bin="$(cd "$(dirname "${AUTUMN_BIN}")" && pwd)/$(basename "${AUTUMN_BIN}")" ;;
+      *) autumn_bin="$(command -v "${AUTUMN_BIN}")" ;;
+    esac
   fi
   work="$(mktemp -d)"
   # shellcheck disable=SC2064  # expand $work now, not at trap time
