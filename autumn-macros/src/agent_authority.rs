@@ -2677,7 +2677,7 @@ impl Analyzer {
                 _ => Provenance::Syntactic,
             };
             self.record(kind, model.clone(), provenance, method.method.span());
-            self.note_cascade(&name, &model, method.method.span());
+            self.note_cascade(&name, model, method.method.span());
         }
     }
 
