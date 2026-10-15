@@ -2327,20 +2327,133 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 /// An unparsable URL never claims a match (the guard errs toward "different",
 /// leaving the profile guard as the enforcement).
 fn same_database(a: &str, b: &str) -> bool {
+    same_database_with(a, b, &|key| std::env::var(key).ok())
+}
+
+/// Whether two resolved hosts can name one server. The default socket
+/// directory is unknown, so an empty host may be any socket path.
+fn hosts_match(left: &str, right: &str) -> bool {
+    let is_socket = |h: &str| h.starts_with('/');
+    left == right || (left.is_empty() && is_socket(right)) || (right.is_empty() && is_socket(left))
+}
+
+/// The pieces of a connection string, read from a URL or from the keyword form.
+struct Raw {
+    params: BTreeMap<String, String>,
+    authority_host: Option<String>,
+    authority_port: Option<u16>,
+    user: String,
+    path_db: String,
+}
+
+/// Like [`same_database`], but the caller passes the environment lookup.
+/// Tests then do not set process environment variables.
+///
+/// A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host
+/// from the `hostaddr` parameter, then `PGHOSTADDR`, then `host`, then the URL
+/// authority, then `PGHOST`. Query parameters win over the authority, and the last repeat of a
+/// parameter wins, as in libpq.
+/// If no host is found, the host is empty and libpq uses its default socket.
+fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    let decode = |raw: &str| {
+        percent_encoding::percent_decode_str(raw)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    let read = |raw: &str| -> Option<Raw> {
+        let Ok(parsed) = url::Url::parse(raw) else {
+            // The keyword form `host=... dbname=...`. The last repeat wins.
+            let pairs = crate::pg::parse_keyword_value_pairs(raw)?;
+            return Some(Raw {
+                params: pairs.into_iter().collect(),
+                authority_host: None,
+                authority_port: None,
+                user: String::new(),
+                path_db: String::new(),
+            });
+        };
+        if !matches!(parsed.scheme(), "postgres" | "postgresql") {
+            return None;
+        }
+        // libpq applies query parameters after the authority. The last repeat
+        // wins, even when empty. Values use percent-decoding only: `+` is a
+        // literal, not a space.
+        Some(Raw {
+            params: crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or_default())
+                .into_iter()
+                .collect(),
+            authority_host: parsed.host_str().map(decode),
+            authority_port: parsed.port(),
+            user: decode(parsed.username()),
+            path_db: decode(parsed.path().strip_prefix('/').unwrap_or_default()),
+        })
+    };
     let parts = |raw: &str| -> Option<(String, u16, String)> {
-        let parsed = url::Url::parse(raw).ok()?;
-        let host = parsed.host_str()?.to_ascii_lowercase();
-        let port = parsed.port().unwrap_or(5432);
-        let name = parsed
-            .path_segments()
-            .and_then(|mut s| s.next())
-            .map(str::to_owned)
-            .filter(|n| !n.is_empty())?;
+        let Raw {
+            params,
+            authority_host,
+            authority_port,
+            user,
+            path_db,
+        } = read(raw)?;
+        // `host` and `hostaddr` are presence-based: an explicit empty value
+        // means the default, and it does not fall back to the environment.
+        let hostaddr = params
+            .get("hostaddr")
+            .cloned()
+            .or_else(|| env("PGHOSTADDR"))
+            .filter(|v| !v.is_empty());
+        let host = hostaddr
+            .or_else(|| params.get("host").cloned())
+            .or(authority_host)
+            .or_else(|| env("PGHOST"))
+            .unwrap_or_default();
+        // A socket directory is case-sensitive. A DNS name is not. An IPv6
+        // address has no brackets and one canonical spelling.
+        let host = if host.starts_with(['/', '@']) {
+            host
+        } else {
+            let name = host
+                .trim_matches(['[', ']'])
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            // An IP literal has one canonical spelling.
+            name.parse::<std::net::IpAddr>()
+                .map_or(name, |ip| ip.to_string())
+        };
+        // An omitted port defaults to `PGPORT`, then to 5432.
+        let port = params.get("port").map_or_else(
+            || {
+                authority_port
+                    .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()))
+                    .unwrap_or(5432)
+            },
+            |v| v.parse().unwrap_or(5432),
+        );
+        // `dbname` is presence-based. An empty name defaults to `PGDATABASE`,
+        // then to the user name, then to the OS login, as in libpq.
+        let name = params.get("dbname").cloned().unwrap_or(path_db);
+        let name = if name.is_empty() {
+            env("PGDATABASE")
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    params
+                        .get("user")
+                        .cloned()
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| Some(user).filter(|v| !v.is_empty()))
+                        .or_else(|| env("PGUSER").filter(|v| !v.is_empty()))
+                        .unwrap_or_else(crate::pg::current_os_user)
+                })
+        } else {
+            name
+        };
         Some((host, port, name))
     };
     match (parts(a), parts(b)) {
-        (Some(left), Some(right)) => left == right,
-        _ => false,
+        (Some((lh, lp, ln)), Some((rh, rp, rn))) => hosts_match(&lh, &rh) && lp == rp && ln == rn,
+        // A Postgres URL this parser cannot read matches only an identical string.
+        _ => (a.starts_with("postgres://") || a.starts_with("postgresql://")) && a == b,
     }
 }
 
@@ -2362,8 +2475,11 @@ fn same_database(a: &str, b: &str) -> bool {
 /// `--force`: the documented staging drill ALWAYS passes `--force` (staging is
 /// not `dev`/`test`), so a guard that `--force` waived would be inert in exactly
 /// the workflow it exists for.
+/// The guard skips the config overlay of `destination_profile`. That overlay
+/// names the database you scrub. The artifact profile is always checked.
 fn guard_configured_source(
     artifact_profile: Option<&str>,
+    destination_profile: &str,
     project_root: &Path,
     targets: &[(String, String)],
     allowed: bool,
@@ -2374,22 +2490,35 @@ fn guard_configured_source(
     let mut candidates: Vec<String> = artifact_profile
         .map(str::to_owned)
         .into_iter()
-        .chain(profiles_with_config(project_root))
+        .chain(profiles_with_config(project_root).into_iter().filter(|p| {
+            migrate::canonical_profile(p) != migrate::canonical_profile(destination_profile)
+        }))
         .filter(|p| !super::is_safe_destructive_profile(p))
         .collect();
     candidates.sort();
     candidates.dedup();
 
     for profile in candidates {
-        let table = migrate::read_autumn_toml_table_with_profile(Some(&profile));
-        let Some(declared) = migrate::resolve_primary_database_url_from_sources(
+        let table = migrate::read_autumn_toml_table_with_profile_in(project_root, Some(&profile));
+        // Control plus every shard: a restore writes all of them. A bad shard
+        // entry refuses: skipping it would skip the check.
+        let shards = migrate::try_resolve_shard_database_urls_from_sources(
             |_| Err(std::env::VarError::NotPresent),
             table.as_ref(),
-        ) else {
-            continue;
-        };
+        )
+        .map_err(|detail| ScrubError::Config {
+            path: format!("autumn-{profile}.toml"),
+            detail,
+        })?;
+        let declared: Vec<String> = migrate::resolve_primary_database_url_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            table.as_ref(),
+        )
+        .into_iter()
+        .chain(shards.into_iter().map(|(_, url)| url))
+        .collect();
         for (_, url) in targets {
-            if same_database(&declared, url) {
+            if declared.iter().any(|d| same_database(d, url)) {
                 return Err(ScrubError::OverwritesConfiguredTarget {
                     profile,
                     database: parsed_db_name(url),
@@ -2511,6 +2640,7 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         );
         guard_configured_source(
             artifact_profile.as_deref(),
+            &profile,
             Path::new("."),
             &targets,
             args.allow_source_overwrite,
@@ -8824,13 +8954,378 @@ mod tests {
         )];
         let empty = tempfile::tempdir().unwrap();
         assert!(
-            guard_configured_source(Some("prod"), empty.path(), &targets, false).is_ok(),
+            guard_configured_source(Some("prod"), "staging", empty.path(), &targets, false).is_ok(),
             "no config overlay means nothing to compare against"
         );
         assert!(
-            guard_configured_source(Some("prod"), empty.path(), &targets, true).is_ok(),
+            guard_configured_source(Some("prod"), "staging", empty.path(), &targets, true).is_ok(),
             "--allow-source-overwrite is the waiver"
         );
+    }
+
+    fn overlay(dir: &Path, profile: &str, body: &str) {
+        std::fs::write(dir.join(format!("autumn-{profile}.toml")), body).unwrap();
+    }
+
+    fn control_target(url: &str) -> Vec<(String, String)> {
+        vec![("control".to_owned(), url.to_owned())]
+    }
+
+    #[test]
+    fn the_destination_profile_is_not_a_protected_source() {
+        // Issue #2366: the drill scrubs `staging` while `autumn-staging.toml` exists.
+        let dir = tempfile::tempdir().unwrap();
+        let url = "postgres://app:pw@stg.example.com:5432/myapp";
+        overlay(
+            dir.path(),
+            "staging",
+            &format!("[database]\nprimary_url = \"{url}\"\n"),
+        );
+        assert!(
+            guard_configured_source(
+                Some("prod"),
+                "staging",
+                dir.path(),
+                &control_target(url),
+                false
+            )
+            .is_ok()
+        );
+        // The same overlay still guards when it is not the destination.
+        assert!(
+            guard_configured_source(
+                Some("prod"),
+                "other",
+                dir.path(),
+                &control_target(url),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_protected_shard_url_is_compared_too() {
+        // Issue #2366: a shard of a protected profile is a protected database.
+        let dir = tempfile::tempdir().unwrap();
+        overlay(
+            dir.path(),
+            "prod",
+            "[database]\nprimary_url = \"postgres://a@prod.example.com/ctl\"\n\n\
+             [[database.shards]]\nname = \"s1\"\n\
+             primary_url = \"postgres://a@prod.example.com/shard1\"\n",
+        );
+        let targets = vec![
+            (
+                "control".to_owned(),
+                "postgres://a@stg.example.com/ctl".to_owned(),
+            ),
+            (
+                "s1".to_owned(),
+                "postgres://a@prod.example.com/shard1".to_owned(),
+            ),
+        ];
+        assert!(
+            guard_configured_source(Some("prod"), "staging", dir.path(), &targets, false).is_err()
+        );
+    }
+
+    #[test]
+    fn hostless_urls_name_the_same_database() {
+        // Issue #2366: a URL without a host takes its host from libpq settings.
+        assert!(same_database_with(
+            "postgres:///prod?user=app&host=/var/run/postgresql",
+            "postgres:///prod?host=/var/run/postgresql",
+            &|_| None
+        ));
+        assert!(!same_database_with(
+            "postgres:///prod?host=/var/run/postgresql",
+            "postgres:///prod?host=/tmp",
+            &|_| None
+        ));
+        // Bare form resolves through `PGHOST`.
+        assert!(same_database_with(
+            "postgres:///prod",
+            "postgres://h.example.com/prod",
+            &|k| (k == "PGHOST").then(|| "h.example.com".to_owned())
+        ));
+        assert!(!same_database_with(
+            "postgres:///prod",
+            "postgres://h.example.com/prod",
+            &|_| None
+        ));
+        // A different database on the same socket stays different.
+        assert!(!same_database_with(
+            "postgres:///prod?host=/tmp",
+            "postgres:///other?host=/tmp",
+            &|_| None
+        ));
+        // `PGHOSTADDR` picks the server whatever name the URL gives.
+        let addr = |k: &str| (k == "PGHOSTADDR").then(|| "10.0.0.1".to_owned());
+        assert!(same_database_with(
+            "postgres://prod.example/app",
+            "postgres://staging.example/app",
+            &addr
+        ));
+        // An inline `hostaddr` beats the environment.
+        assert!(!same_database_with(
+            "postgres://a/app?hostaddr=10.0.0.2",
+            "postgres://b/app",
+            &addr
+        ));
+        // An explicit empty `host=` means the default socket, not `PGHOST`.
+        let pghost = |k: &str| (k == "PGHOST").then(|| "h.example.com".to_owned());
+        assert!(!same_database_with(
+            "postgres:///app?host=",
+            "postgres://h.example.com/app",
+            &pghost
+        ));
+        assert!(same_database_with(
+            "postgres:///app?host=",
+            "postgres:///app?host=",
+            &pghost
+        ));
+        // Parameter names are percent-decoded, as the connection parser does.
+        assert!(same_database_with(
+            "postgres:///app?ho%73t=prod.example.com",
+            "postgres://prod.example.com/app",
+            &|_| None
+        ));
+        // An empty `dbname` defaults to `PGDATABASE`, then to the user name.
+        assert!(same_database_with(
+            "postgres://app@prod/app?dbname=",
+            "postgres://app@prod/app",
+            &|_| None
+        ));
+        assert!(same_database_with(
+            "postgres://prod/x?dbname=",
+            "postgres://prod/db1",
+            &|k| (k == "PGDATABASE").then(|| "db1".to_owned())
+        ));
+        // The keyword form `host=... dbname=...` names a database as well.
+        assert!(same_database_with(
+            "host=prod.example.com dbname=app",
+            "postgres://prod.example.com/app",
+            &|_| None
+        ));
+        assert!(same_database_with(
+            "host=prod.example.com port=6543 dbname='app'",
+            "postgres://prod.example.com:6543/app",
+            &|_| None
+        ));
+        assert!(same_database_with(
+            "host=prod.example.com dbname=app user=a",
+            "host=prod.example.com dbname=app user=b",
+            &|_| None
+        ));
+        assert!(!same_database_with(
+            "host=prod.example.com dbname=app",
+            "postgres://prod.example.com/other",
+            &|_| None
+        ));
+        // A non-Postgres scheme never names a Postgres database.
+        assert!(!same_database_with(
+            "sqlite:///app",
+            "postgres:///app",
+            &|_| None
+        ));
+    }
+
+    #[test]
+    fn libpq_defaults_and_full_paths_name_the_database() {
+        // An omitted port defaults to `PGPORT`.
+        assert!(same_database_with(
+            "postgres://prod.example/app",
+            "postgres://prod.example:6543/app",
+            &|k| (k == "PGPORT").then(|| "6543".to_owned())
+        ));
+        // The effective user names the database: `user` parameter, URL user, then
+        // `PGUSER`.
+        let pguser = |k: &str| (k == "PGUSER").then(|| "alice".to_owned());
+        assert!(same_database_with(
+            "postgres://prod.example/?dbname=&user=bob",
+            "postgres://prod.example/bob",
+            &pguser
+        ));
+        assert!(same_database_with(
+            "postgres://carol@prod.example/?dbname=",
+            "postgres://prod.example/carol",
+            &pguser
+        ));
+        assert!(same_database_with(
+            "postgres://prod.example/?dbname=",
+            "postgres://prod.example/alice",
+            &pguser
+        ));
+        // With no `dbname`, `PGDATABASE` or user, the OS login names the database.
+        assert!(same_database_with(
+            "postgres://prod.example/?dbname=",
+            &format!("postgres://prod.example/{}", crate::pg::current_os_user()),
+            &|_| None
+        ));
+        // A database name may hold a slash: the whole path is the name.
+        assert!(same_database_with(
+            "postgres://prod/db/name",
+            "postgres://prod/db%2Fname",
+            &|_| None
+        ));
+        assert!(!same_database_with(
+            "postgres://prod/db/name",
+            "postgres://prod/db",
+            &|_| None
+        ));
+        // Only the path delimiter is stripped: `//app` names the database `/app`.
+        assert!(same_database_with(
+            "postgres://prod//app",
+            "postgres://prod/%2Fapp",
+            &|_| None
+        ));
+        // IP literals compare by address, not by spelling.
+        assert!(same_database_with(
+            "postgres:///app?hostaddr=0:0:0:0:0:0:0:1",
+            "postgres://[::1]/app",
+            &|_| None
+        ));
+        // The default socket directory is unknown, so an empty host may be any
+        // socket path.
+        assert!(same_database_with(
+            "postgres:///app?host=",
+            "postgres:///app?host=/var/run/postgresql",
+            &|_| None
+        ));
+        assert!(same_database_with(
+            "postgres:///app?host=/var/run/postgresql",
+            "postgres:///app?host=",
+            &|_| None
+        ));
+        assert!(!same_database_with(
+            "postgres:///app?host=",
+            "postgres://h.example.com/app",
+            &|_| None
+        ));
+        // The same non-Postgres URL is not a source overwrite.
+        assert!(!same_database_with(
+            "sqlite:///app",
+            "sqlite:///app",
+            &|_| None
+        ));
+    }
+
+    #[test]
+    fn the_artifact_source_profile_is_protected_even_as_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "postgres://a@prod.example.com/app";
+        overlay(
+            dir.path(),
+            "prod",
+            &format!("[database]\nprimary_url = \"{url}\"\n"),
+        );
+        assert!(
+            guard_configured_source(
+                Some("prod"),
+                "prod",
+                dir.path(),
+                &control_target(url),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_profile_alias_still_names_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "postgres://a@prod.example.com/app";
+        overlay(
+            dir.path(),
+            "prod",
+            &format!("[database]\nprimary_url = \"{url}\"\n"),
+        );
+        assert!(
+            guard_configured_source(None, "production", dir.path(), &control_target(url), false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_malformed_shard_entry_refuses_instead_of_skipping_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        overlay(
+            dir.path(),
+            "prod",
+            "[database]\nprimary_url = \"postgres://a@prod.example.com/ctl\"\n\n\
+             [[database.shards]]\nprimary_url = \"postgres://a@prod.example.com/s1\"\n",
+        );
+        let targets = control_target("postgres://a@stg.example.com/ctl");
+        assert!(matches!(
+            guard_configured_source(Some("prod"), "staging", dir.path(), &targets, false),
+            Err(ScrubError::Config { .. })
+        ));
+    }
+
+    #[test]
+    fn libpq_query_overrides_and_encoding_are_normalised() {
+        let same = |a, b| same_database_with(a, b, &|_| None);
+        assert!(same("postgres://h/ctl", "postgres://h/stg?dbname=ctl"));
+        assert!(same("postgres://h?dbname=prod", "postgres://h/prod"));
+        assert!(same(
+            "postgres://h:6432/prod",
+            "postgres://h/prod?port=6432"
+        ));
+        assert!(same("postgres://h/pr%6Fd", "postgres://h/prod"));
+        assert!(same(
+            "postgres://prod.example.com./app",
+            "postgres://prod.example.com/app"
+        ));
+        assert!(same(
+            "postgres://%2Fvar%2Frun%2Fpostgresql/prod",
+            "postgres:///prod?host=/var/run/postgresql"
+        ));
+        // libpq connects to `hostaddr` even when the URL names a host.
+        assert!(same(
+            "postgres://prod.example.com/prod?hostaddr=10.0.0.1",
+            "postgres://10.0.0.1/prod"
+        ));
+        // Query parameters override the authority. The last repeat wins.
+        assert!(same(
+            "postgres://placeholder/prod?host=a.example.com",
+            "postgres://a.example.com/prod"
+        ));
+        assert!(same(
+            "postgres://x/db?host=stg&host=prod",
+            "postgres://prod/db"
+        ));
+        assert!(same("postgres://h:1/db?port=6432", "postgres://h:6432/db"));
+        // Socket paths are case-sensitive. DNS names are not.
+        assert!(!same(
+            "postgres:///db?host=/run/PostgreSQL",
+            "postgres:///db?host=/run/postgresql"
+        ));
+        assert!(same(
+            "postgres://Prod.Example.com/db",
+            "postgres://prod.example.com/db"
+        ));
+        // `+` is a literal in libpq query values. An empty final value resets.
+        assert!(same(
+            "postgres://h/db?dbname=foo+bar",
+            "postgres://h/foo+bar"
+        ));
+        assert!(same(
+            "postgres://prod:6543/app?port=",
+            "postgres://prod:5432/app"
+        ));
+        assert!(same(
+            "postgres://h/db?port=6543&port=5432",
+            "postgres://h/db"
+        ));
+        // An IPv6 address matches with or without brackets.
+        assert!(same("postgres:///app?hostaddr=::1", "postgres://[::1]/app"));
+        // A URL that does not parse still matches itself.
+        assert!(same(
+            "postgres://h1:1,h2:2/prod",
+            "postgres://h1:1,h2:2/prod"
+        ));
+        assert!(!same("postgres://h/prod", "postgres://h/other"));
     }
 
     #[test]
