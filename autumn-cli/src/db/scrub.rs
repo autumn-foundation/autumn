@@ -2371,6 +2371,12 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
         }
     }
 
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if crate::schema::parse::production_enabled(&variant.attrs) {
+            syn::visit::visit_variant(self, variant);
+        }
+    }
+
     fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
         if crate::schema::parse::production_enabled(&field.attrs) {
             syn::visit::visit_field_value(self, field);
@@ -2995,6 +3001,14 @@ fn guard_configured_source(
             declared.push((profile, urls));
         }
     }
+    // A target that names a `service` hides its host the same way.
+    if !declared.is_empty() && targets.iter().any(|(_, url)| uses_libpq_service(url)) {
+        return Err(ScrubError::SourceScan {
+            detail: "a restore target uses a libpq `service`, whose host the source guard \
+                     cannot resolve; pass --allow-source-overwrite to continue"
+                .to_owned(),
+        });
+    }
     match overwritten_source(&declared, targets, &|key| std::env::var(key).ok()) {
         Some((profile, database)) => {
             Err(ScrubError::OverwritesConfiguredTarget { profile, database })
@@ -3144,8 +3158,10 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         // Scrub only what the restore wrote. A partial artifact leaves the
         // other configured shards live, and they are not ours to anonymize.
         targets = restored_targets(targets, &restored_labels);
-        refuse_partial_output(args, targets.len(), configured)?;
+        refuse_partial_output(args, targets.len(), configured)
+            .inspect_err(|_| warn_unscrubbed())?;
         if targets.is_empty() {
+            warn_unscrubbed();
             return Err(ScrubError::SourceScan {
                 detail: "the restore reported no target it wrote to".to_owned(),
             });
@@ -3160,14 +3176,19 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
     // data in the target. Say so in the loudest possible terms.
     classify_and_apply(args, &profile, &targets, &sources).inspect_err(|_| {
         if restored {
-            eprintln!(
-                "\n\u{26A0}\u{FE0F}  The artifact was ALREADY RESTORED before this failure, so \
-                 the target database now holds UNSCRUBBED data.\n  \
-                 Do not hand it to anyone: fix the problem below and re-run the same \
-                 command, or drop the database."
-            );
+            warn_unscrubbed();
         }
     })
+}
+
+/// Say that a failed run left restored, unscrubbed data in the target.
+fn warn_unscrubbed() {
+    eprintln!(
+        "\n\u{26A0}\u{FE0F}  The artifact was ALREADY RESTORED before this failure, so \
+         the target database now holds UNSCRUBBED data.\n  \
+         Do not hand it to anyone: fix the problem below and re-run the same \
+         command, or drop the database."
+    );
 }
 
 /// The classification inputs that come from files rather than from the database.
@@ -8919,6 +8940,10 @@ mod tests {
             fn reg() -> R { R { #[cfg(test)] m: ModelRegistration::anonymize("users") } }
         "#;
         assert!(extract_anonymize_tables(field).unwrap().is_empty());
+        let variant = r#"
+            enum E { #[cfg(test)] V = { ModelRegistration::anonymize("users"); 0 } }
+        "#;
+        assert!(extract_anonymize_tables(variant).unwrap().is_empty());
     }
 
     #[test]

@@ -598,6 +598,12 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
         }
     }
 
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if production_enabled(&variant.attrs) {
+            syn::visit::visit_variant(self, variant);
+        }
+    }
+
     fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
         if production_enabled(&field.attrs) {
             syn::visit::visit_field_value(self, field);
@@ -2653,6 +2659,7 @@ mod tests {
                 let _r = R { #[cfg(test)] f: { #[model] struct B { #[id] id: i64, #[encrypted] l: String } } };
                 #[cfg(test)] let _x = { #[model] struct V { #[id] id: i64, #[encrypted] b: String } };
             }
+            enum EV { #[cfg(test)] V = { #[model] struct H { #[id] id: i64, #[encrypted] n: String } 0 } }
             #[cfg(test)] enum E { V = { #[model] struct G { #[id] id: i64, #[encrypted] m: String } 0 } }
             struct X;
             impl X {
