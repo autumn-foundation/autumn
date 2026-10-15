@@ -673,8 +673,8 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
     );
     if evicts_lazily(dataset, config) {
         note.push_str(
-            ". The in-memory store does not serve expired records but removes them only on \
-             later writes, so a quiet process can hold them past the window. Use redis to \
+            ". The in-memory store does not serve expired records. It removes them only on \
+             later writes. A quiet process can keep them past the window. Use redis to \
              remove them on time",
         );
     }
@@ -687,8 +687,8 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
     note
 }
 
-/// `true` when the dataset sits in a process-local store that removes expired
-/// records only on later writes.
+/// `true` when the dataset uses a process-local store. That store removes
+/// expired records only on later writes.
 fn evicts_lazily(dataset: RetentionDataset, config: &AutumnConfig) -> bool {
     match dataset {
         RetentionDataset::Idempotency => {
@@ -1147,8 +1147,8 @@ async fn resolve_cutoff(
 
 /// Count the rows `predicate` currently matches.
 ///
-/// `removed_so_far` and `eligible` ride along so a failure here still reports
-/// the rows an earlier batch loop deleted and the count taken before it.
+/// A failure here still reports `removed_so_far` and the earlier `eligible`
+/// count, if any.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 async fn count_stale(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -1523,6 +1523,36 @@ mod tests {
             let note = backend_ttl_note(dataset, &config, 60);
             assert!(!note.contains("quiet process"), "{dataset}: {note}");
         }
+    }
+
+    #[test]
+    fn only_the_dataset_with_an_in_memory_store_warns() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
+        config.jobs.backend = "redis".to_owned();
+        let warns = |dataset| backend_ttl_note(dataset, &config, 60).contains("quiet process");
+        assert!(warns(RetentionDataset::Idempotency));
+        assert!(!warns(RetentionDataset::WebhookReplay));
+        assert!(!warns(RetentionDataset::JobTracking));
+    }
+
+    #[test]
+    fn database_and_sqlite_backends_do_not_warn() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Database;
+        assert!(!evicts_lazily(RetentionDataset::Idempotency, &config));
+        config.jobs.backend = "sqlite".to_owned();
+        assert!(!evicts_lazily(RetentionDataset::JobTracking, &config));
+    }
+
+    #[test]
+    fn the_memory_session_note_keeps_its_own_verdict() {
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Memory;
+        let note = backend_ttl_note(RetentionDataset::Sessions, &config, 60);
+        assert!(note.starts_with("NOT enforced"), "{note}");
+        assert!(!note.contains("quiet process"), "{note}");
     }
 
     #[cfg(all(feature = "db", not(feature = "sqlite")))]
