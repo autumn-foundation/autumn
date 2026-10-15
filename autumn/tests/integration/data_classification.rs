@@ -74,10 +74,30 @@ fn customer() -> Customer {
 #[test]
 fn classified_field_marker_carries_model_field_and_tier() {
     assert_eq!(CustomerEmailClassified::MODEL, "Customer");
-    // Module-qualified: the manifest keys on this, so two crates that each
-    // define a `Customer` with a classified `email` stay separate rows.
+    // The path has module and crate version. The manifest keys on it. Two
+    // crates that each define a `Customer` with a classified `email` stay
+    // separate rows.
     assert!(
-        CustomerEmailClassified::MODEL_PATH.ends_with("::data_classification::Customer"),
+        CustomerEmailClassified::MODEL_PATH.contains("::data_classification@"),
+        "{}",
+        CustomerEmailClassified::MODEL_PATH
+    );
+    // This crate is the defining crate, so its own version is the oracle.
+    let (major, minor, patch, pre) = (
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR"),
+        env!("CARGO_PKG_VERSION_PATCH"),
+        env!("CARGO_PKG_VERSION_PRE"),
+    );
+    let version = match (major, minor) {
+        _ if !pre.is_empty() => format!("{major}.{minor}.{patch}-{pre}"),
+        ("0", "0") => format!("0.0.{patch}"),
+        ("0", _) => format!("0.{minor}"),
+        _ => major.to_string(),
+    };
+    let expected = format!("::data_classification@{version}::Customer");
+    assert!(
+        CustomerEmailClassified::MODEL_PATH.ends_with(&expected),
         "{}",
         CustomerEmailClassified::MODEL_PATH
     );

@@ -805,6 +805,10 @@ mod tests {
     use crate::replication::FileDestination;
     use tokio_util::sync::CancellationToken;
 
+    /// Bound for "is not stuck" checks. A real hang still trips it. A slow
+    /// Windows runner does not.
+    const NOT_STUCK: Duration = Duration::from_secs(30);
+
     fn settings() -> ReplicationSettings {
         ReplicationSettings {
             database_path: std::path::PathBuf::new(),
@@ -1358,7 +1362,7 @@ mod tests {
         let err = fleet.restore(&key, None).await.unwrap_err();
         assert!(matches!(err, FleetError::Io { .. }), "{err}");
         // The key is not stranded on a drain that never finishes.
-        let reopened = tokio::time::timeout(Duration::from_secs(5), fleet.open(&key)).await;
+        let reopened = tokio::time::timeout(NOT_STUCK, fleet.open(&key)).await;
         assert!(
             reopened.is_ok(),
             "open must not hang after a failed restore"
@@ -1409,13 +1413,13 @@ mod tests {
             1,
             "the restore went on past its drain"
         );
-        let reopened = tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
+        let reopened = tokio::time::timeout(NOT_STUCK, fleet.open(&key))
             .await
             .expect("open must not hang after a cancelled restore")
             .unwrap();
         assert_eq!(count(&reopened).await, 1);
         drop(reopened);
-        tokio::time::timeout(Duration::from_secs(5), fleet.close_all())
+        tokio::time::timeout(NOT_STUCK, fleet.close_all())
             .await
             .expect("close_all returns");
     }

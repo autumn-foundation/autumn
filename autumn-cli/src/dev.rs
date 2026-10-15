@@ -140,14 +140,11 @@ const DEV_READY_FILE_PREFIX: &str = "dev-ready.";
 )]
 const DEV_READY_FILE_SUFFIX: &str = ".state";
 
-/// Headroom added to the app's own drain budget before `autumn dev` escalates
-/// to a hard kill.
+/// Longest time a managed-Postgres stop can take.
 ///
-/// `on_shutdown` hooks run **after** the drain completes, so this — not the
-/// drain budget — is what has to cover them. Sized to the managed-Postgres stop
-/// ceiling (`STARTUP_TIMEOUT` in `autumn_web::managed_pg`, 60s, which
-/// `postgresql_embedded` applies to `pg_ctl stop` as well as start): that hook
-/// is the one this whole mechanism exists to let run.
+/// This value equals `STARTUP_TIMEOUT` in `autumn_web::managed_pg`.
+/// `postgresql_embedded` uses that limit for `pg_ctl stop` too.
+/// The CLI cannot import the constant. A test checks that both values match.
 #[cfg_attr(
     unix,
     allow(
@@ -155,7 +152,36 @@ const DEV_READY_FILE_SUFFIX: &str = ".state";
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-const COOPERATIVE_STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
+const MANAGED_PG_STOP_CEILING: Duration = Duration::from_secs(60);
+
+/// Extra time on top of the stop ceiling.
+///
+/// The app polls for the stop signal every 100 ms. The app must also exit
+/// after the stop ends. A busy machine adds more delay.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DELIVERY_AND_EXIT_MARGIN: Duration = Duration::from_secs(15);
+
+/// Extra time added to the app's drain budget before `autumn dev` kills the app.
+///
+/// The `on_shutdown` hooks run inside the drain budget.
+/// `emergency_stop_async` runs after the drain and has no time limit.
+/// Its worst case is a full managed-Postgres stop.
+/// The headroom is that stop limit plus a margin. A slow stop can then finish.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const COOPERATIVE_STOP_HOOK_HEADROOM: Duration =
+    MANAGED_PG_STOP_CEILING.saturating_add(DELIVERY_AND_EXIT_MARGIN);
 
 /// The cooperative-stop budget for an app whose configured graceful-drain
 /// budget is `drain_secs` (`prestop_grace_secs + shutdown_timeout_secs`).
@@ -306,8 +332,73 @@ enum StopOutcome {
     /// distinct from [`Self::Escalated`] so the warning blames the dev setup
     /// rather than accusing the app of ignoring a request it never received.
     Unreachable,
+    /// The app's `autumn-web` predates the signal file (#2458), so it was
+    /// force-killed at once. Waiting could not have helped.
+    Unsupported,
     /// There was no child to stop.
     NotRunning,
+}
+
+/// Whether the running child watches the shutdown-signal file.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSupport {
+    /// The child's ready file carries the capability marker.
+    Supported,
+    /// The child wrote a budget-only ready file: an `autumn-web` that predates
+    /// the signal file.
+    Unsupported,
+    /// No report yet. A slow boot looks the same as an old child, so the caller
+    /// keeps the cooperative wait.
+    Unknown,
+}
+
+/// Read the child's shutdown support from its ready-file contents.
+///
+/// The marker proves support. Without it, only a budget-only file proves an old
+/// child: the signal file shipped in the same release as the endpoint line, so
+/// a file with an endpoint line is an app that drains, only one that predates
+/// the marker. Anything else is `Unknown`, which keeps the safe cooperative wait.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn shutdown_support_from_ready(contents: Option<&str>) -> ShutdownSupport {
+    let Some(text) = contents else {
+        return ShutdownSupport::Unknown;
+    };
+    if autumn_web::app::serve_ready_advertises_shutdown_signal(text) {
+        return ShutdownSupport::Supported;
+    }
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let budget_only =
+        lines.next().is_some_and(|l| l.parse::<u64>().is_ok()) && lines.next().is_none();
+    if budget_only {
+        ShutdownSupport::Unsupported
+    } else {
+        ShutdownSupport::Unknown
+    }
+}
+
+/// [`shutdown_support_from_ready`] for the ready file on disk.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn child_shutdown_support(ready_file: &Path) -> ShutdownSupport {
+    shutdown_support_from_ready(std::fs::read_to_string(ready_file).ok().as_deref())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1350,12 +1441,14 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
         *child = None;
         return;
     };
+    let support = dev_ready_file_path().map_or(ShutdownSupport::Unknown, child_shutdown_support);
     let budget = stop_budget_for_running_child(
         dev_ready_file_path().and_then(child_reported_stop_budget),
         recorded_child_stop_budget(),
         || resolve_cooperative_stop_budget(package),
     );
-    match stop_child_cooperatively(child, signal_path, budget) {
+    match stop_with_support(child, signal_path, support, budget) {
+        StopOutcome::Unsupported => eprintln!("{}", unsupported_warning()),
         StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget)),
         StopOutcome::Unreachable => eprintln!(
             "{}",
@@ -1732,8 +1825,8 @@ fn dev_ready_file_path() -> Option<&'static Path> {
 /// The stop budget the running child reported for itself, if it has booted.
 ///
 /// The app writes its resolved *drain* budget (`prestop_grace_secs +
-/// shutdown_timeout_secs`) to this file at startup-complete; hooks run after the
-/// drain, so the same headroom still applies. A missing, blank, or unparseable
+/// shutdown_timeout_secs`) to this file at startup-complete. The same headroom
+/// still applies after the drain. A missing, blank, or unparseable
 /// file means "no report" — never a zero budget, which would hard-kill instantly.
 #[cfg_attr(
     unix,
@@ -1852,6 +1945,66 @@ fn unreachable_warning(error: &str) -> String {
          its data dir; the next start recovers the cluster through crash \
          recovery, which is slower than a clean stop."
     )
+}
+
+/// The warning printed when the app was force-stopped because its `autumn-web`
+/// does not watch the shutdown-signal file.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn unsupported_warning() -> String {
+    "  Warning: this app's autumn-web is older than the CLI and cannot drain on \
+     request, so it was force-stopped. Its shutdown hooks did not run. A managed \
+     Postgres cluster may still be running. The next start recovers it through \
+     crash recovery. To fix this, run `cargo update -p autumn-web`."
+        .to_owned()
+}
+
+/// Force-kill a child that cannot drain on request. Sends no signal file and
+/// does not wait: the child would never read it.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_unsupported_child(child: &mut Option<Child>, signal_path: &Path) -> StopOutcome {
+    let Some(proc) = child.as_mut() else {
+        return StopOutcome::NotRunning;
+    };
+    let _ = proc.kill();
+    let _ = proc.wait();
+    clear_cooperative_shutdown(signal_path);
+    *child = None;
+    StopOutcome::Unsupported
+}
+
+/// Stop `child` the way its `support` allows: at once when it cannot drain on
+/// request, otherwise through the signal file.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_with_support(
+    child: &mut Option<Child>,
+    signal_path: &Path,
+    support: ShutdownSupport,
+    budget: Duration,
+) -> StopOutcome {
+    match support {
+        ShutdownSupport::Unsupported => stop_unsupported_child(child, signal_path),
+        ShutdownSupport::Supported | ShutdownSupport::Unknown => {
+            stop_child_cooperatively(child, signal_path, budget)
+        }
+    }
 }
 
 /// Stop `child` cooperatively: request a graceful shutdown via the signal file,
@@ -2251,9 +2404,8 @@ mod tests {
 
     #[test]
     fn the_stop_budget_covers_the_managed_postgres_stop_ceiling() {
-        // `on_shutdown` hooks run AFTER the drain, so the headroom — not the
-        // drain budget — is what has to cover a `pg_ctl stop`. autumn-web's
-        // provider gives that operation a 60s ceiling.
+        // After the drain, `emergency_stop_async` can run a full `pg_ctl stop`.
+        // The headroom must cover it. The provider limit for that stop is 60s.
         assert!(
             cooperative_stop_budget(0) >= Duration::from_secs(60),
             "the headroom must cover a managed-Postgres stop"
@@ -2324,9 +2476,8 @@ mod tests {
 
     #[test]
     fn the_reported_budget_gets_the_same_hook_headroom() {
-        // The app reports its DRAIN budget (prestop + shutdown). Hooks run after
-        // the drain, so the headroom still applies — otherwise honouring the
-        // report would reintroduce the very orphan it prevents.
+        // The app reports its drain budget (prestop + shutdown). The headroom
+        // still applies. Without it, a slow Postgres stop is killed.
         let tmp = tempfile::TempDir::new().unwrap();
         let ready = tmp.path().join("dev-ready.state");
         std::fs::write(&ready, "300\n").unwrap();
@@ -2412,6 +2563,34 @@ mod tests {
         assert!(resolve_cooperative_stop_budget(None) >= COOPERATIVE_STOP_HOOK_HEADROOM);
     }
 
+    /// Reads `STARTUP_TIMEOUT` from the framework source.
+    /// The CLI does not enable `managed-pg`. It cannot import the constant.
+    fn managed_pg_stop_ceiling_from_source() -> Duration {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../autumn/src/managed_pg.rs");
+        let source = std::fs::read_to_string(&path).expect("read managed_pg.rs");
+        let secs = source
+            .lines()
+            .find(|l| l.contains("const STARTUP_TIMEOUT: Duration"))
+            .and_then(|l| l.split("from_secs(").nth(1))
+            .and_then(|l| l.split(')').next())
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .expect("parse STARTUP_TIMEOUT");
+        Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_ceiling_constant_matches_the_framework() {
+        assert_eq!(
+            MANAGED_PG_STOP_CEILING,
+            managed_pg_stop_ceiling_from_source()
+        );
+    }
+
+    #[test]
+    fn the_headroom_exceeds_the_managed_pg_stop_ceiling() {
+        assert!(COOPERATIVE_STOP_HOOK_HEADROOM > managed_pg_stop_ceiling_from_source());
+    }
+
     #[test]
     fn escalation_warning_names_the_consequence_not_just_the_timeout() {
         // "silent degradation" is the thing #1616 forbids: if hooks were
@@ -2465,6 +2644,188 @@ mod tests {
             autumn_web::app::SHUTDOWN_SIGNAL_FILE_ENV,
             "the CLI and the runtime must agree on the wire name"
         );
+    }
+
+    // ── Negotiate the shutdown signal (#2458) ──────────────────────────────
+    //
+    // A project can keep an `autumn-web` that predates the signal file. It never
+    // watches the file, so waiting out the budget stalls every edit. The ready
+    // file says which kind of child is running.
+
+    #[test]
+    fn a_ready_file_with_the_marker_means_the_child_will_drain() {
+        let payload = autumn_web::app::serve_ready_payload(1, "tcp 127.0.0.1:3000");
+        assert_eq!(
+            shutdown_support_from_ready(Some(&payload)),
+            ShutdownSupport::Supported
+        );
+    }
+
+    #[test]
+    fn a_budget_only_ready_file_means_the_child_cannot_drain() {
+        for old in ["1", "1\n", " 1 \n\n"] {
+            assert_eq!(
+                shutdown_support_from_ready(Some(old)),
+                ShutdownSupport::Unsupported,
+                "{old:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_with_an_endpoint_line_but_no_marker_still_drains() {
+        // 0.8.0 watches the signal file and reports an endpoint, but has no
+        // marker. Killing it would skip its hooks and orphan Postgres.
+        assert_eq!(
+            shutdown_support_from_ready(Some("1\ntcp 127.0.0.1:3000")),
+            ShutdownSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ready_file_is_not_proof_of_an_old_child() {
+        for junk in ["garbage", "x\ny", "1 2"] {
+            assert_eq!(
+                shutdown_support_from_ready(Some(junk)),
+                ShutdownSupport::Unknown,
+                "{junk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_ready_file_means_the_child_is_still_booting() {
+        // Cannot tell a slow boot from an old child. Keep the cooperative wait.
+        assert_eq!(shutdown_support_from_ready(None), ShutdownSupport::Unknown);
+    }
+
+    #[test]
+    fn a_blank_ready_file_is_not_proof_of_an_old_child() {
+        // The app writes the file atomically, so a blank file is not its work.
+        assert_eq!(
+            shutdown_support_from_ready(Some("  \n")),
+            ShutdownSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn the_ready_file_support_is_read_from_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ready = tmp.path().join("dev-ready.state");
+        assert_eq!(child_shutdown_support(&ready), ShutdownSupport::Unknown);
+        std::fs::write(&ready, "1\n").unwrap();
+        assert_eq!(child_shutdown_support(&ready), ShutdownSupport::Unsupported);
+        std::fs::write(&ready, autumn_web::app::serve_ready_payload(1, "")).unwrap();
+        assert_eq!(child_shutdown_support(&ready), ShutdownSupport::Supported);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsupported_child_is_killed_at_once_without_a_signal_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM; sleep 30")
+                .spawn()
+                .expect("spawn old app"),
+        );
+        let start = std::time::Instant::now();
+        let outcome = stop_unsupported_child(&mut child, &path);
+        assert_eq!(outcome, StopOutcome::Unsupported);
+        assert!(start.elapsed() < Duration::from_secs(10), "must not wait");
+        assert!(child.is_none(), "the child must be reaped");
+        assert!(
+            !path.exists(),
+            "no request is sent to a child that ignores it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsupported_child_is_never_sent_a_request() {
+        // A path under a regular file cannot be created. A request would turn
+        // the outcome into `Unreachable`, so `Unsupported` proves none was made.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("nested").join("stop.signal");
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .expect("spawn old app"),
+        );
+        assert_eq!(
+            stop_unsupported_child(&mut child, &path),
+            StopOutcome::Unsupported
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stop_plan_kills_an_unsupported_child_without_waiting_out_the_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM; sleep 30")
+                .spawn()
+                .expect("spawn old app"),
+        );
+        let start = std::time::Instant::now();
+        let outcome = stop_with_support(
+            &mut child,
+            &path,
+            ShutdownSupport::Unsupported,
+            Duration::from_secs(300),
+        );
+        assert_eq!(outcome, StopOutcome::Unsupported);
+        assert!(start.elapsed() < Duration::from_secs(10), "must not wait");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stop_plan_keeps_the_cooperative_wait_when_support_is_unknown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let script = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; exit 0",
+            path.display()
+        );
+        for support in [ShutdownSupport::Unknown, ShutdownSupport::Supported] {
+            let mut child = Some(
+                Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(&script)
+                    .spawn()
+                    .expect("spawn app"),
+            );
+            let outcome = stop_with_support(&mut child, &path, support, Duration::from_secs(10));
+            assert_eq!(outcome, StopOutcome::Graceful, "{support:?}");
+        }
+    }
+
+    #[test]
+    fn an_unsupported_stop_with_no_child_is_not_running() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut child = None;
+        assert_eq!(
+            stop_unsupported_child(&mut child, &signal_path(tmp.path())),
+            StopOutcome::NotRunning
+        );
+    }
+
+    #[test]
+    fn the_unsupported_warning_names_the_cause_and_the_fix() {
+        let warning = unsupported_warning();
+        assert!(warning.contains("autumn-web"), "{warning}");
+        assert!(warning.contains("cargo update"), "{warning}");
+        assert!(warning.contains("Postgres"), "{warning}");
+        assert!(!warning.contains("did not shut down within"), "{warning}");
     }
 
     use super::*;

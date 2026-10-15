@@ -355,6 +355,25 @@ pub fn find_binary_in_profile(
     bin: Option<&str>,
     profile: &CargoProfile,
 ) -> PathBuf {
+    find_resolved_binary_in_profile(package, bin, profile).path
+}
+
+/// A resolved binary and the directory of the package that owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBinary {
+    /// Path of the built binary.
+    pub path: PathBuf,
+    /// Directory of the owning package's `Cargo.toml`, if known.
+    pub manifest_dir: Option<PathBuf>,
+}
+
+/// Like [`find_binary_in_profile`], and also returns the owning package's
+/// directory. Both come from one selection, so they always match (#2418).
+pub fn find_resolved_binary_in_profile(
+    package: Option<&str>,
+    bin: Option<&str>,
+    profile: &CargoProfile,
+) -> ResolvedBinary {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -371,15 +390,19 @@ pub fn find_binary_in_profile(
     let cwd = std::env::current_dir().expect("current dir");
 
     // `prefer_built`: with `build.target`, use the path Cargo reported.
-    resolve_binary_in_profile(&metadata, package, &cwd, bin, profile).map_or_else(
+    resolve_binary_target(&metadata, package, &cwd, bin, profile).map_or_else(
         |error| {
             eprintln!("\u{2717} {error}");
             std::process::exit(1);
         },
-        crate::built_artifact::prefer_built,
+        |resolved| ResolvedBinary {
+            path: crate::built_artifact::prefer_built(resolved.path),
+            ..resolved
+        },
     )
 }
 
+#[cfg(test)]
 fn resolve_binary_in_profile(
     metadata: &serde_json::Value,
     package: Option<&str>,
@@ -387,6 +410,16 @@ fn resolve_binary_in_profile(
     bin: Option<&str>,
     profile: &CargoProfile,
 ) -> Result<PathBuf, String> {
+    resolve_binary_target(metadata, package, cwd, bin, profile).map(|resolved| resolved.path)
+}
+
+fn resolve_binary_target(
+    metadata: &serde_json::Value,
+    package: Option<&str>,
+    cwd: &Path,
+    bin: Option<&str>,
+    profile: &CargoProfile,
+) -> Result<ResolvedBinary, String> {
     let target_dir = metadata["target_directory"]
         .as_str()
         .ok_or("target_directory missing from cargo metadata")?;
@@ -417,7 +450,7 @@ fn resolve_binary_in_profile(
     // Collect (package-name, binary-name) pairs for every matching package
     // that has at least one `bin` target.  When --bin is given, pick that
     // specific target; otherwise error if a package exposes more than one.
-    let mut candidates: Vec<(String, String)> = Vec::new();
+    let mut candidates: Vec<(String, String, Option<PathBuf>)> = Vec::new();
     for pkg in &matching_packages {
         let pkg_name = match pkg["name"].as_str() {
             Some(n) => n.to_owned(),
@@ -463,14 +496,18 @@ fn resolve_binary_in_profile(
         };
 
         if let Some(b) = chosen {
-            candidates.push((pkg_name, b));
+            let manifest_dir = pkg["manifest_path"]
+                .as_str()
+                .and_then(|manifest| Path::new(manifest).parent())
+                .map(Path::to_path_buf);
+            candidates.push((pkg_name, b, manifest_dir));
         }
     }
 
     // When no explicit --package was given and multiple workspace members each
     // have a binary, we can't pick one safely — ask the user to be explicit.
     if package.is_none() && candidates.len() > 1 {
-        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = candidates.iter().map(|(n, _, _)| n.as_str()).collect();
         return Err(format!(
             "multiple binary packages found in workspace ({}); \
              use -p / --package to select one",
@@ -478,7 +515,7 @@ fn resolve_binary_in_profile(
         ));
     }
 
-    let bin_name = candidates.pop().map(|(_, b)| b).ok_or_else(|| {
+    let (_, bin_name, manifest_dir) = candidates.pop().ok_or_else(|| {
         package.map_or_else(
             || "no binary target found in current package".to_owned(),
             |pkg_name| format!("no binary target found in package '{pkg_name}'"),
@@ -495,7 +532,7 @@ fn resolve_binary_in_profile(
         path.set_extension("exe");
     }
 
-    Ok(path)
+    Ok(ResolvedBinary { path, manifest_dir })
 }
 
 // ── Also compile the binary before running ─────────────────────────────────
@@ -1443,5 +1480,67 @@ mod tests {
         };
         assert_eq!(p.artifact_dir(), "release");
         assert_eq!(resolve_profile_dir(&p), "release");
+    }
+
+    // ── #2418: the package directory follows the resolved binary ────────
+
+    fn two_member_workspace() -> serde_json::Value {
+        serde_json::json!({
+            "target_directory": "/ws/target",
+            "packages": [
+                {
+                    "name": "app",
+                    "manifest_path": "/ws/app/Cargo.toml",
+                    "targets": [{ "name": "app", "kind": ["bin"] }]
+                },
+                {
+                    "name": "lib-only",
+                    "manifest_path": "/ws/lib/Cargo.toml",
+                    "targets": [{ "name": "lib_only", "kind": ["lib"] }]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn the_manifest_dir_is_inferred_without_a_package_flag() {
+        let resolved = resolve_binary_target(
+            &two_member_workspace(),
+            None,
+            Path::new("/ws"),
+            None,
+            &CargoProfile::from_release(true),
+        )
+        .expect("one binary member resolves");
+        assert_eq!(resolved.manifest_dir.as_deref(), Some(Path::new("/ws/app")));
+        assert!(resolved.path.starts_with("/ws/target/release"));
+    }
+
+    #[test]
+    fn the_manifest_dir_follows_an_explicit_package() {
+        let resolved = resolve_binary_target(
+            &two_member_workspace(),
+            Some("app"),
+            Path::new("/elsewhere"),
+            None,
+            &CargoProfile::default(),
+        )
+        .expect("named member resolves");
+        assert_eq!(resolved.manifest_dir.as_deref(), Some(Path::new("/ws/app")));
+    }
+
+    #[test]
+    fn an_ambiguous_workspace_still_errors() {
+        let mut metadata = two_member_workspace();
+        metadata["packages"][1]["targets"][0]["kind"] = serde_json::json!(["bin"]);
+        let error = resolve_binary_target(
+            &metadata,
+            None,
+            Path::new("/ws"),
+            None,
+            &CargoProfile::default(),
+        )
+        .expect_err("two binary members are ambiguous");
+        assert!(error.contains("multiple binary packages"), "{error}");
     }
 }

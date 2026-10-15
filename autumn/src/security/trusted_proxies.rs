@@ -67,21 +67,17 @@ use tower::{Layer, Service};
 use crate::security::config::TrustedProxiesConfig;
 
 /// A parsed trusted-proxy CIDR range or exact IP.
-// Clone class (issues #2452, #2929): `crate::security::proxy::TrustedProxy`
-// is a byte-identical duplicate of this struct's parse/contains logic, kept
-// public with zero production callers of its own. This copy is the one
-// actually wired into `ProxyResolver`/`TrustedProxiesLayer` and the one that
-// carries the proptest fuzz harness (#1690) — a fix here does not reach the
-// sibling copy automatically. See the comment on `proxy::TrustedProxy` for
-// why removing that copy needs a human call rather than an unattended merge.
+///
+/// The only CIDR matcher in the crate. The deprecated
+/// `security::proxy::TrustedProxy` delegates to it.
 #[derive(Debug, Clone, Copy)]
-struct TrustedProxy {
-    network: IpAddr,
-    prefix_len: u8,
+pub struct CidrRange {
+    pub network: IpAddr,
+    pub prefix_len: u8,
 }
 
-impl TrustedProxy {
-    fn parse(value: &str) -> Option<Self> {
+impl CidrRange {
+    pub fn parse(value: &str) -> Option<Self> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return None;
@@ -111,7 +107,7 @@ impl TrustedProxy {
         })
     }
 
-    fn contains(&self, ip: IpAddr) -> bool {
+    pub fn contains(&self, ip: IpAddr) -> bool {
         if self.prefix_len == 0 {
             return matches!(
                 (self.network, ip),
@@ -147,7 +143,7 @@ impl TrustedProxy {
 /// [`ClientScheme`]: crate::extract::ClientScheme
 #[derive(Debug, Clone)]
 pub struct ProxyResolver {
-    ranges: Vec<TrustedProxy>,
+    ranges: Vec<CidrRange>,
     /// True when the original config had at least one range entry (even if all
     /// failed to parse).  When `true` and `ranges` is empty (all entries were
     /// invalid), we treat NO peer as trusted rather than all peers as trusted.
@@ -165,7 +161,7 @@ impl ProxyResolver {
             .ranges
             .iter()
             .filter_map(|proxy| {
-                TrustedProxy::parse(proxy).or_else(|| {
+                CidrRange::parse(proxy).or_else(|| {
                     tracing::warn!(
                         range = %proxy,
                         "ignoring invalid trusted_proxies range"
@@ -476,7 +472,7 @@ impl ProxyResolver {
 
 // ── Fuzzing seams ───────────────────────────────────────────────────────────
 // These `#[cfg(fuzzing)]` wrappers expose the private trusted-proxy parsing
-// surface (`TrustedProxy::parse`, `ProxyResolver::parse_forwarded_ip`, and the
+// surface (`CidrRange::parse`, `ProxyResolver::parse_forwarded_ip`, and the
 // full `X-Forwarded-*` resolver) to the `fuzz/` crate. They are compiled out of
 // every normal build (including `cargo package`), so the published crate is
 // byte-identical. See `fuzz/fuzz_targets/headers.rs`.
@@ -484,7 +480,7 @@ impl ProxyResolver {
 /// Fuzzing seam: parse a single `[security.trusted_proxies]` range/IP entry.
 #[cfg(fuzzing)]
 pub fn __fuzz_parse_trusted_proxy(value: &str) -> bool {
-    TrustedProxy::parse(value).is_some()
+    CidrRange::parse(value).is_some()
 }
 
 /// Fuzzing seam: parse a single `X-Forwarded-For` entry into an IP.
@@ -682,14 +678,14 @@ mod tests {
 
     #[test]
     fn trusted_proxy_parse_exact_ipv4() {
-        let p = TrustedProxy::parse("10.0.0.1").unwrap();
+        let p = CidrRange::parse("10.0.0.1").unwrap();
         assert!(p.contains("10.0.0.1".parse().unwrap()));
         assert!(!p.contains("10.0.0.2".parse().unwrap()));
     }
 
     #[test]
     fn trusted_proxy_parse_cidr() {
-        let p = TrustedProxy::parse("10.0.0.0/24").unwrap();
+        let p = CidrRange::parse("10.0.0.0/24").unwrap();
         assert!(p.contains("10.0.0.1".parse().unwrap()));
         assert!(p.contains("10.0.0.254".parse().unwrap()));
         assert!(!p.contains("10.0.1.0".parse().unwrap()));
@@ -697,18 +693,18 @@ mod tests {
 
     #[test]
     fn trusted_proxy_parse_invalid_returns_none() {
-        assert!(TrustedProxy::parse("not-an-ip").is_none());
-        assert!(TrustedProxy::parse("").is_none());
-        assert!(TrustedProxy::parse("10.0.0.0/33").is_none());
+        assert!(CidrRange::parse("not-an-ip").is_none());
+        assert!(CidrRange::parse("").is_none());
+        assert!(CidrRange::parse("10.0.0.0/33").is_none());
     }
 
     #[test]
     fn trusted_proxy_contains_ipv6() {
-        let proxy = TrustedProxy::parse("2001:db8::/32").unwrap();
+        let proxy = CidrRange::parse("2001:db8::/32").unwrap();
         assert!(proxy.contains("2001:db8:1234::1".parse().unwrap()));
         assert!(!proxy.contains("2001:db9::1".parse().unwrap()));
 
-        let proxy_exact = TrustedProxy::parse("2001:db8::1").unwrap();
+        let proxy_exact = CidrRange::parse("2001:db8::1").unwrap();
         assert!(proxy_exact.contains("2001:db8::1".parse().unwrap()));
         assert!(!proxy_exact.contains("2001:db8::2".parse().unwrap()));
     }
@@ -1137,7 +1133,7 @@ mod tests {
 #[cfg(test)]
 mod proptests {
     //! Property-based invariants for the private trusted-proxy parsers.
-    //! `TrustedProxy::parse` and `ProxyResolver::parse_forwarded_ip` are
+    //! `CidrRange::parse` and `ProxyResolver::parse_forwarded_ip` are
     //! private, so they are fuzzed in-crate here rather than from an
     //! integration test.
     use super::*;
@@ -1146,10 +1142,10 @@ mod proptests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
-        /// `TrustedProxy::parse` never panics on arbitrary input.
+        /// `CidrRange::parse` never panics on arbitrary input.
         #[test]
         fn parse_range_never_panics(s in ".*") {
-            let _ = TrustedProxy::parse(&s);
+            let _ = CidrRange::parse(&s);
         }
 
         /// A bare valid IP parses, and (per the CIDR contract) `contains`
@@ -1157,7 +1153,7 @@ mod proptests {
         #[test]
         fn parse_bare_ipv4_round_trips(a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>()) {
             let ip = std::net::Ipv4Addr::new(a, b, c, d);
-            let parsed = TrustedProxy::parse(&ip.to_string());
+            let parsed = CidrRange::parse(&ip.to_string());
             prop_assert!(parsed.is_some());
             let range = parsed.unwrap();
             prop_assert!(range.contains(std::net::IpAddr::V4(ip)));
@@ -1173,8 +1169,8 @@ mod proptests {
         ) {
             let ip = std::net::Ipv4Addr::new(a, b, c, d).to_string();
             let padded = format!("{pad}{ip}{pad}");
-            let bare = TrustedProxy::parse(&ip);
-            let padded_parsed = TrustedProxy::parse(&padded);
+            let bare = CidrRange::parse(&ip);
+            let padded_parsed = CidrRange::parse(&padded);
             prop_assert_eq!(bare.is_some(), padded_parsed.is_some());
         }
 
@@ -1183,7 +1179,7 @@ mod proptests {
         #[test]
         fn parse_rejects_over_wide_prefix(a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>(), prefix in 33u16..=255) {
             let s = format!("{a}.{b}.{c}.{d}/{prefix}");
-            prop_assert!(TrustedProxy::parse(&s).is_none());
+            prop_assert!(CidrRange::parse(&s).is_none());
         }
 
         /// `parse_forwarded_ip` never panics on arbitrary input.
