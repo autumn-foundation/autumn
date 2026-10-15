@@ -361,6 +361,11 @@ fn resolve_cooperative_stop_budget(package: Option<&str>) -> Duration {
     )
 )]
 fn stop_budget_in(base_dir: &Path, profile: &str) -> Duration {
+    // The app normalizes aliases and case (`development`, `DEV`), and `.env`
+    // loads by the normalized name. Do the same, or `.env` is skipped here.
+    let profile =
+        autumn_web::config::normalize_profile_name(profile).unwrap_or_else(|| "dev".to_owned());
+    let profile = profile.as_str();
     let denv: Box<dyn autumn_web::config::Env> =
         match autumn_web::dotenv::os_env_with_dotenv_in(base_dir, profile) {
             Ok(env) => Box::new(env),
@@ -2566,27 +2571,51 @@ mod tests {
 
     // ── `.env` comes from the selected package (#2444) ─────────────────────
 
-    #[test]
-    fn the_stop_budget_reads_dotenv_from_the_package_dir_not_the_cli_cwd() {
-        // A real shell variable wins over `.env`, and `AUTUMN_DOTENV` or the
-        // profile can turn `.env` loading off. Either would hide the effect.
-        if ["AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "AUTUMN_DOTENV"]
+    /// Whether the shell would hide a `.env` effect in these tests. A real
+    /// shell variable wins over `.env`, and `AUTUMN_DOTENV` can turn loading off.
+    fn the_shell_hides_dotenv_effects() -> bool {
+        ["AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "AUTUMN_DOTENV"]
             .iter()
             .any(|key| std::env::var_os(key).is_some())
-        {
-            return;
-        }
+    }
+
+    fn dotenv_dir_with_a_300s_timeout() -> tempfile::TempDir {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".env"),
             "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=300\n",
         )
         .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn the_stop_budget_reads_dotenv_from_the_package_dir_not_the_cli_cwd() {
+        if the_shell_hides_dotenv_effects() {
+            return;
+        }
+        let tmp = dotenv_dir_with_a_300s_timeout();
         let budget = stop_budget_in(tmp.path(), "dev");
         assert!(
             budget >= cooperative_stop_budget(300),
             "package .env must set the budget, got {budget:?}"
         );
+    }
+
+    #[test]
+    fn the_stop_budget_loads_dotenv_for_a_profile_alias() {
+        // The app treats `development` and `DEV` as `dev` and loads `.env`.
+        if the_shell_hides_dotenv_effects() {
+            return;
+        }
+        let tmp = dotenv_dir_with_a_300s_timeout();
+        for alias in ["development", "DEV", " dev "] {
+            let budget = stop_budget_in(tmp.path(), alias);
+            assert!(
+                budget >= cooperative_stop_budget(300),
+                "`{alias}` must load .env, got {budget:?}"
+            );
+        }
     }
 
     #[test]
