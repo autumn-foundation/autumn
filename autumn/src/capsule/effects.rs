@@ -1597,6 +1597,12 @@ pub fn body_bytes(body: &CapsuleBody) -> Vec<u8> {
 fn describe_http(method: &str, url: &str) -> String {
     let path = url.split_once('?').map_or(url, |(head, _)| head);
     let elided = if path.len() < url.len() { "?…" } else { "" };
+    // The live URL's userinfo is a credential, and this text reaches replay's
+    // JSON and terminal output, so it is dropped like the query string is.
+    let path = crate::capsule::redact::url_userinfo(path).map_or_else(
+        || path.to_owned(),
+        |userinfo| path.replacen(&format!("{userinfo}@"), "[FILTERED]@", 1),
+    );
     format!("{method} {path}{elided}")
 }
 
@@ -3552,5 +3558,11 @@ mod tests {
     fn base64_of(bytes: &[u8]) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn a_divergence_report_never_prints_url_userinfo() {
+        let described = super::describe_http("GET", "https://svc:hunter2pw@api.example/x?k=v");
+        assert_eq!(described, "GET https://[FILTERED]@api.example/x?…");
     }
 }
