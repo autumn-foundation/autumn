@@ -1662,8 +1662,52 @@ impl Analyzer {
                 if let Some(closure) = self.closures.get(&source).cloned() {
                     self.closures.insert(name.to_string(), closure);
                 }
+                if self.ambiguous_fns.contains(&source) {
+                    self.ambiguous_fns.insert(name.to_string());
+                }
             }
+            // A container of callables is named for them, so a member read
+            // out of it (`funcs.0`) or looped over keeps its meaning.
+            Expr::Tuple(t) => self.bind_container_callables(name, t.elems.iter()),
+            Expr::Array(a) => self.bind_container_callables(name, a.elems.iter()),
+            Expr::Repeat(rep) => self.bind_container_callables(name, [&*rep.expr]),
+            Expr::Struct(s) => {
+                self.bind_container_callables(name, s.fields.iter().map(|f| &f.expr));
+            }
+            Expr::Call(call) => self.bind_container_callables(name, call.args.iter()),
+            // `funcs.0` and `funcs[i]` are what `funcs` holds.
+            Expr::Field(f) => self.bind_callable(name, &f.base),
+            Expr::Index(i) => self.bind_callable(name, &i.expr),
             _ => {}
+        }
+    }
+
+    /// Name a container for the callables inside it. Two different effect
+    /// verbs in one container leave the name ambiguous.
+    fn bind_container_callables<'a>(
+        &mut self,
+        name: &str,
+        elements: impl IntoIterator<Item = &'a Expr>,
+    ) {
+        for element in elements {
+            let kept = self.fn_aliases.get(name).cloned();
+            self.bind_callable(name, element);
+            if let (Some(kept), Some(now)) = (kept, self.fn_aliases.get(name).cloned())
+                && path_string(&kept) != path_string(&now)
+            {
+                self.fn_aliases.remove(name);
+                self.ambiguous_fns.insert(name.to_string());
+            }
+        }
+    }
+
+    /// `for run in [tokio::spawn] { run(..) }`: the loop names each element.
+    fn bind_loop_callables(&mut self, pat: &Pat, iterated: &Expr) {
+        let mut names = HashSet::new();
+        collect_pat_idents(pat, &mut names);
+        let sources = iteration_elements(iterated);
+        for name in names {
+            self.bind_container_callables(&name, sources.iter());
         }
     }
 
@@ -2050,6 +2094,7 @@ impl Analyzer {
                 let handle = self.container_handle(&f.expr);
                 let saved = self.enter_binding_scope(&f.pat, handle.as_ref());
                 self.mark_pattern_unread(&f.pat, &f.expr);
+                self.bind_loop_callables(&f.pat, &f.expr);
                 self.block(&f.body);
                 self.leave_binding_scope(saved);
                 self.join_with(before);
@@ -2641,14 +2686,13 @@ impl Analyzer {
     /// A call through a name an earlier binding made a `spawn`, an ambiguous
     /// effect verb, or one effect verb. Returns whether it handled the call.
     fn call_through_alias(&mut self, call: &ExprCall) -> bool {
+        let Some(root) = callee_root(&call.func) else {
+            return false;
+        };
         // A name bound to `tokio::spawn` detaches exactly as the direct
         // spelling does.
-        if let Expr::Path(path) = strip_transparent(&call.func)
-            && let Some(ident) = path.path.get_ident()
-            && self.spawn_aliases.contains(&ident.to_string())
-        {
-            let alias = ident.to_string();
-            self.spawn_error(call.span(), &alias);
+        if self.spawn_aliases.contains(&root) {
+            self.spawn_error(call.span(), &root);
             return true;
         }
         if self.refuse_ambiguous_call(call) {
@@ -2656,11 +2700,8 @@ impl Analyzer {
         }
         // A name bound to an effect verb performs that verb; the alias is the
         // only thing at this call site that names it.
-        if let Expr::Path(path) = strip_transparent(&call.func)
-            && let Some(ident) = path.path.get_ident()
-            && let Some(aliased) = self.fn_aliases.get(&ident.to_string()).cloned()
-        {
-            self.aliased_effect(call, ident.to_string().as_str(), &aliased);
+        if let Some(aliased) = self.fn_aliases.get(&root).cloned() {
+            self.aliased_effect(call, root.as_str(), &aliased);
             return true;
         }
         false
@@ -2669,16 +2710,13 @@ impl Analyzer {
     /// A name bound to different effect verbs on different paths: which one
     /// runs cannot be read, so a call through it is refused.
     fn refuse_ambiguous_call(&mut self, call: &ExprCall) -> bool {
-        let Expr::Path(path) = strip_transparent(&call.func) else {
+        let Some(name) = callee_root(&call.func) else {
             return false;
         };
-        let Some(ident) = path.path.get_ident() else {
-            return false;
-        };
-        if !self.ambiguous_fns.contains(&ident.to_string()) {
+        if !self.ambiguous_fns.contains(&name) {
             return false;
         }
-        let (action, name) = (self.action.clone(), ident.to_string());
+        let action = self.action.clone();
         self.error(
             call.span(),
             format!(
@@ -4592,6 +4630,36 @@ fn tokens_contain_await(tokens: &TokenStream) -> bool {
         TokenTree::Group(group) => tokens_contain_await(&group.stream()),
         _ => false,
     })
+}
+
+/// The name a callee starts from: `run` for `run(..)`, and `funcs` for
+/// `(funcs.0)(..)` or `funcs[i](..)`.
+fn callee_root(func: &Expr) -> Option<String> {
+    match strip_transparent(func) {
+        Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+        Expr::Field(f) => callee_root(&f.base),
+        Expr::Index(i) => callee_root(&i.expr),
+        _ => None,
+    }
+}
+
+/// What a `for` loop hands its pattern, one expression per possible element.
+fn iteration_elements(iterated: &Expr) -> Vec<Expr> {
+    match strip_transparent(iterated) {
+        Expr::Array(a) => a.elems.iter().cloned().collect(),
+        Expr::Repeat(rep) => vec![(*rep.expr).clone()],
+        Expr::Reference(r) => iteration_elements(&r.expr),
+        Expr::MethodCall(mc)
+            if matches!(
+                mc.method.to_string().as_str(),
+                "iter" | "iter_mut" | "into_iter" | "drain" | "copied" | "cloned" | "rev"
+            ) =>
+        {
+            iteration_elements(&mc.receiver)
+        }
+        Expr::Macro(m) if m.mac.path.is_ident("vec") => vec_elements(&m.mac),
+        other => vec![other.clone()],
+    }
 }
 
 /// The values a `break` hands out of a block, at any depth. Deeper loops'
@@ -7424,7 +7492,7 @@ mod tests {
             ExpectedKind::Job,
             "ForbiddenJob",
             r"async fn h(c: bool, job: Job) -> R {
-                let mut f = std::convert::identity(AllowedJob::enqueue);
+                let mut f = make_fn();
                 if c { f = ForbiddenJob::enqueue; }
                 f(&payload).await?;
                 Ok(())
@@ -7555,6 +7623,36 @@ mod tests {
             r"async fn h() -> R {
                 let fut = match start_finance_job() { inner => inner };
                 fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias extracted from a tuple",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let funcs = (tokio::spawn,);
+                let run = funcs.0;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias called through a tuple member",
+            ExpectedKind::Rejected,
+            "funcs",
+            r"async fn h() -> R {
+                let funcs = (tokio::spawn,);
+                (funcs.0)(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias bound by a for loop",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                for run in [tokio::spawn] { run(async {}); }
                 Ok(())
             }",
         ),
