@@ -1994,13 +1994,14 @@ fn run_nonce() -> u128 {
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-fn state_dir_is_usable(dir: &Path) -> bool {
+fn state_dir_is_usable(dir: &Path, pid: u32, nonce: u128) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    let pid = std::process::id();
-    let temporary = dir.join(format!("dev-probe.{pid}.tmp"));
-    let renamed = dir.join(format!("dev-probe.{pid}"));
+    // The run nonce keeps a later run that got the same process id away from a
+    // probe file an earlier run left behind.
+    let temporary = dir.join(format!("dev-probe.{pid}.{nonce}.tmp"));
+    let renamed = dir.join(format!("dev-probe.{pid}.{nonce}"));
     let usable = std::fs::File::create(&temporary).is_ok()
         && std::fs::rename(&temporary, &renamed).is_ok()
         && std::fs::remove_file(&renamed).is_ok();
@@ -2058,7 +2059,7 @@ fn next_child_paths(
         let _ = std::fs::remove_file(previous.ready);
     }
     let dir = dir?;
-    if !state_dir_is_usable(dir) {
+    if !state_dir_is_usable(dir, pid, nonce) {
         return None;
     }
     let number = generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3151,7 +3152,7 @@ mod tests {
     fn a_writable_state_dir_is_usable_and_is_created_when_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("target").join("autumn");
-        assert!(state_dir_is_usable(&dir));
+        assert!(state_dir_is_usable(&dir, 7, 1));
         assert!(dir.is_dir());
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
@@ -3161,13 +3162,26 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_file_left_by_an_earlier_run_does_not_block_this_one() {
+        // A run that died mid-probe leaves its file. A later run with the same
+        // process id has another nonce, so it uses other names.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("dev-probe.7.1"), b"left behind").unwrap();
+        assert!(state_dir_is_usable(tmp.path(), 7, 2));
+        assert!(
+            tmp.path().join("dev-probe.7.1").exists(),
+            "the other run's file is not touched"
+        );
+    }
+
+    #[test]
     fn a_state_dir_that_cannot_exist_is_not_usable() {
         // `<target>/autumn` is a regular file, so nothing can live in it.
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("autumn");
         std::fs::write(&blocker, b"not a directory").unwrap();
-        assert!(!state_dir_is_usable(&blocker));
-        assert!(!state_dir_is_usable(&blocker.join("nested")));
+        assert!(!state_dir_is_usable(&blocker, 7, 1));
+        assert!(!state_dir_is_usable(&blocker.join("nested"), 7, 1));
     }
 
     #[test]
