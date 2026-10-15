@@ -168,7 +168,7 @@ listing every sink it is proven reachable to:
   "fields": [
     {
       "model": "Customer",
-      "model_path": "shop::models::customer::Customer",
+      "model_path": "shop::models::customer@2::Customer",
       "field": "email",
       "classification": "personal_data",
       "reachable_sinks": [
@@ -181,7 +181,7 @@ listing every sink it is proven reachable to:
     },
     {
       "model": "Order",
-      "model_path": "shop::models::order::Order",
+      "model_path": "shop::models::order@1::Order",
       "field": "card_number",
       "classification": "personal_data",
       "reachable_sinks": []
@@ -192,8 +192,13 @@ listing every sink it is proven reachable to:
 
 Rows are keyed on `model_path`, not the display name: two crates can each define
 a `Customer` with a classified `email`, and merging them into one row would hide
-one model's column behind the other's. The report prints the short name unless
-two rows share it.
+one model's column behind the other's. The path has the compatible version of
+the defining crate. `@2` means major version 2. `@0.8` means version 0.8 (a
+crate before 1.0). Two incompatible versions of one crate can link into one
+binary. They get separate rows. A patch release does not change the path.
+A crate before 0.1 is the exception: its path has the patch (`@0.0.2`).
+A prerelease has its full version in the path (`@1.0.0-alpha.1`). The
+report prints the short name unless two rows share it.
 
 An **empty `reachable_sinks` means no leak**: nothing in the binary declares a
 boundary for that column, and a boundary is the only way to a gated sink.

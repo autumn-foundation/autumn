@@ -1289,6 +1289,41 @@ that does not opt in behaves as before.
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### Data flow: manifest rows have a crate version in `model_path`
+
+**Why:** Two incompatible versions of one crate can link into one binary. They
+had the same `model_path`, so `autumn data-flow` merged their rows (issue
+#2375).
+
+**Before (`{X.Y}`):**
+
+```json
+"model_path": "shop::models::customer::Customer"
+```
+
+**After (`{(X+1).0}`):** the path has the compatible version of the defining
+crate. This is the major version. For a crate before 1.0 it is `0.minor`. For a
+crate before 0.1 it is `0.0.patch`. A prerelease is the full version. Other patch releases do not change it.
+
+```json
+"model_path": "shop::models::customer@2::Customer"
+```
+
+Make the manifest again. Commit it:
+
+```sh
+autumn data-flow --manifest data-flow-manifest.json
+```
+
+Until you do, `autumn data-flow --check` reports drift for each row. The
+`model` name is not changed. The report shows the full path only when two rows
+have the same `model` name.
+
+The path changes again when the major version of your own crate changes (or the
+minor version, before 1.0). Make the manifest again after such a release.
+
+**Automation:** `manual` - make the manifest again with the command above.
+
 ### Repository: dependent cascades probe first and `delete_many` hooks parents first
 
 **Why:** A dependent cascade must fire no hook when a `restrict` blocks it, and
