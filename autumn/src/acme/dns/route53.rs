@@ -480,10 +480,12 @@ fn next_zone_page(xml: &str, candidate: &str) -> Option<String> {
     if !xml_element(xml, "IsTruncated").is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
         return None;
     }
-    let wanted = format!("{}.", candidate.trim_end_matches('.').to_ascii_lowercase());
-    let name = xml_element(xml, "NextDNSName")?.trim().to_ascii_lowercase();
+    // AWS may omit the trailing dot in the cursor name.
+    let name = xml_element(xml, "NextDNSName")?
+        .trim()
+        .trim_end_matches('.');
     let id = xml_element(xml, "NextHostedZoneId")?.trim();
-    if name != wanted || !is_hosted_zone_id(id) {
+    if !name.eq_ignore_ascii_case(candidate.trim_end_matches('.')) || !is_hosted_zone_id(id) {
         return None;
     }
     Some(format!("&hostedzoneid={id}"))
@@ -1932,6 +1934,19 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("; "), "{err}");
+    }
+
+    /// #2478: a cursor name without the trailing dot still matches.
+    #[tokio::test]
+    async fn zone_lookup_matches_a_cursor_name_without_the_trailing_dot() {
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            &zone_page("ZPRIVATE", true, Some(("myapp.com", "ZNEXT"))),
+        )])
+        .then(ZONE_LOOKUP, 200, &zone_page("ZPUBLIC", false, None));
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        assert_eq!(provider.zone_id("myapp.com").await.unwrap(), "ZPUBLIC");
     }
 
     /// #2478: a cursor that differs in case still matches the name.
