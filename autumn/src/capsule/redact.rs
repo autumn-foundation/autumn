@@ -630,6 +630,13 @@ pub fn redact_effects(
     // (#2351 item 8).
     for (index, exchange) in effects.http.iter_mut().enumerate() {
         exchange.url = mask_echoes(&exchange.url, values);
+        if let Some(final_url) = exchange.final_url.as_mut() {
+            let masked = mask_echoes(final_url, values);
+            if masked != *final_url {
+                keys.insert(format!("http[{index}].final_url:<echo>"));
+            }
+            *final_url = masked;
+        }
         mask_body_echoes(&mut exchange.request_body, values);
         if mask_body_echoes(&mut exchange.response_body, values) {
             keys.insert(format!("http[{index}].response_body:<echo>"));
@@ -804,21 +811,41 @@ fn mask_url_userinfo(
         return url.to_owned();
     }
     keys.insert(format!("{location}:userinfo"));
+    record_userinfo_components(userinfo, values);
+    format!("{scheme}://{FILTERED_PLACEHOLDER}@{host}{tail}")
+}
+
+/// The `user:password` of an absolute URL's authority, if it has one.
+pub(crate) fn url_userinfo(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, _) = rest.get(..end)?.rsplit_once('@')?;
+    (!userinfo.is_empty()).then_some(userinfo)
+}
+
+/// Retain a URL's userinfo, its user and its password, in the raw spelling and
+/// the percent-decoded *bytes* (a decoded credential need not be UTF-8), plus
+/// the lossy text spelling free-form messages quote. Capture and replay both
+/// call this so they agree on what was masked.
+pub(crate) fn record_userinfo_components(userinfo: &str, values: &mut RedactedValues) {
     let mut retain = |part: &str| {
         if part.is_empty() {
             return;
         }
         values.insert(part.as_bytes());
-        let decoded = percent_encoding::percent_decode_str(part).decode_utf8_lossy();
-        if decoded != part {
-            values.insert(decoded.as_bytes());
+        let decoded: Vec<u8> = percent_encoding::percent_decode_str(part).collect();
+        if decoded != part.as_bytes() {
+            values.insert(&decoded);
+            let lossy = String::from_utf8_lossy(&decoded);
+            if lossy.as_bytes() != decoded.as_slice() {
+                values.insert(lossy.as_bytes());
+            }
         }
     };
     retain(userinfo);
     let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
     retain(user);
     retain(password);
-    format!("{scheme}://{FILTERED_PLACEHOLDER}@{host}{tail}")
 }
 
 /// Mask the query string of a recorded outbound URL by parameter name.
@@ -2154,6 +2181,30 @@ mod tests {
                     .any(|key| key.contains("http[0].request_header:x-api-key")),
                 "{keys:?}"
             );
+        }
+
+        #[test]
+        fn url_userinfo_is_masked_and_echoed_in_the_redirect_target() {
+            let mut hit = exchange("https://svc:hunter2pw@api.example/start");
+            hit.final_url = Some("https://api.example/error/hunter2pw".to_owned());
+            let mut effects = CapsuleEffects {
+                http: vec![hit],
+                ..CapsuleEffects::default()
+            };
+            let keys = redact(&mut effects);
+            let hit = effects.http.first().expect("one exchange");
+            assert_eq!(hit.url, "https://[FILTERED]@api.example/start");
+            let final_url = hit.final_url.as_deref().expect("final url");
+            assert!(!final_url.contains("hunter2pw"), "{final_url}");
+            assert!(keys.contains("http[0].url:userinfo"), "{keys:?}");
+            assert!(keys.contains("http[0].final_url:<echo>"), "{keys:?}");
+        }
+
+        #[test]
+        fn url_userinfo_retains_the_decoded_bytes_of_a_non_utf8_credential() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc:%FFsecret", &mut values);
+            assert!(values.contains(b"\xffsecret"));
         }
 
         #[test]

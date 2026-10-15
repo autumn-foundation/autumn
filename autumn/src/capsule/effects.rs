@@ -626,7 +626,7 @@ impl ReplayEffects {
             drop(seam);
             // The URL matched: learn what its masked values stood for before
             // the report prints the live URL.
-            self.observe_text(&recorded_url, url);
+            self.observe_url(&recorded_url, url);
             let actual = describe_http(method, url);
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Http,
@@ -645,7 +645,7 @@ impl ReplayEffects {
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
         if let Some(recorded) = served.as_ref() {
-            self.observe_text(&recorded.url, url);
+            self.observe_url(&recorded.url, url);
             self.observe_headers(&recorded.request_headers, request.headers);
             self.observe_body(&recorded.request_body, request.body);
         }
@@ -1311,6 +1311,18 @@ impl ReplayEffects {
                     }
                 }
             }
+        }
+    }
+
+    /// [`Self::observe_text`] for a URL, which also decomposes a masked
+    /// userinfo the way capture retained it (user, password, decoded forms).
+    fn observe_url(&self, recorded: &str, actual: &str) {
+        self.observe_text(recorded, actual);
+        if recorded.contains("://[FILTERED]@")
+            && let Some(userinfo) = crate::capsule::redact::url_userinfo(actual)
+            && let Ok(mut observed) = self.observed.lock()
+        {
+            crate::capsule::redact::record_userinfo_components(userinfo, &mut observed);
         }
     }
 
