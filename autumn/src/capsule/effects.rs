@@ -1599,10 +1599,7 @@ fn describe_http(method: &str, url: &str) -> String {
     let elided = if path.len() < url.len() { "?…" } else { "" };
     // The live URL's userinfo is a credential, and this text reaches replay's
     // JSON and terminal output, so it is dropped like the query string is.
-    let path = crate::capsule::redact::url_userinfo(path).map_or_else(
-        || path.to_owned(),
-        |userinfo| path.replacen(&format!("{userinfo}@"), "[FILTERED]@", 1),
-    );
+    let path = crate::capsule::redact::hide_url_userinfo(path);
     format!("{method} {path}{elided}")
 }
 

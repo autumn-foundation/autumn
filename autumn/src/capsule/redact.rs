@@ -837,6 +837,21 @@ pub(crate) fn url_userinfo(url: &str) -> Option<&str> {
     (!userinfo.is_empty()).then_some(userinfo)
 }
 
+/// `url` with its userinfo replaced by the placeholder, for text that reaches
+/// replay output (divergence reports, blocked-call errors).
+pub(crate) fn hide_url_userinfo(url: &str) -> String {
+    url_userinfo(url).map_or_else(
+        || url.to_owned(),
+        |userinfo| {
+            url.replacen(
+                &format!("{userinfo}@"),
+                &format!("{FILTERED_PLACEHOLDER}@"),
+                1,
+            )
+        },
+    )
+}
+
 /// Retain a URL's userinfo, its user and its password, in the raw spelling and
 /// the percent-decoded *bytes* (a decoded credential need not be UTF-8), plus
 /// the lossy text spelling free-form messages quote. Capture and replay both
