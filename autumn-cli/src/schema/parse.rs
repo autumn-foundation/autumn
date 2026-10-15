@@ -816,6 +816,25 @@ impl DisabledModules {
     }
 }
 
+/// `path` with `.` and `..` folded away, without touching the file system. A
+/// `#[path = "a/../b.rs"]` then compares equal to the walked file `b.rs`.
+fn normalize_lexically(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 struct ModulePaths {
     disabled: Vec<std::path::PathBuf>,
@@ -854,7 +873,7 @@ fn collect_module_paths(
                     dir.join(module.ident.to_string()),
                 ]
             },
-            |custom| vec![path_base.join(custom)],
+            |custom| vec![normalize_lexically(&path_base.join(custom))],
         )
     };
     for item in items {
@@ -2762,6 +2781,33 @@ mod tests {
         .unwrap();
         let found = parse_encrypted_columns_path(dir.path()).unwrap();
         assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A `#[path]` with `..` still names the walked file.
+    #[test]
+    fn encrypted_columns_skip_a_test_file_named_by_a_dotdot_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"nested/../fixtures.rs\"] mod fixtures;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+        assert_eq!(
+            normalize_lexically(Path::new("/a/./b/../c")),
+            Path::new("/a/c")
+        );
     }
 
     /// A module nested in a disabled inline module is disabled too.

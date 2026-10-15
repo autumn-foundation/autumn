@@ -5065,14 +5065,14 @@ const PUBLIC_BASE_TABLES: &str = "SELECT rel.relname AS name FROM pg_class rel \
 /// name, event bits and enabled state. A table-name set cannot see a second
 /// trigger added to a table that already has one.
 const TRIGGER_IDENTITIES: &str = "SELECT rel.relname || ':trigger:' || t.tgname || ':' || t.tgtype::text \
-         || ':' || t.tgenabled::text AS name \
+         || ':' || t.tgenabled::text || ':' || md5(pg_get_triggerdef(t.oid)) AS name \
      FROM pg_trigger t \
      JOIN pg_class rel ON rel.oid = t.tgrelid \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE NOT t.tgisinternal \
      UNION ALL \
      SELECT rel.relname || ':rule:' || r.rulename || ':' || r.ev_type::text \
-         || ':' || r.ev_enabled::text AS name \
+         || ':' || r.ev_enabled::text || ':' || md5(pg_get_ruledef(r.oid)) AS name \
      FROM pg_rewrite r \
      JOIN pg_class rel ON rel.oid = r.ev_class \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
@@ -9092,6 +9092,8 @@ mod tests {
 
     #[test]
     fn the_matview_snapshot_changes_when_a_view_is_recreated() {
+        assert!(TRIGGER_IDENTITIES.contains("pg_get_triggerdef"));
+        assert!(TRIGGER_IDENTITIES.contains("pg_get_ruledef"));
         assert!(PUBLIC_MATVIEWS.contains("rel.oid"));
         assert!(PUBLIC_MATVIEWS.contains("pg_get_viewdef"));
     }
