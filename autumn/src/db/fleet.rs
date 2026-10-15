@@ -4130,11 +4130,6 @@ mod tests {
         }
     }
 
-    /// Bound for "is not stuck" checks. A real hang still trips it. A slow
-    /// Windows runner, which builds a database and runs its migrations in
-    /// this time, does not.
-    const NOT_STUCK: Duration = Duration::from_secs(30);
-
     /// Cancel `call` after `after`, as a request timeout does.
     async fn cancelled<T>(after: Duration, call: impl Future<Output = T>) {
         assert!(
