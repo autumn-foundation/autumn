@@ -18,7 +18,7 @@ autumn_web::app()
     .await;
 ```
 
-In production, the Postgres-backed store persists assignments across restarts. Replicas that run `PgExperimentStore::spawn_poll_listener` poll for weight changes:
+In production, the Postgres-backed store persists assignments across restarts. Replicas that run `PgExperimentStore::spawn_poll_listener` refresh their experiment snapshot on each interval:
 
 ```sh
 autumn migrate          # creates autumn_experiments, autumn_experiment_assignments, etc.
@@ -52,7 +52,7 @@ use autumn_web::experiments::Experiments;
 
 #[get("/checkout")]
 async fn checkout(exps: Experiments) -> AutumnResult<Markup> {
-    let variant = exps.assign("checkout_v2")?;
+    let variant = exps.assign_async("checkout_v2").await?;
     Ok(html! {
         @match variant.as_str() {
             "treatment" => (render_new_checkout()),
@@ -65,8 +65,13 @@ async fn checkout(exps: Experiments) -> AutumnResult<Markup> {
 Or use the service directly with an explicit actor:
 
 ```rust
-let variant = experiments.assign("checkout_v2", "user:42")?;
+let variant = experiments.assign_async("checkout_v2", "user:42", None).await?;
 ```
+
+`assign_async` runs the lookup on Tokio's blocking pool. Use it in async
+handlers. `assign` is the same call without the pool. With a Postgres store it
+can block the worker on a database connect, so use it only in sync code, tests
+and tools.
 
 ---
 
@@ -283,3 +288,20 @@ assert_eq!(variant, again);
 - **Client-side delivery**: server-rendered assignment only.
 - **Multi-armed bandits**: fixed-weight experiments only.
 - **Cross-experiment causal inference**: use mutual exclusion groups for isolation.
+
+---
+
+## Store failures
+
+`PgExperimentStore` keeps all experiment configs in memory. A config read does
+not connect to the database on the request thread. When the snapshot is older
+than the TTL (default 1 second), the store refreshes it on Tokio's blocking
+pool and returns the last-known value without waiting. `AppBuilder::with_experiment_store`
+loads the snapshot at startup.
+
+When the database fails, the last-known configs stay in use. The store logs a
+warning and counts the error (`PgExperimentStore::refresh_errors`). Before the
+first load, a read returns an error.
+
+Per-actor lookups (override, sticky assignment) are not in the snapshot. They
+connect to the database, so call `assign_async` in async handlers.

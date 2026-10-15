@@ -1972,6 +1972,11 @@ backend-conditionally rather than assuming Postgres.
   only on `Ok(None)`. A store error serves last-known values; set a fallback
   with `FeatureFlagService::with_default` and register it with
   `AppBuilder::with_flag_service`.
+- `PgExperimentStore` works the same way (issue #3262): `get` reads a snapshot
+  and never connects on a Tokio worker. In async handlers, call
+  `Experiments::assign_async` (or `ExperimentService::assign_async`), not
+  `assign`: the per-actor lookups still connect, and `assign_async` runs them
+  on the blocking pool.
 - `DatabaseConfig::effective_primary_postgres_url()` is the screen to branch on
   (`effective_primary_url()` returns the target whatever backend it names).
 - `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite`

@@ -2341,6 +2341,13 @@ jobs:
             --test integration_tests -- --ignored idempotency_ \
             | tee "$RUNNER_TEMP/idempotency-pg-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-cov.log"
+          # Issue #3262: the Postgres experiment store's snapshot, refresh and
+          # write paths run only in these Docker tests of the consolidated
+          # binary. A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored experiments_pg_integration:: \
+            | tee "$RUNNER_TEMP/experiments-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/experiments-pg-cov.log"
           # Issue #2875: the Postgres tracking store's database-clock expiry
           # runs only in these Docker tests. Check the count: a filter that
           # matches nothing exits 0.
