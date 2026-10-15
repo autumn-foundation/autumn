@@ -130,19 +130,22 @@ GENERATED_FLAVORS=(
 # `cargo deny check advisories` against the `deny.toml` it ships (issue #2466).
 # This audits what a user's first CI run audits:
 #
-#   - the app's own root manifest (`maud`, `diesel_migrations`, ...),
+#   - the app's own root manifest,
 #   - a fresh lockfile resolved from crates.io, not the workspace lock,
 #   - dev-dependencies (cargo-deny includes them by default).
 #
-# The one deliberate difference: `autumn-web` is patched to this checkout, so
-# the gate covers the release in flight. The published crate may not exist yet.
-# The patch changes where autumn-web comes from, not how its dependencies
-# resolve.
+# One difference: `autumn-web` is patched to this checkout. The gate then
+# covers the release in flight. The published crate may not exist yet.
 #
-# Cost: one `cargo fetch` per flavor. Set AUTUMN_BIN to reuse a built CLI.
+# Cost: one CLI build, plus a `cargo fetch` and an audit per flavor.
+# Set AUTUMN_BIN to skip the build.
 audit_generated_apps() {
-  local root work flags name index=0
+  local root work flags name autumn_bin="" index=0
   root="$(pwd)"
+  if [ -n "${AUTUMN_BIN:-}" ]; then
+    # Absolute, because the CLI runs from a temp dir.
+    autumn_bin="$(cd "$(dirname "${AUTUMN_BIN}")" && pwd)/$(basename "${AUTUMN_BIN}")"
+  fi
   work="$(mktemp -d)"
   # shellcheck disable=SC2064  # expand $work now, not at trap time
   trap "rm -rf '${work}'" RETURN
@@ -152,8 +155,8 @@ audit_generated_apps() {
     name="advisory-app-${index}"
     log "generated app advisories (autumn new ${flags:-<default>})"
     # shellcheck disable=SC2086  # flags are a word list on purpose
-    if [ -n "${AUTUMN_BIN:-}" ]; then
-      ( cd "${work}" && "${AUTUMN_BIN}" new "${name}" ${flags} >/dev/null )
+    if [ -n "${autumn_bin}" ]; then
+      ( cd "${work}" && "${autumn_bin}" new "${name}" ${flags} >/dev/null )
     else
       ( cd "${work}" && cargo run -q --manifest-path "${root}/Cargo.toml" \
           -p autumn-cli --bin autumn -- new "${name}" ${flags} >/dev/null )
@@ -165,6 +168,12 @@ autumn-web = { path = "${root}/autumn" }
 TOML
     (
       cd "${work}/${name}"
+      # The app pins its toolchain, as it does in a user's CI. rustup 1.28
+      # does not install a missing one on its own.
+      toolchain="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null)"
+      if [ -n "${toolchain}" ] && command -v rustup >/dev/null 2>&1; then
+        rustup toolchain install --profile minimal "${toolchain}" >/dev/null
+      fi
       cargo fetch
       cargo deny --offline check advisories
     )

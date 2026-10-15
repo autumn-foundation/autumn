@@ -450,9 +450,9 @@ embedded-Postgres build stack) — and only that flavor gets it, so cargo-deny's
 waivers has gone stale.
 
 Those waivers are why a freshly scaffolded app's CI is green on day one instead
-of red on the first push. Autumn's own CI re-audits autumn-web's dependency tree
-against that exact policy on every run, so the shipped waiver set cannot quietly
-stop covering what the scaffold ships.
+of red on the first push. Autumn's CI generates each app flavor and audits it with
+that policy on every run. The shipped waiver set cannot stop covering the
+scaffold without a red build.
 
 Never disable the gate to get green. `continue-on-error: true`, `|| true`, and
 deleting the step all turn a security control into a decoration. Autumn's own
@@ -492,10 +492,11 @@ unwaived advisory sits in the tree being published:
 Five graphs, because "the dependency tree" means five different things here.
 The third pass generates every `autumn new` flavor with the CLI in this
 checkout. It then runs `cargo deny check advisories` inside each app, against
-the `deny.toml` that app ships. That is what your first CI run does: the same
-root manifest, the same dev-dependencies, and a fresh lockfile from crates.io.
-One difference: `autumn-web` is patched to the checkout, so the gate covers the
-release in flight. Cost: one `cargo fetch` per flavor.
+the `deny.toml` that app ships. This is what your first CI run audits: the same
+root manifest, the same dev-dependencies and a fresh lockfile from crates.io.
+One difference: the gate patches `autumn-web` to this checkout. It therefore
+audits the release in flight. Cost: a CLI build, plus one `cargo fetch` and one
+audit per flavor.
 
 The other two are satellite graphs *inside this repo*, not your app's
 concern: `fuzz/` and `examples/island-flock/` are each their own excluded
@@ -716,7 +717,7 @@ them. Doctor reads that path and ages it the same way.
 | `autumn doctor --json` | …as machine-readable output, ids and severities included. |
 | `cargo deny fetch db` | Refresh the RustSec advisory database doctor reads. |
 | `cargo deny check advisories` | Is anything in this tree known-vulnerable? (reads `deny.toml`) |
-| `./scripts/check-advisories.sh` | …for Autumn's own graphs, and for the app scaffold's. |
+| `./scripts/check-advisories.sh` | …for Autumn's own graphs, and for every generated app. |
 | `./scripts/check-advisories.sh --self-test` | Can that gate still reject a known CVE? |
 | `gh attestation verify F --repo O/R` | Did `O/R`'s CI build exactly these bytes? |
 

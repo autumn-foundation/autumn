@@ -626,8 +626,8 @@ fn the_gate_audits_real_generated_apps() {
     );
 }
 
-/// The generated flavors the gate audits must match every flavor
-/// `autumn new` can produce, so a new flavor cannot ship unaudited.
+/// The gate must audit every flavor in `scaffold_flavors()`. Add a new
+/// flavor to both lists.
 #[test]
 fn the_gate_audits_every_scaffold_flavor() {
     let audited = gate_generated_flavors();
@@ -672,8 +672,12 @@ fn gate_generated_flavors() -> Vec<String> {
         .and_then(|rest| rest.split("\n)").next())
         .unwrap_or_else(|| panic!("the gate must declare GENERATED_FLAVORS:\n{script}"));
     body.lines()
-        .map(|line| line.trim().trim_matches('"').to_owned())
-        .filter(|line| !line.starts_with('#'))
+        .map(str::trim)
+        .filter(|line| line.starts_with('"'))
+        .map(|line| {
+            let end = line[1..].find('"').map_or(line.len(), |at| at + 1);
+            line[1..end].to_owned()
+        })
         .collect()
 }
 

@@ -886,12 +886,10 @@ jobs:
       - uses: taiki-e/install-action@v2.87.20
         with:
           tool: cargo-deny@0.20.2
-      # Advisories go through the shared gate (issue #1600) so PR CI, the
-      # publish gate and a local run are literally the same check: the
-      # workspace graph, the SQLite backend graph, and every `autumn new`
-      # flavor, generated and audited with its own `deny.toml` (#2466). It
-      # retries the advisory-database fetch and fails closed if
-      # the database stays unreachable.
+      # The shared gate (issue #1600) makes PR CI, the publish gate and a local
+      # run the same check. It audits the workspace graph, the SQLite graph and
+      # every `autumn new` flavor (#2466). It retries the advisory-database
+      # fetch. It fails closed if the database stays unreachable.
       - name: Dependency advisory gate
         run: ./scripts/check-advisories.sh
       # A gate nobody has watched fail is indistinguishable from one that no
