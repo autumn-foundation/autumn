@@ -603,14 +603,22 @@ fn cascade_levels(config: &RepoConfig, pg_name: &Ident) -> TokenStream {
         .filter(|dep| dep.action != DependentAction::Restrict)
     {
         let child = &dep.child_repo;
+        // `crate::models::PgNodeRepository` is this repository too.
+        if child.segments.last().is_some_and(|s| s.ident == *pg_name) {
+            continue;
+        }
         let rendered = quote!(#child).to_string();
-        if child.is_ident(pg_name) || legs.iter().any(|l| l.child.to_string() == rendered) {
+        let destroy = dep.action == DependentAction::Destroy;
+        // One child can appear in several clauses. The runtime runs each, so
+        // the child's own cascade counts if any clause destroys.
+        if let Some(seen) = legs.iter_mut().find(|l| l.child.to_string() == rendered) {
+            seen.destroy |= destroy;
             continue;
         }
         legs.push(CascadeLeg {
             model: quote! { #child::__AUTUMN_MODEL_IDENT },
             child: quote! { #child },
-            destroy: dep.action == DependentAction::Destroy,
+            destroy,
         });
     }
     level_consts(any_const(&legs), &|k| cascade_level(&legs, k))
@@ -23377,6 +23385,41 @@ mod tests {
         assert!(
             !generated.contains("PgAuditRepository :: __AUTUMN_MODEL_IDENT"),
             "restrict writes nothing: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_later_destroy_clause_keeps_the_childs_own_cascade() {
+        // `nullify` first, `destroy` second, one child. The runtime runs both,
+        // so the child's own cascade must be listed.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgCommentRepository, fk = "editor_id", on_delete = destroy)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_path_to_itself_does_not_name_itself() {
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                dependent(crate::models::PgCommentRepository, fk = "parent_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE"),
+            "{generated}"
         );
     }
 

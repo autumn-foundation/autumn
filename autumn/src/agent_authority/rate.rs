@@ -45,6 +45,10 @@ struct Bucket {
 }
 
 /// One token bucket per grant, keyed by its name and declaration site.
+///
+/// Two crates that declare a grant with one name at one `file:line` share a
+/// bucket. A grant shared by several crates needs one bucket, so the key has
+/// no crate part.
 #[derive(Debug, Default)]
 pub struct RateLimiter {
     buckets: Mutex<HashMap<String, Bucket>>,

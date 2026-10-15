@@ -50,6 +50,7 @@
 //! See `docs/guide/agent-authority.md`.
 
 pub mod manifest;
+#[cfg(feature = "mcp")]
 pub(crate) mod rate;
 
 use serde::{Deserialize, Serialize};
