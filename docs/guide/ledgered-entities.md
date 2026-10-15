@@ -203,11 +203,77 @@ Some consequences worth knowing:
 - If a snapshot does not decode into the current model, `ledger_as_of` and
   `ledger_diff` return `LedgerError::SnapshotSchemaMismatch`. This is not tamper
   evidence. To read old revisions after adding a required field, put
-  `#[serde(default)]` on it. Run `ledger_verify` to rule out an edit. The ledger does not
-  convert renamed fields or changed types yet.
+  `#[serde(default)]` on it. For a renamed or retyped field, set a schema
+  version and an upcast function. See
+  [Changing a model's shape](#changing-a-models-shape). Run `ledger_verify` to
+  rule out an edit.
 - A field added as `Option<T>` needs no attribute. An old snapshot without it
   reads as `None`. `ledger_diff` shows no change for that field until a
   revision sets it. This does not hold with `skip_serializing_if`.
+
+## Changing a model's shape
+
+A revision keeps the columns the model had when the revision was written. After
+you change the model, `ledger_as_of` and `ledger_diff` must still read it.
+
+- **Add a field.** Use `Option<T>`, or add `#[serde(default)]`. An old revision
+  reads the default. Also raise the schema version. See the verify rule below.
+- **Rename or retype a field.** Raise the schema version. Write an upcast
+  function that converts an old snapshot:
+
+```rust
+#[repository(Invoice, soft_delete, ledgered(schema_version = 2, upcast = upcast_invoice))]
+pub trait InvoiceRepository {}
+
+// Version 1 called `title` `subject`.
+fn upcast_invoice(from_version: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+    if from_version < 2 {
+        let object = snapshot.as_object_mut().ok_or("the snapshot is not an object")?;
+        if let Some(subject) = object.remove("subject") {
+            object.insert("title".to_string(), subject);
+        }
+    }
+    Ok(())
+}
+```
+
+How it works:
+
+- A model at schema version 2 or more writes `"$schema_version": N` into each new
+  snapshot. The revision hash covers it, so an edit to it breaks the chain. A
+  snapshot without the key is version 1. A model at version 1 writes no key, so
+  existing chains keep their hashes. `ledger_revisions` returns the snapshot
+  as stored, key included.
+- The ledger calls your function only for a snapshot older than the current
+  version. The function gets the version the revision was written at. It must
+  handle every version below `N`. The model then reads the converted snapshot
+  with its usual rules, so `#[serde(default)]` still fills a new field. A
+  function that panics gives the same error as one that returns an error.
+- `schema_version = 0`, and `upcast` without `schema_version = 2` or more, are
+  compile errors.
+- If the function returns an error, `ledger_as_of` and `ledger_diff` return
+  `LedgerError::SnapshotSchemaMismatch` with your message. This is not tamper
+  evidence.
+- A revision written by a newer model, for example after a rollback, is not
+  converted. If the model can still decode it, the ledger reads it. If not, the
+  error names both versions.
+- `ledger_diff` converts both revisions to the current shape before it compares
+  them. It shows only real changes. A renamed field is not a change.
+
+How `ledger_verify` treats a schema change:
+
+- It converts the head revision with your function. Then it compares the head
+  with the live row.
+- If the head is older than the model's schema version, it compares only the
+  columns that both have. A column that the head never recorded is not compared.
+  The next write records it. So a deploy does not cause a `LiveStateMismatch`
+  report. **Raise the schema version when you add a column.** Without this, a
+  record whose head predates the column reports `LiveStateMismatch`.
+- If the head is at the model's schema version, the comparison is strict. A
+  column that the head lacks is a difference. This keeps an out-of-band edit to
+  such a column visible.
+- If your function fails on the head, `ledger_verify` skips the live check and
+  writes a warning to the log. The hash chain is still checked.
 
 ## Bitemporality
 

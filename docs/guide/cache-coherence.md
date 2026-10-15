@@ -605,7 +605,13 @@ tell "we checked and it was fine" from "we never looked".
   `#[repository(..., dependent(...))]` cascade **is** covered: it registers a
   write against the child model it deletes or nullifies, resolved from that
   child repository's own published model rather than guessed from its type name
-  (`on_delete = restrict` is excluded — it probes and never writes). But
+  (`on_delete = restrict` is excluded — it probes and never writes). A cascade
+  that reaches further `destroy` cascades is also covered. The audit follows
+  each child's own `dependent(...)` list at link time. A root delete registers
+  a write for every model below it. The root must declare an edge for each one.
+  The audit matches repositories by trait name. Two traits with the same name
+  count as one. `nullify` and `delete_all` write one table, so the audit does
+  not follow them further. But
   `#[has_many(Child, dependent = destroy)]` and
   `#[belongs_to(Parent, counter_cache)]` are declared on the model, which
   `#[repository]` cannot see, so the writes they cause carry no descriptor.

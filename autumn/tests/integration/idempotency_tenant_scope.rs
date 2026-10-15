@@ -22,7 +22,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_web::config::AutumnConfig;
-use autumn_web::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
+use autumn_web::idempotency::{
+    IdempotencyEntry, IdempotencyFuture, IdempotencyLayer, IdempotencyRecord, IdempotencyStore,
+    MemoryIdempotencyStore,
+};
 use autumn_web::session::{
     MemoryStore as SessionMemoryStore, Session, SessionConfig, SessionLayer, SessionStore,
 };
@@ -385,4 +388,241 @@ async fn manually_composed_stack_uses_finalized_tenant_after_switch() {
         "a retry after an org switch must replay through a manually composed SessionLayer + \
          tenancy_middleware + IdempotencyLayer stack too, not just AppBuilder's"
     );
+}
+
+/// Session store whose `save` pauses after it persists. A test can then send a
+/// request while the first response is in its commit step.
+#[derive(Clone)]
+struct GatedSaveStore {
+    inner: Arc<SessionMemoryStore>,
+    saved: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+    gated: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SessionStore for GatedSaveStore {
+    async fn load(
+        &self,
+        id: &str,
+    ) -> Result<
+        Option<std::collections::HashMap<String, String>>,
+        autumn_web::session::SessionStoreError,
+    > {
+        self.inner.load(id).await
+    }
+
+    async fn save(
+        &self,
+        id: &str,
+        data: std::collections::HashMap<String, String>,
+    ) -> Result<(), autumn_web::session::SessionStoreError> {
+        self.inner.save(id, data).await?;
+        // Only the first save pauses; later requests pass through.
+        if self.gated.swap(false, Ordering::SeqCst) {
+            self.saved.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(())
+    }
+
+    async fn destroy(&self, id: &str) -> Result<(), autumn_web::session::SessionStoreError> {
+        self.inner.destroy(id).await
+    }
+}
+
+static GATED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+async fn gated_switch_handler(session: Session) -> String {
+    let calls = GATED_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    session.insert("tenant_id", "org-b").await;
+    format!("switched-{calls}")
+}
+
+/// Issue #2455: a request can arrive between `store.save` and the idempotency
+/// commit. It has the same unrotated cookie and resolves the new tenant.
+/// Nothing locked that alias key, so the handler ran twice.
+#[tokio::test]
+async fn concurrent_retry_during_session_commit_does_not_rerun_handler() {
+    GATED_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    "session".clone_into(&mut config.tenancy.source);
+    let state = AppState::for_test();
+    state.insert_extension(config);
+
+    let inner = SessionMemoryStore::new();
+    let mut seed = std::collections::HashMap::new();
+    seed.insert("tenant_id".to_owned(), "org-a".to_owned());
+    inner.save("gated-session", seed).await.expect("seed");
+    let saved = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let store = GatedSaveStore {
+        inner: Arc::new(inner),
+        saved: Arc::clone(&saved),
+        resume: Arc::clone(&resume),
+        gated: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+
+    let idempotency_store: Arc<dyn IdempotencyStore> = Arc::new(MemoryIdempotencyStore::new(
+        std::time::Duration::from_secs(60),
+    ));
+    let app = axum::Router::new()
+        .route("/switch-org", axum::routing::post(gated_switch_handler))
+        .layer(IdempotencyLayer::new(idempotency_store))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tenancy_middleware,
+        ))
+        .layer(
+            SessionLayer::new(store, SessionConfig::default())
+                .with_tenancy_session_key(Some(Arc::from("tenant_id"))),
+        );
+    let request = || {
+        axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/switch-org")
+            .header("idempotency-key", "gated-key")
+            .header("cookie", "autumn.sid=gated-session")
+            .body(Body::empty())
+            .expect("request must build")
+    };
+
+    let first = tokio::spawn(app.clone().oneshot(request()));
+    tokio::time::timeout(std::time::Duration::from_secs(10), saved.notified())
+        .await
+        .expect("first save must start");
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(10), app.oneshot(request()))
+        .await
+        .expect("second request must not hang")
+        .unwrap();
+    resume.notify_one();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), first)
+        .await
+        .expect("first request must finish")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        second.status(),
+        axum::http::StatusCode::CONFLICT,
+        "a request during the commit must wait, not run"
+    );
+    assert_eq!(
+        GATED_HANDLER_CALLS.load(Ordering::SeqCst),
+        1,
+        "the handler must run once"
+    );
+    assert_eq!(first.status(), axum::http::StatusCode::OK);
+}
+
+/// Idempotency store that refuses every lock after the first. The first lock
+/// is the request's primary key. The second is the session alias key.
+struct RefuseAliasLockStore {
+    inner: MemoryIdempotencyStore,
+    locks: AtomicUsize,
+}
+
+impl IdempotencyStore for RefuseAliasLockStore {
+    fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+        self.inner.get(key)
+    }
+
+    fn set<'a>(
+        &'a self,
+        key: &'a str,
+        owner: &'a str,
+        record: IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: std::time::Duration,
+    ) -> IdempotencyFuture<'a, bool> {
+        self.inner.set(key, owner, record, body_hash, ttl)
+    }
+
+    fn try_lock<'a>(
+        &'a self,
+        key: &'a str,
+        owner: &'a str,
+        lock_ttl: std::time::Duration,
+    ) -> IdempotencyFuture<'a, bool> {
+        if self.locks.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Box::pin(std::future::ready(Ok(false)));
+        }
+        self.inner.try_lock(key, owner, lock_ttl)
+    }
+
+    fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+        self.inner.unlock(key, owner)
+    }
+}
+
+static REFUSED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+async fn refused_switch_handler(session: Session) -> String {
+    let calls = REFUSED_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    session.insert("tenant_id", "org-b").await;
+    format!("switched-{calls}")
+}
+
+/// If the alias lock fails, the response is `503`. The session stays
+/// unsaved, and the handler does not run again.
+#[tokio::test]
+async fn alias_lock_failure_returns_503_and_keeps_the_old_session() {
+    REFUSED_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    "session".clone_into(&mut config.tenancy.source);
+    let state = AppState::for_test();
+    state.insert_extension(config);
+
+    let session_store = SessionMemoryStore::new();
+    let mut seed = std::collections::HashMap::new();
+    seed.insert("tenant_id".to_owned(), "org-a".to_owned());
+    session_store
+        .save("refused-session", seed)
+        .await
+        .expect("seed");
+
+    let idempotency_store: Arc<dyn IdempotencyStore> = Arc::new(RefuseAliasLockStore {
+        inner: MemoryIdempotencyStore::new(std::time::Duration::from_secs(60)),
+        locks: AtomicUsize::new(0),
+    });
+    let app = axum::Router::new()
+        .route("/switch-org", axum::routing::post(refused_switch_handler))
+        .layer(IdempotencyLayer::new(idempotency_store))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tenancy_middleware,
+        ))
+        .layer(
+            SessionLayer::new(session_store.clone(), SessionConfig::default())
+                .with_tenancy_session_key(Some(Arc::from("tenant_id"))),
+        );
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/switch-org")
+        .header("idempotency-key", "refused-key")
+        .header("cookie", "autumn.sid=refused-session")
+        .body(Body::empty())
+        .expect("request must build");
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(
+        response.headers().get("set-cookie").is_none(),
+        "no cookie for an unsaved session"
+    );
+    assert_eq!(REFUSED_HANDLER_CALLS.load(Ordering::SeqCst), 1);
+    let stored = session_store
+        .load("refused-session")
+        .await
+        .expect("load")
+        .expect("session row");
+    assert_eq!(stored.get("tenant_id").map(String::as_str), Some("org-a"));
 }
