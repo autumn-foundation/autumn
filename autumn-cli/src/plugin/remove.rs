@@ -1269,45 +1269,37 @@ autumn-plugin-live-feed = "0.3.1"
         );
     }
 
-    /// #2476: a `[[bin]]` that names `src/main.rs` makes the explicit-target
-    /// scan read that file. It must see the file without the mount this
-    /// command removes, not the copy on disk.
-    #[test]
-    fn an_explicit_main_target_does_not_retain_the_mount_being_removed() {
-        let cargo = format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n");
-        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
-
-        let outcome = plan_remove(tmp.path(), admin()).unwrap();
-        let RemoveOutcome::Removed {
-            removed,
-            dependency_retained,
-            ..
-        } = &outcome
-        else {
-            panic!("expected Removed, got {outcome:?}");
-        };
-        assert!(dependency_retained.is_none(), "{dependency_retained:?}");
-        assert!(removed.contains(&Wire::Dependency), "{removed:?}");
+    /// What removing the admin plugin from a project whose manifest names
+    /// `src/main.rs` as an explicit `[[bin]]` removes and keeps (#2476).
+    fn removal_with_bin_path(
+        path: &str,
+        main_rs: &str,
+        sibling: Option<(&str, &str)>,
+    ) -> (Vec<Wire>, Option<DependencyKept>) {
+        let cargo = format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"{path}\"\n");
+        let tmp = fake_project(main_rs, &cargo);
+        if let Some((name, src)) = sibling {
+            std::fs::write(tmp.path().join("src").join(name), src).unwrap();
+        }
+        match plan_remove(tmp.path(), admin()).unwrap() {
+            RemoveOutcome::Removed {
+                removed,
+                dependency_retained,
+                ..
+            } => (removed, dependency_retained),
+            other => panic!("expected Removed, got {other:?}"),
+        }
     }
 
-    /// `./src/main.rs` is the same target as `src/main.rs`.
+    /// The explicit-target scan sees `src/main.rs` without the mount this
+    /// command removes, not the copy on disk. `./src/main.rs` is the same file.
     #[test]
-    fn a_dot_slash_main_target_does_not_retain_the_mount_being_removed() {
-        let cargo =
-            format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"./src/main.rs\"\n");
-        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
-
-        let outcome = plan_remove(tmp.path(), admin()).unwrap();
-        let RemoveOutcome::Removed {
-            removed,
-            dependency_retained,
-            ..
-        } = &outcome
-        else {
-            panic!("expected Removed, got {outcome:?}");
-        };
-        assert!(dependency_retained.is_none(), "{dependency_retained:?}");
-        assert!(removed.contains(&Wire::Dependency), "{removed:?}");
+    fn an_explicit_main_target_does_not_retain_the_mount_being_removed() {
+        for path in ["src/main.rs", "./src/main.rs"] {
+            let (removed, kept) = removal_with_bin_path(path, SCAFFOLD_MAIN, None);
+            assert!(kept.is_none(), "{path}: {kept:?}");
+            assert!(removed.contains(&Wire::Dependency), "{path}: {removed:?}");
+        }
     }
 
     /// A second use of the crate in the post-removal `main.rs` keeps it.
@@ -1315,45 +1307,19 @@ autumn-plugin-live-feed = "0.3.1"
     fn an_explicit_main_target_that_still_uses_the_plugin_retains_it() {
         let main =
             format!("{SCAFFOLD_MAIN}\nfn extra() {{ let _ = autumn_admin_plugin::Other; }}\n");
-        let cargo = format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n");
-        let tmp = fake_project(&main, &cargo);
-
-        let outcome = plan_remove(tmp.path(), admin()).unwrap();
-        let RemoveOutcome::Removed {
-            dependency_retained,
-            ..
-        } = &outcome
-        else {
-            panic!("expected Removed, got {outcome:?}");
-        };
-        assert!(dependency_retained.is_some(), "{outcome:?}");
+        let (_, kept) = removal_with_bin_path("src/main.rs", &main, None);
+        assert!(kept.is_some());
     }
 
     /// A sibling file under `src/` is still read from disk.
     #[test]
     fn an_explicit_main_target_with_a_using_sibling_module_retains_it() {
-        let cargo = format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n");
-        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
-        std::fs::write(
-            tmp.path().join("src/extra.rs"),
+        let sibling = (
+            "extra.rs",
             "pub fn f() { let _ = autumn_admin_plugin::Other; }\n",
-        )
-        .unwrap();
-
-        let outcome = plan_remove(tmp.path(), admin()).unwrap();
-        let RemoveOutcome::Removed {
-            dependency_retained,
-            ..
-        } = &outcome
-        else {
-            panic!("expected Removed, got {outcome:?}");
-        };
-        assert!(
-            dependency_retained
-                .as_ref()
-                .is_some_and(|kept| kept.reason().contains("extra.rs")),
-            "{dependency_retained:?}"
         );
+        let (_, kept) = removal_with_bin_path("src/main.rs", SCAFFOLD_MAIN, Some(sibling));
+        assert!(kept.is_some_and(|kept| kept.reason().contains("extra.rs")));
     }
 
     /// A sibling module of such a target counts too — the target's own tree is
