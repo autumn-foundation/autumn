@@ -814,6 +814,11 @@ mod tests {
         }
 
         let provider = Flaky(Mutex::new(Vec::new()));
+        assert_eq!(provider.name(), "flaky");
+        provider
+            .upsert_txt(&TxtRecord::new("a.example", "v"))
+            .await
+            .unwrap();
         let err = provider
             .delete_txt_batch(&[
                 TxtRecord::new("a.example", "bad1"),

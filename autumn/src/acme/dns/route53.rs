@@ -1961,4 +1961,20 @@ mod tests {
 
         assert_eq!(provider.zone_id("myapp.com").await.unwrap(), "ZPUBLIC");
     }
+    /// #2478: removing a value that is not there writes nothing.
+    #[tokio::test]
+    async fn batch_removal_of_an_absent_value_writes_nothing() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, zone_hit()),
+            (RRSET_LIST, &rrset_with(&["other"])),
+        ]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider
+            .delete_txt_batch(&[TxtRecord::new("myapp.com", "absent")])
+            .await
+            .expect("nothing to remove");
+
+        assert!(transport.sent().iter().all(|r| r.method != "POST"));
+    }
 }
