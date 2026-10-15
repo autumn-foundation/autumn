@@ -211,6 +211,12 @@ pub(crate) struct RepoConfig {
     /// valid time equals transaction time: the fact became true when the
     /// database learned it.
     ledger_valid_time: Option<String>,
+    /// Snapshot schema version (`ledgered(schema_version = 2)`, #2326). Defaults
+    /// to 1. A version above 1 is written into each new snapshot.
+    ledger_schema_version: u32,
+    /// Function that converts an older snapshot
+    /// (`ledgered(schema_version = 2, upcast = path)`, #2326).
+    ledger_upcast: Option<syn::Path>,
     /// When `true`, suppress the auto-generated `impl VersionedRecord for Model`.
     /// Use this when the model already has a hand-written `VersionedRecord`
     /// implementation (custom serialization, non-`i64` primary key, etc.) to
@@ -520,13 +526,13 @@ fn cached_read_companion_path(path: &syn::Path, prefix: &str) -> syn::Path {
 /// invalidation for a read that cannot go stale, and a gate that fails correct
 /// code is a gate that gets deleted.
 ///
-/// Returns the child repository paths, deduplicated by their rendered form. The
+/// Returns each child repository path and whether the cascade recurses into it,
+/// deduplicated by rendered form. The
 /// model is NOT inferred from the repository's type name — see
 /// `__AUTUMN_MODEL_NAME` in [`generate_coherence_items`] for why that guess is
 /// wrong exactly where it matters.
-fn dependent_child_repositories(config: &RepoConfig) -> Vec<syn::Path> {
-    let mut seen: Vec<String> = Vec::new();
-    let mut paths: Vec<syn::Path> = Vec::new();
+fn dependent_child_repositories(config: &RepoConfig) -> Vec<(syn::Path, bool)> {
+    let mut children: Vec<(String, syn::Path, bool)> = Vec::new();
     for dep in config
         .dependents
         .iter()
@@ -534,12 +540,16 @@ fn dependent_child_repositories(config: &RepoConfig) -> Vec<syn::Path> {
     {
         let child = &dep.child_repo;
         let rendered = quote!(#child).to_string();
-        if !seen.contains(&rendered) {
-            seen.push(rendered);
-            paths.push(dep.child_repo.clone());
+        // Only `destroy` runs the child's own cascade. `nullify` and
+        // `delete_all` are one statement on the child table.
+        let recurses = dep.action == DependentAction::Destroy;
+        if let Some(seen) = children.iter_mut().find(|(r, _, _)| *r == rendered) {
+            seen.2 |= recurses;
+        } else {
+            children.push((rendered, dep.child_repo.clone(), recurses));
         }
     }
-    paths
+    children.into_iter().map(|(_, p, r)| (p, r)).collect()
 }
 
 /// Write methods that run the `dependent(...)` cascade.
@@ -584,8 +594,9 @@ fn cascade_mutation_registrations(
                 );
             child_repos
                 .iter()
-                .map(|child| {
+                .map(|(child, recurses)| {
                     let (edges, acknowledged) = (edges.clone(), acknowledged.clone());
+                    let recurses = *recurses;
                     quote! {
                     ::autumn_web::reexports::inventory::submit! {
                         ::autumn_web::cache::coherence::MutationDescriptor {
@@ -604,6 +615,9 @@ fn cascade_mutation_registrations(
                             invalidates: &[#(#edges),*],
                             acknowledged_stale: #acknowledged,
                             location: concat!(file!(), ":", line!()),
+                            cascades_into: ::core::option::Option::Some(
+                                (<#child>::__AUTUMN_REPOSITORY_NAME, #recurses)
+                            ),
                         }
                     }
                     }
@@ -768,6 +782,7 @@ fn generate_coherence_items(
                         invalidates: &[#(#edges),*],
                         acknowledged_stale: #acknowledged,
                         location: concat!(file!(), ":", line!()),
+                        cascades_into: ::core::option::Option::None,
                     }
                 }
             }
@@ -800,6 +815,10 @@ fn generate_coherence_items(
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_NAME: fn() -> &'static ::core::primitive::str =
                 || ::core::any::type_name::<#model_name>();
+
+            #[doc(hidden)]
+            pub const __AUTUMN_REPOSITORY_NAME: &'static ::core::primitive::str =
+                #trait_name_str;
 
             /// The model this repository writes, unqualified — the subject an
             /// agent-authority grant names (#1691). `__AUTUMN_MODEL_NAME`
@@ -849,6 +868,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut no_versioned_record_impl = false;
     let mut ledgered = false;
     let mut ledger_valid_time: Option<String> = None;
+    let mut ledger_schema_version: Option<u32> = None;
+    let mut ledger_upcast: Option<syn::Path> = None;
     let mut primary_reads = false;
     let mut sharded = false;
     let mut broadcasts = false;
@@ -1023,9 +1044,17 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                             let value: LitStr = nested.value()?.parse()?;
                             ledger_valid_time = Some(value.value());
                             Ok(())
+                        } else if nested.path.is_ident("schema_version") {
+                            let value: syn::LitInt = nested.value()?.parse()?;
+                            ledger_schema_version = Some(value.base10_parse::<u32>()?);
+                            Ok(())
+                        } else if nested.path.is_ident("upcast") {
+                            ledger_upcast = Some(nested.value()?.parse()?);
+                            Ok(())
                         } else {
                             Err(nested.error(
-                                "expected `valid_time = \"column\"` inside `ledgered(...)`",
+                                "expected `valid_time = \"column\"`, `schema_version = N` or \
+                                 `upcast = path` inside `ledgered(...)`",
                             ))
                         }
                     })?;
@@ -1343,11 +1372,29 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  `no_versioned_record_impl`, or drop `ledgered = true`",
             ));
         }
-    } else if ledger_valid_time.is_some() {
+    } else if ledger_valid_time.is_some()
+        || ledger_schema_version.is_some()
+        || ledger_upcast.is_some()
+    {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "ledgered(valid_time = \"...\") has no effect without the ledger; write \
-             `ledgered(valid_time = \"...\")` rather than disabling `ledgered`",
+            "ledgered(...) options have no effect without the ledger; write \
+             `ledgered(...)` rather than disabling `ledgered`",
+        ));
+    }
+    // #2326: a version below 1 names no shape, and a hook for version 1 never runs.
+    if ledger_schema_version == Some(0) {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "ledgered(schema_version = 0) is not a version: the first schema is version 1. \
+             Use 2 or more after you rename or retype a snapshot field",
+        ));
+    }
+    if ledger_upcast.is_some() && ledger_schema_version.unwrap_or(1) < 2 {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "ledgered(upcast = ...) needs `schema_version = 2` or more. The hook converts \
+             a snapshot older than the current version. Nothing is older than version 1",
         ));
     }
     if let Some(spec) = &retention {
@@ -1517,6 +1564,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         no_versioned_record_impl,
         ledgered,
         ledger_valid_time,
+        ledger_schema_version: ledger_schema_version.unwrap_or(1),
+        ledger_upcast,
         primary_reads,
         sharded,
         broadcasts,
@@ -2443,8 +2492,13 @@ fn ledger_append_ts(
                 __lg_tenant_id,
                 <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&__lg_row),
             )?;
-            let __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
+            let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
                 __lg_row.__autumn_commit_hook_to_value()?;
+            // #2326: a model past schema version 1 records the version it wrote.
+            ::autumn_web::ledger::stamp_schema_version(
+                &mut __lg_snapshot,
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION,
+            );
             #valid_from_stmt
             ::autumn_web::ledger::append_revision(
                 &mut *#conn_ident,
@@ -4189,10 +4243,27 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         });
+        // #2326: the snapshot schema version, and the hook that converts an older one.
+        let schema_version = config.ledger_schema_version;
+        let schema_version_item = (schema_version > 1).then(|| {
+            quote! { const LEDGER_SCHEMA_VERSION: u32 = #schema_version; }
+        });
+        let upcast_method = config.ledger_upcast.as_ref().map(|path| {
+            quote! {
+                fn ledger_upcast(
+                    from_version: u32,
+                    snapshot: &mut ::autumn_web::reexports::serde_json::Value,
+                ) -> ::core::result::Result<(), ::std::string::String> {
+                    #path(from_version, snapshot)
+                }
+            }
+        });
         quote! {
             impl ::autumn_web::ledger::LedgeredRecord for #model_name {
                 #valid_from_method
                 #tenant_method
+                #schema_version_item
+                #upcast_method
             }
         }
     } else {
@@ -5145,20 +5216,44 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     record_id: i64,
                     revision: &::autumn_web::ledger::LedgerRevision,
                 ) -> ::autumn_web::AutumnResult<#model_name> {
+                    // #2326: bring an older snapshot to the current shape first.
+                    let (snapshot, stored) = Self::__autumn_ledger_upcast(record_id, revision)?;
                     // #2326: the codec leaves an undecryptable envelope in place. Refuse it here.
                     ::autumn_web::ledger::ensure_snapshot_recoverable(
                         #table_name,
                         record_id,
                         revision.seq,
-                        &revision.snapshot,
+                        &snapshot,
                     )?;
-                    #model_name::__autumn_commit_hook_from_value(revision.snapshot.clone())
-                        .map_err(|err| ::autumn_web::ledger::schema_mismatch(
+                    #model_name::__autumn_commit_hook_from_value(snapshot)
+                        .map_err(|err| ::autumn_web::ledger::schema_mismatch_at(
                             #table_name,
                             record_id,
                             revision.seq,
+                            stored,
+                            <#model_name as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION,
                             &format!("cannot decode into {}: {err}", stringify!(#model_name)),
                         ))
+                }
+
+                /// A revision's snapshot in the current model shape, with the
+                /// version it was written at (#2326).
+                #[doc(hidden)]
+                fn __autumn_ledger_upcast(
+                    record_id: i64,
+                    revision: &::autumn_web::ledger::LedgerRevision,
+                ) -> ::autumn_web::AutumnResult<(
+                    ::autumn_web::reexports::serde_json::Value,
+                    u32,
+                )> {
+                    ::autumn_web::ledger::upcast_snapshot(
+                        #table_name,
+                        record_id,
+                        revision.seq,
+                        &revision.snapshot,
+                        <#model_name as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION,
+                        <#model_name as ::autumn_web::ledger::LedgeredRecord>::ledger_upcast,
+                    )
                 }
 
                 /// A revision's model, in the same public projection
@@ -5258,10 +5353,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // already is, and the live row was re-encoded
                                 // through the same codec. Decrypted before
                                 // comparison — see the helper.
-                                if Self::__autumn_ledger_live_matches(&head.snapshot, live_value) {
-                                    ::autumn_web::ledger::LedgerLiveState::Matches
-                                } else {
-                                    ::autumn_web::ledger::LedgerLiveState::Diverged
+                                // #2326: the head may predate a schema change. Bring it to
+                                // the current shape. When that fails, skip the live check.
+                                // A schema error is not tamper evidence.
+                                match Self::__autumn_ledger_upcast(record_id, head) {
+                                    ::core::result::Result::Ok((snapshot, stored)) => {
+                                        // Only a head from an older schema version may
+                                        // lack a column. A head at the current version
+                                        // is compared strictly.
+                                        let older = stored
+                                            < <#model_name as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION;
+                                        if Self::__autumn_ledger_live_matches(&snapshot, live_value, older) {
+                                            ::autumn_web::ledger::LedgerLiveState::Matches
+                                        } else {
+                                            ::autumn_web::ledger::LedgerLiveState::Diverged
+                                        }
+                                    }
+                                    ::core::result::Result::Err(err) => {
+                                        ::autumn_web::ledger::note_live_check_skipped(
+                                            #table_name,
+                                            record_id,
+                                            &err,
+                                        );
+                                        ::autumn_web::ledger::LedgerLiveState::NotChecked
+                                    }
                                 }
                             }
                         }
@@ -5305,6 +5420,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// carries the `key_id` that encrypted it, so a retired key still
                 /// decrypts.
                 ///
+                /// `tolerate_new_columns` is set only for a head written under an older
+                /// schema version. See `autumn_web::ledger::snapshots_agree`.
+                ///
                 /// A column whose key is gone entirely cannot be compared at all;
                 /// it is dropped from **both** sides rather than read as a
                 /// divergence. Only that residue is invisible to the cross-check,
@@ -5313,6 +5431,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 fn __autumn_ledger_live_matches(
                     head: &::autumn_web::reexports::serde_json::Value,
                     live: &::autumn_web::reexports::serde_json::Value,
+                    tolerate_new_columns: bool,
                 ) -> bool {
                     let mut head = head.clone();
                     let mut live = live.clone();
@@ -5329,8 +5448,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             object.remove(column);
                         }
                     }
-                    ::autumn_web::ledger::canonical_json(&head)
-                        == ::autumn_web::ledger::canonical_json(&live)
+                    // #2326: a head from an older schema may lack a new column.
+                    ::autumn_web::ledger::snapshots_agree(&head, &live, tolerate_new_columns)
                 }
 
                 /// The live row encoded through the model's durable codec, or
@@ -21506,6 +21625,55 @@ mod tests {
     }
 
     #[test]
+    fn a_cascade_names_its_child_repository_for_the_closure() {
+        // The parent cannot see the grandchild. It names the child so the
+        // audit can follow the chain (#2364).
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgTagRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("cascades_into : :: core :: option :: Option :: Some (")
+                && out.contains("< PgCommentRepository > :: __AUTUMN_REPOSITORY_NAME"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("< PgTagRepository > :: __AUTUMN_REPOSITORY_NAME"),
+            "{out}"
+        );
+        assert!(out.contains("pub const __AUTUMN_REPOSITORY_NAME"), "{out}");
+    }
+
+    #[test]
+    fn only_a_destroy_cascade_is_followed_down() {
+        // `nullify` and `delete_all` are one SQL statement on the child
+        // table. They never reach the child's own cascade.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgTagRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let link = |child: &str, recurses: &str| {
+            out.contains(&format!(
+                "< {child} > :: __AUTUMN_REPOSITORY_NAME , {recurses})"
+            ))
+        };
+        assert!(link("PgCommentRepository", "true"), "{out}");
+        assert!(link("PgTagRepository", "false"), "{out}");
+        assert!(link("PgVoteRepository", "false"), "{out}");
+    }
+
+    #[test]
     fn a_dependent_cascade_registers_a_write_against_the_child_model() {
         // `PostRepository::delete_by_id` really does delete `Comment` rows, so
         // a cached read derived from `Comment` is stranded by it. Registering
@@ -28554,6 +28722,146 @@ mod tests {
     }
 
     #[test]
+    fn ledgered_parses_a_schema_version_and_an_upcast_hook() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = 3, upcast = legacy::upcast_post)"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.ledger_schema_version, 3);
+        let path = config.ledger_upcast.expect("the hook path");
+        assert_eq!(quote! { #path }.to_string(), "legacy :: upcast_post");
+    }
+
+    #[test]
+    fn ledgered_defaults_to_schema_version_one_with_no_hook() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered = true".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.ledger_schema_version, 1);
+        assert!(config.ledger_upcast.is_none());
+    }
+
+    #[test]
+    fn ledgered_rejects_schema_version_zero() {
+        let tokens: proc_macro2::TokenStream = "Post, soft_delete, ledgered(schema_version = 0)"
+            .parse()
+            .unwrap();
+        let msg = parse_repo_args(tokens)
+            .err()
+            .expect("version 0 names no shape")
+            .to_string();
+        assert!(msg.contains("schema_version = 0"), "{msg}");
+    }
+
+    #[test]
+    fn ledgered_rejects_an_upcast_hook_that_could_never_run() {
+        for args in [
+            "Post, soft_delete, ledgered(upcast = f)",
+            "Post, soft_delete, ledgered(schema_version = 1, upcast = f)",
+        ] {
+            let tokens: proc_macro2::TokenStream = args.parse().unwrap();
+            let msg = parse_repo_args(tokens)
+                .err()
+                .expect("a hook needs an older version to convert")
+                .to_string();
+            assert!(msg.contains("schema_version = 2"), "{args}: {msg}");
+        }
+    }
+
+    #[test]
+    fn ledgered_rejects_a_non_numeric_schema_version() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = \"2\")"
+                .parse()
+                .unwrap();
+        assert!(parse_repo_args(tokens).is_err());
+    }
+
+    #[test]
+    fn ledgered_rejects_a_schema_version_that_overflows() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = 99999999999)"
+                .parse()
+                .unwrap();
+        assert!(parse_repo_args(tokens).is_err());
+    }
+
+    #[test]
+    fn schema_options_need_the_ledger() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = 2), ledgered = false"
+                .parse()
+                .unwrap();
+        let msg = parse_repo_args(tokens)
+            .err()
+            .expect("options without the ledger do nothing")
+            .to_string();
+        assert!(msg.contains("no effect without the ledger"), "{msg}");
+    }
+
+    #[test]
+    fn repository_macro_stamps_the_schema_version_before_the_append() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered(schema_version = 3, upcast = upcast_post) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        // Each append site stamps first. So the first stamp comes before the
+        // first append, and the counts match.
+        let stamp = generated
+            .find("stamp_schema_version")
+            .expect("each snapshot is stamped");
+        let append = generated
+            .find("ledger :: append_revision (")
+            .expect("the revision is appended");
+        assert!(stamp < append, "the stamp must come before the append");
+        assert_eq!(
+            generated
+                .matches("ledger :: stamp_schema_version (")
+                .count(),
+            generated.matches("ledger :: append_revision (").count(),
+            "every append site stamps its snapshot"
+        );
+        assert!(
+            generated.contains("const LEDGER_SCHEMA_VERSION : u32 = 3"),
+            "the record impl declares the version: {generated}"
+        );
+        assert!(
+            generated.contains("upcast_post (from_version , snapshot)"),
+            "the record impl calls the hook: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_upcasts_before_it_decodes_and_before_the_live_check() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let upcast = generated
+            .find("Self :: __autumn_ledger_upcast (")
+            .expect("the read path upcasts");
+        let decode = generated[upcast..]
+            .find("__autumn_commit_hook_from_value")
+            .expect("the model is decoded after the upcast");
+        assert!(decode > 0);
+        assert!(
+            generated.contains("ledger :: upcast_snapshot"),
+            "the helper runs the shared upcast: {generated}"
+        );
+        assert!(
+            generated.contains("snapshots_agree"),
+            "the live check compares the columns both shapes have: {generated}"
+        );
+        assert!(
+            !generated.contains("const LEDGER_SCHEMA_VERSION"),
+            "a version 1 model keeps the trait default: {generated}"
+        );
+    }
+
+    #[test]
     fn repository_macro_ledgered_omits_purge() {
         let generated = repository_macro(
             quote! { Post, soft_delete, ledgered = true },
@@ -29011,7 +29319,10 @@ mod tests {
     fn repository_expansion_stays_within_budget() {
         // (label, attribute args, ceiling in bytes of `TokenStream::to_string`)
         let budgets: Vec<(&str, proc_macro2::TokenStream, usize)> = vec![
-            ("plain", quote! { Post }, 80_000),
+            // Raised from 80_000 (#2364): each write descriptor gained a
+            // `cascades_into` field, and each repository one name const.
+            // Understood and intended: about 400 bytes.
+            ("plain", quote! { Post }, 81_000),
             ("soft_delete", quote! { Post, soft_delete }, 89_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
             ("api", quote! { Post, api = "/posts" }, 95_000),
