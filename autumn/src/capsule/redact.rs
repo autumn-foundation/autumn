@@ -812,43 +812,65 @@ fn mask_url_userinfo(
     keys: &mut BTreeSet<String>,
     location: &str,
 ) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Some((head, userinfo, host)) = split_userinfo(url) else {
         return url.to_owned();
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = rest.get(..end).unwrap_or_default();
-    let tail = rest.get(end..).unwrap_or_default();
-    let Some((userinfo, host)) = authority.rsplit_once('@') else {
-        return url.to_owned();
-    };
-    if userinfo.is_empty() {
-        return url.to_owned();
-    }
     keys.insert(format!("{location}:userinfo"));
     record_userinfo_components(userinfo, values);
-    format!("{scheme}://{FILTERED_PLACEHOLDER}@{host}{tail}")
+    format!("{head}{FILTERED_PLACEHOLDER}@{host}")
+}
+
+/// Split an absolute URL into what precedes its userinfo, the userinfo, and
+/// the rest (`host…`).
+///
+/// A special scheme (`http`, `https`, `ws`, `wss`, `ftp`) is parsed the way the
+/// HTTP client's URL parser does: `https:user:secret@host`, `https:/user:…` and
+/// backslash spellings all reach the wire as credentialed URLs, so a literal
+/// `://` is only required of other schemes.
+fn split_userinfo(url: &str) -> Option<(&str, &str, &str)> {
+    let colon = url.find(':')?;
+    let scheme = url.get(..colon)?;
+    let mut chars = scheme.chars();
+    if !chars.next()?.is_ascii_alphabetic()
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let special = ["http", "https", "ws", "wss", "ftp"]
+        .iter()
+        .any(|name| scheme.eq_ignore_ascii_case(name));
+    let after_scheme = url.get(colon.checked_add(1)?..)?;
+    let slashes = after_scheme
+        .find(|c: char| !(c == '/' || (special && c == '\\')))
+        .unwrap_or(after_scheme.len());
+    if !special && slashes < 2 {
+        return None;
+    }
+    let authority_start = colon.checked_add(1)?.checked_add(slashes)?;
+    let head = url.get(..authority_start)?;
+    let rest = url.get(authority_start..)?;
+    let end = rest
+        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(rest.len());
+    let (userinfo, _) = rest.get(..end)?.rsplit_once('@')?;
+    if userinfo.is_empty() {
+        return None;
+    }
+    let host_and_tail = rest.get(userinfo.len().checked_add(1)?..)?;
+    Some((head, userinfo, host_and_tail))
 }
 
 /// The `user:password` of an absolute URL's authority, if it has one.
 pub(crate) fn url_userinfo(url: &str) -> Option<&str> {
-    let (_, rest) = url.split_once("://")?;
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (userinfo, _) = rest.get(..end)?.rsplit_once('@')?;
-    (!userinfo.is_empty()).then_some(userinfo)
+    split_userinfo(url).map(|(_, userinfo, _)| userinfo)
 }
 
 /// `url` with its userinfo replaced by the placeholder, for text that reaches
 /// replay output (divergence reports, blocked-call errors).
 pub(crate) fn hide_url_userinfo(url: &str) -> String {
-    url_userinfo(url).map_or_else(
+    split_userinfo(url).map_or_else(
         || url.to_owned(),
-        |userinfo| {
-            url.replacen(
-                &format!("{userinfo}@"),
-                &format!("{FILTERED_PLACEHOLDER}@"),
-                1,
-            )
-        },
+        |(head, _, host)| format!("{head}{FILTERED_PLACEHOLDER}@{host}"),
     )
 }
 
@@ -2256,6 +2278,16 @@ mod tests {
             assert_eq!(url_userinfo("https://h/p?x=a@b"), None);
             assert_eq!(url_userinfo("https://@h/p"), None);
             assert_eq!(url_userinfo("no-scheme"), None);
+            // Spellings the HTTP client's URL parser also accepts.
+            assert_eq!(url_userinfo("https:a:b@h/p"), Some("a:b"));
+            assert_eq!(url_userinfo("HTTPS:/a:b@h/p"), Some("a:b"));
+            assert_eq!(url_userinfo("https:\\\\a:b@h\\p"), Some("a:b"));
+            assert_eq!(url_userinfo("mailto:a@b"), None);
+            assert_eq!(url_userinfo("postgres://a:b@h/db"), Some("a:b"));
+            assert_eq!(
+                hide_url_userinfo("https:a:b@h/p?q=1"),
+                "https:[FILTERED]@h/p?q=1"
+            );
         }
 
         #[test]
