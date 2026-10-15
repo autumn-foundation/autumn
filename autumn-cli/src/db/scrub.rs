@@ -2558,10 +2558,22 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 fn same_database_in(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
     match (database_endpoint(a, env), database_endpoint(b, env)) {
         (Some((ends_a, name_a)), Some((ends_b, name_b))) => {
-            name_a == name_b && ends_a.iter().any(|e| ends_b.contains(e))
+            name_a == name_b
+                && ends_a
+                    .iter()
+                    .any(|a| ends_b.iter().any(|b| same_endpoint(a, b)))
         }
         _ => false,
     }
+}
+
+/// Whether two `(host, port)` endpoints can be one server. An empty host is the
+/// compiled-in default socket directory, which this guard cannot name, so it
+/// also matches any explicit socket path on the same port. That errs toward
+/// refusing.
+fn same_endpoint(a: &(String, u16), b: &(String, u16)) -> bool {
+    let socket = |h: &str| h.starts_with('/');
+    a == b || (a.1 == b.1 && ((a.0.is_empty() && socket(&b.0)) || (b.0.is_empty() && socket(&a.0))))
 }
 
 /// The `(host, port)` endpoints and database a URL reaches, resolved as libpq does.
@@ -2773,6 +2785,7 @@ fn conninfo_endpoint(
     // The database defaults to the user name when none is given.
     let name = values
         .get("dbname")
+        .filter(|n| !n.is_empty())
         .cloned()
         .or_else(|| env("PGDATABASE"))
         .or_else(|| values.get("user").cloned())
@@ -10445,6 +10458,21 @@ mod tests {
         assert!(same_database_in(
             "postgres:///app?hostaddr=10.0.0.1&hostaddr=10.0.0.5",
             "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod user=app dbname=''",
+            "host=prod user=app dbname=app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app",
+            "postgresql://%2Fvar%2Frun%2Fpostgresql/app",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///app",
+            "postgres://db.example/app",
             &env
         ));
         assert!(same_database_in(
