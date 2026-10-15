@@ -3826,6 +3826,37 @@ mod tests {
     }
 
     #[test]
+    fn artifact_labels_names_the_manifest_targets_before_a_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            &Manifest {
+                autumn_version: "0".to_owned(),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                profile: "prod".to_owned(),
+                format: "custom".to_owned(),
+                targets: vec![ManifestTarget {
+                    label: "shard:a".to_owned(),
+                    file: "shard-a.dump".to_owned(),
+                    database: "a".to_owned(),
+                    backend: "postgres".to_owned(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_labels(dir.path()),
+            Some(vec!["shard:a".to_owned()])
+        );
+        assert_eq!(
+            artifact_labels(Path::new("offsite:prod/latest")),
+            None,
+            "an offsite reference resolves later"
+        );
+        assert_eq!(artifact_labels(&dir.path().join("missing")), None);
+    }
+
+    #[test]
     fn restore_plan_select_filters_to_named_shard() {
         let plan = RestorePlan {
             dir: PathBuf::from("/x"),

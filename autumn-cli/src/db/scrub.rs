@@ -8820,6 +8820,149 @@ mod tests {
     }
 
     #[test]
+    fn the_new_refusals_render_an_actionable_message() {
+        let too_long = ScrubError::EncryptedEnvelopeTooLong {
+            column: "users.bio".to_owned(),
+            limit: 100,
+            needed: 148,
+        }
+        .to_string();
+        assert!(
+            too_long.contains("100") && too_long.contains("148"),
+            "{too_long}"
+        );
+        let operand = ScrubError::IndexOperandColumn {
+            column: "users.email".to_owned(),
+            kind: "an exclusion constraint",
+        }
+        .to_string();
+        assert!(
+            operand.contains("exclusion constraint") && operand.contains("`safe`"),
+            "{operand}"
+        );
+        let drift = ScrubError::SchemaChanged {
+            entries: vec!["users.ssn (column added)".to_owned()],
+        }
+        .to_string();
+        assert!(
+            drift.contains("users.ssn") && drift.contains("Nothing was written"),
+            "{drift}"
+        );
+    }
+
+    #[test]
+    fn the_anonymize_scan_visits_every_item_and_expression_kind() {
+        // Parse-only: the scan never type-checks. Each construct reaches a
+        // visitor arm, and none of them registers a table.
+        let src = r#"
+            const C: u8 = 1;
+            static S: u8 = 2;
+            trait T { const X: u8; fn f(&self) { let _ = 1; } }
+            struct W;
+            impl W { const Y: u8 = 3; fn g(&self) -> u8 { 4 } }
+            async fn h(v: Vec<u8>, mut n: u8, o: Option<u8>) -> Option<u8> {
+                let a = [1, 2];
+                n = a[0] + 1;
+                let _ = async { 5 }.await;
+                let _ = (n as u16, |x: u8| x, const { 6 }, v.len(), (n), &n, n..3);
+                let _ = [0u8; 2];
+                for i in 0..2 { if i == 1 { break; } else { continue; } }
+                while n > 9 { n -= 1; }
+                loop { break; }
+                if let Some(z) = o { let _ = z; }
+                let _ = unsafe { 7 };
+                let _ = -n;
+                let _ = struct_lit();
+                let _ = o?;
+                println!("{}", n);
+                match n { 0 => {} _ => {} }
+                return o;
+            }
+            fn struct_lit() -> W { W }
+        "#;
+        assert!(extract_anonymize_tables(src).unwrap().is_empty());
+        let disabled = r#"
+            #[cfg(test)] const C: u8 = 1;
+            #[cfg(test)] static S: u8 = 2;
+            trait T { #[cfg(test)] const X: u8; #[cfg(test)] fn f(&self); }
+            struct W;
+            impl W { #[cfg(test)] const Y: u8 = 3; #[cfg(test)] fn g(&self) {} }
+            fn k() { #[cfg(test)] println!("x"); #[cfg(test)] let _ = 1; }
+        "#;
+        assert!(extract_anonymize_tables(disabled).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_anonymize_scan_reports_unreadable_and_unresolvable_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            scan_anonymize_tables(&dir.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(dir.path().join("bad.rs"), "fn {").unwrap();
+        let err = scan_anonymize_tables(dir.path()).unwrap_err();
+        assert!(matches!(err, ScrubError::SourceScan { .. }), "{err:?}");
+        std::fs::write(
+            dir.path().join("bad.rs"),
+            "fn f(t: &str) { ModelRegistration::anonymize(t); }",
+        )
+        .unwrap();
+        let err = scan_anonymize_tables(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ScrubError::UnresolvableAnonymize { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn conninfo_pairs_handles_quotes_escapes_and_rejections() {
+        let pairs = |s: &str| conninfo_pairs(s);
+        assert_eq!(
+            pairs("host = 'a b' dbname=x\\ y"),
+            Some(vec![
+                ("host".to_owned(), "a b".to_owned()),
+                ("dbname".to_owned(), "x y".to_owned())
+            ])
+        );
+        assert_eq!(
+            pairs("host='a\\'b'"),
+            Some(vec![("host".to_owned(), "a'b".to_owned())])
+        );
+        assert_eq!(pairs("host"), None, "no equals sign");
+        assert_eq!(pairs("host='open"), None, "unterminated quote");
+        assert_eq!(pairs("host="), None, "empty unquoted value");
+        assert_eq!(
+            pairs("host=a\\"),
+            Some(vec![("host".to_owned(), "a".to_owned())])
+        );
+        assert_eq!(pairs(""), Some(Vec::new()));
+        assert_eq!(without_userinfo("no scheme"), "no scheme");
+        assert_eq!(without_userinfo("postgres://h/db"), "postgres://h/db");
+    }
+
+    #[test]
+    fn report_triggers_prints_only_for_triggered_write_targets() {
+        let plan = ScrubPlan::default();
+        let facts = DatabaseFacts {
+            triggered_tables: BTreeSet::from(["autumn_jobs".to_owned()]),
+            ..DatabaseFacts::default()
+        };
+        // No purge: nothing to report.
+        report_triggers(&plan, &[], None, &facts);
+        // A purge target with a trigger: prints the warning.
+        report_triggers(
+            &plan,
+            &[(
+                "autumn_jobs".to_owned(),
+                "DELETE FROM autumn_jobs".to_owned(),
+            )],
+            None,
+            &facts,
+        );
+    }
+
+    #[test]
     fn the_generated_column_probe_runs_on_servers_without_attgenerated() {
         assert!(GENERATED_COLUMNS.contains("to_jsonb(att)"));
     }

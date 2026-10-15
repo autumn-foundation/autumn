@@ -2733,6 +2733,59 @@ mod tests {
         assert!(found["users"]["email"], "{found:?}");
     }
 
+    /// Disabled and odd spellings the module and `cfg` helpers must survive.
+    #[test]
+    fn module_and_cfg_helpers_survive_odd_input() {
+        let attrs = |src: &str| syn::parse_str::<syn::ItemFn>(src).unwrap().attrs;
+        // A malformed `cfg_attr` or `cfg` keeps the item.
+        assert!(production_enabled(&attrs("#[cfg_attr] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg_attr(test)] fn f() {}")));
+        assert!(production_enabled(&attrs(
+            "#[cfg_attr(not(test), derive(Debug))] fn f() {}"
+        )));
+        assert!(production_enabled(&attrs(
+            "#[cfg_attr(not(test), cfg(feature = \"x\"))] fn f() {}"
+        )));
+        assert!(production_enabled(&attrs("#[cfg] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg(\"literal\")] fn f() {}")));
+        assert!(!production_enabled(&attrs("#[cfg(any())] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg(all())] fn f() {}")));
+        // A file-level `cfg(test)` empties the scan; an unparsable file adds nothing.
+        assert!(
+            parse_encrypted_columns(
+                "#![cfg(test)]\n#[model] pub struct U { #[encrypted] pub a: String }"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let dir = std::path::PathBuf::from("src");
+        let modules = disabled_module_paths(&[
+            (dir.join("bad.rs"), "fn {".to_owned()),
+            (
+                dir.join("lib.rs"),
+                "#![cfg(test)]\n#[path = 1] mod odd;\n#[cfg(test)] #[path] mod odd2;".to_owned(),
+            ),
+        ]);
+        assert!(modules.excludes(&dir.join("odd.rs")));
+        assert!(!modules.excludes(&dir.join("other.rs")));
+    }
+
+    /// A dangling symlink has no metadata and is skipped, not an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone.rs"), dir.path().join("dangling.rs"))
+            .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(!found["users"]["email"], "{found:?}");
+    }
+
     /// A model in an inline module, at any depth, is still a model.
     #[test]
     fn encrypted_columns_are_found_in_inline_modules() {
