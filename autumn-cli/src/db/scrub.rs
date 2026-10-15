@@ -208,6 +208,16 @@ pub enum ScrubError {
         /// Token characters the column must still have room for.
         floor: usize,
     },
+    /// The replacement envelope of an `#[encrypted]` column is longer than its
+    /// bounded column.
+    EncryptedEnvelopeTooLong {
+        /// `table.column`.
+        column: String,
+        /// The column's character limit.
+        limit: usize,
+        /// Characters the envelope takes.
+        needed: usize,
+    },
     /// A declaration tried to write plaintext into an `#[encrypted]` column.
     PlaintextIntoEncrypted {
         /// Each entry is `table.column` plus the strategy that was declared.
@@ -218,6 +228,21 @@ pub enum ScrubError {
     CheckConstrainedColumn {
         /// `table.column`.
         column: String,
+    },
+    /// A PII column is an operand of a constraint no per-row token can be
+    /// shown to keep satisfied: a unique index expression or predicate, or an
+    /// exclusion constraint.
+    IndexOperandColumn {
+        /// `table.column`.
+        column: String,
+        /// What the column is an operand of.
+        kind: &'static str,
+    },
+    /// The schema changed between classification and the apply transaction, so
+    /// the plan no longer covers every column.
+    SchemaChanged {
+        /// What changed, sorted.
+        entries: Vec<String>,
     },
     /// The target holds `#[encrypted]` columns but no encryption key could be
     /// resolved, so a valid replacement envelope cannot be produced.
@@ -478,8 +503,9 @@ impl std::fmt::Display for ScrubError {
                 f,
                 "{} column(s) are primary, foreign or partition keys but declared PII:\n{}\n  \
                  Rewriting a key column would break referential integrity or move rows \
-                 between partitions. Declare these columns `safe`. For a foreign key, \
-                 scrub the referenced table's own PII columns.",
+                 between partitions. Declare these columns `safe`; an `#[encrypted]` one \
+                 then keeps its ciphertext. For a foreign key, scrub the referenced \
+                 table's own PII columns.",
                 columns.len(),
                 bullet_list(columns),
             ),
@@ -523,6 +549,16 @@ impl std::fmt::Display for ScrubError {
                  `email` (25). Pick one that fits, use `null` if the column is nullable, \
                  widen the column, or declare it `safe`."
             ),
+            Self::EncryptedEnvelopeTooLong {
+                column,
+                limit,
+                needed,
+            } => write!(
+                f,
+                "{column:?} holds at most {limit} characters, but the encrypted replacement \
+                 takes {needed}.\n  \
+                 Widen the column, or declare it `safe` to keep its ciphertext."
+            ),
             Self::PlaintextIntoEncrypted { columns } => write!(
                 f,
                 "{} column(s) carry #[encrypted] in the model but {SCRUB_CONFIG_FILE} declares a \
@@ -542,6 +578,21 @@ impl std::fmt::Display for ScrubError {
                  Declare the column `safe` if the constraint means it holds no free-form PII, \
                  or drop the constraint on the copy before scrubbing."
             ),
+            Self::IndexOperandColumn { column, kind } => write!(
+                f,
+                "{column:?} is an operand of {kind}. No per-row value can be shown to keep \
+                 that constraint true: a value that is unique alone can still collide \
+                 after the expression or predicate.\n  \
+                 Declare the column `safe` if it holds no free-form PII, or drop the \
+                 constraint on the copy before scrubbing."
+            ),
+            Self::SchemaChanged { entries } => write!(
+                f,
+                "The schema changed while the scrub ran:\n{}\n  \
+                 The plan used an earlier snapshot and may not cover every column. \
+                 Nothing was written. Run the command again.",
+                bullet_list(entries),
+            ),
             Self::EncryptionKeyUnavailable { profile, detail } => write!(
                 f,
                 "This database has #[encrypted] columns, but no encryption key could be resolved \
@@ -553,12 +604,12 @@ impl std::fmt::Display for ScrubError {
             ),
             Self::EncryptedMetadataUnavailable => write!(
                 f,
-                "No model source was found, so the scrub cannot tell which columns are \
+                "No `src/` tree was found, so the scrub cannot tell which columns are \
                  #[encrypted].\n  \
-                 That matters more than it sounds: an unrecognised encrypted column declared \
+                 This matters: an unrecognised encrypted column declared \
                  `safe` keeps its production ciphertext, and one given a plaintext strategy \
                  becomes permanently unreadable. Run the scrub from the project root (where \
-                 `src/models` lives), or name them — with their mode — in {SCRUB_CONFIG_FILE}:\n    \
+                 `src/` lives), or name them — with their mode — in {SCRUB_CONFIG_FILE}:\n    \
                  [tables.users.encrypted]\n    api_token = \"randomized\"\n    \
                  email = \"deterministic\"\n  \
                  An app with no encrypted columns at all still needs one empty \
@@ -802,12 +853,14 @@ impl std::fmt::Display for ScrubError {
             ),
             Self::RowLevelSecurity { tables } => write!(
                 f,
-                "{} table(s) this run reads or writes have row-level security enabled:\n{}\n  \
+                "{} table(s) this run reads or writes have row-level security that binds the \
+                 connected role:\n{}\n  \
                  A role that does not bypass RLS sees only the rows its policies expose, and \
                  every phase then reports a success it cannot stand behind: an `UPDATE` \
                  rewrites part of the PII, a `DELETE` reports a table emptied that is not, and \
                  the foreign key re-count misses the very orphan it exists to find. \
-                 Connect as the table owner or a BYPASSRLS role.",
+                 Connect as a superuser, a BYPASSRLS role, or the table owner (the owner is \
+                 still bound when the table is FORCE ROW LEVEL SECURITY).",
                 tables.len(),
                 bullet_list(tables),
             ),
@@ -1431,37 +1484,43 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             let declared_safe = declared_safe_here
                 || (!anonymized && inputs.config.defaults.safe_columns.contains(&column.name));
 
-            let (spec, source) = if is_encrypted {
-                // An at-rest-encrypted column is never rewritten with a plain
-                // string: the resolved strategy is always a re-encryption (see
-                // `Strategy::Encrypted`), so a declaration can only choose to
-                // NULL it, never to write plaintext into it.
-                match declared_pii {
-                    None | Some(Strategy::Encrypted) => {
-                        (Strategy::Encrypted, ClassSource::Encrypted)
+            let (spec, source) =
+                if is_encrypted && is_key && declared_pii.is_none() && declared_safe_here {
+                    // Never rewrite a structural column. Re-encrypting it is a
+                    // write. Only a per-table `safe` entry keeps the ciphertext,
+                    // not a cross-table default.
+                    continue;
+                } else if is_encrypted {
+                    // An at-rest-encrypted column is never rewritten with a plain
+                    // string: the resolved strategy is always a re-encryption (see
+                    // `Strategy::Encrypted`), so a declaration can only choose to
+                    // NULL it, never to write plaintext into it.
+                    match declared_pii {
+                        None | Some(Strategy::Encrypted) => {
+                            (Strategy::Encrypted, ClassSource::Encrypted)
+                        }
+                        Some(Strategy::Null) => (Strategy::Null, ClassSource::Config),
+                        Some(other) => {
+                            plaintext_into_encrypted.push((qualified, other.as_str()));
+                            continue;
+                        }
                     }
-                    Some(Strategy::Null) => (Strategy::Null, ClassSource::Config),
-                    Some(other) => {
-                        plaintext_into_encrypted.push((qualified, other.as_str()));
+                } else if let Some(strategy) = declared_pii {
+                    (strategy, ClassSource::Config)
+                } else if declared_safe {
+                    continue;
+                } else if anonymized {
+                    // A table-level inference never claims the structural columns:
+                    // rewriting a key would break referential integrity, and the
+                    // registration says nothing about them.
+                    if is_key {
                         continue;
                     }
-                }
-            } else if let Some(strategy) = declared_pii {
-                (strategy, ClassSource::Config)
-            } else if declared_safe {
-                continue;
-            } else if anonymized {
-                // A table-level inference never claims the structural columns:
-                // rewriting a key would break referential integrity, and the
-                // registration says nothing about them.
-                if is_key {
+                    (Strategy::Auto, ClassSource::GdprAnonymize)
+                } else {
+                    unclassified.push(qualified);
                     continue;
-                }
-                (Strategy::Auto, ClassSource::GdprAnonymize)
-            } else {
-                unclassified.push(qualified);
-                continue;
-            };
+                };
 
             if is_key {
                 key_pii.push(qualified);
@@ -1519,6 +1578,18 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             if inputs.facts.checked_columns.contains(&pair) {
                 return Err(ScrubError::CheckConstrainedColumn { column: qualified });
             }
+            if inputs.facts.unique_expression_columns.contains(&pair) {
+                return Err(ScrubError::IndexOperandColumn {
+                    column: qualified,
+                    kind: "a unique index expression or predicate",
+                });
+            }
+            if inputs.facts.exclusion_columns.contains(&pair) {
+                return Err(ScrubError::IndexOperandColumn {
+                    column: qualified,
+                    kind: "an exclusion constraint",
+                });
+            }
             if plan.strategy == Strategy::Auto {
                 plan.strategy = auto_strategy(column).map_err(|e| qualify(e, &qualified))?;
             }
@@ -1543,6 +1614,31 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             }
 
             if plan.strategy == Strategy::Encrypted {
+                // The same plan-time gates the SQL strategies get: a failure at
+                // apply time can land after an artifact restored real data.
+                if !is_texty(&column.ty) {
+                    return Err(ScrubError::StrategyTypeMismatch {
+                        column: qualified,
+                        strategy: plan.strategy.as_str(),
+                        detail: format!("{:?}", column.ty),
+                    });
+                }
+                let shape = email_shaped(&column.name);
+                let needed = envelope_len(shape);
+                // `name` holds 63 bytes and truncates silently.
+                let limit = char_max_len(&column.ty).or_else(|| {
+                    matches!(&column.ty, ColumnType::Opaque { pg_type } if pg_type == "name")
+                        .then_some(63)
+                });
+                if let Some(limit) = limit
+                    && limit < needed
+                {
+                    return Err(ScrubError::EncryptedEnvelopeTooLong {
+                        column: qualified,
+                        limit,
+                        needed,
+                    });
+                }
                 // Not expressible as SQL: the replacement is an AEAD envelope
                 // produced in Rust, row by row, under the target's own key.
                 encrypted_rewrites.push(EncryptedRewrite {
@@ -1553,7 +1649,7 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                         .and_then(|c| c.get(&column.name))
                         .copied()
                         .unwrap_or(false),
-                    shape: email_shaped(&column.name),
+                    shape,
                 });
                 resolved.push(plan);
                 continue;
@@ -1705,10 +1801,8 @@ fn check_safe_overrides_encrypted(
             // IR does not carry, so the two tests disagreed about what counts as
             // structural.
             //
-            // Necessary but NOT sufficient to make such a column configurable:
-            // classification resolves `#[encrypted]` before it looks at `safe`,
-            // so a structural encrypted column still fails as `PiiOnKeyColumn`
-            // with no declaration that terminates. Tracked in #2366.
+            // Classification honours that `safe` declaration for a structural
+            // column: the ciphertext stays where it is.
             if by_name
                 .get(table.as_str())
                 .and_then(|t| {
@@ -2205,12 +2299,21 @@ fn qualified_ident(table: &str) -> String {
 ///
 /// Returns [`ScrubError::SourceScan`] if the source is not valid Rust, or
 /// [`ScrubError::UnresolvableAnonymize`] for a non-literal table name.
+#[cfg(test)]
 fn extract_anonymize_tables(src: &str) -> Result<BTreeSet<String>, ScrubError> {
+    scan_anonymize_source(src)
+}
+
+/// Collect the production anonymize registrations in one source file.
+fn scan_anonymize_source(src: &str) -> Result<BTreeSet<String>, ScrubError> {
     use syn::visit::Visit as _;
 
     let file = syn::parse_file(src).map_err(|e| ScrubError::SourceScan {
         detail: e.to_string(),
     })?;
+    if !crate::schema::parse::production_enabled(&file.attrs) {
+        return Ok(BTreeSet::new());
+    }
     let mut scan = AnonymizeScan::default();
     scan.visit_file(&file);
     if let Some(detail) = scan.unresolved.into_iter().next() {
@@ -2219,7 +2322,8 @@ fn extract_anonymize_tables(src: &str) -> Result<BTreeSet<String>, ScrubError> {
     Ok(scan.tables)
 }
 
-/// `syn` visitor collecting `ModelRegistration::anonymize("<table>")` calls.
+/// `syn` visitor collecting `ModelRegistration::anonymize("<table>")` calls
+/// outside `cfg`-disabled syntax.
 #[derive(Default)]
 struct AnonymizeScan {
     tables: BTreeSet<String>,
@@ -2227,7 +2331,101 @@ struct AnonymizeScan {
 }
 
 impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        let attrs: &[syn::Attribute] = crate::schema::parse::item_attrs(item);
+        if crate::schema::parse::production_enabled(attrs) {
+            syn::visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        let attrs: &[syn::Attribute] = crate::schema::parse::trait_item_attrs(item);
+        if crate::schema::parse::production_enabled(attrs) {
+            syn::visit::visit_trait_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        let attrs: &[syn::Attribute] = crate::schema::parse::impl_item_attrs(item);
+        if crate::schema::parse::production_enabled(attrs) {
+            syn::visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        let attrs: &[syn::Attribute] = crate::schema::parse::expr_attrs(expr);
+        if crate::schema::parse::production_enabled(attrs) {
+            syn::visit::visit_expr(self, expr);
+        }
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if crate::schema::parse::production_enabled(&arm.attrs) {
+            syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_stmt_macro(&mut self, stmt: &'ast syn::StmtMacro) {
+        if crate::schema::parse::production_enabled(&stmt.attrs) {
+            syn::visit::visit_stmt_macro(self, stmt);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if crate::schema::parse::production_enabled(crate::schema::parse::foreign_item_attrs(item))
+        {
+            syn::visit::visit_foreign_item(self, item);
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &'ast syn::Pat) {
+        if crate::schema::parse::production_enabled(crate::schema::parse::pat_attrs(pat)) {
+            syn::visit::visit_pat(self, pat);
+        }
+    }
+
+    fn visit_generic_param(&mut self, param: &'ast syn::GenericParam) {
+        if crate::schema::parse::production_enabled(crate::schema::parse::generic_param_attrs(
+            param,
+        )) {
+            syn::visit::visit_generic_param(self, param);
+        }
+    }
+
+    fn visit_fn_arg(&mut self, arg: &'ast syn::FnArg) {
+        if crate::schema::parse::production_enabled(crate::schema::parse::fn_arg_attrs(arg)) {
+            syn::visit::visit_fn_arg(self, arg);
+        }
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if crate::schema::parse::production_enabled(&field.attrs) {
+            syn::visit::visit_field(self, field);
+        }
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if crate::schema::parse::production_enabled(&variant.attrs) {
+            syn::visit::visit_variant(self, variant);
+        }
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if crate::schema::parse::production_enabled(&field.attrs) {
+            syn::visit::visit_field_value(self, field);
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if crate::schema::parse::production_enabled(&local.attrs) {
+            syn::visit::visit_local(self, local);
+        }
+    }
+
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if !crate::schema::parse::production_enabled(&node.attrs) {
+            return;
+        }
         if let syn::Expr::Path(path) = &*node.func {
             let segments = &path.path.segments;
             let is_anonymize = segments.len() >= 2
@@ -2249,58 +2447,76 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
     }
 }
 
-/// Scan every `.rs` file under `root` (recursively) for anonymize registrations.
+/// Scan every production `.rs` file under `root` (recursively) for anonymize
+/// registrations. A file reached only through a `#[cfg(test)] mod x;` is test
+/// code and is skipped with everything below it.
 fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
-    let mut out = BTreeSet::new();
     if !root.is_dir() {
-        return Ok(out);
+        return Ok(BTreeSet::new());
     }
+    let io_err = |path: &Path, e: &dyn std::fmt::Display| ScrubError::SourceScan {
+        detail: format!("{}: {e}", path.display()),
+    };
+    let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|e| ScrubError::SourceScan {
-            detail: format!("{}: {e}", dir.display()),
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|e| ScrubError::SourceScan {
-                detail: format!("{}: {e}", dir.display()),
-            })?;
+        for entry in std::fs::read_dir(&dir).map_err(|e| io_err(&dir, &e))? {
+            let entry = entry.map_err(|e| io_err(&dir, &e))?;
             let path = entry.path();
-            let file_type = entry.file_type().map_err(|e| ScrubError::SourceScan {
-                detail: format!("{}: {e}", path.display()),
-            })?;
+            let file_type = entry.file_type().map_err(|e| io_err(&path, &e))?;
             if file_type.is_dir() {
                 stack.push(path);
             } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-                let src = std::fs::read_to_string(&path).map_err(|e| ScrubError::SourceScan {
-                    detail: format!("{}: {e}", path.display()),
-                })?;
-                let found = extract_anonymize_tables(&src).map_err(|e| match e {
-                    ScrubError::SourceScan { detail } => ScrubError::SourceScan {
-                        detail: format!("{}: {detail}", path.display()),
-                    },
-                    ScrubError::UnresolvableAnonymize { detail } => {
-                        ScrubError::UnresolvableAnonymize {
-                            detail: format!("{} — {detail}", path.display()),
-                        }
-                    }
-                    other => other,
-                })?;
-                out.extend(found);
+                files.push(path);
             }
+        }
+    }
+    files.sort();
+
+    let mut scanned = Vec::with_capacity(files.len());
+    let mut sources = Vec::with_capacity(files.len());
+    for path in files {
+        let src = std::fs::read_to_string(&path).map_err(|e| io_err(&path, &e))?;
+        scanned.push((path.clone(), scan_anonymize_source(&src)));
+        sources.push((path, src));
+    }
+    let disabled = crate::schema::parse::disabled_module_paths(&sources);
+
+    let mut out = BTreeSet::new();
+    for (path, result) in scanned {
+        if disabled.excludes(&path) {
+            continue;
+        }
+        match result {
+            Ok(tables) => out.extend(tables),
+            Err(ScrubError::SourceScan { detail }) => {
+                return Err(ScrubError::SourceScan {
+                    detail: format!("{}: {detail}", path.display()),
+                });
+            }
+            Err(ScrubError::UnresolvableAnonymize { detail }) => {
+                return Err(ScrubError::UnresolvableAnonymize {
+                    detail: format!("{} — {detail}", path.display()),
+                });
+            }
+            Err(other) => return Err(other),
         }
     }
     Ok(out)
 }
 
-/// Read the `#[encrypted]` column set from the project's models, degrading to an
-/// empty map when the project has no models directory at all.
+/// Read the `#[encrypted]` column set from every production source file under
+/// `src/`, the tree the GDPR scanner walks too. A model may live anywhere; a
+/// column the scan missed would keep its ciphertext or take plaintext.
+/// Degrades to an empty map when the project has no `src/` at all.
 fn encrypted_columns(
     project_root: &Path,
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, ScrubError> {
-    let Some(path) = crate::schema::existing_models_path(project_root) else {
+    let src = project_root.join("src");
+    if !src.is_dir() {
         return Ok(BTreeMap::new());
-    };
-    crate::schema::parse::parse_encrypted_columns_path(&path).map_err(|e| ScrubError::SourceScan {
+    }
+    crate::schema::parse::parse_encrypted_columns_path(&src).map_err(|e| ScrubError::SourceScan {
         detail: e.to_string(),
     })
 }
@@ -2322,139 +2538,439 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 
 /// Whether two connection strings address the same database: same host, same
 /// port, same database name. Credentials are deliberately ignored — a read-only
-/// role pointed at production is still production.
+/// role pointed at production is still production. `env` supplies `PGHOST` /
+/// `PGPORT` for hostless URLs.
 ///
 /// An unparsable URL never claims a match (the guard errs toward "different",
 /// leaving the profile guard as the enforcement).
-fn same_database(a: &str, b: &str) -> bool {
-    same_database_with(a, b, &|key| std::env::var(key).ok())
+fn same_database_in(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    match (database_endpoint(a, env), database_endpoint(b, env)) {
+        (Some((ends_a, name_a)), Some((ends_b, name_b))) => {
+            name_a == name_b
+                && ends_a
+                    .iter()
+                    .any(|a| ends_b.iter().any(|b| same_endpoint(a, b)))
+        }
+        _ => false,
+    }
 }
 
-/// Whether two resolved hosts can name one server. The default socket
-/// directory is unknown, so an empty host may be any socket path.
-fn hosts_match(left: &str, right: &str) -> bool {
-    let is_socket = |h: &str| h.starts_with('/');
-    left == right || (left.is_empty() && is_socket(right)) || (right.is_empty() && is_socket(left))
+/// Whether two `(host, port)` endpoints can be one server. An empty host is the
+/// compiled-in default socket directory, which this guard cannot name, so it
+/// also matches any explicit socket path on the same port. That errs toward
+/// refusing.
+fn same_endpoint(a: &(String, u16), b: &(String, u16)) -> bool {
+    let socket = |h: &str| h.starts_with('/');
+    a == b || (a.1 == b.1 && ((a.0.is_empty() && socket(&b.0)) || (b.0.is_empty() && socket(&a.0))))
 }
 
-/// The pieces of a connection string, read from a URL or from the keyword form.
-struct Raw {
-    params: BTreeMap<String, String>,
-    authority_host: Option<String>,
-    authority_port: Option<u16>,
-    user: String,
-    path_db: String,
-}
-
-/// Like [`same_database`], but the caller passes the environment lookup.
-/// Tests then do not set process environment variables.
+/// The `(host, port)` endpoints and database a URL reaches, resolved as libpq does.
 ///
-/// A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host
-/// from the `hostaddr` parameter, then `PGHOSTADDR`, then `host`, then the URL
-/// authority, then `PGHOST`. Query parameters win over the authority, and the last repeat of a
-/// parameter wins, as in libpq.
-/// If no host is found, the host is empty and libpq uses its default socket.
-fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
-    let decode = |raw: &str| {
-        percent_encoding::percent_decode_str(raw)
+/// A hostless URL (`postgres:///db?host=/run/postgresql`) names its host in the
+/// `host` or `hostaddr` query parameter, else in `PGHOST`, else it uses the
+/// default local socket (an empty host). The port follows the same order.
+fn database_endpoint(
+    raw: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(Vec<(String, u16)>, String)> {
+    // The same test tokio-postgres uses: only these prefixes start a URL, so a
+    // keyword string with `password=https://…` is not one.
+    if !(raw.starts_with("postgres://") || raw.starts_with("postgresql://")) {
+        return conninfo_endpoint(raw, env);
+    }
+    let user = url_user(raw);
+    let stripped = without_userinfo(raw);
+    let (scheme, rest) = stripped.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // The authority can list several `host:port` pairs, which `url::Url`
+    // rejects. Read them here and parse the rest behind a placeholder.
+    let listed = authority_endpoints(&rest[..end])?;
+    let parsed = url::Url::parse(&format!("{scheme}://placeholder{}", &rest[end..])).ok()?;
+    let pairs = raw_query_pairs(parsed.query().unwrap_or_default());
+    // The last repeat of a parameter wins, even when empty. An empty value is
+    // the default and does not fall back to the environment.
+    let query = |key: &str| {
+        pairs
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let query_set = |key: &str| query(key).filter(|v| !v.is_empty());
+    // An explicit `dbname` replaces the path, even when empty. The whole path is
+    // the name, so it may hold a slash.
+    let path_name =
+        percent_encoding::percent_decode_str(parsed.path().strip_prefix('/').unwrap_or_default())
+            .decode_utf8_lossy()
+            .into_owned();
+    let name = Some(query("dbname").unwrap_or(path_name))
+        .filter(|n| !n.is_empty())
+        .or_else(|| env("PGDATABASE").filter(|n| !n.is_empty()))
+        .or_else(|| query_set("user"))
+        .or(user)
+        .or_else(|| env("PGUSER").filter(|n| !n.is_empty()))
+        .unwrap_or_else(crate::pg::current_os_user);
+    // Named query parameters apply after the authority, so they win. `hostaddr`
+    // is the network address libpq connects to; `host` is then only a name.
+    let addr = query("hostaddr").or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty()));
+    let fallback_hosts = query("host").or_else(|| {
+        if listed.is_empty() {
+            env("PGHOST").filter(|v| !v.is_empty())
+        } else if addr.is_some() {
+            // The authority hosts name the empty `hostaddr` items.
+            Some(
+                listed
+                    .iter()
+                    .map(|(host, _)| host.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        } else {
+            None
+        }
+    });
+    let merged = merge_hosts(addr, fallback_hosts);
+    let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if let Some(list) = merged {
+        let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
+        let ports = if listed.len() == hosts.len() {
+            listed.iter().map(|(_, p)| *p).collect()
+        } else if let [(_, port)] = listed.as_slice() {
+            // One port applies to every host.
+            vec![*port; hosts.len()]
+        } else {
+            vec![None; hosts.len()]
+        };
+        (hosts, ports)
+    } else if listed.is_empty() {
+        let list = env("PGHOST").filter(|v| !v.is_empty()).unwrap_or_default();
+        let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
+        let none = vec![None; hosts.len()];
+        (hosts, none)
+    } else {
+        listed.into_iter().unzip()
+    };
+    // A named `port` overrides the authority's port, as the host does.
+    let query_port = query("port");
+    let own_ports = if query_port.is_some() {
+        vec![None; hosts.len()]
+    } else {
+        own_ports
+    };
+    Some((pair_endpoints(hosts, own_ports, query_port, env), name))
+}
+
+/// Pair hosts with ports as libpq does. A port list matches the host list by
+/// position, one port applies to every host, and an empty item or a missing
+/// port is the default port (`PGPORT`, else 5432).
+fn pair_endpoints(
+    hosts: Vec<String>,
+    own_ports: Vec<Option<u16>>,
+    port_list: Option<String>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, u16)> {
+    // An explicit empty port is the compiled-in default, not `PGPORT`.
+    let fallback = if port_list.is_some() {
+        5432
+    } else {
+        env("PGPORT").and_then(|p| p.parse().ok()).unwrap_or(5432)
+    };
+    let items: Vec<Option<u16>> = port_list
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split(',').map(|v| v.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    hosts
+        .into_iter()
+        .zip(own_ports)
+        .enumerate()
+        .map(|(i, (host, own))| {
+            let port = own
+                .or_else(|| {
+                    if items.len() == 1 {
+                        items[0]
+                    } else {
+                        items.get(i).copied().flatten()
+                    }
+                })
+                .unwrap_or(fallback);
+            (host, port)
+        })
+        .collect()
+}
+
+fn normalize_host(host: &str) -> String {
+    let host = percent_encoding::percent_decode_str(host.trim())
+        .decode_utf8_lossy()
+        .into_owned();
+    // A socket directory is case-sensitive. A DNS name is not, and an IP
+    // literal has one canonical spelling.
+    if host.starts_with(['/', '@']) {
+        return host.trim_end_matches('/').to_owned();
+    }
+    let name = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    name.parse::<std::net::IpAddr>()
+        .map_or(name, |ip| ip.to_string())
+}
+
+/// The `host[:port]` pairs of a URI authority, comma separated. Empty for an
+/// empty authority; `None` for a port that is not a number.
+fn authority_endpoints(authority: &str) -> Option<Vec<(String, Option<u16>)>> {
+    if authority.is_empty() {
+        return Some(Vec::new());
+    }
+    authority
+        .split(',')
+        .map(|item| {
+            let (host, port) = if let Some(inner) = item.strip_prefix('[') {
+                let (host, after) = inner.split_once(']')?;
+                (host, after.strip_prefix(':'))
+            } else if let Some((host, port)) = item.rsplit_once(':') {
+                (host, Some(port))
+            } else {
+                (item, None)
+            };
+            let port = match port {
+                Some("") | None => None,
+                Some(p) => Some(p.parse().ok()?),
+            };
+            Some((normalize_host(host), port))
+        })
+        .collect()
+}
+
+/// Parse libpq `key = value` pairs the way `autumn/src/pg_conn_str.rs` does:
+/// whitespace around `=`, single-quoted values, and `\` escaping the next
+/// character inside and outside quotes. `None` for a string it rejects.
+fn conninfo_pairs(s: &str) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    let mut it = s.chars().peekable();
+    loop {
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut key = String::new();
+        while let Some(&c) = it.peek() {
+            if c.is_whitespace() || c == '=' {
+                break;
+            }
+            key.push(c);
+            it.next();
+        }
+        if key.is_empty() {
+            return Some(pairs);
+        }
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        if it.next() != Some('=') {
+            return None;
+        }
+        while it.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut value = String::new();
+        if it.next_if_eq(&'\'').is_some() {
+            loop {
+                match it.next()? {
+                    '\'' => break,
+                    '\\' => value.push(it.next()?),
+                    c => value.push(c),
+                }
+            }
+        } else {
+            while let Some(&c) = it.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                it.next();
+                if c == '\\' {
+                    match it.next() {
+                        Some(escaped) => value.push(escaped),
+                        None => break,
+                    }
+                } else {
+                    value.push(c);
+                }
+            }
+            if value.is_empty() {
+                return None;
+            }
+        }
+        pairs.push((key, value));
+    }
+}
+
+/// [`database_endpoint`] for the keyword/value form: `host=h port=5432 dbname=d`.
+fn conninfo_endpoint(
+    raw: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(Vec<(String, u16)>, String)> {
+    // The last repeat of a keyword wins, even when empty. An empty value is the
+    // default and does not fall back to the environment.
+    let values: BTreeMap<String, String> = conninfo_pairs(raw)?.into_iter().collect();
+    let set = |key: &str| values.get(key).filter(|v| !v.is_empty()).cloned();
+    let env = |key: &str| env(key).filter(|v| !v.is_empty());
+    // The database defaults to the user name when none is given.
+    let name = set("dbname")
+        .or_else(|| env("PGDATABASE"))
+        .or_else(|| set("user"))
+        .or_else(|| env("PGUSER"))
+        .unwrap_or_else(crate::pg::current_os_user);
+    // `hostaddr` is the network address libpq connects to.
+    let host_list = merge_hosts(
+        values
+            .get("hostaddr")
+            .cloned()
+            .or_else(|| env("PGHOSTADDR")),
+        values.get("host").cloned().or_else(|| env("PGHOST")),
+    )
+    .unwrap_or_default();
+    let hosts: Vec<String> = host_list.split(',').map(normalize_host).collect();
+    let own = vec![None; hosts.len()];
+    let endpoints = pair_endpoints(hosts, own, values.get("port").cloned(), &env);
+    Some((endpoints, name))
+}
+
+/// Merge `hostaddr` and `host` lists. An empty `hostaddr` item uses the host
+/// name at the same position.
+fn merge_hosts(addr: Option<String>, name: Option<String>) -> Option<String> {
+    let Some(addr) = addr else { return name };
+    let names: Vec<&str> = name
+        .as_deref()
+        .map_or_else(Vec::new, |n| n.split(',').collect());
+    let merged: Vec<&str> = addr
+        .split(',')
+        .enumerate()
+        .map(|(i, a)| {
+            if a.is_empty() {
+                names.get(i).copied().unwrap_or_default()
+            } else {
+                a
+            }
+        })
+        .collect();
+    Some(merged.join(","))
+}
+
+/// The user name of a URL, percent-decoded. The database defaults to it.
+fn url_user(raw: &str) -> Option<String> {
+    let (_, rest) = raw.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, _) = rest[..end].rsplit_once('@')?;
+    let user = userinfo.split(':').next()?;
+    (!user.is_empty()).then(|| {
+        percent_encoding::percent_decode_str(user)
+            .decode_utf8_lossy()
+            .into_owned()
+    })
+}
+
+/// The `key=value` pairs of a URI query, percent-decoded only. A `+` stays a
+/// plus, as in the connection parser; `url::Url::query_pairs` would read it as
+/// a space.
+fn raw_query_pairs(query: &str) -> Vec<(String, String)> {
+    let decode = |text: &str| {
+        percent_encoding::percent_decode_str(text)
             .decode_utf8_lossy()
             .into_owned()
     };
-    let read = |raw: &str| -> Option<Raw> {
-        let Ok(parsed) = url::Url::parse(raw) else {
-            // The keyword form `host=... dbname=...`. The last repeat wins.
-            let pairs = crate::pg::parse_keyword_value_pairs(raw)?;
-            return Some(Raw {
-                params: pairs.into_iter().collect(),
-                authority_host: None,
-                authority_port: None,
-                user: String::new(),
-                path_db: String::new(),
-            });
-        };
-        if !matches!(parsed.scheme(), "postgres" | "postgresql") {
-            return None;
-        }
-        // libpq applies query parameters after the authority. The last repeat
-        // wins, even when empty. Values use percent-decoding only: `+` is a
-        // literal, not a space.
-        Some(Raw {
-            params: crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or_default())
-                .into_iter()
-                .collect(),
-            authority_host: parsed.host_str().map(decode),
-            authority_port: parsed.port(),
-            user: decode(parsed.username()),
-            path_db: decode(parsed.path().strip_prefix('/').unwrap_or_default()),
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode(key), decode(value))
         })
-    };
-    let parts = |raw: &str| -> Option<(String, u16, String)> {
-        let Raw {
-            params,
-            authority_host,
-            authority_port,
-            user,
-            path_db,
-        } = read(raw)?;
-        // `host` and `hostaddr` are presence-based: an explicit empty value
-        // means the default, and it does not fall back to the environment.
-        let hostaddr = params
-            .get("hostaddr")
-            .cloned()
-            .or_else(|| env("PGHOSTADDR"))
-            .filter(|v| !v.is_empty());
-        let host = hostaddr
-            .or_else(|| params.get("host").cloned())
-            .or(authority_host)
-            .or_else(|| env("PGHOST"))
-            .unwrap_or_default();
-        // A socket directory is case-sensitive. A DNS name is not. An IPv6
-        // address has no brackets and one canonical spelling.
-        let host = if host.starts_with(['/', '@']) {
-            host
-        } else {
-            let name = host
-                .trim_matches(['[', ']'])
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
-            // An IP literal has one canonical spelling.
-            name.parse::<std::net::IpAddr>()
-                .map_or(name, |ip| ip.to_string())
-        };
-        // An omitted port defaults to `PGPORT`, then to 5432.
-        let port = params.get("port").map_or_else(
-            || {
-                authority_port
-                    .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()))
-                    .unwrap_or(5432)
-            },
-            |v| v.parse().unwrap_or(5432),
-        );
-        // `dbname` is presence-based. An empty name defaults to `PGDATABASE`,
-        // then to the user name, then to the OS login, as in libpq.
-        let name = params.get("dbname").cloned().unwrap_or(path_db);
-        let name = if name.is_empty() {
-            env("PGDATABASE")
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| {
-                    params
-                        .get("user")
-                        .cloned()
-                        .filter(|v| !v.is_empty())
-                        .or_else(|| Some(user).filter(|v| !v.is_empty()))
-                        .or_else(|| env("PGUSER").filter(|v| !v.is_empty()))
-                        .unwrap_or_else(crate::pg::current_os_user)
-                })
-        } else {
-            name
-        };
-        Some((host, port, name))
-    };
-    match (parts(a), parts(b)) {
-        (Some((lh, lp, ln)), Some((rh, rp, rn))) => hosts_match(&lh, &rh) && lp == rp && ln == rn,
-        // A Postgres URL this parser cannot read matches only an identical string.
-        _ => (a.starts_with("postgres://") || a.starts_with("postgresql://")) && a == b,
+        .collect()
+}
+
+/// Whether a connection string selects a libpq `service`, as a keyword or as a
+/// URI query parameter.
+fn uses_libpq_service(raw: &str) -> bool {
+    if raw.starts_with("postgres://") || raw.starts_with("postgresql://") {
+        let query = raw.split_once('?').map_or("", |(_, q)| q);
+        let query = query.split('#').next().unwrap_or_default();
+        raw_query_pairs(query).iter().any(|(k, _)| k == "service")
+    } else {
+        conninfo_pairs(raw).is_some_and(|pairs| pairs.iter().any(|(k, _)| k == "service"))
     }
+}
+
+/// `raw` with any `user:password@` removed. An empty host with credentials
+/// (`postgres://app@/db`) is valid libpq but does not parse as a URL.
+fn without_userinfo(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return raw.to_owned();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    rest[..end].rfind('@').map_or_else(
+        || raw.to_owned(),
+        |at| format!("{scheme}://{}", &rest[at + 1..]),
+    )
+}
+
+/// Refuse `--output` when the scrub covers only some configured targets.
+fn refuse_partial_output(
+    args: &ScrubArgs,
+    scrubbed: usize,
+    configured: usize,
+) -> Result<(), ScrubError> {
+    if args.output.is_some() && scrubbed < configured {
+        return Err(ScrubError::SourceScan {
+            detail: "--output needs every configured target, but the artifact restores only some"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// The write targets an artifact restore actually wrote to.
+///
+/// A control-only or single-shard artifact leaves every other configured shard
+/// live; scrubbing those would anonymize data nobody asked to touch.
+fn restored_targets(targets: Vec<(String, String)>, restored: &[String]) -> Vec<(String, String)> {
+    targets
+        .into_iter()
+        .filter(|(label, _)| restored.contains(label))
+        .collect()
+}
+
+/// Profiles whose config could name the artifact's source: the artifact's own
+/// profile plus every profile with a config overlay, minus the always-safe
+/// `dev` and `test`. The destination's own overlay is skipped (it names the
+/// target), but a manifest that names the destination as the source stays.
+fn source_candidates(
+    artifact_profile: Option<&str>,
+    configured: &[String],
+    destination: &str,
+) -> Vec<String> {
+    let destination = migrate::canonical_profile(destination);
+    let mut candidates: Vec<String> = artifact_profile
+        .map(str::to_owned)
+        .into_iter()
+        .chain(
+            configured
+                .iter()
+                .filter(|p| migrate::canonical_profile(p) != destination)
+                .cloned(),
+        )
+        .filter(|p| !super::is_safe_destructive_profile(p))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// The first `(profile, database)` where a declared URL is a write target.
+fn overwritten_source(
+    declared: &[(String, Vec<String>)],
+    targets: &[(String, String)],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, String)> {
+    declared.iter().find_map(|(profile, urls)| {
+        urls.iter().find_map(|declared_url| {
+            targets
+                .iter()
+                .find(|(_, url)| same_database_in(declared_url, url, env))
+                .map(|(_, url)| (profile.clone(), parsed_db_name(url)))
+        })
+    })
 }
 
 /// Refuse to scrub a database that a **config file** declares for a
@@ -2465,11 +2981,16 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
 /// checked, not just the one an artifact's manifest names. A bare `.dump`/`.sql`
 /// artifact carries no manifest at all, so keying the guard off known provenance
 /// would silently skip it in exactly the case where the operator knows least
-/// about what they are restoring.
+/// about what they are restoring. The destination profile is not a source: its
+/// own overlay names the target by definition.
+///
+/// A profile's control URL and every shard URL are compared, because a restore
+/// writes control plus every shard.
 ///
 /// Deliberately reads only `autumn.toml` / `autumn-<profile>.toml`, never the
-/// environment: an env-provided `DATABASE_URL` is shared by every profile
-/// resolution, so consulting it would make this guard fire on legitimate scrubs.
+/// environment for URLs: an env-provided `DATABASE_URL` is shared by every
+/// profile resolution, so consulting it would make this guard fire on
+/// legitimate scrubs.
 ///
 /// It has its own waiver (`--allow-source-overwrite`) rather than riding on
 /// `--force`: the documented staging drill ALWAYS passes `--force` (staging is
@@ -2487,21 +3008,20 @@ fn guard_configured_source(
     if allowed {
         return Ok(());
     }
-    let mut candidates: Vec<String> = artifact_profile
-        .map(str::to_owned)
-        .into_iter()
-        .chain(profiles_with_config(project_root).into_iter().filter(|p| {
-            migrate::canonical_profile(p) != migrate::canonical_profile(destination_profile)
-        }))
-        .filter(|p| !super::is_safe_destructive_profile(p))
-        .collect();
-    candidates.sort();
-    candidates.dedup();
-
+    let candidates = source_candidates(
+        artifact_profile,
+        &profiles_with_config(project_root),
+        destination_profile,
+    );
+    let mut declared: Vec<(String, Vec<String>)> = Vec::new();
     for profile in candidates {
         let table = migrate::read_autumn_toml_table_with_profile_in(project_root, Some(&profile));
-        // Control plus every shard: a restore writes all of them. A bad shard
-        // entry refuses: skipping it would skip the check.
+        let control = migrate::resolve_primary_database_url_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            table.as_ref(),
+        );
+        // A shard list that does not resolve cannot be compared. Refuse rather
+        // than treat it as "no shards".
         let shards = migrate::try_resolve_shard_database_urls_from_sources(
             |_| Err(std::env::VarError::NotPresent),
             table.as_ref(),
@@ -2510,23 +3030,41 @@ fn guard_configured_source(
             path: format!("autumn-{profile}.toml"),
             detail,
         })?;
-        let declared: Vec<String> = migrate::resolve_primary_database_url_from_sources(
-            |_| Err(std::env::VarError::NotPresent),
-            table.as_ref(),
-        )
-        .into_iter()
-        .chain(shards.into_iter().map(|(_, url)| url))
-        .collect();
-        for (_, url) in targets {
-            if declared.iter().any(|d| same_database(d, url)) {
-                return Err(ScrubError::OverwritesConfiguredTarget {
-                    profile,
-                    database: parsed_db_name(url),
-                });
-            }
+        let urls: Vec<String> = control
+            .into_iter()
+            .chain(shards.into_iter().map(|(_, url)| url))
+            .collect();
+        // A libpq `service` names its host and port in a file this guard does
+        // not read. Refuse rather than model it as the default local endpoint.
+        // The ambient `PGSERVICE` applies to a string that names none.
+        let ambient_service =
+            !urls.is_empty() && std::env::var("PGSERVICE").is_ok_and(|service| !service.is_empty());
+        if ambient_service || urls.iter().any(|url| uses_libpq_service(url)) {
+            return Err(ScrubError::SourceScan {
+                detail: format!(
+                    "the {profile:?} profile uses a libpq `service`, whose host the source \
+                     guard cannot resolve; pass --allow-source-overwrite to continue"
+                ),
+            });
+        }
+        if !urls.is_empty() {
+            declared.push((profile, urls));
         }
     }
-    Ok(())
+    // A target that names a `service` hides its host the same way.
+    if !declared.is_empty() && targets.iter().any(|(_, url)| uses_libpq_service(url)) {
+        return Err(ScrubError::SourceScan {
+            detail: "a restore target uses a libpq `service`, whose host the source guard \
+                     cannot resolve; pass --allow-source-overwrite to continue"
+                .to_owned(),
+        });
+    }
+    match overwritten_source(&declared, targets, &|key| std::env::var(key).ok()) {
+        Some((profile, database)) => {
+            Err(ScrubError::OverwritesConfiguredTarget { profile, database })
+        }
+        None => Ok(()),
+    }
 }
 
 /// Profile names that have an `autumn-<profile>.toml` overlay in the project.
@@ -2620,7 +3158,8 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
     // data into the target. Only schema-dependent refusals can land after it.
     let sources = load_source_classification(args)?;
 
-    let targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
+    let mut targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
+    let configured = targets.len();
 
     let restored = if let Some(artifact) = &args.artifact {
         let artifact_profile = super::backup::artifact_source_profile(artifact);
@@ -2638,24 +3177,45 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
                 |p| format!("{p:?} profile")
             )
         );
+        // Only the targets the restore will write matter to the guard. A local
+        // artifact names them up front; an offsite one is resolved later, so
+        // every configured target counts.
+        let guarded = super::backup::artifact_labels(artifact).map_or_else(
+            || targets.clone(),
+            |labels| restored_targets(targets.clone(), &labels),
+        );
+        // `--output` backs up every configured target, so a partial artifact
+        // would package databases the scrub never touched.
+        refuse_partial_output(args, guarded.len(), configured)?;
         guard_configured_source(
             artifact_profile.as_deref(),
             &profile,
             Path::new("."),
-            &targets,
+            &guarded,
             args.allow_source_overwrite,
         )?;
         eprintln!(
             "\u{2500}\u{2500} restoring {} \u{2500}\u{2500}",
             artifact.display()
         );
-        super::backup::restore(&super::backup::RestoreArgs {
+        let restored_labels = super::backup::restore(&super::backup::RestoreArgs {
             artifact: artifact.clone(),
             profile: args.profile.clone(),
             force: args.force,
             shard: None,
             offsite: false,
         })?;
+        // Scrub only what the restore wrote. A partial artifact leaves the
+        // other configured shards live, and they are not ours to anonymize.
+        targets = restored_targets(targets, &restored_labels);
+        refuse_partial_output(args, targets.len(), configured)
+            .inspect_err(|_| warn_unscrubbed())?;
+        if targets.is_empty() {
+            warn_unscrubbed();
+            return Err(ScrubError::SourceScan {
+                detail: "the restore reported no target it wrote to".to_owned(),
+            });
+        }
         true
     } else {
         false
@@ -2666,14 +3226,19 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
     // data in the target. Say so in the loudest possible terms.
     classify_and_apply(args, &profile, &targets, &sources).inspect_err(|_| {
         if restored {
-            eprintln!(
-                "\n\u{26A0}\u{FE0F}  The artifact was ALREADY RESTORED before this failure, so \
-                 the target database now holds UNSCRUBBED data.\n  \
-                 Do not hand it to anyone: fix the problem below and re-run the same \
-                 command, or drop the database."
-            );
+            warn_unscrubbed();
         }
     })
+}
+
+/// Say that a failed run left restored, unscrubbed data in the target.
+fn warn_unscrubbed() {
+    eprintln!(
+        "\n\u{26A0}\u{FE0F}  The artifact was ALREADY RESTORED before this failure, so \
+         the target database now holds UNSCRUBBED data.\n  \
+         Do not hand it to anyone: fix the problem below and re-run the same \
+         command, or drop the database."
+    );
 }
 
 /// The classification inputs that come from files rather than from the database.
@@ -2697,7 +3262,7 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
     let config = load_config(args.config.as_deref())?;
     check_purge_list(&config)?;
     let project_root = Path::new(".");
-    let models_path = crate::schema::existing_models_path(project_root);
+    let has_sources = project_root.join("src").is_dir();
     let declared_encrypted = config
         .tables
         .iter()
@@ -2708,7 +3273,7 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
     // `safe` it keeps production ciphertext, given a plaintext strategy it
     // becomes permanently unreadable. So this is a refusal, not a warning —
     // unless the declaration names them (and their mode) itself.
-    if models_path.is_none() && !declared_encrypted {
+    if !has_sources && !declared_encrypted {
         return Err(ScrubError::EncryptedMetadataUnavailable);
     }
 
@@ -2943,7 +3508,12 @@ fn classify_and_apply(
 
         report_plan(label, &plan);
         report_framework_tables(&facts.framework_tables, &sources.config);
-        report_triggers(&plan, sampling.as_ref(), &facts);
+        report_triggers(
+            &plan,
+            &purge_statements(&facts.framework_tables, &sources.config),
+            sampling.as_ref(),
+            &facts,
+        );
         if let Some(sampling) = &sampling {
             report_sample_plan(label, sampling);
         }
@@ -3417,6 +3987,7 @@ fn classify_and_apply(
                 unpopulated: &facts.unpopulated_views,
             },
             sampling.as_ref(),
+            facts,
             label,
         )
         .inspect_err(|_| warn_committed(&committed))?;
@@ -3826,29 +4397,46 @@ fn human_bytes(bytes: i64) -> String {
     }
 }
 
-/// Warn when a table the scrub rewrites carries user-defined triggers.
+/// Tables this run writes to that carry a user-defined trigger or rule.
 ///
-/// An audit/history trigger copies the pre-scrub `OLD` row into another table as
-/// the `UPDATE` runs — so a table scrubbed earlier in the same transaction can be
-/// re-populated with real values behind the scrub's back.
-fn report_triggers(plan: &ScrubPlan, sampling: Option<&sample::SamplePlan>, facts: &DatabaseFacts) {
-    // A sample DELETEs from tables the column plan never names — a pure join
-    // table has no PII column at all — and an `AFTER DELETE` audit trigger
-    // copies the row it removed somewhere else, which is the same hazard from
-    // the other side.
-    let mut triggered: Vec<&str> = plan
+/// Covers all three classes of write: the column plan, the `[framework] purge`
+/// targets (framework tables are not in `plan.tables`), and the sample.
+fn triggered_write_targets(
+    plan: &ScrubPlan,
+    purges: &[(String, String)],
+    sampling: Option<&sample::SamplePlan>,
+    facts: &DatabaseFacts,
+) -> Vec<String> {
+    let mut triggered: Vec<String> = plan
         .tables
         .iter()
         .map(|t| t.table.as_str())
+        .chain(purges.iter().map(|(table, _)| table.as_str()))
         .chain(
             sampling
                 .into_iter()
                 .flat_map(sample::SamplePlan::subsetted_tables),
         )
         .filter(|t| facts.triggered_tables.contains(*t))
+        .map(str::to_owned)
         .collect();
     triggered.sort_unstable();
     triggered.dedup();
+    triggered
+}
+
+/// Warn when a table the scrub rewrites carries user-defined triggers.
+///
+/// An audit/history trigger copies the pre-scrub `OLD` row into another table as
+/// the `UPDATE` runs — so a table scrubbed earlier in the same transaction can be
+/// re-populated with real values behind the scrub's back.
+fn report_triggers(
+    plan: &ScrubPlan,
+    purges: &[(String, String)],
+    sampling: Option<&sample::SamplePlan>,
+    facts: &DatabaseFacts,
+) {
+    let triggered = triggered_write_targets(plan, purges, sampling, facts);
     if triggered.is_empty() {
         return;
     }
@@ -4166,6 +4754,12 @@ pub struct DatabaseFacts {
     /// question for a migration diff and the wrong one for "can this rewrite
     /// collide".
     pub unique_columns: BTreeSet<(String, String)>,
+    /// Columns read by a unique index's expression or predicate. Injectivity on
+    /// a column's own value does not survive an arbitrary expression: every
+    /// scrubbed address starts `scrubbed+`, so `UNIQUE (left(email, 1))` collides.
+    pub unique_expression_columns: BTreeSet<(String, String)>,
+    /// Columns named by an exclusion constraint, which is not `indisunique`.
+    pub exclusion_columns: BTreeSet<(String, String)>,
     /// Columns covered by a `NULLS NOT DISTINCT` unique index, where more than
     /// one `NULL` is itself a uniqueness violation.
     pub nulls_not_distinct_columns: BTreeSet<(String, String)>,
@@ -4178,9 +4772,10 @@ pub struct DatabaseFacts {
     /// the parent moves each row to the partition its new key belongs to: it
     /// aborts when none exists, and collapses the table into one when one does.
     pub partition_key_columns: BTreeSet<(String, String)>,
-    /// Tables with row-level security enabled. A non-bypassing role silently
-    /// updates only the rows its policies expose — a fail-open a scrub cannot
-    /// tolerate.
+    /// Tables whose row-level security binds the connected role. Such a role
+    /// silently updates only the rows its policies expose — a fail-open a scrub
+    /// cannot tolerate. A superuser, a `BYPASSRLS` role and an unforced owner
+    /// are not bound, so their tables are absent.
     pub rls_tables: BTreeSet<String>,
     /// Legacy `INHERITS` children as `child (inherits parent)`, sorted. Empty
     /// for a declaratively partitioned schema, which the sample does model.
@@ -4308,6 +4903,11 @@ pub struct DatabaseFacts {
     /// and be reported clean. `pg_class` shows them all, and the difference is
     /// a refusal.
     pub public_base_tables: BTreeSet<String>,
+    /// Every materialized view in `public` as `name:oid:populated`. The drift check
+    /// compares it, because the refresh list is fixed at probe time.
+    pub public_materialized_views: BTreeSet<String>,
+    /// Every user trigger and rule by identity. The drift check compares it.
+    pub trigger_identities: BTreeSet<String>,
     /// Every foreign key in `public`, whole constraints rather than the loose
     /// columns above: `--sample` walks this graph to decide which rows a subset
     /// must carry for every reference to resolve.
@@ -4394,7 +4994,7 @@ const PARTITION_KEY_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS c
              || '($|[^[:alnum:]_])'))";
 
 /// Move each sub-partitioned table's key columns onto its root table.
-fn fold_partition_keys(
+fn fold_into_parent(
     keys: impl IntoIterator<Item = (String, String)>,
     partitions: &BTreeMap<String, String>,
 ) -> BTreeSet<(String, String)> {
@@ -4452,6 +5052,176 @@ fn has_catalog_column(
     .load(conn)
     .map_err(|e| ScrubError::Sql(e.to_string()))?;
     Ok(!rows.is_empty())
+}
+
+/// Tables in `public` whose row-level security restricts the connected role.
+///
+/// RLS only binds a role the table's policies apply to. A superuser and a
+/// `BYPASSRLS` role skip it; so does the table owner, unless the table is
+/// `FORCE ROW LEVEL SECURITY`. Refusing those would make the documented remedy
+/// ("connect as the owner") a dead end. `current_user` is the role RLS checks.
+const RLS_RESTRICTED_TABLES: &str = "SELECT rel.relname AS name FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relrowsecurity \
+       AND NOT COALESCE((SELECT r.rolsuper OR r.rolbypassrls FROM pg_roles r \
+                         WHERE r.rolname = current_user), false) \
+       AND NOT (pg_has_role(current_user, rel.relowner, 'USAGE') \
+                AND NOT rel.relforcerowsecurity)";
+
+/// Every base table in `public`, foreign tables included.
+const PUBLIC_BASE_TABLES: &str = "SELECT rel.relname AS name FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relkind IN ('r', 'p', 'f')";
+
+/// Every user trigger and rewrite rule on a `public` relation, by identity:
+/// name, event bits and enabled state. A table-name set cannot see a second
+/// trigger added to a table that already has one.
+const TRIGGER_IDENTITIES: &str = "SELECT rel.relname || ':trigger:' || t.tgname || ':' || t.tgtype::text \
+         || ':' || t.tgenabled::text || ':' || md5(pg_get_triggerdef(t.oid)) AS name \
+     FROM pg_trigger t \
+     JOIN pg_class rel ON rel.oid = t.tgrelid \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE NOT t.tgisinternal \
+     UNION ALL \
+     SELECT rel.relname || ':rule:' || r.rulename || ':' || r.ev_type::text \
+         || ':' || r.ev_enabled::text || ':' || md5(pg_get_ruledef(r.oid)) AS name \
+     FROM pg_rewrite r \
+     JOIN pg_class rel ON rel.oid = r.ev_class \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE r.rulename <> '_RETURN'";
+
+/// Generated and `GENERATED ALWAYS` identity columns, read through `to_jsonb` so
+/// the same text runs on servers that lack `attgenerated` (before 12). A column
+/// that stops being generated mid-run is an ordinary column holding real values.
+const GENERATED_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
+     FROM pg_attribute att \
+     JOIN pg_class rel ON rel.oid = att.attrelid \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE att.attnum > 0 AND NOT att.attisdropped \
+       AND (coalesce(to_jsonb(att)->>'attgenerated', '') <> '' \
+            OR to_jsonb(att)->>'attidentity' = 'a')";
+
+/// Every materialized view in `public`, by name, OID and population state, and
+/// every ordinary view in any user schema by definition hash. The refresh list and its order are
+/// drawn from the probe. A view created, recreated (new OID), or replaced in
+/// place would keep stale rows or reorder the refreshes.
+const PUBLIC_MATVIEWS: &str = "SELECT rel.relname || ':' || rel.oid::text || ':' || rel.relispopulated::text AS name \
+     FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relkind = 'm' \
+     UNION ALL \
+     SELECT ns.nspname || '.' || rel.relname || ':view:' || md5(pg_get_viewdef(rel.oid)) AS name \
+     FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace \
+       AND ns.nspname <> 'information_schema' AND ns.nspname !~ '^pg_' \
+     WHERE rel.relkind = 'v'";
+
+/// Every live column of those tables.
+const PUBLIC_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
+     FROM pg_attribute att \
+     JOIN pg_class rel ON rel.oid = att.attrelid \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relkind IN ('r', 'p', 'f') AND att.attnum > 0 AND NOT att.attisdropped";
+
+/// Compare the facts the plan was built from with what this connection sees now.
+///
+/// Covers the names the plan classified, and the hazards the refusals read: the
+/// RLS set and the trigger and rule sets. A migration that lands between the
+/// probe and the locks must not leave a stale answer behind.
+fn live_schema_drift(
+    conn: &mut PgConnection,
+    facts: &DatabaseFacts,
+) -> Result<Vec<String>, diesel::result::Error> {
+    let names = |conn: &mut PgConnection, sql: &str| -> Result<BTreeSet<String>, _> {
+        Ok::<_, diesel::result::Error>(
+            sql_query(sql)
+                .load::<NameRow>(conn)?
+                .into_iter()
+                .map(|r| r.name)
+                .collect(),
+        )
+    };
+    let tables = names(conn, PUBLIC_BASE_TABLES)?;
+    let columns = pair_set(sql_query(PUBLIC_COLUMNS).load::<PairRow>(conn)?);
+    let mut drift = schema_drift(
+        (&facts.public_base_tables, &facts.public_columns),
+        (&tables, &columns),
+    );
+    let generated = pair_set(sql_query(GENERATED_COLUMNS).load::<PairRow>(conn)?);
+    drift.extend(
+        generated
+            .symmetric_difference(&facts.generated_columns)
+            .map(|(t, c)| format!("{t}.{c} (generated state changed)")),
+    );
+    let mut triggered = names(conn, &triggers_reaching(""))?;
+    triggered.extend(names(conn, &rules_reaching(""))?);
+    let mut delete_triggered = names(conn, &triggers_reaching("AND (t.tgtype & 8) <> 0 "))?;
+    delete_triggered.extend(names(conn, &rules_reaching("AND r.ev_type = '4' "))?);
+    for (label, before, after) in [
+        (
+            "row-level security",
+            &facts.rls_tables,
+            names(conn, RLS_RESTRICTED_TABLES)?,
+        ),
+        (
+            "materialized view",
+            &facts.public_materialized_views,
+            names(conn, PUBLIC_MATVIEWS)?,
+        ),
+        (
+            "trigger or rule",
+            &facts.trigger_identities,
+            names(conn, TRIGGER_IDENTITIES)?,
+        ),
+        ("triggers or rules", &facts.triggered_tables, triggered),
+        (
+            "DELETE triggers or rules",
+            &facts.delete_triggered_tables,
+            delete_triggered,
+        ),
+    ] {
+        drift.extend(
+            after
+                .symmetric_difference(before)
+                .map(|t| format!("{t} ({label} changed)")),
+        );
+    }
+    drift.sort();
+    Ok(drift)
+}
+
+/// List the tables and columns that differ between two snapshots, sorted.
+fn schema_drift(
+    before: (&BTreeSet<String>, &BTreeSet<(String, String)>),
+    after: (&BTreeSet<String>, &BTreeSet<(String, String)>),
+) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    drift.extend(
+        after
+            .0
+            .difference(before.0)
+            .map(|t| format!("{t} (table added)")),
+    );
+    drift.extend(
+        before
+            .0
+            .difference(after.0)
+            .map(|t| format!("{t} (table dropped)")),
+    );
+    drift.extend(
+        after
+            .1
+            .difference(before.1)
+            .map(|(t, c)| format!("{t}.{c} (column added)")),
+    );
+    drift.extend(
+        before
+            .1
+            .difference(after.1)
+            .map(|(t, c)| format!("{t}.{c} (column dropped)")),
+    );
+    drift.sort();
+    drift
 }
 
 /// Gather every catalog fact the plan validation needs.
@@ -4588,7 +5358,7 @@ fn probe_database_facts(
     } else {
         "i.indkey"
     };
-    let mut unique_columns = pair_set(
+    let unique_columns = pair_set(
         sql_query(format!(
             "SELECT rel.relname AS tbl, att.attname AS col \
              FROM pg_index i \
@@ -4613,30 +5383,67 @@ fn probe_database_facts(
     //   on `group_id`, but rewriting `active` changes which rows the index
     //   COVERS — pulling previously-excluded duplicates into it.
     //
-    // `pg_depend` records both the expression- and the predicate-referenced
-    // columns, so one query covers them.
+    // Keep these in their own set, not in `unique_columns`. A strategy that is
+    // unique on the column value says nothing about an expression over it, so
+    // no strategy is allowed.
     //
-    // NOTE: adding them here is only a PARTIAL guard, and deliberately recorded
-    // as such. `Strategy::allowed_on_unique` permits `email`/`name`/`redact` on
-    // a unique column because those are injective on the column's own value —
-    // but injectivity does not survive an arbitrary expression. Every scrubbed
-    // address starts `scrubbed+`, so `UNIQUE (left(email, 1))` still collides at
-    // execution time. A correct guard needs its own refusal for expression
-    // operands rather than folding them into the unique set; tracked in #2366.
-    unique_columns.extend(pair_set(
+    // `pg_depend` cannot find them: a column that an expression or predicate
+    // reads is an auto dependency, like a plain key column. The stored node
+    // trees name each column as `varattno N`. Match on that, as
+    // `PARTITION_KEY_COLUMNS` does for expression partition keys. `varattno 0`
+    // is a whole-row reference: it reads every column.
+    let unique_expression_columns = pair_set(
         sql_query(
             "SELECT rel.relname AS tbl, att.attname AS col \
              FROM pg_index i \
              JOIN pg_class rel ON rel.oid = i.indrelid \
              JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             JOIN pg_depend d ON d.objid = i.indexrelid AND d.refobjid = i.indrelid \
-             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = d.refobjsubid \
-             WHERE i.indisunique AND d.refobjsubid > 0 \
-             AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)",
+             JOIN pg_attribute att ON att.attrelid = rel.oid \
+               AND att.attnum > 0 AND NOT att.attisdropped \
+             WHERE i.indisunique \
+               AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL) \
+               AND (coalesce(i.indexprs::text, '') || ' ' || coalesce(i.indpred::text, '')) \
+                   ~ ('[^[:alnum:]_]varattno (0|' || att.attnum || ')[^0-9]')",
         )
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
-    ));
+    );
+
+    // An exclusion constraint index is `indisexclusion`, not `indisunique`, so
+    // the probes above miss it. Count its plain columns (`indkey`) and the
+    // columns its expressions and predicate read (`pg_depend` and the node
+    // trees, as for the unique probe above).
+    let exclusion_columns = pair_set(
+        sql_query(format!(
+            "SELECT rel.relname AS tbl, att.attname AS col \
+             FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             JOIN pg_attribute att ON att.attrelid = rel.oid \
+             AND att.attnum = ANY({key_slice}) \
+             WHERE i.indisexclusion AND att.attnum > 0 \
+             UNION \
+             SELECT rel.relname, att.attname \
+             FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             JOIN pg_depend d ON d.objid = i.indexrelid AND d.refobjid = i.indrelid \
+             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = d.refobjsubid \
+             WHERE i.indisexclusion AND d.refobjsubid > 0 \
+             UNION \
+             SELECT rel.relname, att.attname \
+             FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             JOIN pg_attribute att ON att.attrelid = rel.oid \
+               AND att.attnum > 0 AND NOT att.attisdropped \
+             WHERE i.indisexclusion \
+               AND (coalesce(i.indexprs::text, '') || ' ' || coalesce(i.indpred::text, '')) \
+                   ~ ('[^[:alnum:]_]varattno (0|' || att.attnum || ')[^0-9]')"
+        ))
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+    );
 
     // `NULLS NOT DISTINCT` (PG15+) makes a second NULL a violation, so the
     // `null` strategy stops being unique-safe. `indnullsnotdistinct` does not
@@ -4694,6 +5501,17 @@ fn probe_database_facts(
             BTreeMap::new()
         };
 
+    // A constraint declared on a partition alone (a child-only `CHECK`, a local
+    // unique index) still fires when the run's `UPDATE` reaches that partition
+    // through its parent, and the plan only looks at the parent. Fold each
+    // constraint fact onto the root, as the partition keys are below.
+    let foreign_key_columns = fold_into_parent(foreign_key_columns, &partitions);
+    let checked_columns = fold_into_parent(checked_columns, &partitions);
+    let unique_columns = fold_into_parent(unique_columns, &partitions);
+    let unique_expression_columns = fold_into_parent(unique_expression_columns, &partitions);
+    let exclusion_columns = fold_into_parent(exclusion_columns, &partitions);
+    let nulls_not_distinct_columns = fold_into_parent(nulls_not_distinct_columns, &partitions);
+
     // Partition-key columns. `partattrs` holds `0` for an expression key. For
     // those tables, match the column names in the key definition. An over-match
     // refuses a non-key column, which is safe. Sub-partition keys fold into the
@@ -4705,7 +5523,7 @@ fn probe_database_facts(
                     .load(&mut conn)
                     .map_err(|e| ScrubError::Sql(e.to_string()))?,
             );
-            fold_partition_keys(rows, &partitions)
+            fold_into_parent(rows, &partitions)
         } else {
             BTreeSet::new()
         };
@@ -4735,14 +5553,9 @@ fn probe_database_facts(
         names
     };
 
-    let rls_tables = names(
-        "SELECT rel.relname AS name FROM pg_class rel \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE rel.relrowsecurity",
-        &mut conn,
-    )?
-    .into_iter()
-    .collect();
+    let rls_tables = names(RLS_RESTRICTED_TABLES, &mut conn)?
+        .into_iter()
+        .collect();
 
     // Two questions, one shape: which tables carry a user-defined trigger at
     // all (the warning), and which carry one that fires on `DELETE` (the
@@ -5011,25 +5824,14 @@ fn probe_database_facts(
     // `f` (foreign tables) is deliberately included: introspection reads only
     // `BASE TABLE`, so a foreign table left pointing at production would be
     // classified by nothing at all and still report a clean scrub.
-    let public_base_tables = names(
-        "SELECT rel.relname AS name FROM pg_class rel \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE rel.relkind IN ('r', 'p', 'f')",
-        &mut conn,
-    )?
-    .into_iter()
-    .collect();
+    let public_base_tables = names(PUBLIC_BASE_TABLES, &mut conn)?.into_iter().collect();
+    let public_materialized_views = names(PUBLIC_MATVIEWS, &mut conn)?.into_iter().collect();
+    let trigger_identities = names(TRIGGER_IDENTITIES, &mut conn)?.into_iter().collect();
 
     let public_columns = pair_set(
-        sql_query(
-            "SELECT rel.relname AS tbl, att.attname AS col \
-             FROM pg_attribute att \
-             JOIN pg_class rel ON rel.oid = att.attrelid \
-             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             WHERE rel.relkind IN ('r', 'p', 'f') AND att.attnum > 0 AND NOT att.attisdropped",
-        )
-        .load(&mut conn)
-        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+        sql_query(PUBLIC_COLUMNS)
+            .load(&mut conn)
+            .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
 
     Ok(DatabaseFacts {
@@ -5037,6 +5839,8 @@ fn probe_database_facts(
         checked_columns,
         generated_columns,
         unique_columns,
+        unique_expression_columns,
+        exclusion_columns,
         nulls_not_distinct_columns,
         partitions,
         partition_key_columns,
@@ -5055,6 +5859,8 @@ fn probe_database_facts(
         framework_tables,
         public_columns,
         public_base_tables,
+        public_materialized_views,
+        trigger_identities,
         foreign_keys,
     })
 }
@@ -6054,10 +6860,7 @@ fn rewrite_encrypted_column(
     for chunk in rows.chunks(ENCRYPTED_BATCH_ROWS) {
         let mut values = Vec::with_capacity(chunk.len());
         for row in chunk {
-            let plaintext = match rewrite.shape {
-                Strategy::Email => format!("scrubbed+{}{SCRUB_EMAIL_DOMAIN}", row.token),
-                _ => format!("[scrubbed:{}]", row.token),
-            };
+            let plaintext = encrypted_plaintext(rewrite.shape, &row.token);
             // A key ring is installed before the apply pass, so this can only
             // fail on a genuinely broken key — surfaced as a SQL-shaped error so
             // the transaction rolls back with everything else.
@@ -6085,6 +6888,24 @@ fn rewrite_encrypted_column(
         .execute(conn)?;
     }
     Ok(updated)
+}
+
+/// The plaintext sealed into an `#[encrypted]` column for one row.
+fn encrypted_plaintext(shape: Strategy, token: &str) -> String {
+    match shape {
+        Strategy::Email => format!("scrubbed+{token}{SCRUB_EMAIL_DOMAIN}"),
+        _ => format!("[scrubbed:{token}]"),
+    }
+}
+
+/// Characters of the stored base64 envelope for [`encrypted_plaintext`]: a
+/// 20-byte header, the plaintext, and a 16-byte AEAD tag. The token is two
+/// `md5` hex digests, 64 characters.
+fn envelope_len(shape: Strategy) -> usize {
+    const HEADER_AND_TAG: usize = 20 + 16;
+    const TOKEN: usize = 64;
+    let plaintext = encrypted_plaintext(shape, &"0".repeat(TOKEN)).len();
+    (HEADER_AND_TAG + plaintext).div_ceil(3) * 4
 }
 
 /// What one database's scrub wrote: `(table, rows)` per rewrite, plus the
@@ -6157,12 +6978,15 @@ fn verify_sample_survived_refreshes(
 
 /// Run every statement for one database inside a single transaction, so a
 /// failure can never leave a half-scrubbed database behind.
+// One transaction, in write order; splitting it would hide that order.
+#[allow(clippy::too_many_lines)]
 fn execute(
     url: &str,
     plan: &ScrubPlan,
     purges: &[(String, String)],
     views: &ViewRefresh<'_>,
     sampling: Option<&sample::SamplePlan>,
+    facts: &DatabaseFacts,
     label: &str,
 ) -> Result<Applied, ScrubError> {
     if plan.tables.is_empty() && purges.is_empty() && views.ordered.is_empty() && sampling.is_none()
@@ -6172,6 +6996,7 @@ fn execute(
     let mut conn = probe_connection(url, label, "apply the scrub")?;
     let mut counts = Vec::with_capacity(plan.tables.len());
     let mut outcome = None;
+    let mut drift: Vec<String> = Vec::new();
     // The transaction's error type carries BOTH channels, so a sample refusal
     // rolls back as itself rather than as an opaque database error.
     conn.transaction::<_, sample::SampleFailure, _>(|conn| {
@@ -6191,6 +7016,15 @@ fn execute(
         // the table emptied.
         for statement in lock_statements(plan, purges, sampling) {
             sql_query(statement).execute(conn)?;
+        }
+        // The locks above wait for a concurrent migration to commit, then see
+        // its schema. Compare against the snapshot the plan was built from, so
+        // a column added in that window cannot commit unclassified.
+        drift = live_schema_drift(conn, facts)?;
+        if !drift.is_empty() {
+            return Err(sample::SampleFailure::Db(
+                diesel::result::Error::RollbackTransaction,
+            ));
         }
         // Purges run FIRST so a framework-owned table that references a
         // sampled one is already empty when the sample removes its parents —
@@ -6336,9 +7170,20 @@ fn execute(
         if let (Some(settled), Some(plan)) = (outcome.as_ref(), sampling) {
             verify_sample_survived_refreshes(conn, settled, plan)?;
         }
+        // Again, as the last check before commit: a table the plan does not
+        // lock can change after the first comparison.
+        drift = live_schema_drift(conn, facts)?;
+        if !drift.is_empty() {
+            return Err(sample::SampleFailure::Db(
+                diesel::result::Error::RollbackTransaction,
+            ));
+        }
         Ok(())
     })
     .map_err(|e| match e {
+        _ if !drift.is_empty() => ScrubError::SchemaChanged {
+            entries: std::mem::take(&mut drift),
+        },
         sample::SampleFailure::Refused(refusal) => ScrubError::from(refusal),
         sample::SampleFailure::Db(error) => ScrubError::Sql(error.to_string()),
     })?;
@@ -7864,6 +8709,37 @@ mod tests {
     }
 
     #[test]
+    fn a_purge_target_with_a_trigger_is_reported_like_any_other_write() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name", "bio"]
+            [framework]
+            purge = ["autumn_jobs"]
+            "#,
+        )
+        .unwrap();
+        let facts = DatabaseFacts {
+            framework_tables: vec!["autumn_jobs".to_owned()],
+            triggered_tables: BTreeSet::from(["autumn_jobs".to_owned()]),
+            ..DatabaseFacts::default()
+        };
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .unwrap();
+        let purges = purge_statements(&facts.framework_tables, &config);
+        assert_eq!(
+            triggered_write_targets(&plan, &purges, None, &facts),
+            vec!["autumn_jobs".to_owned()]
+        );
+    }
+
+    #[test]
     fn column_level_privilege_gaps_are_refused_too() {
         // A role can see a table but not all of its columns: the table
         // classifies, the visible columns are rewritten, and the hidden PII
@@ -7978,6 +8854,392 @@ mod tests {
             matches!(err, ScrubError::CheckConstrainedColumn { ref column } if column == "users.bio"),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_structural_encrypted_column_can_be_declared_safe() {
+        // `users.email` is `#[encrypted]` and another table references it, so it
+        // can never be rewritten. The only honest outcome is that the ciphertext
+        // stays; a `safe` declaration must be able to say so.
+        let facts = DatabaseFacts {
+            foreign_key_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let encrypted = encrypted_columns_of("users", &["email"]);
+        let safe = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "bio"]
+            [tables.users]
+            safe = ["email"]
+            [tables.users.pii]
+            full_name = "name"
+            "#,
+        )
+        .unwrap();
+        let plan = plan_with_facts(&[users_table()], &safe, &encrypted, &no_anonymize(), &facts)
+            .expect("a declared-safe structural encrypted column terminates");
+        assert!(plan.column("users", "email").is_none());
+
+        let undeclared = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "bio"]
+            [tables.users.pii]
+            full_name = "name"
+            "#,
+        )
+        .unwrap();
+        let err = plan_with_facts(
+            &[users_table()],
+            &undeclared,
+            &encrypted,
+            &no_anonymize(),
+            &facts,
+        )
+        .expect_err("without a declaration it still fails");
+        assert!(
+            matches!(err, ScrubError::PiiOnKeyColumn { ref columns } if columns == &vec!["users.email".to_owned()]),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("ciphertext"), "{err}");
+    }
+
+    #[test]
+    fn a_libpq_service_source_is_not_modelled_as_a_local_endpoint() {
+        assert!(uses_libpq_service(
+            "service=production user=app dbname=mydb"
+        ));
+        assert!(!uses_libpq_service("host=prod dbname=app"));
+        assert!(uses_libpq_service("postgres:///app?service=production"));
+        assert!(!uses_libpq_service("postgres://prod/app?sslmode=require"));
+    }
+
+    #[test]
+    fn the_new_refusals_render_an_actionable_message() {
+        let too_long = ScrubError::EncryptedEnvelopeTooLong {
+            column: "users.bio".to_owned(),
+            limit: 100,
+            needed: 148,
+        }
+        .to_string();
+        assert!(
+            too_long.contains("100") && too_long.contains("148"),
+            "{too_long}"
+        );
+        let operand = ScrubError::IndexOperandColumn {
+            column: "users.email".to_owned(),
+            kind: "an exclusion constraint",
+        }
+        .to_string();
+        assert!(
+            operand.contains("exclusion constraint") && operand.contains("`safe`"),
+            "{operand}"
+        );
+        let drift = ScrubError::SchemaChanged {
+            entries: vec!["users.ssn (column added)".to_owned()],
+        }
+        .to_string();
+        assert!(
+            drift.contains("users.ssn") && drift.contains("Nothing was written"),
+            "{drift}"
+        );
+    }
+
+    #[test]
+    fn the_anonymize_scan_visits_every_item_and_expression_kind() {
+        // Parse-only: the scan never type-checks. Each construct reaches a
+        // visitor arm, and none of them registers a table.
+        let src = r#"
+            const C: u8 = 1;
+            static S: u8 = 2;
+            trait T { const X: u8; fn f(&self) { let _ = 1; } }
+            struct W;
+            impl W { const Y: u8 = 3; fn g(&self) -> u8 { 4 } }
+            async fn h(v: Vec<u8>, mut n: u8, o: Option<u8>) -> Option<u8> {
+                let a = [1, 2];
+                n = a[0] + 1;
+                let _ = async { 5 }.await;
+                let _ = (n as u16, |x: u8| x, const { 6 }, v.len(), (n), &n, n..3);
+                let _ = [0u8; 2];
+                for i in 0..2 { if i == 1 { break; } else { continue; } }
+                while n > 9 { n -= 1; }
+                loop { break; }
+                if let Some(z) = o { let _ = z; }
+                let _ = unsafe { 7 };
+                let _ = -n;
+                let _ = struct_lit();
+                let _ = o?;
+                println!("{}", n);
+                match n { 0 => {} _ => {} }
+                return o;
+            }
+            fn struct_lit() -> W { W }
+        "#;
+        assert!(extract_anonymize_tables(src).unwrap().is_empty());
+        let disabled = r#"
+            #[cfg(test)] const C: u8 = 1;
+            #[cfg(test)] static S: u8 = 2;
+            trait T { #[cfg(test)] const X: u8; #[cfg(test)] fn f(&self); }
+            struct W;
+            impl W { #[cfg(test)] const Y: u8 = 3; #[cfg(test)] fn g(&self) {} }
+            fn k() { #[cfg(test)] println!("x"); #[cfg(test)] let _ = 1; }
+        "#;
+        assert!(extract_anonymize_tables(disabled).unwrap().is_empty());
+        let field = r#"
+            fn reg() -> R { R { #[cfg(test)] m: ModelRegistration::anonymize("users") } }
+        "#;
+        assert!(extract_anonymize_tables(field).unwrap().is_empty());
+        let variant = r#"
+            enum E { #[cfg(test)] V = { ModelRegistration::anonymize("users"); 0 } }
+        "#;
+        assert!(extract_anonymize_tables(variant).unwrap().is_empty());
+        let decl = r#"
+            struct S { #[cfg(test)] f: [(); { ModelRegistration::anonymize("users"); 0 }] }
+        "#;
+        assert!(extract_anonymize_tables(decl).unwrap().is_empty());
+        let item = r#"
+            #[cfg(test)] struct F { f: [(); { ModelRegistration::anonymize("users"); 0 }] }
+        "#;
+        assert!(extract_anonymize_tables(item).unwrap().is_empty());
+        let param = r#"
+            fn f(#[cfg(test)] x: [(); { ModelRegistration::anonymize("users"); 0 }]) {}
+        "#;
+        assert!(extract_anonymize_tables(param).unwrap().is_empty());
+        let generic = r#"
+            struct R<#[cfg(test)] T = [(); { ModelRegistration::anonymize("users"); 0 }]>(T);
+        "#;
+        assert!(extract_anonymize_tables(generic).unwrap().is_empty());
+        let closure = r#"
+            fn c() { let _ = |#[cfg(test)] x: [(); { ModelRegistration::anonymize("users"); 0 }]| {}; }
+        "#;
+        assert!(extract_anonymize_tables(closure).unwrap().is_empty());
+        let foreign = r#"
+            #[cfg(test)] extern "C" { static X: [u8; { ModelRegistration::anonymize("users"); 0 }]; }
+            extern "C" { #[cfg(test)] static Y: [u8; { ModelRegistration::anonymize("users"); 0 }]; }
+        "#;
+        assert!(extract_anonymize_tables(foreign).unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_needs_every_configured_target() {
+        let with_output = ScrubArgs {
+            output: Some(PathBuf::from("out")),
+            ..ScrubArgs::default()
+        };
+        assert!(refuse_partial_output(&with_output, 1, 2).is_err());
+        assert!(refuse_partial_output(&with_output, 2, 2).is_ok());
+        assert!(refuse_partial_output(&ScrubArgs::default(), 1, 2).is_ok());
+    }
+
+    #[test]
+    fn the_anonymize_scan_reports_unreadable_and_unresolvable_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            scan_anonymize_tables(&dir.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(dir.path().join("bad.rs"), "fn {").unwrap();
+        let err = scan_anonymize_tables(dir.path()).unwrap_err();
+        assert!(matches!(err, ScrubError::SourceScan { .. }), "{err:?}");
+        std::fs::write(
+            dir.path().join("bad.rs"),
+            "fn f(t: &str) { ModelRegistration::anonymize(t); }",
+        )
+        .unwrap();
+        let err = scan_anonymize_tables(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ScrubError::UnresolvableAnonymize { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn conninfo_pairs_handles_quotes_escapes_and_rejections() {
+        let pairs = |s: &str| conninfo_pairs(s);
+        assert_eq!(
+            pairs("host = 'a b' dbname=x\\ y"),
+            Some(vec![
+                ("host".to_owned(), "a b".to_owned()),
+                ("dbname".to_owned(), "x y".to_owned())
+            ])
+        );
+        assert_eq!(
+            pairs("host='a\\'b'"),
+            Some(vec![("host".to_owned(), "a'b".to_owned())])
+        );
+        assert_eq!(pairs("host"), None, "no equals sign");
+        assert_eq!(pairs("host='open"), None, "unterminated quote");
+        assert_eq!(pairs("host="), None, "empty unquoted value");
+        assert_eq!(
+            pairs("host=a\\"),
+            Some(vec![("host".to_owned(), "a".to_owned())])
+        );
+        assert_eq!(pairs(""), Some(Vec::new()));
+        assert_eq!(without_userinfo("no scheme"), "no scheme");
+        assert_eq!(without_userinfo("postgres://h/db"), "postgres://h/db");
+    }
+
+    #[test]
+    fn report_triggers_prints_only_for_triggered_write_targets() {
+        let plan = ScrubPlan::default();
+        let facts = DatabaseFacts {
+            triggered_tables: BTreeSet::from(["autumn_jobs".to_owned()]),
+            ..DatabaseFacts::default()
+        };
+        // No purge: nothing to report.
+        report_triggers(&plan, &[], None, &facts);
+        // A purge target with a trigger: prints the warning.
+        report_triggers(
+            &plan,
+            &[(
+                "autumn_jobs".to_owned(),
+                "DELETE FROM autumn_jobs".to_owned(),
+            )],
+            None,
+            &facts,
+        );
+    }
+
+    #[test]
+    fn the_generated_column_probe_runs_on_servers_without_attgenerated() {
+        assert!(GENERATED_COLUMNS.contains("to_jsonb(att)"));
+    }
+
+    #[test]
+    fn the_matview_snapshot_changes_when_a_view_is_recreated() {
+        assert!(TRIGGER_IDENTITIES.contains("pg_get_triggerdef"));
+        assert!(TRIGGER_IDENTITIES.contains("pg_get_ruledef"));
+        assert!(PUBLIC_MATVIEWS.contains("rel.oid"));
+        assert!(PUBLIC_MATVIEWS.contains("pg_get_viewdef"));
+    }
+
+    #[test]
+    fn the_view_snapshot_covers_views_outside_public() {
+        assert!(PUBLIC_MATVIEWS.contains("ns.nspname || '.'"));
+        assert!(PUBLIC_MATVIEWS.contains("!~ '^pg_'"));
+    }
+
+    #[test]
+    fn the_rls_probe_asks_about_the_connected_role() {
+        for term in [
+            "rolsuper",
+            "rolbypassrls",
+            "relforcerowsecurity",
+            "relowner",
+        ] {
+            assert!(
+                RLS_RESTRICTED_TABLES.contains(term),
+                "the RLS probe must consult {term}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_index_expression_or_exclusion_operand_is_refused_for_every_strategy() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "full_name", "bio"]
+            [tables.users.pii]
+            email = "email"
+            "#,
+        )
+        .unwrap();
+        for facts in [
+            DatabaseFacts {
+                unique_expression_columns: BTreeSet::from([(
+                    "users".to_owned(),
+                    "email".to_owned(),
+                )]),
+                ..DatabaseFacts::default()
+            },
+            DatabaseFacts {
+                exclusion_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
+                ..DatabaseFacts::default()
+            },
+        ] {
+            let err = plan_with_facts(
+                &[users_table()],
+                &config,
+                &empty_encrypted(),
+                &no_anonymize(),
+                &facts,
+            )
+            .expect_err("injective on its own value is not injective under an expression");
+            assert!(
+                matches!(err, ScrubError::IndexOperandColumn { ref column, .. } if column == "users.email"),
+                "got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partition_only_constraint_folds_into_its_parent() {
+        let partitions = BTreeMap::from([("users_2026".to_owned(), "users".to_owned())]);
+        let checks = fold_into_parent(
+            vec![
+                ("users_2026".to_owned(), "email".to_owned()),
+                ("orders".to_owned(), "total".to_owned()),
+            ],
+            &partitions,
+        );
+        assert!(checks.contains(&("users".to_owned(), "email".to_owned())));
+        assert!(checks.contains(&("orders".to_owned(), "total".to_owned())));
+    }
+
+    #[test]
+    fn an_encrypted_declaration_on_a_non_text_column_is_refused_at_plan_time() {
+        let mut table = users_table();
+        table.columns[3].ty = ColumnType::Int64; // `bio`
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name"]
+            "#,
+        )
+        .unwrap();
+        let err = plan_for(
+            &[table],
+            &config,
+            &encrypted_columns_of("users", &["bio"]),
+            &no_anonymize(),
+        )
+        .expect_err("an AEAD text envelope cannot be stored in an integer column");
+        assert!(
+            matches!(err, ScrubError::StrategyTypeMismatch { ref column, strategy: "encrypted", .. } if column == "users.bio"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_that_cannot_fit_a_bounded_column_is_refused_at_plan_time() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name"]
+            "#,
+        )
+        .unwrap();
+        let bounded = |limit: &str| {
+            let mut table = users_table();
+            table.columns[3].ty = ColumnType::Opaque {
+                pg_type: format!("varchar({limit})"),
+            };
+            plan_for(
+                &[table],
+                &config,
+                &encrypted_columns_of("users", &["bio"]),
+                &no_anonymize(),
+            )
+        };
+        let err = bounded("100").expect_err("a 148-character envelope cannot fit 100");
+        assert!(
+            matches!(err, ScrubError::EncryptedEnvelopeTooLong { ref column, limit: 100, needed: 148 } if column == "users.bio"),
+            "{err:?}"
+        );
+        bounded("148").expect("exactly enough room");
     }
 
     #[test]
@@ -8099,7 +9361,7 @@ mod tests {
             partitions: BTreeMap::from([("users_2026".to_owned(), "users".to_owned())]),
             ..DatabaseFacts::default()
         };
-        let keys = fold_partition_keys(
+        let keys = fold_into_parent(
             vec![("users_2026".to_owned(), "email".to_owned())],
             &facts.partitions,
         );
@@ -8904,20 +10166,592 @@ mod tests {
     #[test]
     fn same_database_compares_host_port_and_name_ignoring_credentials() {
         // Same server + database, different credentials: still the same target.
-        assert!(same_database(
+        assert!(same_database_in(
             "postgres://app:pw@db.example.com:5432/myapp",
-            "postgres://readonly:other@db.example.com:5432/myapp"
+            "postgres://readonly:other@db.example.com:5432/myapp",
+            &env_of(&[])
         ));
-        assert!(!same_database(
+        assert!(!same_database_in(
             "postgres://app:pw@db.example.com:5432/myapp",
-            "postgres://app:pw@db.example.com:5432/myapp_staging"
+            "postgres://app:pw@db.example.com:5432/myapp_staging",
+            &env_of(&[])
         ));
-        assert!(!same_database(
+        assert!(!same_database_in(
             "postgres://app:pw@db.example.com:5432/myapp",
-            "postgres://app:pw@staging.example.com:5432/myapp"
+            "postgres://app:pw@staging.example.com:5432/myapp",
+            &env_of(&[])
         ));
         // An unparsable URL never claims a match.
-        assert!(!same_database("not a url", "not a url"));
+        assert!(!same_database_in("not a url", "not a url", &env_of(&[])));
+    }
+
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn hostless_urls_naming_one_socket_are_the_same_database() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "postgres:///prod?host=/var/run/postgresql",
+            "postgres://app:pw@/prod?host=/var/run/postgresql",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///prod?host=/var/run/postgresql",
+            "postgres:///prod?host=/tmp",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///prod?host=/tmp",
+            "postgres:///staging?host=/tmp",
+            &env
+        ));
+    }
+
+    #[test]
+    fn a_hostless_url_resolves_its_host_and_port_like_libpq() {
+        let env = env_of(&[("PGHOST", "db.example.com"), ("PGPORT", "6543")]);
+        assert!(same_database_in(
+            "postgres:///prod",
+            "postgres://db.example.com:6543/prod",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///prod",
+            "postgres://db.example.com:5432/prod",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://u@/prod?hostaddr=10.0.0.5&port=5433",
+            "postgres://10.0.0.5:5433/prod",
+            &env
+        ));
+    }
+
+    #[test]
+    fn two_bare_urls_share_the_default_socket() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "postgres:///prod",
+            "postgres:///prod",
+            &env
+        ));
+    }
+
+    #[test]
+    fn a_shard_url_of_a_source_profile_is_a_protected_source() {
+        let env = env_of(&[]);
+        let declared = vec![(
+            "prod".to_owned(),
+            vec![
+                "postgres://app@prod-control/ctl".to_owned(),
+                "postgres://app@prod-shard-a/orders".to_owned(),
+            ],
+        )];
+        let targets = vec![
+            (
+                "control".to_owned(),
+                "postgres://app@staging-control/ctl".to_owned(),
+            ),
+            (
+                "shard:a".to_owned(),
+                "postgres://app@prod-shard-a:5432/orders".to_owned(),
+            ),
+        ];
+        assert_eq!(
+            overwritten_source(&declared, &targets, &env),
+            Some(("prod".to_owned(), "orders".to_owned()))
+        );
+        let clean = vec![(
+            "control".to_owned(),
+            "postgres://app@staging-control/ctl".to_owned(),
+        )];
+        assert_eq!(overwritten_source(&declared, &clean, &env), None);
+    }
+
+    #[test]
+    fn the_destination_profile_is_never_its_own_source() {
+        let configured = vec!["prod".to_owned(), "staging".to_owned(), "dev".to_owned()];
+        assert_eq!(
+            source_candidates(Some("prod"), &configured, "staging"),
+            vec!["prod".to_owned()],
+            "staging is the destination; dev is safe by definition"
+        );
+        assert_eq!(
+            source_candidates(None, &configured, "staging"),
+            vec!["prod".to_owned()]
+        );
+        assert_eq!(
+            source_candidates(Some("prod"), &["prod".to_owned()], "prod"),
+            vec!["prod".to_owned()],
+            "a manifest that names the destination as the source stays protected"
+        );
+        assert_eq!(
+            source_candidates(None, &["staging".to_owned()], "staging"),
+            Vec::<String>::new(),
+            "the destination's own overlay names the target, not a source"
+        );
+    }
+
+    #[test]
+    fn only_the_targets_an_artifact_restored_are_scrubbed() {
+        let targets = vec![
+            ("control".to_owned(), "postgres://h/ctl".to_owned()),
+            ("shard:a".to_owned(), "postgres://h/a".to_owned()),
+            ("shard:b".to_owned(), "postgres://h/b".to_owned()),
+        ];
+        let kept = restored_targets(targets.clone(), &["shard:a".to_owned()]);
+        assert_eq!(kept, vec![targets[1].clone()]);
+        assert!(
+            restored_targets(targets, &[]).is_empty(),
+            "an artifact that restored nothing scrubs nothing"
+        );
+    }
+
+    #[test]
+    fn encrypted_columns_are_read_from_the_whole_src_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("billing")).unwrap();
+        std::fs::write(
+            src.join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub ssn: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("billing").join("card.rs"),
+            "#[model] pub struct Card { #[id] pub id: i64, #[encrypted] pub pan: String }",
+        )
+        .unwrap();
+        let found = encrypted_columns(dir.path()).unwrap();
+        assert!(found["users"].contains_key("ssn"));
+        assert!(
+            found["cards"].contains_key("pan"),
+            "a model outside `src/models` is still found"
+        );
+    }
+
+    #[test]
+    fn registrations_under_cfg_test_are_not_production_registrations() {
+        let found = |src: &str| extract_anonymize_tables(src).unwrap();
+        let reg = |t: &str| format!("fn f() {{ ModelRegistration::anonymize(\"{t}\"); }}");
+
+        assert!(found(&format!("#[cfg(test)] mod tests {{ {} }}", reg("a"))).is_empty());
+        assert!(found(&format!("#[cfg(test)] {}", reg("a"))).is_empty());
+        assert!(
+            found("fn f() { #[cfg(test)] { ModelRegistration::anonymize(\"a\"); } }").is_empty()
+        );
+        assert!(
+            found("fn f() { #[cfg(test)] (ModelRegistration::anonymize(\"a\"),); }").is_empty()
+        );
+        assert!(
+            found(&format!(
+                "#[cfg_attr(not(test), cfg(test))] mod m {{ {} }}",
+                reg("a")
+            ))
+            .is_empty()
+        );
+        assert!(
+            found(&format!(
+                "#[cfg_attr(not(test), cfg_attr(all(), cfg(test)))] mod m {{ {} }}",
+                reg("a")
+            ))
+            .is_empty()
+        );
+        // An unknown predicate may or may not add the `cfg`: keep the item.
+        assert_eq!(
+            found(&format!(
+                "#[cfg_attr(feature = \"x\", cfg(test))] mod m {{ {} }}",
+                reg("a")
+            )),
+            BTreeSet::from(["a".to_owned()])
+        );
+        assert!(
+            found(
+                "fn f(x: u8) { match x { #[cfg(test)] 0 => { ModelRegistration::anonymize(\"a\"); } _ => {} } }"
+            )
+            .is_empty()
+        );
+        assert!(found(&format!("#[cfg(test)] trait T {{ {} }}", reg("a"))).is_empty());
+        assert!(found(&format!("#![cfg(test)]\n{}", reg("a"))).is_empty());
+        assert!(
+            found(&format!(
+                "#[cfg(all(test, feature = \"x\"))] mod t {{ {} }}",
+                reg("a")
+            ))
+            .is_empty()
+        );
+        assert!(
+            found(&format!(
+                "struct S; #[cfg(test)] impl S {{ {} }}",
+                reg("a").replace("fn f", "fn g")
+            ))
+            .is_empty()
+        );
+        // Enabled or unknown cfgs keep their registrations: erring toward the
+        // scrub is the safe direction.
+        for cfg in [
+            "not(test)",
+            "any(test, feature = \"x\")",
+            "feature = \"x\"",
+            "unix",
+        ] {
+            assert_eq!(
+                found(&format!("#[cfg({cfg})] mod m {{ {} }}", reg("a"))),
+                BTreeSet::from(["a".to_owned()]),
+                "cfg({cfg})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_line_cfg_test_module_file_is_not_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path();
+        std::fs::create_dir_all(src.join("tests")).unwrap();
+        std::fs::write(src.join("lib.rs"), "#[cfg(test)] mod tests;\nmod live;\n").unwrap();
+        std::fs::write(
+            src.join("tests.rs"),
+            "mod deep;\nfn f() { ModelRegistration::anonymize(\"fixture\"); }",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("tests").join("deep.rs"),
+            "fn f() { ModelRegistration::anonymize(\"deep_fixture\"); }",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("live.rs"),
+            "fn f() { ModelRegistration::anonymize(\"users\"); }",
+        )
+        .unwrap();
+        assert_eq!(
+            scan_anonymize_tables(src).unwrap(),
+            BTreeSet::from(["users".to_owned()])
+        );
+    }
+
+    #[test]
+    fn schema_drift_names_added_and_dropped_tables_and_columns() {
+        let pair = |t: &str, c: &str| (t.to_owned(), c.to_owned());
+        let before_tables = BTreeSet::from(["users".to_owned(), "old".to_owned()]);
+        let before_columns = BTreeSet::from([pair("users", "id"), pair("users", "bio")]);
+        let after_tables = BTreeSet::from(["users".to_owned(), "fresh".to_owned()]);
+        let after_columns = BTreeSet::from([pair("users", "id"), pair("users", "ssn")]);
+        assert_eq!(
+            schema_drift(
+                (&before_tables, &before_columns),
+                (&after_tables, &after_columns)
+            ),
+            vec![
+                "fresh (table added)".to_owned(),
+                "old (table dropped)".to_owned(),
+                "users.bio (column dropped)".to_owned(),
+                "users.ssn (column added)".to_owned(),
+            ]
+        );
+        assert!(
+            schema_drift(
+                (&before_tables, &before_columns),
+                (&before_tables, &before_columns)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn cfg_predicates_combine_and_unknown_ones_count_as_on() {
+        let on = |cfg: &str| {
+            crate::schema::parse::production_enabled(
+                &syn::parse_str::<syn::ItemFn>(&format!("#[cfg({cfg})] fn f() {{}}"))
+                    .unwrap()
+                    .attrs,
+            )
+        };
+        for (cfg, kept) in [
+            ("test", false),
+            ("not(not(test))", false),
+            ("all(unix, test)", false),
+            ("not(all(test, feature = \"x\"))", true),
+            ("any(test, test)", false),
+            ("all()", true),
+            ("any()", false),
+        ] {
+            assert_eq!(on(cfg), kept, "cfg({cfg})");
+        }
+    }
+
+    #[test]
+    fn endpoints_decode_the_database_name_and_honour_dbname() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "postgres://h/prod%5Fdb",
+            "postgres://h/prod_db",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://h?dbname=prod",
+            "postgres://h/prod",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://%2Fvar%2Frun%2Fpostgresql/prod",
+            "postgres:///prod?host=/var/run/postgresql",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://a,b/prod",
+            "postgres://b/prod",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://u:p%40ss@h/prod",
+            "postgres://h/prod",
+            &env
+        ));
+    }
+
+    #[test]
+    fn an_encrypted_name_column_cannot_hold_the_envelope() {
+        let mut table = users_table();
+        table.columns[3].ty = ColumnType::Opaque {
+            pg_type: "name".to_owned(),
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name"]
+            "#,
+        )
+        .unwrap();
+        let err = plan_for(
+            &[table],
+            &config,
+            &encrypted_columns_of("users", &["bio"]),
+            &no_anonymize(),
+        )
+        .expect_err("`name` holds 63 bytes");
+        assert!(
+            matches!(err, ScrubError::EncryptedEnvelopeTooLong { limit: 63, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_hostaddr_item_uses_the_host_name() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "host=a,b hostaddr=,10.0.0.5 dbname=app",
+            "host=a dbname=app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app?host=a,b&hostaddr=,10.0.0.5",
+            "postgres://a/app",
+            &env
+        ));
+        let pghost = env_of(&[("PGHOST", "a,b")]);
+        assert!(same_database_in(
+            "hostaddr=,10.0.0.5 dbname=app",
+            "host=a dbname=app",
+            &pghost
+        ));
+        assert!(same_database_in(
+            "postgres:///app?hostaddr=,10.0.0.5",
+            "postgres://a/app",
+            &pghost
+        ));
+        assert!(same_database_in(
+            "postgres://a,b/app?hostaddr=,10.0.0.5",
+            "postgres://a/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://a:6543/app?host=b,c",
+            "postgres://b:6543/app",
+            &env
+        ));
+        assert_eq!(merge_hosts(None, Some("h".into())), Some("h".into()));
+        assert_eq!(merge_hosts(Some(",x".into()), None), Some(",x".into()));
+    }
+
+    #[test]
+    fn empty_keyword_and_environment_values_are_ignored() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "host=prod hostaddr=10.0.0.5 hostaddr='' dbname=app",
+            "host=prod dbname=app",
+            &env
+        ));
+        let me = crate::pg::current_os_user();
+        assert!(same_database_in(
+            "host=prod",
+            &format!("host=prod user={me} dbname={me}"),
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://prod",
+            &format!("postgres://{me}@prod/{me}"),
+            &env
+        ));
+        let pgport = env_of(&[("PGPORT", "6543")]);
+        assert!(same_database_in(
+            "host=prod port='' dbname=app",
+            "host=prod port=5432 dbname=app",
+            &pgport
+        ));
+        assert!(same_database_in(
+            "host=prod dbname=app",
+            "host=prod port=6543 dbname=app",
+            &pgport
+        ));
+        let empty_db = env_of(&[("PGDATABASE", "")]);
+        assert!(same_database_in(
+            "host=prod user=app",
+            "host=prod dbname=app",
+            &empty_db
+        ));
+    }
+
+    #[test]
+    fn libpq_pairs_a_port_list_with_the_host_list() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "postgres:///d?host=a,b&port=5432,6543",
+            "postgres://b:6543/d",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///d?host=a,b&port=5432,6543",
+            "postgres://b:5432/d",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgresql://a:5432,b:6543/app",
+            "postgres://b:6543/app",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgresql://a:5432,b:6543/app",
+            "postgres://b:5432/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app?host=prod.example&hostaddr=10.0.0.5",
+            "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod.example hostaddr=10.0.0.5 dbname=app",
+            "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod user=app",
+            "postgres://app@prod/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://app@prod",
+            "host=prod dbname=app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://prod.example/app?hostaddr=10.0.0.5",
+            "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app?hostaddr=10.0.0.1&hostaddr=10.0.0.5",
+            "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod user=app dbname=''",
+            "host=prod user=app dbname=app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app",
+            "postgresql://%2Fvar%2Frun%2Fpostgresql/app",
+            &env
+        ));
+        assert!(!same_database_in(
+            "postgres:///app",
+            "postgres://db.example/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://alice@prod/?user=app",
+            "postgres://app@prod/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://db/?dbname=prod+db",
+            "postgres://db/prod+db",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://db:5432/app?port=6543",
+            "postgres://db:6543/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://prod.example/app",
+            "postgres://10.0.0.5/app",
+            &env_of(&[("PGHOSTADDR", "10.0.0.5")])
+        ));
+        assert!(same_database_in(
+            "postgres:///app?host=a,b&port=,6543",
+            "postgres://a:5432/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=a,b port=,6543 dbname=app",
+            "postgres://b:6543/app",
+            &env
+        ));
+    }
+
+    #[test]
+    fn keyword_strings_and_ipv6_endpoints_compare_like_urls() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "host=prod dbname=app password=https://issuer",
+            "postgres://prod/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://[::1]:5432/app",
+            "postgres:///app?host=::1",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod port=5433 dbname=app",
+            "postgres://prod:5433/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host='a' dbname='app' user=u",
+            "postgres://a/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=/tmp/postgres\\ socket dbname=app",
+            "postgres:///app?host=/tmp/postgres%20socket",
+            &env
+        ));
+    }
+
+    #[test]
+    fn the_envelope_length_is_exact_for_both_shapes() {
+        assert_eq!(envelope_len(Strategy::Redact), 148);
+        assert_eq!(envelope_len(Strategy::Email), 168);
     }
 
     #[test]
@@ -9033,98 +10867,98 @@ mod tests {
     #[test]
     fn hostless_urls_name_the_same_database() {
         // Issue #2366: a URL without a host takes its host from libpq settings.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres:///prod?user=app&host=/var/run/postgresql",
             "postgres:///prod?host=/var/run/postgresql",
             &|_| None
         ));
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "postgres:///prod?host=/var/run/postgresql",
             "postgres:///prod?host=/tmp",
             &|_| None
         ));
         // Bare form resolves through `PGHOST`.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres:///prod",
             "postgres://h.example.com/prod",
             &|k| (k == "PGHOST").then(|| "h.example.com".to_owned())
         ));
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "postgres:///prod",
             "postgres://h.example.com/prod",
             &|_| None
         ));
         // A different database on the same socket stays different.
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "postgres:///prod?host=/tmp",
             "postgres:///other?host=/tmp",
             &|_| None
         ));
         // `PGHOSTADDR` picks the server whatever name the URL gives.
         let addr = |k: &str| (k == "PGHOSTADDR").then(|| "10.0.0.1".to_owned());
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://prod.example/app",
             "postgres://staging.example/app",
             &addr
         ));
         // An inline `hostaddr` beats the environment.
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "postgres://a/app?hostaddr=10.0.0.2",
             "postgres://b/app",
             &addr
         ));
         // An explicit empty `host=` means the default socket, not `PGHOST`.
         let pghost = |k: &str| (k == "PGHOST").then(|| "h.example.com".to_owned());
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "postgres:///app?host=",
             "postgres://h.example.com/app",
             &pghost
         ));
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres:///app?host=",
             "postgres:///app?host=",
             &pghost
         ));
         // Parameter names are percent-decoded, as the connection parser does.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres:///app?ho%73t=prod.example.com",
             "postgres://prod.example.com/app",
             &|_| None
         ));
         // An empty `dbname` defaults to `PGDATABASE`, then to the user name.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://app@prod/app?dbname=",
             "postgres://app@prod/app",
             &|_| None
         ));
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://prod/x?dbname=",
             "postgres://prod/db1",
             &|k| (k == "PGDATABASE").then(|| "db1".to_owned())
         ));
         // The keyword form `host=... dbname=...` names a database as well.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "host=prod.example.com dbname=app",
             "postgres://prod.example.com/app",
             &|_| None
         ));
-        assert!(same_database_with(
+        assert!(same_database_in(
             "host=prod.example.com port=6543 dbname='app'",
             "postgres://prod.example.com:6543/app",
             &|_| None
         ));
-        assert!(same_database_with(
+        assert!(same_database_in(
             "host=prod.example.com dbname=app user=a",
             "host=prod.example.com dbname=app user=b",
             &|_| None
         ));
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "host=prod.example.com dbname=app",
             "postgres://prod.example.com/other",
             &|_| None
         ));
         // A non-Postgres scheme never names a Postgres database.
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "sqlite:///app",
             "postgres:///app",
             &|_| None
@@ -9134,7 +10968,7 @@ mod tests {
     #[test]
     fn libpq_defaults_and_full_paths_name_the_database() {
         // An omitted port defaults to `PGPORT`.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://prod.example/app",
             "postgres://prod.example:6543/app",
             &|k| (k == "PGPORT").then(|| "6543".to_owned())
@@ -9142,73 +10976,71 @@ mod tests {
         // The effective user names the database: `user` parameter, URL user, then
         // `PGUSER`.
         let pguser = |k: &str| (k == "PGUSER").then(|| "alice".to_owned());
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://prod.example/?dbname=&user=bob",
             "postgres://prod.example/bob",
             &pguser
         ));
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://carol@prod.example/?dbname=",
             "postgres://prod.example/carol",
             &pguser
         ));
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://prod.example/?dbname=",
             "postgres://prod.example/alice",
             &pguser
         ));
         // With no `dbname`, `PGDATABASE` or user, the OS login names the database.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://prod.example/?dbname=",
             &format!("postgres://prod.example/{}", crate::pg::current_os_user()),
             &|_| None
         ));
         // A database name may hold a slash: the whole path is the name.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://prod/db/name",
             "postgres://prod/db%2Fname",
             &|_| None
         ));
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "postgres://prod/db/name",
             "postgres://prod/db",
             &|_| None
         ));
         // Only the path delimiter is stripped: `//app` names the database `/app`.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres://prod//app",
             "postgres://prod/%2Fapp",
             &|_| None
         ));
         // IP literals compare by address, not by spelling.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres:///app?hostaddr=0:0:0:0:0:0:0:1",
             "postgres://[::1]/app",
             &|_| None
         ));
         // The default socket directory is unknown, so an empty host may be any
         // socket path.
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres:///app?host=",
             "postgres:///app?host=/var/run/postgresql",
             &|_| None
         ));
-        assert!(same_database_with(
+        assert!(same_database_in(
             "postgres:///app?host=/var/run/postgresql",
             "postgres:///app?host=",
             &|_| None
         ));
-        assert!(!same_database_with(
+        assert!(!same_database_in(
             "postgres:///app?host=",
             "postgres://h.example.com/app",
             &|_| None
         ));
         // The same non-Postgres URL is not a source overwrite.
-        assert!(!same_database_with(
-            "sqlite:///app",
-            "sqlite:///app",
-            &|_| None
-        ));
+        assert!(!same_database_in("sqlite:///app", "sqlite:///app", &|_| {
+            None
+        }));
     }
 
     #[test]
@@ -9265,7 +11097,7 @@ mod tests {
 
     #[test]
     fn libpq_query_overrides_and_encoding_are_normalised() {
-        let same = |a, b| same_database_with(a, b, &|_| None);
+        let same = |a, b| same_database_in(a, b, &|_| None);
         assert!(same("postgres://h/ctl", "postgres://h/stg?dbname=ctl"));
         assert!(same("postgres://h?dbname=prod", "postgres://h/prod"));
         assert!(same(
