@@ -3484,7 +3484,7 @@ where
 /// [`pending_shard_framework_migrations`] (the status path) cannot disagree about
 /// what a shard needs. Adding a shard-required set means adding it here.
 #[cfg(feature = "db")]
-const fn shard_framework_migration_sets() -> [&'static EmbeddedMigrations; 3] {
+pub(crate) const fn shard_framework_migration_sets() -> [&'static EmbeddedMigrations; 3] {
     [
         &crate::version_history::VERSION_HISTORY_MIGRATIONS,
         &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,

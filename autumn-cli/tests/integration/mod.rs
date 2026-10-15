@@ -13,6 +13,7 @@ mod deploy;
 mod destroy_module_import_features;
 mod destroy_provenance;
 mod edge;
+mod fleet_cli;
 mod generate_json_postgres;
 mod generate_lock_version_postgres;
 mod generate_position_scaffold;

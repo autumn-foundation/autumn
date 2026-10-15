@@ -12949,12 +12949,9 @@ async fn setup_database(
             if config.database.fleet.is_some() {
                 fleet_control_target_identified(custom_pool_provider, topology.migration_url())?;
             }
-            crate::db::fleet::build_for_app(
-                config,
-                topology.migration_url(),
-                Arc::clone(&migrations),
-                |set| !migration_set_is_control_framework(set),
-            )?
+            crate::db::fleet::build_for_app(config, topology.migration_url(), &migrations, |set| {
+                !migration_set_is_control_framework(set)
+            })?
             .map_or(shards, |fleet| {
                 tracing::info!(
                     mode = %fleet.mode(),
@@ -13488,7 +13485,7 @@ async fn migrate_fleet_or_exit(
     config: &AutumnConfig,
     migrations: Arc<Vec<(&'static str, crate::migrate::EmbeddedMigrations)>>,
 ) -> usize {
-    let fleet = match crate::db::fleet::build_for_app(config, None, migrations, |set| {
+    let fleet = match crate::db::fleet::build_for_app(config, None, &migrations, |set| {
         !migration_set_is_control_framework(set)
     }) {
         Ok(Some(fleet)) => fleet,
@@ -15025,7 +15022,7 @@ mod fleet_boot_tests {
             .validate()
             .expect("lexically, the paths differ");
         let Err(err) =
-            crate::db::fleet::build_for_app(&config, None, Arc::new(Vec::new()), |_| true)
+            crate::db::fleet::build_for_app(&config, None, &Arc::new(Vec::new()), |_| true)
         else {
             panic!("a fleet root aliasing the control database must be refused");
         };
@@ -15064,15 +15061,16 @@ mod fleet_boot_tests {
             restore_missing: false,
         });
         let resolved = format!("sqlite://{}", root.join("control.db").display());
-        let Err(err) =
-            crate::db::fleet::build_for_app(&config, Some(&resolved), Arc::new(Vec::new()), |_| {
-                true
-            })
-        else {
+        let Err(err) = crate::db::fleet::build_for_app(
+            &config,
+            Some(&resolved),
+            &Arc::new(Vec::new()),
+            |_| true,
+        ) else {
             panic!("a resolved control database inside the root must be refused");
         };
         assert!(err.contains("control database"), "{err}");
-        crate::db::fleet::build_for_app(&config, None, Arc::new(Vec::new()), |_| true)
+        crate::db::fleet::build_for_app(&config, None, &Arc::new(Vec::new()), |_| true)
             .expect("the configured control database is outside the root");
     }
 
@@ -15129,7 +15127,7 @@ mod fleet_boot_tests {
                 crate::version_history::VERSION_HISTORY_MIGRATIONS,
             ),
         ]);
-        let fleet = crate::db::fleet::build_for_app(&config, None, all, |set| {
+        let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {
             !migration_set_is_control_framework(set)
         })
         .unwrap()
@@ -15141,7 +15139,7 @@ mod fleet_boot_tests {
 
         config.database.fleet = None;
         assert!(
-            crate::db::fleet::build_for_app(&config, None, Arc::new(Vec::new()), |_| true)
+            crate::db::fleet::build_for_app(&config, None, &Arc::new(Vec::new()), |_| true)
                 .unwrap()
                 .is_none()
         );
@@ -15170,7 +15168,7 @@ mod fleet_boot_tests {
             restore_missing: false,
         });
         let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
-        let fleet = crate::db::fleet::build_for_app(&config, None, all, |set| {
+        let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {
             !migration_set_is_control_framework(set)
         })
         .unwrap()

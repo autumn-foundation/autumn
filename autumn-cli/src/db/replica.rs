@@ -155,28 +155,46 @@ pub fn run(command: &ReplicaCommand) {
 
 /// The `[replication]` section plus the resolved app config it came from.
 #[derive(Debug)]
-struct Loaded {
-    profile: String,
-    replication: ReplicationConfig,
-    config: AutumnConfig,
+pub struct Loaded {
+    pub profile: String,
+    pub replication: ReplicationConfig,
+    pub config: AutumnConfig,
 }
 
 /// Resolve `[replication]` exactly the way the running app does.
 fn load(profile: Option<&str>) -> Result<Loaded, ReplicaError> {
+    let (profile, config) = load_app_config(profile)?;
+    Loaded::new(profile, config)
+}
+
+/// Resolve the app config the way the running app does: `autumn.toml`, the
+/// `[profile.<p>]` overlay, `.env.<profile>` and `AUTUMN_*` overrides.
+/// Returns the canonical profile with it.
+pub fn load_app_config(profile: Option<&str>) -> Result<(String, AutumnConfig), ReplicaError> {
     let profile = migrate::canonical_profile(&migrate::effective_profile(profile));
     let env = crate::db::backup::dotenv_env_for_profile(&profile);
     let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile));
-    resolve(table.as_ref(), &env, &profile)
+    let config = resolve_app_config(table.as_ref(), &env)?;
+    Ok((profile, config))
 }
 
 /// Pure core of [`load`]: build the replication view from a merged TOML table
 /// and an `Env`. Separated so the fresh-box behaviour is unit-testable without
 /// touching the filesystem or the process environment.
+#[cfg(test)]
 fn resolve(
     table: Option<&toml::Table>,
     env: &dyn autumn_web::config::Env,
     profile: &str,
 ) -> Result<Loaded, ReplicaError> {
+    Loaded::new(profile.to_owned(), resolve_app_config(table, env)?)
+}
+
+/// Pure core of [`load_app_config`].
+fn resolve_app_config(
+    table: Option<&toml::Table>,
+    env: &dyn autumn_web::config::Env,
+) -> Result<AutumnConfig, ReplicaError> {
     let mut config = match table {
         Some(table) => {
             let toml_str = toml::to_string(table).map_err(|e| ReplicaError::Config {
@@ -191,22 +209,26 @@ fn resolve(
         None => AutumnConfig::default(),
     };
     config.apply_env_overrides_with_env(env);
-
-    let replication = config
-        .replication
-        .clone()
-        .map(|boxed| *boxed)
-        .ok_or(ReplicaError::NotConfigured)?;
-    Ok(Loaded {
-        profile: profile.to_owned(),
-        replication,
-        config,
-    })
+    Ok(config)
 }
 
 impl Loaded {
+    /// The `[replication]` view of a resolved config.
+    pub fn new(profile: String, config: AutumnConfig) -> Result<Self, ReplicaError> {
+        let replication = config
+            .replication
+            .clone()
+            .map(|boxed| *boxed)
+            .ok_or(ReplicaError::NotConfigured)?;
+        Ok(Self {
+            profile,
+            replication,
+            config,
+        })
+    }
+
     /// The destination key prefix for this app/profile.
-    fn root(&self) -> String {
+    pub fn root(&self) -> String {
         segment::root_prefix(self.replication.prefix.as_deref(), &self.profile)
     }
 
@@ -228,7 +250,7 @@ impl Loaded {
             .map(|bucket| (bucket, self.config.storage.s3.endpoint.clone()))
     }
 
-    fn destination(&self) -> Result<std::sync::Arc<dyn ReplicaDestination>, ReplicaError> {
+    pub fn destination(&self) -> Result<std::sync::Arc<dyn ReplicaDestination>, ReplicaError> {
         let storage = self.storage_destination();
         autumn_web::replication::build_destination(
             &self.replication,
@@ -298,7 +320,7 @@ fn fastrand_u64() -> u64 {
 }
 
 /// Parse `--timestamp` as RFC 3339.
-fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>, ReplicaError> {
+pub fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>, ReplicaError> {
     value.map_or(Ok(None), |raw| {
         DateTime::parse_from_rfc3339(raw.trim())
             .map(|t| Some(t.with_timezone(&Utc)))

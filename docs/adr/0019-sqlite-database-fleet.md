@@ -241,7 +241,9 @@ with a lease, so two processes draining one database is safe.
 
 ## Roadmap
 
-1. **CLI.** `autumn fleet list | migrate | backup | delete | restore`.
+1. **CLI.** `autumn fleet list | migrate | backup | delete | restore`
+   ([#3232](https://github.com/autumn-foundation/autumn/issues/3232)). See
+   [Operating the fleet](../guide/sqlite-fleet.md#operating-the-fleet).
 2. **Slot ownership and fencing.** A control-table epoch per slot range, so a
    host that takes over a range fences the old owner before
    `restore_missing` serves it (CloudKit's incarnation counter, Notion's
@@ -275,6 +277,8 @@ with a lease, so two processes draining one database is safe.
 - `autumn/src/db/fleet.rs` tests: single-flight open, LRU and idle eviction,
   busy databases never evicted, delete and tombstone, misplaced-file refusal,
   `VACUUM INTO` backup, refusal of pending migrations, lifecycle hooks.
+- `autumn-cli/tests/integration/fleet_cli.rs`: each `autumn fleet` subcommand
+  against a temporary fleet root; `restore` from a local replica.
 - `autumn/tests/sqlite_fleet.rs`: `ShardedDb`, a `#[repository(tenant_scoped,
   sharded)]` repository, `CrossShard` and `each_shard` against a tenant fleet
   and a slot fleet over HTTP; `400` / `404` / `409` paths; `db:fleet` health.
