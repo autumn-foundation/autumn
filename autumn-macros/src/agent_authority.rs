@@ -70,7 +70,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use proc_macro2::{Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use quote::{ToTokens as _, format_ident, quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
@@ -1675,6 +1675,8 @@ impl Analyzer {
                 self.bind_container_callables(name, s.fields.iter().map(|f| &f.expr));
             }
             Expr::Call(call) => self.bind_container_callables(name, call.args.iter()),
+            // `&tokio::spawn` is the same function item.
+            Expr::Reference(r) => self.bind_callable(name, &r.expr),
             // A block, `if` or `match` is whatever its tails are.
             Expr::Block(_) | Expr::If(_) | Expr::Match(_) | Expr::Unsafe(_) => {
                 self.bind_container_callables(name, value_tails(init));
@@ -4824,11 +4826,26 @@ fn macro_path_is_standard(path: &syn::Path, shadowed: &HashSet<String>) -> bool 
 
 /// Does a macro body name a `spawn`-family function?
 fn tokens_contain_spawn(tokens: &TokenStream) -> bool {
-    tokens.clone().into_iter().any(|tt| match tt {
-        TokenTree::Ident(ident) => SPAWN_FNS.contains(&ident.to_string().as_str()),
-        TokenTree::Group(group) => tokens_contain_spawn(&group.stream()),
-        _ => false,
-    })
+    let mut iter = tokens.clone().into_iter().peekable();
+    while let Some(tt) = iter.next() {
+        match tt {
+            // Only a call counts: `spawn(..)` or `spawn::<T>(..)`. A bare
+            // `spawn` is data, as in `let spawn = 1;`.
+            TokenTree::Ident(ident) if SPAWN_FNS.contains(&ident.to_string().as_str()) => {
+                let called = match iter.peek() {
+                    Some(TokenTree::Group(group)) => group.delimiter() == Delimiter::Parenthesis,
+                    Some(TokenTree::Punct(punct)) => punct.as_char() == ':',
+                    _ => false,
+                };
+                if called {
+                    return true;
+                }
+            }
+            TokenTree::Group(group) if tokens_contain_spawn(&group.stream()) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn tokens_look_like_fn(tokens: &TokenStream) -> bool {
@@ -7823,6 +7840,16 @@ mod tests {
             }",
         ),
         (
+            "spawn alias borrowed before binding",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = &tokio::spawn;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -8176,6 +8203,14 @@ mod tests {
                 let rows = vec![1, 2, 3];
                 Ok(json!({ "label": label, "rows": rows }))
             }"#,
+        ),
+        (
+            "a data identifier named spawn inside an inert macro",
+            r"async fn h() -> R {
+                let spawn = 1;
+                assert_eq!(spawn, 1);
+                Ok(())
+            }",
         ),
         (
             "a let named tokio does not hide the crate path",
