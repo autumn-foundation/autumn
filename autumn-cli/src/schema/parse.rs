@@ -387,6 +387,14 @@ pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     }
 }
 
+/// The attributes of a `syn::FnArg`.
+pub fn fn_arg_attrs(arg: &syn::FnArg) -> &[syn::Attribute] {
+    match arg {
+        syn::FnArg::Receiver(r) => &r.attrs,
+        syn::FnArg::Typed(t) => &t.attrs,
+    }
+}
+
 /// The attributes of a `syn::TraitItem`, or none for a kind without any.
 pub fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
     match item {
@@ -596,6 +604,12 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
         if production_enabled(&arm.attrs) {
             syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_fn_arg(&mut self, arg: &'ast syn::FnArg) {
+        if production_enabled(fn_arg_attrs(arg)) {
+            syn::visit::visit_fn_arg(self, arg);
         }
     }
 
@@ -2667,6 +2681,7 @@ mod tests {
                 #[cfg(test)] let _x = { #[model] struct V { #[id] id: i64, #[encrypted] b: String } };
             }
             enum EV { #[cfg(test)] V = { #[model] struct H { #[id] id: i64, #[encrypted] n: String } 0 } }
+            fn param(#[cfg(test)] x: [(); { #[model] struct M { #[id] id: i64, #[encrypted] q: String } 0 }]) {}
             struct TY;
             impl TY { #[cfg(test)] type A = [(); { #[model] struct J { #[id] id: i64, #[encrypted] o: String } 0 }]; }
             trait TT2 { #[cfg(test)] type B = [(); { #[model] struct K { #[id] id: i64, #[encrypted] p: String } 0 }]; }

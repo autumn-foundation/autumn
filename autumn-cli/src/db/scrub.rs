@@ -2371,6 +2371,12 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
         }
     }
 
+    fn visit_fn_arg(&mut self, arg: &'ast syn::FnArg) {
+        if crate::schema::parse::production_enabled(crate::schema::parse::fn_arg_attrs(arg)) {
+            syn::visit::visit_fn_arg(self, arg);
+        }
+    }
+
     fn visit_field(&mut self, field: &'ast syn::Field) {
         if crate::schema::parse::production_enabled(&field.attrs) {
             syn::visit::visit_field(self, field);
@@ -8970,6 +8976,10 @@ mod tests {
             #[cfg(test)] struct F { f: [(); { ModelRegistration::anonymize("users"); 0 }] }
         "#;
         assert!(extract_anonymize_tables(item).unwrap().is_empty());
+        let param = r#"
+            fn f(#[cfg(test)] x: [(); { ModelRegistration::anonymize("users"); 0 }]) {}
+        "#;
+        assert!(extract_anonymize_tables(param).unwrap().is_empty());
     }
 
     #[test]
