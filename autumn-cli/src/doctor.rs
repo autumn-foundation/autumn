@@ -8073,20 +8073,14 @@ fn check_acme_domain_entries(domains: &[String], dns_configured: bool) -> Option
     None
 }
 
-/// The set of domains the `--online` doctor actively probes (port 80/443 + DNS).
+/// The base domains the `--online` doctor probes for `_acme-challenge` DNS.
 ///
-/// This is EVERY configured domain, not just the first: issuance orders an
-/// authorization for each name in `config.domains`, so probing only the first
-/// name can let doctor pass while issuance fails on an unprobed domain. Extracted
-/// as a pure helper so the "probe every configured domain" contract is
-/// unit-testable without real network I/O — `run()` enqueues one bounded port
-/// task and one DNS task for each domain returned here.
+/// Every configured domain, not just the first: issuance orders an
+/// authorization for each name. A `*.` entry maps to its base domain, which
+/// holds the challenge record. The entry is deduplicated against an explicit
+/// apex (#1620). For port and address checks see
+/// [`acme_online_reachability_hosts`].
 fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
-    // A `*.myapp.com` entry has no address record of its own, so probing it
-    // literally would resolve to nothing and report a permanent, meaningless
-    // Warn on every wildcard deployment. Probe the base domain it covers
-    // instead — that IS the host tenants' subdomains point at — and drop the
-    // duplicate when the apex is also listed explicitly (#1620).
     let mut probed: Vec<String> = Vec::new();
     for domain in &config.domains {
         let target = domain.strip_prefix("*.").unwrap_or(domain).to_owned();
@@ -8095,6 +8089,30 @@ fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
         }
     }
     probed
+}
+
+/// A host a `*.` entry covers, probed in place of the wildcard.
+const WILDCARD_PROBE_LABEL: &str = "doctor-check";
+
+/// The hosts the `--online` doctor probes for address and port reachability.
+///
+/// A wildcard record usually has no apex record beside it. Probing the base
+/// domain would warn although every covered host resolves, so a `*.` entry is
+/// probed as a host it covers (#2478). The `_acme-challenge` check keeps the
+/// base name: see [`acme_online_probe_domains`].
+fn acme_online_reachability_hosts(config: &AcmeDoctorConfig) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for domain in &config.domains {
+        let host = match domain.strip_prefix("*.") {
+            Some("") => continue,
+            Some(base) => format!("{WILDCARD_PROBE_LABEL}.{base}"),
+            None => domain.clone(),
+        };
+        if !host.is_empty() && !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 /// Inspect the stored ACME certificate for the CONFIGURED domains under the
@@ -10416,7 +10434,7 @@ pub fn run(opts: DoctorOptions) {
             // bounded and gated behind --online.
             if opts.online {
                 let dns01 = acme.dns.is_some();
-                for domain in acme_online_probe_domains(&acme) {
+                for domain in acme_online_reachability_hosts(&acme) {
                     let d80 = domain.clone();
                     tasks.push(Box::new(move || {
                         let p80 = probe_port(&d80, 80);
@@ -15432,6 +15450,29 @@ pub struct Vault {
         assert_eq!(
             acme_online_probe_domains(&cfg),
             vec!["a.example.com".to_owned(), "b.example.com".to_owned()]
+        );
+    }
+
+    // #2478: a wildcard needs no apex record, so reachability checks use a
+    // host the wildcard covers. `_acme-challenge` still uses the base name.
+    #[test]
+    fn wildcard_reachability_probes_a_covered_host() {
+        let cfg = acme_doctor_cfg(&["*.myapp.com"], "ops@myapp.com");
+        assert_eq!(
+            acme_online_reachability_hosts(&cfg),
+            vec!["doctor-check.myapp.com".to_owned()]
+        );
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["myapp.com".to_owned()],
+            "the challenge record stays at the base domain"
+        );
+
+        // An explicit apex is probed too; plain names are unchanged.
+        let cfg = acme_doctor_cfg(&["myapp.com", "*.myapp.com", "*.myapp.com"], "o@myapp.com");
+        assert_eq!(
+            acme_online_reachability_hosts(&cfg),
+            vec!["myapp.com".to_owned(), "doctor-check.myapp.com".to_owned()]
         );
     }
 

@@ -33,7 +33,7 @@ use hmac::{Hmac, Mac as _};
 use sha2::{Digest as _, Sha256};
 
 use super::http::{HttpRequest, HttpResponse, HttpTransport};
-use super::{DnsProvider, SecretString, TxtRecord, sanitize_upstream};
+use super::{DnsProvider, SecretString, TxtRecord, join_errors, sanitize_upstream};
 
 /// Route 53's API host. Route 53 is a global service with a single endpoint.
 const API_HOST: &str = "route53.amazonaws.com";
@@ -43,6 +43,9 @@ const API_PREFIX: &str = "/2013-04-01";
 const SERVICE: &str = "route53";
 /// TTL for the ephemeral challenge record set.
 const CHALLENGE_TTL_SECS: u32 = 60;
+
+/// Most `ListHostedZonesByName` pages read for one candidate name.
+const MAX_ZONE_PAGES: usize = 10;
 
 /// The AWS credentials and zone hints Route 53 issuance needs.
 #[derive(Clone)]
@@ -143,22 +146,7 @@ impl Route53Provider {
         }
         let candidates = zone_candidates(fqdn);
         for candidate in &candidates {
-            let body = self
-                .send(
-                    HttpRequest::new(
-                        "GET",
-                        format!(
-                            // More than one, because split-horizon DNS gives a
-                            // name BOTH a private and a public hosted zone;
-                            // `maxitems=1` would hand back whichever sorts first
-                            // and hide the other.
-                            "https://{API_HOST}{API_PREFIX}/hostedzonesbyname?dnsname={candidate}.&maxitems=10"
-                        ),
-                    ),
-                    "look up the Route 53 hosted zone",
-                )
-                .await?;
-            if let Some(id) = hosted_zone_id_for(&body, candidate) {
+            if let Some(id) = self.public_zone_id(candidate, fqdn).await? {
                 self.zone_ids
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -171,6 +159,42 @@ impl Route53Provider {
              matching any of {}. Check the credentials' account, or set `hosted_zone_id` in the \
              DNS credential to name the zone explicitly",
             candidates.join(", ")
+        ))
+    }
+
+    /// The public hosted zone named `candidate`, reading every page.
+    ///
+    /// More than one item per page, because split-horizon DNS gives a name BOTH a
+    /// private and a public zone; `maxitems=1` would hide one. Zones sort by
+    /// name, so a name can span pages. The walk follows the cursor while it
+    /// still names `candidate` (issue #2478).
+    async fn public_zone_id(&self, candidate: &str, fqdn: &str) -> Result<Option<String>, String> {
+        let mut cursor = String::new();
+        for _ in 0..MAX_ZONE_PAGES {
+            let body = self
+                .send(
+                    HttpRequest::new(
+                        "GET",
+                        format!(
+                            "https://{API_HOST}{API_PREFIX}/hostedzonesbyname?\
+                             dnsname={candidate}.{cursor}&maxitems=10"
+                        ),
+                    ),
+                    "look up the Route 53 hosted zone",
+                )
+                .await?;
+            if let Some(id) = hosted_zone_id_for(&body, candidate) {
+                return Ok(Some(id));
+            }
+            match next_zone_page(&body, candidate) {
+                Some(next) => cursor = next,
+                None => return Ok(None),
+            }
+        }
+        Err(format!(
+            "could not find the Route 53 hosted zone for {fqdn}: more than {MAX_ZONE_PAGES} pages \
+             of hosted zones are named {candidate}. Set `hosted_zone_id` in the DNS credential \
+             to name the zone explicitly"
         ))
     }
 
@@ -255,31 +279,44 @@ impl Route53Provider {
             }
         }
 
+        // A failed publish stops at once: the caller cleans up. A failed removal
+        // goes on, so one bad zone cannot strand records in the others (#2478).
+        let mut errors = Vec::new();
         for (fqdn, values) in groups {
-            let zone = self.zone_id(fqdn).await?;
-            let current = self.current_rrset(&zone, fqdn).await?;
-            let next: Vec<String> = if add {
-                let mut next = current.values.clone();
-                for value in &values {
-                    if !next.iter().any(|v| v == value) {
-                        next.push((*value).to_owned());
-                    }
+            if let Err(e) = self.apply_group(fqdn, &values, add).await {
+                if add {
+                    return Err(e);
                 }
-                next
-            } else {
-                current
-                    .values
-                    .iter()
-                    .filter(|v| !values.contains(&v.as_str()))
-                    .cloned()
-                    .collect()
-            };
-            if next == current.values {
-                continue;
+                errors.push(e);
             }
-            self.write_values(&zone, fqdn, &next, &current).await?;
         }
-        Ok(())
+        join_errors(&errors)
+    }
+
+    /// Publish or remove `values` at one name: a single read-modify-write.
+    async fn apply_group(&self, fqdn: &str, values: &[&str], add: bool) -> Result<(), String> {
+        let zone = self.zone_id(fqdn).await?;
+        let current = self.current_rrset(&zone, fqdn).await?;
+        let next: Vec<String> = if add {
+            let mut next = current.values.clone();
+            for value in values {
+                if !next.iter().any(|v| v == value) {
+                    next.push((*value).to_owned());
+                }
+            }
+            next
+        } else {
+            current
+                .values
+                .iter()
+                .filter(|v| !values.contains(&v.as_str()))
+                .cloned()
+                .collect()
+        };
+        if next == current.values {
+            return Ok(());
+        }
+        self.write_values(&zone, fqdn, &next, &current).await
     }
 }
 
@@ -430,6 +467,25 @@ fn strip_zone_prefix(id: &str) -> &str {
 /// Whether `id` has the shape of a Route 53 hosted zone id.
 fn is_hosted_zone_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The `hostedzoneid` query suffix for the page after `xml`, if one exists and
+/// can hold `candidate`. The page also repeats `dnsname`.
+///
+/// `None` when the response is complete, or when its cursor names another
+/// zone: later pages sort after `candidate`, so none can match. The cursor
+/// goes into the URL, so it is held to the expected shapes.
+fn next_zone_page(xml: &str, candidate: &str) -> Option<String> {
+    if !xml_element(xml, "IsTruncated").is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
+        return None;
+    }
+    let wanted = format!("{}.", candidate.trim_end_matches('.').to_ascii_lowercase());
+    let name = xml_element(xml, "NextDNSName")?.trim().to_ascii_lowercase();
+    let id = xml_element(xml, "NextHostedZoneId")?.trim();
+    if name != wanted || !is_hosted_zone_id(id) {
+        return None;
+    }
+    Some(format!("&hostedzoneid={id}"))
 }
 
 /// The **public** hosted zone id in a `ListHostedZonesByName` response whose
@@ -1719,5 +1775,135 @@ mod tests {
               <Config><PrivateZone>true</PrivateZone></Config></HostedZone>
             </HostedZones></ListHostedZonesByNameResponse>";
         assert_eq!(hosted_zone_id_for(private_only, "myapp.com"), None);
+    }
+    /// #2478: one failed removal must not stop the rest of the batch.
+    #[tokio::test]
+    async fn a_failed_removal_does_not_abort_later_names() {
+        let transport =
+            RecordingTransport::new(&[(ZONE_LOOKUP, zone_hit()), (RRSET_CHANGE, changed())])
+                .then(RRSET_LIST, 500, "<Error><Message>boom</Message></Error>")
+                .then(RRSET_LIST, 200, &rrset_with(&["value-apex"]));
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        let err = provider
+            .delete_txt_batch(&[
+                TxtRecord::new("other.myapp.com", "value-other"),
+                TxtRecord::new("myapp.com", "value-apex"),
+            ])
+            .await
+            .expect_err("the first name fails");
+
+        assert!(err.contains("boom"), "the failure is reported: {err}");
+        let deletes = transport
+            .sent()
+            .iter()
+            .filter(|r| r.method == "POST" && r.body.contains("<Action>DELETE</Action>"))
+            .count();
+        assert_eq!(deletes, 1, "the later name is still cleaned up");
+    }
+
+    /// #2478: a failed publish still stops at once; the caller cleans up.
+    #[tokio::test]
+    async fn a_failed_publish_stops_the_batch() {
+        let transport = RecordingTransport::new(&[(ZONE_LOOKUP, zone_hit())]).then(
+            RRSET_LIST,
+            500,
+            "<Error><Message>boom</Message></Error>",
+        );
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider
+            .upsert_txt_batch(&[
+                TxtRecord::new("other.myapp.com", "v1"),
+                TxtRecord::new("myapp.com", "v2"),
+            ])
+            .await
+            .expect_err("the first name fails");
+
+        let lists = transport
+            .sent()
+            .iter()
+            .filter(|r| r.url.contains("/rrset?"))
+            .count();
+        assert_eq!(lists, 1, "no read for the second name");
+    }
+
+    fn zone_page(id: &str, private: bool, next: Option<(&str, &str)>) -> String {
+        let cursor = next.map_or_else(
+            || "<IsTruncated>false</IsTruncated>".to_owned(),
+            |(name, id)| {
+                format!(
+                    "<IsTruncated>true</IsTruncated><NextDNSName>{name}</NextDNSName>\
+                     <NextHostedZoneId>{id}</NextHostedZoneId>"
+                )
+            },
+        );
+        format!(
+            "<ListHostedZonesByNameResponse><HostedZones>\
+             <HostedZone><Id>/hostedzone/{id}</Id><Name>myapp.com.</Name>\
+             <Config><PrivateZone>{private}</PrivateZone></Config></HostedZone>\
+             </HostedZones>{cursor}</ListHostedZonesByNameResponse>"
+        )
+    }
+
+    /// #2478: the public zone may sit on page two.
+    #[tokio::test]
+    async fn zone_lookup_follows_the_pagination_cursor() {
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            &zone_page("ZPRIVATE", true, Some(("myapp.com.", "ZNEXT"))),
+        )])
+        .then(ZONE_LOOKUP, 200, &zone_page("ZPUBLIC", false, None));
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        assert_eq!(provider.zone_id("myapp.com").await.unwrap(), "ZPUBLIC");
+        let urls: Vec<String> = transport.sent().iter().map(|r| r.url.clone()).collect();
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert!(
+            urls[1].contains("dnsname=myapp.com.&hostedzoneid=ZNEXT"),
+            "{urls:?}"
+        );
+    }
+
+    /// #2478: a cursor that left the candidate name ends the walk.
+    #[tokio::test]
+    async fn zone_lookup_stops_when_the_cursor_leaves_the_name() {
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            &zone_page("ZPRIVATE", true, Some(("zzz.example.", "ZNEXT"))),
+        )]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        let err = provider.zone_id("myapp.com").await.unwrap_err();
+        assert!(err.contains("no Route 53 hosted zone"), "{err}");
+        assert_eq!(transport.sent().len(), 1, "no second page");
+    }
+
+    /// #2478: a runaway cursor ends with an error that names the fix.
+    #[tokio::test]
+    async fn zone_lookup_gives_up_with_a_hint_after_too_many_pages() {
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            &zone_page("ZPRIVATE", true, Some(("myapp.com.", "ZNEXT"))),
+        )]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        let err = provider.zone_id("myapp.com").await.unwrap_err();
+        assert!(err.contains("hosted_zone_id"), "{err}");
+        assert!(!err.contains("no Route 53 hosted zone"), "{err}");
+        assert_eq!(transport.sent().len(), MAX_ZONE_PAGES);
+    }
+
+    /// #2478: a cursor from AWS cannot reshape the next request.
+    #[tokio::test]
+    async fn zone_lookup_ignores_a_malformed_cursor() {
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            &zone_page("ZPRIVATE", true, Some(("myapp.com.", "Z/../x?y"))),
+        )]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        provider.zone_id("myapp.com").await.unwrap_err();
+        assert_eq!(transport.sent().len(), 1, "no follow-up request");
     }
 }
