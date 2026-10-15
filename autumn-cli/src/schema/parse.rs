@@ -387,6 +387,29 @@ pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     }
 }
 
+/// The attributes of a `syn::Pat`, or none for a kind without any.
+pub fn pat_attrs(pat: &syn::Pat) -> &[syn::Attribute] {
+    match pat {
+        syn::Pat::Const(p) => &p.attrs,
+        syn::Pat::Ident(p) => &p.attrs,
+        syn::Pat::Lit(p) => &p.attrs,
+        syn::Pat::Macro(p) => &p.attrs,
+        syn::Pat::Or(p) => &p.attrs,
+        syn::Pat::Paren(p) => &p.attrs,
+        syn::Pat::Path(p) => &p.attrs,
+        syn::Pat::Range(p) => &p.attrs,
+        syn::Pat::Reference(p) => &p.attrs,
+        syn::Pat::Rest(p) => &p.attrs,
+        syn::Pat::Slice(p) => &p.attrs,
+        syn::Pat::Struct(p) => &p.attrs,
+        syn::Pat::Tuple(p) => &p.attrs,
+        syn::Pat::TupleStruct(p) => &p.attrs,
+        syn::Pat::Type(p) => &p.attrs,
+        syn::Pat::Wild(p) => &p.attrs,
+        _ => &[],
+    }
+}
+
 /// The attributes of a `syn::GenericParam`.
 pub fn generic_param_attrs(param: &syn::GenericParam) -> &[syn::Attribute] {
     match param {
@@ -613,6 +636,12 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
         if production_enabled(&arm.attrs) {
             syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &'ast syn::Pat) {
+        if production_enabled(pat_attrs(pat)) {
+            syn::visit::visit_pat(self, pat);
         }
     }
 
@@ -2698,6 +2727,7 @@ mod tests {
             enum EV { #[cfg(test)] V = { #[model] struct H { #[id] id: i64, #[encrypted] n: String } 0 } }
             fn param(#[cfg(test)] x: [(); { #[model] struct M { #[id] id: i64, #[encrypted] q: String } 0 }]) {}
             struct GP<#[cfg(test)] T = [(); { #[model] struct N { #[id] id: i64, #[encrypted] r: String } 0 }]>(T);
+            fn clo() { let _ = |#[cfg(test)] x: [(); { #[model] struct CL { #[id] id: i64, #[encrypted] s: String } 0 }]| {}; }
             struct TY;
             impl TY { #[cfg(test)] type A = [(); { #[model] struct J { #[id] id: i64, #[encrypted] o: String } 0 }]; }
             trait TT2 { #[cfg(test)] type B = [(); { #[model] struct K { #[id] id: i64, #[encrypted] p: String } 0 }]; }
