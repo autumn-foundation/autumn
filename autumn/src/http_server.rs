@@ -312,9 +312,11 @@ where
         let Some(permit) = wait_for_slot(permits.as_ref(), signal_tx.closed()).await else {
             break;
         };
+        // `biased`: after a shutdown, never accept another connection.
         let (io, remote_addr) = tokio::select! {
-            conn = listener.accept() => conn,
+            biased;
             () = signal_tx.closed() => break,
+            conn = listener.accept() => conn,
         };
         let permit = permit.or_else(|| take_handoff(handoff.as_ref()));
 
