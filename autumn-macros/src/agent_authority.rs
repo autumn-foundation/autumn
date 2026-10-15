@@ -1733,7 +1733,39 @@ impl Analyzer {
                     self.bind_container_callables(name, yielded);
                 }
             }
+            // `choose()` where `choose` is a closure bound earlier yields what
+            // that closure's body yields.
+            Expr::Call(call)
+                if matches!(strip_transparent(&call.func), Expr::Path(_))
+                    && callee_root(&call.func)
+                        .is_some_and(|root| self.closures.contains_key(&root)) =>
+            {
+                if let Some(closure) =
+                    callee_root(&call.func).and_then(|root| self.closures.get(&root).cloned())
+                {
+                    let yielded = value_tails(&closure.body)
+                        .into_iter()
+                        .chain(return_values(&closure.body));
+                    self.bind_container_callables(name, yielded);
+                }
+            }
             Expr::Call(call) => self.bind_container_callables(name, call.args.iter()),
+            // `Some(tokio::spawn).unwrap()`, `f.clone()`: the same value.
+            Expr::MethodCall(mc)
+                if TRANSPARENT_BUILDERS.contains(&mc.method.to_string().as_str()) =>
+            {
+                self.bind_callable(name, &mc.receiver);
+            }
+            // `opt.unwrap_or(tokio::spawn)` is the option's value or the default.
+            Expr::MethodCall(mc)
+                if matches!(
+                    mc.method.to_string().as_str(),
+                    "unwrap_or" | "or" | "copied" | "cloned" | "into"
+                ) =>
+            {
+                self.bind_callable(name, &mc.receiver);
+                self.bind_container_callables(name, mc.args.iter());
+            }
             // `&tokio::spawn` and `tokio::spawn as fn(..)` are the same item.
             Expr::Reference(r) => self.bind_callable(name, &r.expr),
             Expr::Cast(c) => self.bind_callable(name, &c.expr),
@@ -8201,6 +8233,27 @@ mod tests {
             r"async fn h() -> R {
                 let fut = async { return Ok::<_, E>(start_finance_job()); }.await?;
                 fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias taken out of an Option",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = Some(tokio::spawn).unwrap();
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias returned by a bound closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let choose = || tokio::spawn;
+                let run = choose();
+                run(async {});
                 Ok(())
             }",
         ),
