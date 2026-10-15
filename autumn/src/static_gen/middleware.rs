@@ -255,14 +255,26 @@ pub fn resolved_entry_content_type(
 
 /// The type ISR must see in a fresh response for `entry`, or `None` for no check.
 ///
-/// A declared type is pinned by the route attribute, so the handler header
-/// cannot desync from it and needs no guard.
-fn isr_expected_content_type<'a>(entry: &'a ManifestEntry, route_path: &str) -> Option<&'a str> {
+/// A usable declared type is pinned by the route attribute, so the handler
+/// header cannot desync from it and needs no guard.
+fn isr_expected_content_type(
+    entry: &ManifestEntry,
+    route_path: &str,
+    file_path: &Path,
+) -> Option<String> {
+    let usable = usable_recorded_content_type(entry.content_type.as_deref());
     if entry.content_type_explicit {
-        return None;
+        // An unusable declared value is ignored when serving, so guard the
+        // type that is served instead.
+        return match usable {
+            Some(_) => None,
+            None => resolved_content_type(None, route_path, file_path)
+                .to_str()
+                .ok()
+                .map(str::to_owned),
+        };
     }
-    usable_recorded_content_type(entry.content_type.as_deref())
-        .map(|recorded| effective_content_type(recorded, route_path))
+    usable.map(|recorded| effective_content_type(recorded, route_path).to_owned())
 }
 
 impl StaticFileLayer {
@@ -404,7 +416,7 @@ impl StaticFileLayer {
                 // Only a value the serve path would actually honour: an
                 // unusable one is ignored there, so treating it as the ISR
                 // expectation would refuse every regeneration forever.
-                isr_expected_content_type(entry, request_path),
+                isr_expected_content_type(entry, request_path, &file_path).as_deref(),
             );
         }
 
@@ -2011,8 +2023,8 @@ mod tests {
 
         let manifest = StaticManifest::load(&dist_dir.join("manifest.json")).expect("manifest");
         let entry = &manifest.routes["/logo.png"];
-        let expected = isr_expected_content_type(entry, "/logo.png");
-        regenerate_page(&router, "/logo.png", &hit.file_path, expected)
+        let expected = isr_expected_content_type(entry, "/logo.png", &hit.file_path);
+        regenerate_page(&router, "/logo.png", &hit.file_path, expected.as_deref())
             .await
             .expect("an explicit entry regenerates whatever the handler header says");
     }
@@ -2032,7 +2044,25 @@ mod tests {
     #[test]
     fn isr_does_not_guard_the_type_of_an_explicit_entry() {
         let entry = explicit_entry("application/octet-stream", Some(1));
-        assert_eq!(isr_expected_content_type(&entry, "/logo.png"), None);
+        let file = Path::new("logo.png/index.html");
+        assert_eq!(isr_expected_content_type(&entry, "/logo.png", file), None);
+    }
+
+    /// An explicit flag with no usable type serves the derived type, so ISR
+    /// must guard that same type.
+    #[test]
+    fn isr_guards_the_fallback_type_of_an_unusable_explicit_entry() {
+        let file = Path::new("logo.png/index.html");
+        for bad in [None, Some(""), Some("   "), Some("image/p\u{e9}ng")] {
+            let entry = ManifestEntry::new("logo.png/index.html")
+                .with_content_type(bad.map(str::to_owned))
+                .with_content_type_explicit(true);
+            assert_eq!(
+                isr_expected_content_type(&entry, "/logo.png", file).as_deref(),
+                Some("image/png"),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -2040,7 +2070,8 @@ mod tests {
         let entry = ManifestEntry::new("theme.css/index.html")
             .with_content_type(Some("text/plain; charset=utf-8".to_owned()));
         assert_eq!(
-            isr_expected_content_type(&entry, "/theme.css"),
+            isr_expected_content_type(&entry, "/theme.css", Path::new("theme.css/index.html"))
+                .as_deref(),
             Some("text/css; charset=utf-8")
         );
     }
