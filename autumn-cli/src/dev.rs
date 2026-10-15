@@ -1922,9 +1922,11 @@ fn run_nonce() -> u128 {
     })
 }
 
-/// Whether `dir` can hold the marker files: it exists, or can be made, and a
-/// file can be written in it. Live reload only warns when its own setup in the
-/// same directory fails, so this is checked before the app is told to use it.
+/// Whether `dir` can hold the marker files: it exists, or can be made, and the
+/// steps the protocol uses all work in it. The app writes its ready file as a
+/// temporary file, renames it into place, and the CLI later removes it. Live
+/// reload only warns when its own setup in the same directory fails, so this is
+/// checked before the app is told to use the directory.
 #[cfg_attr(
     unix,
     allow(
@@ -1936,9 +1938,14 @@ fn state_dir_is_usable(dir: &Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    let probe = dir.join(format!("dev-probe.{}", std::process::id()));
-    let usable = std::fs::File::create(&probe).is_ok();
-    let _ = std::fs::remove_file(&probe);
+    let pid = std::process::id();
+    let temporary = dir.join(format!("dev-probe.{pid}.tmp"));
+    let renamed = dir.join(format!("dev-probe.{pid}"));
+    let usable = std::fs::File::create(&temporary).is_ok()
+        && std::fs::rename(&temporary, &renamed).is_ok()
+        && std::fs::remove_file(&renamed).is_ok();
+    let _ = std::fs::remove_file(&temporary);
+    let _ = std::fs::remove_file(&renamed);
     usable
 }
 
