@@ -109,6 +109,10 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let request_id = req.extensions().get::<RequestId>().map(ToString::to_string);
+        let agent_call = req
+            .extensions()
+            .get::<crate::agent_authority::AgentInvocation>()
+            .is_some();
 
         // Open an always-on request span carrying the well-known correlation
         // fields. They are declared up front (Empty) so `set_user_id` /
@@ -161,7 +165,14 @@ where
             ctx,
             async move {
                 let response = inner.await?;
-                let (parts, body) = response.into_parts();
+                let (mut parts, body) = response.into_parts();
+                // An MCP tool call reads the principal off the response: the
+                // scope is gone once this future ends.
+                if agent_call && let Some(actor) = crate::current::Current::scoped_actor() {
+                    parts
+                        .extensions
+                        .insert(crate::agent_authority::AgentActor(actor));
+                }
                 // Capture the request's *resolved* actor scope (the auth layer has
                 // published the principal by now) and re-establish it on every
                 // streamed frame, so a lazy/SSE body's writes stay attributed to

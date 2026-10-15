@@ -599,6 +599,14 @@ pub struct AgentAuthority {
     pub asserted_effect_free: &'static [AssertedEffectFree],
 }
 
+/// The principal a route's own auth layer resolved for an MCP tool call.
+///
+/// Set on the dispatched **response** for tool calls only. The dispatcher
+/// reads it to name the principal in the outcome audit row. The attempt row is
+/// written before dispatch, so it cannot carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentActor(pub String);
+
 /// The compile-known authority of the MCP tool currently being invoked.
 ///
 /// Inserted as a request extension by the MCP dispatcher before the tool runs,

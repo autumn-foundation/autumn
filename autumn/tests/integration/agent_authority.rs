@@ -651,6 +651,44 @@ async fn unauthenticated_call_is_attributed_to_the_anonymous_agent() {
     }
 }
 
+/// A handler that publishes a principal, the way the auth layer does.
+#[post("/api/guarded-refunds")]
+#[api_doc(mcp, summary = "Draft a refund behind auth")]
+async fn guarded_refund(Json(_body): Json<RefundRequest>) -> AutumnResult<Json<RefundReceipt>> {
+    autumn_web::current::Current::set_actor("user-42");
+    Ok(Json(RefundReceipt {
+        correlation_id: String::new(),
+        tool: String::new(),
+        grant: None,
+        request_id: String::new(),
+    }))
+}
+
+static GUARDED_REFUND_AUTHORITY: AgentAuthority =
+    test_authority("guarded_refund", &COMPENSABLE_GRANT);
+
+#[tokio::test]
+async fn a_route_guarded_call_names_its_principal_in_the_outcome() {
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![guarded_refund], &GUARDED_REFUND_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+
+    call_tool(
+        &client,
+        "guarded_refund",
+        serde_json::json!({ "body": { "memo": "who" } }),
+    )
+    .await;
+
+    let events = sink.agent_events();
+    assert_eq!(events.len(), 2, "{events:#?}");
+    // Written before dispatch, so the principal is not known yet.
+    assert_eq!(events[0].actor_id, "agent:anonymous");
+    assert_eq!(events[1].actor_id, "user-42");
+}
+
 // ── 6: fail-closed when the attempt record cannot be written ──────────
 
 #[tokio::test]

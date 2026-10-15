@@ -852,18 +852,17 @@ other key the caller sends is counted, not quoted (`body,+2 unknown`), because
 the caller chooses those names and an audit row is not the place to discover
 that one of them was a newline or someone's national insurance number.
 
-> **Where `actor_id` comes from, and what it cannot see.** It is resolved on the
-> `/mcp` envelope, *before* the tool is dispatched. A principal that the route's
-> own guard resolves — `#[secured]` or `RequireApiToken` on the handler — is
-> published into the dispatched request's task-local scope, which is torn down
-> before the dispatcher regains control, so neither event can see it. A tool
-> guarded only at the route therefore records `agent:anonymous` even though a
-> named principal performed the action. Read `agent:anonymous` as *"no principal
-> was established at the endpoint"*, never as *"nobody"* — and when you need the
-> trail to name who acted, authenticate the endpoint itself (see
-> [Secure the endpoint, not just the handler](#secure-the-endpoint-not-just-the-handler)).
-> Either way the outcome event's `request_id` joins the row to the dispatched
-> request's own log lines, which do carry its resolved `user_id`.
+> **Where `actor_id` comes from.** The `/mcp` envelope resolves it before the
+> tool runs. A route guard (`#[secured]`, `RequireApiToken`) resolves its
+> principal later, inside the dispatched request. The dispatcher reads that
+> principal from the response, so the **outcome** event names it. The
+> **attempt** event is written before dispatch, so it still says
+> `agent:anonymous`. Join the two events with `correlation_id`.
+> `agent:anonymous` on an outcome means no principal was established anywhere.
+> To name the actor on the attempt event too, authenticate the endpoint itself
+> (see [Secure the endpoint, not just the handler](#secure-the-endpoint-not-just-the-handler)).
+> The dispatcher removes control characters from the id and keeps at most 128
+> characters.
 
 ### `correlation_id` vs `request_id`
 
