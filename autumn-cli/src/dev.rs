@@ -1825,10 +1825,12 @@ struct ChildPaths {
     ready: PathBuf,
 }
 
-/// The file names for child number `generation` of dev-loop process `pid`.
+/// The file names for child number `generation` of one dev-loop run.
 ///
 /// The process id keeps two `autumn dev` runs in one workspace (`-p api` and
 /// `-p admin`) apart. A shared file would let one run drain the other's app.
+/// The run nonce keeps a later run apart that got the same process id, because
+/// the OS reuses ids and an unclean exit can leave files behind.
 #[cfg_attr(
     unix,
     allow(
@@ -1836,15 +1838,32 @@ struct ChildPaths {
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-fn child_paths_in(dir: &Path, pid: u32, generation: u64) -> ChildPaths {
+fn child_paths_in(dir: &Path, pid: u32, nonce: u128, generation: u64) -> ChildPaths {
     ChildPaths {
         signal: dir.join(format!(
-            "{DEV_SHUTDOWN_SIGNAL_PREFIX}{pid}.{generation}{DEV_SHUTDOWN_SIGNAL_SUFFIX}"
+            "{DEV_SHUTDOWN_SIGNAL_PREFIX}{pid}.{nonce}.{generation}{DEV_SHUTDOWN_SIGNAL_SUFFIX}"
         )),
         ready: dir.join(format!(
-            "{DEV_READY_FILE_PREFIX}{pid}.{generation}{DEV_READY_FILE_SUFFIX}"
+            "{DEV_READY_FILE_PREFIX}{pid}.{nonce}.{generation}{DEV_READY_FILE_SUFFIX}"
         )),
     }
+}
+
+/// A value that differs between runs: the start time in nanoseconds.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn run_nonce() -> u128 {
+    static NONCE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    })
 }
 
 /// The paths of the running child, if one was started.
@@ -1865,7 +1884,7 @@ static CHILD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 fn begin_child_paths() -> Option<ChildPaths> {
     let dir = dev_state_dir()?;
     let generation = CHILD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    let paths = child_paths_in(dir, std::process::id(), generation);
+    let paths = child_paths_in(dir, std::process::id(), run_nonce(), generation);
     let previous = CHILD_PATHS.lock().ok()?.replace(paths.clone());
     if let Some(previous) = previous {
         let _ = std::fs::remove_file(previous.signal);
@@ -2811,7 +2830,7 @@ mod tests {
     #[test]
     fn child_paths_sit_in_the_given_directory() {
         let dir = Path::new("target").join("autumn");
-        let paths = child_paths_in(&dir, 7, 1);
+        let paths = child_paths_in(&dir, 7, 1, 1);
         assert_eq!(paths.signal.parent(), Some(dir.as_path()));
         assert_eq!(paths.ready.parent(), Some(dir.as_path()));
     }
@@ -2821,12 +2840,15 @@ mod tests {
         // Two `autumn dev` runs in one workspace share a target directory. A
         // shared file would let one run drain the other's app.
         let dir = Path::new("d");
-        let first = child_paths_in(dir, 42, 1);
+        let first = child_paths_in(dir, 42, 5, 1);
         let name = first.signal.file_name().and_then(|n| n.to_str()).unwrap();
         assert!(name.starts_with(DEV_SHUTDOWN_SIGNAL_PREFIX), "{name}");
         assert!(name.ends_with(DEV_SHUTDOWN_SIGNAL_SUFFIX), "{name}");
         assert!(name.contains("42"), "{name}");
-        assert_ne!(first, child_paths_in(dir, 43, 1), "other process");
+        assert_ne!(first, child_paths_in(dir, 43, 5, 1), "other process");
+        // The OS reuses process ids. A later run with the same id must not
+        // reach the files an unclean exit left behind.
+        assert_ne!(first, child_paths_in(dir, 42, 6, 1), "same id, later run");
     }
 
     #[test]
@@ -2834,8 +2856,8 @@ mod tests {
         // An old file that could not be deleted must not pass for the new
         // child's shutdown request or ready file.
         let dir = Path::new("d");
-        let first = child_paths_in(dir, 42, 1);
-        let second = child_paths_in(dir, 42, 2);
+        let first = child_paths_in(dir, 42, 5, 1);
+        let second = child_paths_in(dir, 42, 5, 2);
         assert_ne!(first.signal, second.signal);
         assert_ne!(first.ready, second.ready);
     }
