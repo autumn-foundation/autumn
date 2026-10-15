@@ -106,6 +106,11 @@ Mark a deliberately-unauthenticated handler with the new `#[public]` attribute
 (mirrors `#[secured]`) to classify it as `public` and clear it from the
 `unclassified` set.
 
+A layer can be the guard, such as `RequireApiToken`. Mount that group with
+`AppBuilder::scoped_guarded`, not `scoped` (issue #2468). Its routes are then
+`gated` with `provenance: "declared"`. Do not use `#[public]` on them. The
+audit cannot check that the layer authenticates.
+
 An unclassified-route diagnostic now names the offending handler's `file:line`
 (from `file!()`/`line!()`) alongside its module, e.g. `POST /widgets (handler
 `create_widget` [myapp::widgets] at src/routes/widgets.rs:12)`, so it can be
