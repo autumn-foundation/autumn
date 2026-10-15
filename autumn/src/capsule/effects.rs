@@ -1318,7 +1318,7 @@ impl ReplayEffects {
     /// userinfo the way capture retained it (user, password, decoded forms).
     fn observe_url(&self, recorded: &str, actual: &str) {
         self.observe_text(recorded, actual);
-        if recorded.contains("://[FILTERED]@")
+        if crate::capsule::redact::url_userinfo(recorded) == Some("[FILTERED]")
             && let Some(userinfo) = crate::capsule::redact::url_userinfo(actual)
             && let Ok(mut observed) = self.observed.lock()
         {

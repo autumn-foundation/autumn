@@ -643,9 +643,9 @@ pub fn redact_effects(
     // the filter pass does. Replay refuses a capsule with masked input
     // (#2351 item 8).
     for (index, exchange) in effects.http.iter_mut().enumerate() {
-        exchange.url = mask_echoes(&exchange.url, values);
+        exchange.url = mask_url_echoes(&exchange.url, values);
         if let Some(final_url) = exchange.final_url.as_mut() {
-            let masked = mask_echoes(final_url, values);
+            let masked = mask_url_echoes(final_url, values);
             if masked != *final_url {
                 keys.insert(format!("http[{index}].final_url:<echo>"));
             }
@@ -820,16 +820,20 @@ fn mask_url_userinfo(
     format!("{head}{FILTERED_PLACEHOLDER}@{host}")
 }
 
-/// Split an absolute URL into what precedes its userinfo, the userinfo, and
-/// the rest (`host…`).
+/// Byte range of an absolute URL's authority (`userinfo@host:port`) within `url`.
 ///
-/// A special scheme (`http`, `https`, `ws`, `wss`, `ftp`) is parsed the way the
-/// HTTP client's URL parser does: `https:user:secret@host`, `https:/user:…` and
-/// backslash spellings all reach the wire as credentialed URLs, so a literal
-/// `://` is only required of other schemes.
-fn split_userinfo(url: &str) -> Option<(&str, &str, &str)> {
-    let colon = url.find(':')?;
-    let scheme = url.get(..colon)?;
+/// A special scheme (`http`, `https`, `ws`, `wss`, `ftp`) is read the way the
+/// HTTP client's URL parser reads it: leading control characters and spaces are
+/// skipped, and `https:user:secret@host`, `https:/user:…` and backslash
+/// spellings all reach the wire as credentialed URLs, so a literal `://` is
+/// only required of other schemes.
+fn authority_bounds(url: &str) -> Option<(usize, usize)> {
+    let lead = url
+        .len()
+        .checked_sub(url.trim_start_matches(|c: char| c <= ' ').len())?;
+    let from_scheme = url.get(lead..)?;
+    let colon = from_scheme.find(':')?;
+    let scheme = from_scheme.get(..colon)?;
     let mut chars = scheme.chars();
     if !chars.next()?.is_ascii_alphabetic()
         || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -839,25 +843,53 @@ fn split_userinfo(url: &str) -> Option<(&str, &str, &str)> {
     let special = ["http", "https", "ws", "wss", "ftp"]
         .iter()
         .any(|name| scheme.eq_ignore_ascii_case(name));
-    let after_scheme = url.get(colon.checked_add(1)?..)?;
+    let after_scheme = from_scheme.get(colon.checked_add(1)?..)?;
     let slashes = after_scheme
         .find(|c: char| !(c == '/' || (special && c == '\\')))
         .unwrap_or(after_scheme.len());
     if !special && slashes < 2 {
         return None;
     }
-    let authority_start = colon.checked_add(1)?.checked_add(slashes)?;
-    let head = url.get(..authority_start)?;
-    let rest = url.get(authority_start..)?;
-    let end = rest
+    let start = lead
+        .checked_add(colon)?
+        .checked_add(1)?
+        .checked_add(slashes)?;
+    let rest = url.get(start..)?;
+    let len = rest
         .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
         .unwrap_or(rest.len());
-    let (userinfo, _) = rest.get(..end)?.rsplit_once('@')?;
+    Some((start, start.checked_add(len)?))
+}
+
+/// Split an absolute URL into what precedes its userinfo, the userinfo, and
+/// the rest (`host…`).
+fn split_userinfo(url: &str) -> Option<(&str, &str, &str)> {
+    let (start, end) = authority_bounds(url)?;
+    let authority = url.get(start..end)?;
+    let (userinfo, _) = authority.rsplit_once('@')?;
     if userinfo.is_empty() {
         return None;
     }
-    let host_and_tail = rest.get(userinfo.len().checked_add(1)?..)?;
+    let head = url.get(..start)?;
+    let host_and_tail = url.get(start.checked_add(userinfo.len())?.checked_add(1)?..)?;
     Some((head, userinfo, host_and_tail))
+}
+
+/// [`mask_echoes`] over everything after a URL's authority.
+///
+/// The scheme and host are structure, not payload: a retained credential that
+/// happens to equal a host label (`payments:secret@payments.example`) must not
+/// turn the destination into a wildcard replay would then match against any
+/// host.
+fn mask_url_echoes(url: &str, redacted: &RedactedValues) -> String {
+    match authority_bounds(url) {
+        Some((_, end)) => format!(
+            "{}{}",
+            url.get(..end).unwrap_or_default(),
+            mask_echoes(url.get(end..).unwrap_or_default(), redacted)
+        ),
+        None => mask_echoes(url, redacted),
+    }
 }
 
 /// The `user:password` of an absolute URL's authority, if it has one.
@@ -2303,6 +2335,26 @@ mod tests {
             ] {
                 assert!(values.contains(expected), "{expected:?}");
             }
+        }
+
+        #[test]
+        fn a_credential_equal_to_a_host_label_does_not_wildcard_the_host() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://payments:secret@payments.example/x")],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            let url = &effects.http.first().expect("one exchange").url;
+            assert_eq!(url, "https://[FILTERED]@payments.example/x");
+        }
+
+        #[test]
+        fn userinfo_behind_leading_control_characters_is_still_found() {
+            assert_eq!(url_userinfo("\n https://a:b@h/p"), Some("a:b"));
+            assert_eq!(
+                hide_url_userinfo("\nhttps:a:b@h/p"),
+                "\nhttps:[FILTERED]@h/p"
+            );
         }
 
         #[test]
