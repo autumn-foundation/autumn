@@ -192,7 +192,16 @@ mod imp {
                     .migration_source("app", migrations)
                     .framework_migrations();
             }
-            builder.build().map_err(|e| e.to_string())
+            let fleet = builder.build().map_err(|e| e.to_string())?;
+            // The check boot makes: a key must not reach the control database.
+            let control: Vec<&str> = self
+                .config
+                .database
+                .effective_primary_url()
+                .into_iter()
+                .collect();
+            fleet.check_control_outside_root(&control)?;
+            Ok(fleet)
         }
 
         fn replicated(&self) -> bool {
@@ -378,19 +387,21 @@ mod imp {
                 remapped.join(", ")
             ));
         }
+        let rt = runtime()?;
+        let keys = match key {
+            Some(raw) => vec![parse_key(&fleet, raw)?],
+            None => rt.block_on(fleet.list()).map_err(|e| e.to_string())?,
+        };
+        refuse_unknown_versions(&rt, &fleet, &keys)?;
         if target.replicated() {
             eprintln!(
                 "  \u{2139} [replication] is on. A migration of a database that a running \
                  app has open can make its replicator start a new generation."
             );
         }
-        let rt = runtime()?;
 
-        if let Some(raw) = key {
-            let key = parse_key(&fleet, raw)?;
-            let applied = rt
-                .block_on(fleet.migrate(&key))
-                .map_err(|e| e.to_string())?;
+        if let (Some(_), [key]) = (key, keys.as_slice()) {
+            let applied = rt.block_on(fleet.migrate(key)).map_err(|e| e.to_string())?;
             eprintln!("\u{2713} {key}: {applied} migration(s) applied.");
             return Ok(());
         }
@@ -417,6 +428,41 @@ mod imp {
         Ok(())
     }
 
+    /// Refuse to migrate when a database records a version that none of this
+    /// command's sets has. Another set (a plugin's) migrates these databases,
+    /// and the version map depends on it, so only boot can migrate them.
+    fn refuse_unknown_versions(
+        rt: &tokio::runtime::Runtime,
+        fleet: &DatabaseFleet,
+        keys: &[FleetDbKey],
+    ) -> Result<(), String> {
+        let known = fleet.known_migration_versions();
+        let mut found = Vec::new();
+        for key in keys {
+            // A file that cannot be read fails in the migration, with its reason.
+            let Ok(info) = rt.block_on(fleet.inspect(key)) else {
+                continue;
+            };
+            let unknown: Vec<String> = info
+                .applied_migrations
+                .into_iter()
+                .filter(|v| known.binary_search(v).is_err())
+                .collect();
+            if !unknown.is_empty() {
+                found.push(format!("{key}: {}", unknown.join(", ")));
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "These databases record migrations that are not in {MIGRATIONS_DIR}/ or the \
+             framework sets:\n  {}\n  A plugin set probably applied them. Run the app once \
+             with AUTUMN_MIGRATE=1 instead.",
+            found.join("\n  ")
+        ))
+    }
+
     fn backup(target: &Target, key: &str, dest: &Path) -> Result<(), String> {
         let fleet = target.build(None)?;
         let key = parse_key(&fleet, key)?;
@@ -426,6 +472,10 @@ mod imp {
                 dest.display()
             ));
         }
+        // The copy holds tenant data: only the owner can read it, from its
+        // first byte.
+        #[cfg(unix)]
+        nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
         let rt = runtime()?;
         let result = rt.block_on(async {
             let result = fleet.backup(&key, dest).await;
@@ -433,13 +483,6 @@ mod imp {
             result
         });
         result.map_err(|e| e.to_string())?;
-        // The copy holds tenant data: only the owner reads it.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("could not restrict {}: {e}", dest.display()))?;
-        }
         eprintln!(
             "\u{2713} Copied {key} to {} ({} byte(s)).",
             dest.display(),

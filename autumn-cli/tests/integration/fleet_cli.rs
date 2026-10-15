@@ -369,6 +369,41 @@ mod sqlite {
     }
 
     #[test]
+    fn fleet_migrate_refuses_a_database_another_set_migrated() {
+        let app = App::new("");
+        app.provision(&app.fleet(), &["acme", "globex"], 0);
+        // A plugin set recorded this version at boot.
+        exec(
+            &app.path("globex"),
+            "INSERT INTO __diesel_schema_migrations (version) VALUES ('20990101000000')",
+        );
+
+        let stderr = run_err(&app.dir, &["fleet", "migrate"]);
+        assert!(stderr.contains("tenant:globex: 20990101000000"), "{stderr}");
+        assert!(stderr.contains("AUTUMN_MIGRATE=1"), "{stderr}");
+        // Only the clean database, by key.
+        run_ok(&app.dir, &["fleet", "migrate", "--key", "tenant:acme"]);
+    }
+
+    #[test]
+    fn fleet_refuses_a_control_database_inside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fleet");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            format!(
+                "[database]\nurl = \"sqlite://{}\"\n\n[database.fleet]\nmode = \"tenant\"\n\
+                 root = \"fleet\"\n",
+                root.join("control.db").display()
+            ),
+        )
+        .unwrap();
+        let stderr = run_err(tmp.path(), &["fleet", "list"]);
+        assert!(stderr.contains("control database"), "{stderr}");
+    }
+
+    #[test]
     fn fleet_backup_writes_a_copy() {
         let app = App::new("");
         app.provision(&app.fleet(), &["acme"], 3);

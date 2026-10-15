@@ -2271,6 +2271,56 @@ impl DatabaseFleet {
         names
     }
 
+    /// Refuse a control database (one of `control_urls`) inside the root: a
+    /// tenant or slot path could open it. Boot and `autumn fleet` call this.
+    ///
+    /// Config validation compares paths lexically, so a symlinked root can
+    /// still reach the control database. `root()` is canonical, so this
+    /// compares the control file's canonical path.
+    ///
+    /// # Errors
+    ///
+    /// The control database that resolves inside the root.
+    pub fn check_control_outside_root(&self, control_urls: &[&str]) -> Result<(), String> {
+        let inside = control_urls
+            .iter()
+            .filter_map(|url| crate::config::sqlite_url_file(url))
+            .filter_map(|path| canonical_target(&path))
+            .find(|control| control.starts_with(self.root()));
+        inside.map_or(Ok(()), |control| {
+            Err(format!(
+                "the control database {} resolves inside database.fleet.root {}; a tenant or \
+                 slot path could open it. Put the control database outside the fleet root",
+                control.display(),
+                self.root().display()
+            ))
+        })
+    }
+
+    /// The versions this fleet's sets record, substitutes included. Sorted.
+    ///
+    /// A database that records another version was migrated by a set this
+    /// fleet does not have (a plugin's, say).
+    #[must_use]
+    pub fn known_migration_versions(&self) -> Vec<String> {
+        let migrations = &self.inner.migrations;
+        let mut versions: Vec<String> = migrations
+            .history
+            .iter()
+            .flatten()
+            .map(|(version, name)| {
+                migrations
+                    .disambiguated
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| version.clone())
+            })
+            .collect();
+        versions.sort();
+        versions.dedup();
+        versions
+    }
+
     /// Apply the pending migrations of one database on disk, without opening
     /// a pool. Returns the number of applied migrations. It does not create
     /// the database.
@@ -3127,29 +3177,17 @@ pub(crate) fn build_for_app(
         DEFAULT_MIN_RESIDENCY,
     )
     .map_err(|e| format!("Failed to set up database.fleet: {e}"))?;
-    // Config validation compares paths lexically; a symlinked root can still
-    // reach the control database. `root()` is canonical, so compare the
-    // control file's canonical path too: the configured one, and the one a
-    // custom pool provider resolved at runtime (it may differ).
-    let control_targets = config
+    // The configured control database, and the one a custom pool provider
+    // resolved at runtime (it may differ).
+    let control_urls: Vec<&str> = config
         .database
         .effective_primary_url()
         .into_iter()
         .chain(resolved_control_url)
-        .filter_map(crate::config::sqlite_url_file)
-        .filter_map(|path| canonical_target(&path));
-    if let Some(control) = control_targets
-        .into_iter()
-        .find(|control| control.starts_with(fleet.root()))
-    {
-        return Err(format!(
-            "Failed to set up database.fleet: the control database {} resolves inside \
-             database.fleet.root {}; a tenant or slot path could open it. Put the control \
-             database outside the fleet root",
-            control.display(),
-            fleet.root().display()
-        ));
-    }
+        .collect();
+    fleet
+        .check_control_outside_root(&control_urls)
+        .map_err(|e| format!("Failed to set up database.fleet: {e}"))?;
     Ok(Some(fleet))
 }
 
@@ -4097,6 +4135,33 @@ mod tests {
         )
         .unwrap();
         boot.open(&FleetDbKey::Slot(1)).await.unwrap();
+    }
+
+    #[test]
+    fn known_versions_are_the_recorded_versions_of_every_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let mut expected: Vec<String> =
+            crate::migrate::migration_versions_and_names::<diesel::sqlite::Sqlite, _>(
+                &crate::version_history::VERSION_HISTORY_MIGRATIONS,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(version, _)| version)
+            .collect();
+        expected.sort();
+        assert_eq!(fleet.known_migration_versions(), expected);
+    }
+
+    #[test]
+    fn a_control_database_inside_the_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(&tmp.path().join("fleet"), FleetMode::Slot, |_| {});
+        let inside = format!("sqlite://{}", fleet.root().join("control.db").display());
+        let outside = format!("sqlite://{}", tmp.path().join("control.db").display());
+        let err = fleet.check_control_outside_root(&[&inside]).unwrap_err();
+        assert!(err.contains("control database"), "{err}");
+        fleet.check_control_outside_root(&[&outside]).unwrap();
     }
 
     #[test]

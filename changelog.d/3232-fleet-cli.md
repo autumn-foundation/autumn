@@ -7,5 +7,7 @@
 - **db:** `DatabaseFleet::migrate` migrates one database.
   `DatabaseFleet::inspect` reads the identity row and the applied migrations
   (`FleetDbInfo`) and writes nothing. `DatabaseFleet::remapped_migrations`
-  lists migrations recorded under a substitute version. The builder gets
+  lists migrations recorded under a substitute version,
+  `known_migration_versions` the versions the fleet's sets record, and
+  `check_control_outside_root` refuses a control database inside the root. The builder gets
   `migration_source` and `framework_migrations`.

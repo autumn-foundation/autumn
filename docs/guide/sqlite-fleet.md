@@ -169,12 +169,16 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   `database.fleet.root` does not exist, so a wrong directory does not give an
   empty fleet. For a new volume, create the root directory first.
 - Only `restore` creates a database file. The other commands do not.
+- Like boot, each command stops when the control database resolves inside
+  the fleet root.
 - `list --open` reads each file and changes no data. It exits non-zero when
   it cannot read a file.
 - `migrate` reads the app's `migrations/` directory. It does not apply plugin
   migrations. For those, run the app once with `AUTUMN_MIGRATE=1`. If an app
   migration has the same version as a framework migration, `migrate` stops:
-  only boot can record that pair correctly.
+  only boot can record that pair correctly. `migrate` also stops when a
+  database records a migration that is not in `migrations/` or the framework
+  sets (a plugin migration, for example).
 - A failure on one database does not stop the others. `migrate` lists each
   failure and exits non-zero.
 - With `[replication]` on, a migration of a database that the app has open
