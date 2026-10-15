@@ -812,7 +812,8 @@ mod tests {
         assert!(evaluate(Some(&base), &second, &acks).blocked());
     }
 
-    /// The digest covers the payload. A hand-widened payload must fail.
+    /// The digest covers the payload. A hand-widened payload with the old digest must
+    /// fail. The digest catches mistakes. It is not a secret.
     #[test]
     fn a_hand_widened_ceiling_is_refused() {
         let base = admin_base();

@@ -304,7 +304,9 @@ Rules worth knowing:
   - Unrelated pushes keep it valid. A **new** widening needs a new
     acknowledgment.
   - The marker digest covers the ceiling text. A truncated or edited paste does
-    not match.
+    not match. This catches mistakes. It is not a secret: anyone can compute
+    the digest for a wider ceiling. Paste only the line the report printed.
+    Do not paste a line from another author without a check.
 
   The gate uses the same rules as the diff: roles are OR-ed, scopes are
   AND-ed, an open classification is widest. A finding that names no single
