@@ -499,9 +499,10 @@ mod imp {
         if dest.symlink_metadata().is_ok() {
             return Err(taken());
         }
-        // The copy holds tenant data. It is written in a new directory that
-        // only this user can open, then linked to `dest`. A link never
-        // replaces or follows a file another user put at `dest`.
+        // The copy holds tenant data. It is written in a new directory, then
+        // linked to `dest`. A link never replaces or follows a file another
+        // user put at `dest`. On Unix only this user can open the directory
+        // and the copy. On Windows both get the ACL of `dest`'s directory.
         #[cfg(unix)]
         nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
         let parent = dest

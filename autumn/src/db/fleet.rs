@@ -2242,6 +2242,8 @@ impl DatabaseFleet {
         };
         let outcomes = futures::stream::iter(keys.into_iter().map(|key| async move {
             let outcome = match self.check_key(&key) {
+                // Never opened: on Windows the open would create the file.
+                Ok(()) if !self.exists(&key) => Ok(0),
                 Ok(()) => self.migrate_existing(&key).await,
                 Err(error) => Err(error),
             };

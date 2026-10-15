@@ -186,7 +186,9 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
 - With `[replication]` on, a migration of a database that the app has open
   can make the replicator start a new generation. `AUTUMN_MIGRATE=1` does the
   same.
-- `backup` makes a file that only its owner can read.
+- `backup` never replaces or follows a file at `dest`. On Unix, only its
+  owner can read the copy. On Windows, the copy gets the ACL of the `dest`
+  directory: put backups in a directory that only you can read.
 - `delete` and `restore` destroy data, so they need `--force` on every
   profile. When another process has the file open (an app that serves the
   tenant), they stop with "open in another process" and change nothing. Wait
