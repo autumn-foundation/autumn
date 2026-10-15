@@ -244,32 +244,55 @@ mod imp {
         len(path) + len(Path::new(&wal))
     }
 
-    /// The versions in `migrations/`, or `None` when it cannot be read.
-    fn app_versions() -> Option<Vec<String>> {
+    /// What the `--open` columns compare a database with.
+    struct AppView {
+        /// The versions in `migrations/`, as named on disk.
+        versions: Vec<String>,
+        /// Every version the CLI's sets record, sorted.
+        known: Vec<String>,
+        /// No two of the CLI's sets share a version, so a version on disk is
+        /// the version a database records.
+        exact: bool,
+    }
+
+    /// The app view, or `None` when `migrations/` cannot be read.
+    fn app_view(target: &Target) -> Option<AppView> {
         let source = diesel_migrations::FileBasedMigrations::from_path(MIGRATIONS_DIR).ok()?;
-        let migrations =
+        let versions =
             diesel::migration::MigrationSource::<diesel::sqlite::Sqlite>::migrations(&source)
-                .ok()?;
-        Some(
-            migrations
+                .ok()?
                 .iter()
                 .map(|m| m.name().version().to_string())
-                .collect(),
-        )
+                .collect();
+        let fleet = target.build(Some(source)).ok()?;
+        Some(AppView {
+            versions,
+            known: fleet.known_migration_versions(),
+            exact: fleet.remapped_migrations().is_empty(),
+        })
     }
 
     /// The `--open` columns: the latest applied app migration and the number
-    /// of app migrations not applied. Without `migrations/`, the latest
-    /// applied migration of any set, and no pending count.
+    /// of app migrations not applied. Without an exact app view (no
+    /// `migrations/`, a shared version, or a database that records a version
+    /// of another set), the latest applied migration of any set and no
+    /// pending count: boot can record an app migration under a substitute.
     fn migration_columns(
         applied: &[String],
-        app: Option<&[String]>,
+        app: Option<&AppView>,
     ) -> (Option<String>, Option<usize>) {
+        let app = app
+            .filter(|app| app.exact && applied.iter().all(|v| app.known.binary_search(v).is_ok()));
         let Some(app) = app else {
             return (applied.iter().max().cloned(), None);
         };
-        let latest = app.iter().filter(|v| applied.contains(v)).max().cloned();
-        let pending = app.iter().filter(|v| !applied.contains(v)).count();
+        let latest = app
+            .versions
+            .iter()
+            .filter(|v| applied.contains(v))
+            .max()
+            .cloned();
+        let pending = app.versions.iter().filter(|v| !applied.contains(v)).count();
         (latest, Some(pending))
     }
 
@@ -278,7 +301,7 @@ mod imp {
         let rt = runtime()?;
         let keys = rt.block_on(fleet.list()).map_err(|e| e.to_string())?;
         eprintln!("  \u{2139} root: {}", fleet.root().display());
-        let app = if open { app_versions() } else { None };
+        let app = if open { app_view(target) } else { None };
 
         let mut rows = Vec::with_capacity(keys.len());
         let mut failed = 0_usize;
@@ -293,7 +316,7 @@ mod imp {
                 match rt.block_on(fleet.inspect(key)) {
                     Ok(info) => {
                         let (latest, pending) =
-                            migration_columns(&info.applied_migrations, app.as_deref());
+                            migration_columns(&info.applied_migrations, app.as_ref());
                         row["identity"] = info.identity.into();
                         row["migration_version"] = latest.into();
                         row["pending"] = pending.into();
@@ -406,9 +429,9 @@ mod imp {
             return Ok(());
         }
 
-        let report = rt
-            .block_on(fleet.migrate_all(concurrency))
-            .map_err(|e| e.to_string())?;
+        // Exactly the checked keys: a database made since the check is not
+        // visited (the app made it with every set).
+        let report = rt.block_on(fleet.migrate_keys(keys, concurrency));
         for (key, error) in &report.failed {
             eprintln!("  \u{2717} {key}: {error}");
         }
@@ -691,10 +714,14 @@ mod imp {
         #[test]
         fn migration_columns_follow_the_app_set() {
             let strings = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+            let app = AppView {
+                versions: strings(&["1", "2"]),
+                known: strings(&["1", "2", "20260907101530"]),
+                exact: true,
+            };
             // A framework version sorts after the app's: it must not hide
             // that the app migration `2` is pending.
             let applied = strings(&["1", "20260907101530"]);
-            let app = strings(&["1", "2"]);
             assert_eq!(
                 migration_columns(&applied, Some(&app)),
                 (Some("1".to_owned()), Some(1))
@@ -704,6 +731,18 @@ mod imp {
                 (Some("20260907101530".to_owned()), None)
             );
             assert_eq!(migration_columns(&[], Some(&app)), (None, Some(2)));
+            // A version of another set: boot may record an app migration
+            // under a substitute, so no pending count.
+            let foreign = strings(&["1", "20990101000000"]);
+            assert_eq!(
+                migration_columns(&foreign, Some(&app)),
+                (Some("20990101000000".to_owned()), None)
+            );
+            let shared = AppView {
+                exact: false,
+                ..app
+            };
+            assert_eq!(migration_columns(&applied, Some(&shared)).1, None);
         }
     }
 }

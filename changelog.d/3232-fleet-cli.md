@@ -4,7 +4,8 @@
   SQLite database fleet from the command line (issue #3232). It needs the
   `sqlite` build of the CLI. See "Operating the fleet" in
   `docs/guide/sqlite-fleet.md`.
-- **db:** `DatabaseFleet::migrate` migrates one database.
+- **db:** `DatabaseFleet::migrate` migrates one database, and
+  `DatabaseFleet::migrate_keys` a given list.
   `DatabaseFleet::inspect` reads the identity row and the applied migrations
   (`FleetDbInfo`) and writes nothing. `DatabaseFleet::remapped_migrations`
   lists migrations recorded under a substitute version,

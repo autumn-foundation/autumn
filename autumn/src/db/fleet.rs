@@ -2223,14 +2223,28 @@ impl DatabaseFleet {
         &self,
         concurrency: usize,
     ) -> Result<FleetMigrationReport, FleetError> {
-        use futures::StreamExt as _;
         let keys = self.list().await?;
+        Ok(self.migrate_keys(keys, concurrency).await)
+    }
+
+    /// [`migrate_all`](Self::migrate_all) on exactly `keys`, for a caller
+    /// that checked each database first: a database created since then is
+    /// not visited. A key whose file is gone is skipped, never created.
+    pub async fn migrate_keys(
+        &self,
+        keys: Vec<FleetDbKey>,
+        concurrency: usize,
+    ) -> FleetMigrationReport {
+        use futures::StreamExt as _;
         let mut report = FleetMigrationReport {
             databases: keys.len(),
             ..FleetMigrationReport::default()
         };
         let outcomes = futures::stream::iter(keys.into_iter().map(|key| async move {
-            let outcome = self.migrate_existing(&key).await;
+            let outcome = match self.check_key(&key) {
+                Ok(()) => self.migrate_existing(&key).await,
+                Err(error) => Err(error),
+            };
             (key, outcome)
         }))
         .buffer_unordered(concurrency.max(1))
@@ -2247,7 +2261,7 @@ impl DatabaseFleet {
             .counters
             .migrations_applied
             .fetch_add(report.applied as u64, Ordering::Relaxed);
-        Ok(report)
+        report
     }
 
     /// Migrations this fleet records under a substitute version, because two
@@ -4135,6 +4149,41 @@ mod tests {
         )
         .unwrap();
         boot.open(&FleetDbKey::Slot(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_keys_visits_only_the_given_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .build()
+            .unwrap();
+        for slot in [1, 2] {
+            bare.open(&FleetDbKey::Slot(slot)).await.unwrap();
+        }
+        bare.close_all().await;
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let report = fleet
+            .migrate_keys(vec![FleetDbKey::Slot(1), FleetDbKey::Slot(3)], 2)
+            .await;
+        assert_eq!((report.databases, report.applied), (2, 3));
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(
+            !fleet.exists(&FleetDbKey::Slot(3)),
+            "a missing key is not created"
+        );
+        // Slot 2 was not given: it still has pending migrations.
+        let pending = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .migrations(
+                "version-history",
+                crate::version_history::VERSION_HISTORY_MIGRATIONS,
+            )
+            .apply_migrations_on_open(false)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            pending.open(&FleetDbKey::Slot(2)).await,
+            Err(FleetError::PendingMigrations { .. })
+        ));
     }
 
     #[test]
