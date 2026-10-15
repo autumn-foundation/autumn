@@ -673,9 +673,9 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
     );
     if evicts_lazily(dataset, config) {
         note.push_str(
-            ". The in-memory store does not serve expired records. It removes them only on \
-             later writes. A quiet process can keep them past the window. Use redis to \
-             remove them on time",
+            ". With the built-in in-memory store, expired records are not served. The store \
+             removes them only on later writes. A quiet process can keep them past the \
+             window. Use redis to remove them on time",
         );
     }
     if dataset == RetentionDataset::Sessions {
@@ -1509,7 +1509,10 @@ mod tests {
             RetentionDataset::JobTracking,
         ] {
             let note = backend_ttl_note(dataset, &config, 60);
-            assert!(note.contains("does not serve expired"), "{dataset}: {note}");
+            assert!(
+                note.contains("built-in in-memory store"),
+                "{dataset}: {note}"
+            );
             assert!(note.contains("quiet process"), "{dataset}: {note}");
         }
     }
