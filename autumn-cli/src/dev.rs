@@ -92,7 +92,7 @@ const DEV_SHUTDOWN_SIGNAL_ENV: &str = "AUTUMN_SHUTDOWN_SIGNAL_FILE";
 
 /// Filename parts of the cooperative-shutdown file, written beside the
 /// live-reload state. The dev-loop process id goes between them — see
-/// [`resolve_dev_shutdown_signal_path`].
+/// [`child_paths_in`].
 #[cfg_attr(
     unix,
     allow(
@@ -259,43 +259,6 @@ fn recorded_child_stop_budget() -> Option<Duration> {
         0 => None,
         secs => Some(Duration::from_secs(secs)),
     }
-}
-
-/// Whether the running child's ready file was cleared before it spawned.
-///
-/// If an old file cannot be deleted, it could pass for this child's file, and
-/// the app cannot replace it on Windows. Readiness is then not tracked.
-static CHILD_READY_TRACKABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-/// Whether removing an old marker file left no file behind.
-#[cfg_attr(
-    unix,
-    allow(
-        dead_code,
-        reason = "the non-Unix stop path, compiled and tested everywhere"
-    )
-)]
-fn marker_cleared(removal: &std::io::Result<()>) -> bool {
-    match removal {
-        Ok(()) => true,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-    }
-}
-
-/// The ready file to track for the running child, if it can be trusted.
-#[cfg_attr(
-    unix,
-    allow(
-        dead_code,
-        reason = "the non-Unix stop path, compiled and tested everywhere"
-    )
-)]
-fn trackable_ready_file() -> Option<&'static Path> {
-    CHILD_READY_TRACKABLE
-        .load(Ordering::SeqCst)
-        .then(dev_ready_file_path)
-        .flatten()
 }
 
 /// The budget to stop the running child with, most authoritative first.
@@ -1402,46 +1365,21 @@ fn start_server(
     if show_config {
         command.env("AUTUMN_SHOW_CONFIG", "1");
     }
-    // Hand the app the cooperative-shutdown file so a stop can run its
-    // `on_shutdown` hooks on a platform with no `SIGTERM` (#1616). Clear any
-    // stale request first: a file left by a crashed `autumn dev` would drain
-    // this child the moment it boots. Only wired where it is the stop
-    // mechanism — on Unix `stop_server` signals, and an unset variable keeps
-    // the runtime's watcher inert.
+    // Hand the app its own shutdown and ready files so a stop can run its
+    // `on_shutdown` hooks on a platform with no `SIGTERM` (#1616), and so the
+    // app can report its drain budget and when it is up. Fresh paths for each
+    // child: an old file can never drain this child at boot or pass for its
+    // ready file. Only wired where it is the stop mechanism: on Unix
+    // `stop_server` signals, and an unset variable keeps the watcher inert.
     #[cfg(not(unix))]
-    let mut signal_cleared = true;
-    #[cfg(not(unix))]
-    if let Some(signal_path) = dev_shutdown_signal_path() {
-        signal_cleared = marker_cleared(&std::fs::remove_file(signal_path));
-        // An old request that stays would drain this child at boot. Without the
-        // variable, the child does not watch the file at all.
-        if signal_cleared {
-            command.env(DEV_SHUTDOWN_SIGNAL_ENV, signal_path);
-        }
+    if let Some(paths) = begin_child_paths() {
+        command.env(DEV_SHUTDOWN_SIGNAL_ENV, &paths.signal);
+        command.env(SERVE_READY_FILE_ENV, &paths.ready);
         // Resolve the child's stop budget from the config it is about to boot
         // with, and keep it for the stop. `autumn.toml` is watched, so by the
-        // time this child is stopped the file may say something different — and
+        // time this child is stopped the file may say something different, and
         // the child would still be draining on these numbers.
         record_child_stop_budget(resolve_cooperative_stop_budget(package));
-    }
-    // Let the app tell us its own resolved drain budget rather than making the
-    // CLI guess — the seam `autumn serve` already uses, and the only way to see
-    // a budget a custom `with_config_loader` produced. Clear any stale file
-    // first so this child cannot be stopped on its predecessor's number.
-    #[cfg(not(unix))]
-    if let Some(ready) = dev_ready_file_path() {
-        // A stale shutdown request makes the child drain at boot and skip its
-        // ready write, so readiness cannot be tracked then either.
-        let cleared = marker_cleared(&std::fs::remove_file(ready)) && signal_cleared;
-        CHILD_READY_TRACKABLE.store(cleared, Ordering::SeqCst);
-        if cleared {
-            command.env(SERVE_READY_FILE_ENV, ready);
-        } else {
-            eprintln!(
-                "  Warning: could not clear {} or the shutdown file. Close the program that holds it. Until then, a stop cannot ask the app to drain.",
-                ready.display()
-            );
-        }
     }
 
     match command.spawn() {
@@ -1492,12 +1430,12 @@ fn stop_server_unix(child: &mut Option<Child>) {
 /// through the file it watches, and force-kill only if it will not.
 #[cfg(not(unix))]
 fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
-    let Some(signal_path) = dev_shutdown_signal_path() else {
-        // `start_server` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` from this same
-        // cached value, so with no path the child was never told to watch
-        // anything. Waiting out the full budget for a request nobody can
-        // receive would make every rebuild slower than the hard kill this
-        // replaced — so kill directly, and say why.
+    let Some(paths) = current_child_paths() else {
+        // `start_server` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` from the same
+        // paths, so with none the child was never told to watch anything.
+        // Waiting out the full budget for a request nobody can receive would
+        // make every rebuild slower than the hard kill this replaced. So kill
+        // directly, and say why.
         if let Some(proc) = child.as_mut() {
             let _ = proc.kill();
             let _ = proc.wait();
@@ -1509,12 +1447,12 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
     let budget = std::cell::Cell::new(Duration::ZERO);
     let outcome = stop_child_cooperatively(
         child,
-        signal_path,
-        trackable_ready_file(),
+        &paths.signal,
+        Some(&paths.ready),
         COOPERATIVE_STOP_BOOT_CAP,
         || {
             let resolved = stop_budget_for_running_child(
-                trackable_ready_file().and_then(child_reported_stop_budget),
+                child_reported_stop_budget(&paths.ready),
                 recorded_child_stop_budget(),
                 || resolve_cooperative_stop_budget(package),
             );
@@ -1841,23 +1779,16 @@ fn resolve_dev_reload_state_path() -> Result<PathBuf, String> {
         .join(DEV_RELOAD_STATE_FILE))
 }
 
-/// Where the cooperative-shutdown file lives: beside the live-reload state,
-/// inside the target directory, so it is swept by `cargo clean`.
-///
-/// Two properties matter and neither is incidental.
+/// The directory for this session's shutdown and ready files: beside the
+/// live-reload state, inside the target directory, so `cargo clean` sweeps it.
 ///
 /// **Tolerant.** This resolves through [`try_cargo_metadata`], not
-/// [`resolve_target_directory`], which `exit(1)`s on unreadable metadata.
-/// `Cargo.toml` is a watched file, so a half-saved manifest is an ordinary
-/// dev-loop event — and on Windows the stop happens *before* the rebuild. An
-/// exit from inside the stop path would leave the app, and the managed Postgres
-/// cluster it owns, running with nobody left to reap them: the exact orphan this
-/// mechanism exists to prevent, through a new door.
+/// [`resolve_target_directory`], which `exit(1)`s on unreadable metadata. A
+/// half-saved `Cargo.toml` is an ordinary dev-loop event, and on Windows the
+/// stop runs before the rebuild. An exit there would leave the app and its
+/// managed Postgres running with nobody to stop them.
 ///
-/// **Unique per dev-loop process.** Two `autumn dev` instances in one workspace
-/// (`-p api` and `-p admin`) share a target directory. A shared signal file
-/// would let one instance's rebuild drain the other instance's app, and let one
-/// instance's cleanup delete the request the other is still waiting on.
+/// **Cached.** A stop must be cheap and must not run `cargo metadata`.
 #[cfg_attr(
     unix,
     allow(
@@ -1865,35 +1796,94 @@ fn resolve_dev_reload_state_path() -> Result<PathBuf, String> {
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-fn resolve_dev_shutdown_signal_path() -> Option<PathBuf> {
-    let metadata = try_cargo_metadata()?;
-    let target = metadata["target_directory"].as_str()?;
-    Some(Path::new(target).join("autumn").join(format!(
-        "{DEV_SHUTDOWN_SIGNAL_PREFIX}{}{DEV_SHUTDOWN_SIGNAL_SUFFIX}",
-        std::process::id()
-    )))
-}
-
-/// This dev-loop session's ready file, resolved once — the path the app writes
-/// its resolved drain budget to.
-#[cfg_attr(
-    unix,
-    allow(
-        dead_code,
-        reason = "the non-Unix stop path, compiled and tested everywhere"
-    )
-)]
-fn dev_ready_file_path() -> Option<&'static Path> {
-    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
+fn dev_state_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
         let metadata = try_cargo_metadata()?;
         let target = metadata["target_directory"].as_str()?;
-        Some(Path::new(target).join("autumn").join(format!(
-            "{DEV_READY_FILE_PREFIX}{}{DEV_READY_FILE_SUFFIX}",
-            std::process::id()
-        )))
+        Some(Path::new(target).join("autumn"))
     })
     .as_deref()
+}
+
+/// The shutdown and ready files of one child.
+///
+/// Each child gets its own pair, so a file left by an earlier child, such as one
+/// that could not be deleted, can never pass for this child's.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildPaths {
+    /// The app watches this file. Creating it asks the app to drain.
+    signal: PathBuf,
+    /// The app writes its drain budget here once it is up.
+    ready: PathBuf,
+}
+
+/// The file names for child number `generation` of dev-loop process `pid`.
+///
+/// The process id keeps two `autumn dev` runs in one workspace (`-p api` and
+/// `-p admin`) apart. A shared file would let one run drain the other's app.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn child_paths_in(dir: &Path, pid: u32, generation: u64) -> ChildPaths {
+    ChildPaths {
+        signal: dir.join(format!(
+            "{DEV_SHUTDOWN_SIGNAL_PREFIX}{pid}.{generation}{DEV_SHUTDOWN_SIGNAL_SUFFIX}"
+        )),
+        ready: dir.join(format!(
+            "{DEV_READY_FILE_PREFIX}{pid}.{generation}{DEV_READY_FILE_SUFFIX}"
+        )),
+    }
+}
+
+/// The paths of the running child, if one was started.
+static CHILD_PATHS: std::sync::Mutex<Option<ChildPaths>> = std::sync::Mutex::new(None);
+
+/// How many children this run has started.
+static CHILD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pick fresh paths for the child about to start, and remove the last child's
+/// files. The removal is best-effort: a file that stays is harmless.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn begin_child_paths() -> Option<ChildPaths> {
+    let dir = dev_state_dir()?;
+    let generation = CHILD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let paths = child_paths_in(dir, std::process::id(), generation);
+    let previous = CHILD_PATHS.lock().ok()?.replace(paths.clone());
+    if let Some(previous) = previous {
+        let _ = std::fs::remove_file(previous.signal);
+        let _ = std::fs::remove_file(previous.ready);
+    }
+    Some(paths)
+}
+
+/// The paths of the running child.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn current_child_paths() -> Option<ChildPaths> {
+    CHILD_PATHS.lock().ok()?.clone()
 }
 
 /// The stop budget the running child reported for itself, if it has booted.
@@ -1922,24 +1912,6 @@ fn child_reported_stop_budget(ready_file: &Path) -> Option<Duration> {
         .parse::<u64>()
         .ok()?;
     Some(cooperative_stop_budget(secs))
-}
-
-/// This dev-loop session's cooperative-shutdown file, resolved once.
-///
-/// Cached so the stop path never shells out to `cargo metadata`: a stop must be
-/// cheap, and must never fail for a reason unrelated to the child it is
-/// stopping.
-#[cfg_attr(
-    unix,
-    allow(
-        dead_code,
-        reason = "the non-Unix stop path, compiled and tested everywhere"
-    )
-)]
-fn dev_shutdown_signal_path() -> Option<&'static Path> {
-    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    PATH.get_or_init(resolve_dev_shutdown_signal_path)
-        .as_deref()
 }
 
 /// Ask the running app to shut down gracefully by creating the file it watches.
@@ -2837,39 +2809,43 @@ mod tests {
     }
 
     #[test]
-    fn dev_shutdown_signal_path_sits_beside_the_live_reload_state() {
-        let path = resolve_dev_shutdown_signal_path().expect("shutdown signal path");
-        assert!(
-            path.parent()
-                .is_some_and(|p| p.ends_with(Path::new("target").join("autumn"))),
-            "unexpected directory: {}",
-            path.display()
-        );
+    fn child_paths_sit_in_the_given_directory() {
+        let dir = Path::new("target").join("autumn");
+        let paths = child_paths_in(&dir, 7, 1);
+        assert_eq!(paths.signal.parent(), Some(dir.as_path()));
+        assert_eq!(paths.ready.parent(), Some(dir.as_path()));
     }
 
     #[test]
-    fn dev_shutdown_signal_path_is_unique_per_dev_loop_process() {
-        // Two `autumn dev` instances in one workspace share a target directory.
-        // A shared file would let one instance's rebuild drain the other's app.
-        let path = resolve_dev_shutdown_signal_path().expect("shutdown signal path");
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("a file name");
+    fn child_paths_carry_the_process_id_and_the_generation() {
+        // Two `autumn dev` runs in one workspace share a target directory. A
+        // shared file would let one run drain the other's app.
+        let dir = Path::new("d");
+        let first = child_paths_in(dir, 42, 1);
+        let name = first.signal.file_name().and_then(|n| n.to_str()).unwrap();
         assert!(name.starts_with(DEV_SHUTDOWN_SIGNAL_PREFIX), "{name}");
         assert!(name.ends_with(DEV_SHUTDOWN_SIGNAL_SUFFIX), "{name}");
-        assert!(
-            name.contains(&std::process::id().to_string()),
-            "the file name must carry this process's id: {name}"
-        );
+        assert!(name.contains("42"), "{name}");
+        assert_ne!(first, child_paths_in(dir, 43, 1), "other process");
     }
 
     #[test]
-    fn dev_shutdown_signal_path_is_cached_across_calls() {
-        // The stop path reads this; resolving per stop would shell out to
-        // `cargo metadata` on every rebuild and could fail on a half-saved
-        // Cargo.toml — inside the stop, where a failure orphans the app.
-        assert_eq!(dev_shutdown_signal_path(), dev_shutdown_signal_path());
+    fn each_child_gets_paths_no_earlier_child_used() {
+        // An old file that could not be deleted must not pass for the new
+        // child's shutdown request or ready file.
+        let dir = Path::new("d");
+        let first = child_paths_in(dir, 42, 1);
+        let second = child_paths_in(dir, 42, 2);
+        assert_ne!(first.signal, second.signal);
+        assert_ne!(first.ready, second.ready);
+    }
+
+    #[test]
+    fn the_state_dir_is_cached_across_calls() {
+        // The stop path reads this. Resolving per stop would run `cargo
+        // metadata` on every rebuild, and could fail on a half-saved
+        // Cargo.toml, inside the stop, where a failure orphans the app.
+        assert_eq!(dev_state_dir(), dev_state_dir());
     }
 
     #[test]
@@ -3000,15 +2976,6 @@ mod tests {
         let member = root.path().join("api");
         std::fs::create_dir(&member).unwrap();
         assert_eq!(member_dir_to_watch(&member, root.path()), Some(member));
-    }
-
-    #[test]
-    fn a_ready_file_that_could_not_be_removed_is_not_cleared() {
-        let gone = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-        let locked = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert!(marker_cleared(&Ok(())));
-        assert!(marker_cleared(&gone));
-        assert!(!marker_cleared(&locked));
     }
 
     #[test]
