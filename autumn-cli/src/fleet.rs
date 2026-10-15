@@ -84,6 +84,20 @@ mod imp {
                 .to_owned(),
         )
     }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn the_postgres_build_names_the_sqlite_build() {
+            let err = super::run(&super::FleetCommand::List {
+                profile: None,
+                open: false,
+                json: false,
+            })
+            .unwrap_err();
+            assert!(err.contains("--features sqlite"), "{err}");
+        }
+    }
 }
 
 #[cfg(feature = "sqlite")]

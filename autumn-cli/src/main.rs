@@ -7486,6 +7486,76 @@ mod tests {
 
     use super::*;
 
+    /// Parse `autumn fleet ...` into the `fleet` module's command.
+    fn fleet_command(args: &[&str]) -> fleet::FleetCommand {
+        let cli = Cli::try_parse_from(["autumn", "fleet"].iter().chain(args)).unwrap();
+        match cli.command {
+            Commands::Fleet(cmd) => cmd.into_command(),
+            _ => panic!("expected the fleet command"),
+        }
+    }
+
+    #[test]
+    fn fleet_subcommands_parse_into_fleet_commands() {
+        use fleet::FleetCommand;
+        assert_eq!(
+            fleet_command(&["list", "--open", "--json", "--profile", "prod"]),
+            FleetCommand::List {
+                profile: Some("prod".to_owned()),
+                open: true,
+                json: true
+            }
+        );
+        assert_eq!(
+            fleet_command(&["migrate"]),
+            FleetCommand::Migrate {
+                profile: None,
+                concurrency: 8,
+                key: None
+            }
+        );
+        assert_eq!(
+            fleet_command(&["migrate", "--concurrency", "2", "--key", "tenant:acme"]),
+            FleetCommand::Migrate {
+                profile: None,
+                concurrency: 2,
+                key: Some("tenant:acme".to_owned())
+            }
+        );
+        assert_eq!(
+            fleet_command(&["backup", "tenant:acme", "/backups/acme.db"]),
+            FleetCommand::Backup {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                dest: std::path::PathBuf::from("/backups/acme.db")
+            }
+        );
+        assert_eq!(
+            fleet_command(&["delete", "tenant:acme", "--force"]),
+            FleetCommand::Delete {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                force: true
+            }
+        );
+        assert_eq!(
+            fleet_command(&[
+                "restore",
+                "slot:00042",
+                "--timestamp",
+                "2026-10-01T12:00:00Z"
+            ]),
+            FleetCommand::Restore {
+                profile: None,
+                key: "slot:00042".to_owned(),
+                timestamp: Some("2026-10-01T12:00:00Z".to_owned()),
+                force: false
+            }
+        );
+        // Zero would migrate nothing at all.
+        assert!(Cli::try_parse_from(["autumn", "fleet", "migrate", "--concurrency", "0"]).is_err());
+    }
+
     #[test]
     fn parse_new_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();

@@ -506,6 +506,52 @@ mod tests {
     }
 
     #[test]
+    fn a_config_without_replication_still_resolves() {
+        let table: toml::Table = toml::from_str(
+            r#"
+            [database]
+            url = "sqlite:///var/lib/app.db"
+            "#,
+        )
+        .expect("toml");
+        let config = resolve_app_config(Some(&table), &MapEnv::new()).expect("resolves");
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("sqlite:///var/lib/app.db")
+        );
+        let err = Loaded::new("dev".to_owned(), config).expect_err("no [replication]");
+        assert!(matches!(err, ReplicaError::NotConfigured), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_config_is_a_config_error() {
+        let table: toml::Table = toml::from_str("[database]\nurl = 42\n").expect("toml");
+        let err = resolve_app_config(Some(&table), &MapEnv::new()).expect_err("bad url");
+        assert!(matches!(err, ReplicaError::Config { .. }), "{err}");
+    }
+
+    #[test]
+    fn private_dirs_are_new_tagged_and_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = create_private_dir(tmp.path(), "fleet-backup").unwrap();
+        let second = create_private_dir(tmp.path(), "fleet-backup").unwrap();
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".autumn-fleet-backup-"), "{name}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&first).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        // A base that cannot hold a directory: the error names the base.
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let err = create_private_dir(&file, "x").unwrap_err();
+        assert!(format!("{err}").contains("scratch directory"), "{err}");
+    }
+
+    #[test]
     fn a_missing_section_reports_how_to_configure_one() {
         let err = resolve(None, &MapEnv::new(), "prod").expect_err("must fail");
         let rendered = format!("{err}");
