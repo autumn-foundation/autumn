@@ -1678,7 +1678,7 @@ impl Analyzer {
             // `&tokio::spawn` is the same function item.
             Expr::Reference(r) => self.bind_callable(name, &r.expr),
             // A block, `if` or `match` is whatever its tails are.
-            Expr::Block(_) | Expr::If(_) | Expr::Match(_) | Expr::Unsafe(_) => {
+            Expr::Block(_) | Expr::If(_) | Expr::Match(_) | Expr::Unsafe(_) | Expr::Loop(_) => {
                 self.bind_container_callables(name, value_tails(init));
             }
             // `funcs.0` and `funcs[i]` are what `funcs` holds.
@@ -1843,6 +1843,25 @@ impl Analyzer {
 
     /// Is this a call whose awaited effect the analysis has not read?
     fn is_unread_call(&self, expr: &Expr) -> bool {
+        // A bare async block is a future nothing has polled, so it holds no
+        // unread call. Awaiting it polls the block and yields its tail.
+        let mut peeled = expr;
+        while let Expr::Paren(p) = peeled {
+            peeled = &p.expr;
+        }
+        match peeled {
+            Expr::Async(_) => return false,
+            Expr::Await(a) => {
+                let mut base = &*a.base;
+                while let Expr::Paren(p) = base {
+                    base = &p.expr;
+                }
+                if let Expr::Async(block) = base {
+                    return self.block_tail_is_unread(&block.block);
+                }
+            }
+            _ => {}
+        }
         match strip_transparent(expr) {
             // `(|| start())()` yields what the closure body yields.
             Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
@@ -1853,8 +1872,6 @@ impl Analyzer {
                             .any(|value| self.value_unread(value))
                 })
             }
-            // `async { start() }.await` yields what the block's tail yields.
-            Expr::Async(a) => self.block_tail_is_unread(&a.block),
             Expr::Unsafe(u) => self.block_tail_is_unread(&u.block),
             head @ (Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_) | Expr::Path(_)) => {
                 !self.awaited_is_readable(head)
@@ -4770,8 +4787,14 @@ fn value_tails(expr: &Expr) -> Vec<&Expr> {
         }
     }
     match strip_transparent(expr) {
+        Expr::Block(b) if b.label.is_some() => {
+            let mut values = block_tail(&b.block);
+            values.extend(break_values(&b.block));
+            values
+        }
         Expr::Block(b) => block_tail(&b.block),
         Expr::Unsafe(u) => block_tail(&u.block),
+        Expr::Loop(l) => break_values(&l.body),
         Expr::If(i) => {
             let mut tails = block_tail(&i.then_branch);
             if let Some((_, other)) = &i.else_branch {
@@ -7850,6 +7873,16 @@ mod tests {
             }",
         ),
         (
+            "spawn alias yielded by a loop break",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = loop { break tokio::spawn; };
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -8209,6 +8242,14 @@ mod tests {
             r"async fn h() -> R {
                 let spawn = 1;
                 assert_eq!(spawn, 1);
+                Ok(())
+            }",
+        ),
+        (
+            "a bare async block is a future nothing has polled",
+            r"async fn h() -> R {
+                let outer = async { start_finance_job() };
+                outer.await;
                 Ok(())
             }",
         ),
