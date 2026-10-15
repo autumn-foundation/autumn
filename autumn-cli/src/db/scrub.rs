@@ -2332,85 +2332,28 @@ struct AnonymizeScan {
 
 impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
     fn visit_item(&mut self, item: &'ast syn::Item) {
-        let attrs: &[syn::Attribute] = match item {
-            syn::Item::Mod(i) => &i.attrs,
-            syn::Item::Fn(i) => &i.attrs,
-            syn::Item::Impl(i) => &i.attrs,
-            syn::Item::Const(i) => &i.attrs,
-            syn::Item::Static(i) => &i.attrs,
-            syn::Item::Trait(i) => &i.attrs,
-            _ => &[],
-        };
+        let attrs: &[syn::Attribute] = crate::schema::parse::item_attrs(item);
         if crate::schema::parse::production_enabled(attrs) {
             syn::visit::visit_item(self, item);
         }
     }
 
     fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
-        let attrs: &[syn::Attribute] = match item {
-            syn::TraitItem::Fn(i) => &i.attrs,
-            syn::TraitItem::Const(i) => &i.attrs,
-            _ => &[],
-        };
+        let attrs: &[syn::Attribute] = crate::schema::parse::trait_item_attrs(item);
         if crate::schema::parse::production_enabled(attrs) {
             syn::visit::visit_trait_item(self, item);
         }
     }
 
     fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
-        let attrs: &[syn::Attribute] = match item {
-            syn::ImplItem::Fn(i) => &i.attrs,
-            syn::ImplItem::Const(i) => &i.attrs,
-            _ => &[],
-        };
+        let attrs: &[syn::Attribute] = crate::schema::parse::impl_item_attrs(item);
         if crate::schema::parse::production_enabled(attrs) {
             syn::visit::visit_impl_item(self, item);
         }
     }
 
     fn visit_expr(&mut self, expr: &'ast syn::Expr) {
-        let attrs: &[syn::Attribute] = match expr {
-            syn::Expr::Array(e) => &e.attrs,
-            syn::Expr::Assign(e) => &e.attrs,
-            syn::Expr::Async(e) => &e.attrs,
-            syn::Expr::Await(e) => &e.attrs,
-            syn::Expr::Binary(e) => &e.attrs,
-            syn::Expr::Block(e) => &e.attrs,
-            syn::Expr::Break(e) => &e.attrs,
-            syn::Expr::Call(e) => &e.attrs,
-            syn::Expr::Cast(e) => &e.attrs,
-            syn::Expr::Closure(e) => &e.attrs,
-            syn::Expr::Const(e) => &e.attrs,
-            syn::Expr::Continue(e) => &e.attrs,
-            syn::Expr::Field(e) => &e.attrs,
-            syn::Expr::ForLoop(e) => &e.attrs,
-            syn::Expr::Group(e) => &e.attrs,
-            syn::Expr::If(e) => &e.attrs,
-            syn::Expr::Index(e) => &e.attrs,
-            syn::Expr::Infer(e) => &e.attrs,
-            syn::Expr::Let(e) => &e.attrs,
-            syn::Expr::Lit(e) => &e.attrs,
-            syn::Expr::Loop(e) => &e.attrs,
-            syn::Expr::Macro(e) => &e.attrs,
-            syn::Expr::Match(e) => &e.attrs,
-            syn::Expr::MethodCall(e) => &e.attrs,
-            syn::Expr::Paren(e) => &e.attrs,
-            syn::Expr::Path(e) => &e.attrs,
-            syn::Expr::Range(e) => &e.attrs,
-            syn::Expr::RawAddr(e) => &e.attrs,
-            syn::Expr::Reference(e) => &e.attrs,
-            syn::Expr::Repeat(e) => &e.attrs,
-            syn::Expr::Return(e) => &e.attrs,
-            syn::Expr::Struct(e) => &e.attrs,
-            syn::Expr::Try(e) => &e.attrs,
-            syn::Expr::TryBlock(e) => &e.attrs,
-            syn::Expr::Tuple(e) => &e.attrs,
-            syn::Expr::Unary(e) => &e.attrs,
-            syn::Expr::Unsafe(e) => &e.attrs,
-            syn::Expr::While(e) => &e.attrs,
-            syn::Expr::Yield(e) => &e.attrs,
-            _ => &[],
-        };
+        let attrs: &[syn::Attribute] = crate::schema::parse::expr_attrs(expr);
         if crate::schema::parse::production_enabled(attrs) {
             syn::visit::visit_expr(self, expr);
         }
@@ -2626,9 +2569,10 @@ fn database_endpoint(
         .or_else(|| os_user(env))?;
     // Named query parameters apply after the authority, so they win. `hostaddr`
     // is the network address libpq connects to; `host` is then only a name.
-    let named = query("hostaddr")
-        .or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty()))
-        .or_else(|| query("host"));
+    let named = merge_hosts(
+        query("hostaddr").or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty())),
+        query("host"),
+    );
     let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if let Some(list) = named {
         let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
         let ports = if listed.len() == hosts.len() {
@@ -2797,17 +2741,40 @@ fn conninfo_endpoint(
         .or_else(|| env("PGUSER"))
         .or_else(|| os_user(&env))?;
     // `hostaddr` is the network address libpq connects to.
-    let host_list = values
-        .get("hostaddr")
-        .cloned()
-        .or_else(|| env("PGHOSTADDR"))
-        .or_else(|| values.get("host").cloned())
-        .or_else(|| env("PGHOST"))
-        .unwrap_or_default();
+    let host_list = merge_hosts(
+        values
+            .get("hostaddr")
+            .cloned()
+            .or_else(|| env("PGHOSTADDR")),
+        values.get("host").cloned(),
+    )
+    .or_else(|| env("PGHOST"))
+    .unwrap_or_default();
     let hosts: Vec<String> = host_list.split(',').map(normalize_host).collect();
     let own = vec![None; hosts.len()];
     let endpoints = pair_endpoints(hosts, own, values.get("port").cloned(), &env);
     Some((endpoints, name))
+}
+
+/// Merge `hostaddr` and `host` lists. An empty `hostaddr` item uses the host
+/// name at the same position.
+fn merge_hosts(addr: Option<String>, name: Option<String>) -> Option<String> {
+    let Some(addr) = addr else { return name };
+    let names: Vec<&str> = name
+        .as_deref()
+        .map_or_else(Vec::new, |n| n.split(',').collect());
+    let merged: Vec<&str> = addr
+        .split(',')
+        .enumerate()
+        .map(|(i, a)| {
+            if a.is_empty() {
+                names.get(i).copied().unwrap_or_default()
+            } else {
+                a
+            }
+        })
+        .collect();
+    Some(merged.join(","))
 }
 
 /// The operating-system user, which libpq uses when no user is given. Read
@@ -10426,6 +10393,23 @@ mod tests {
             matches!(err, ScrubError::EncryptedEnvelopeTooLong { limit: 63, .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn an_empty_hostaddr_item_uses_the_host_name() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "host=a,b hostaddr=,10.0.0.5 dbname=app",
+            "host=a dbname=app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app?host=a,b&hostaddr=,10.0.0.5",
+            "postgres://a/app",
+            &env
+        ));
+        assert_eq!(merge_hosts(None, Some("h".into())), Some("h".into()));
+        assert_eq!(merge_hosts(Some(",x".into()), None), Some(",x".into()));
     }
 
     #[test]

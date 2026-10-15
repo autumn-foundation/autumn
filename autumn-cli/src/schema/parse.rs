@@ -370,6 +370,87 @@ pub fn parse_encrypted_columns(
     Ok(scan.found)
 }
 
+/// The attributes of a `syn::Item`, or none for a kind without any.
+pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::TraitItem`, or none for a kind without any.
+pub fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Fn(i) => &i.attrs,
+        syn::TraitItem::Const(i) => &i.attrs,
+
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::ImplItem`, or none for a kind without any.
+pub fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Fn(i) => &i.attrs,
+        syn::ImplItem::Const(i) => &i.attrs,
+
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::Expr`, or none for a kind without any.
+pub fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Array(e) => &e.attrs,
+        syn::Expr::Assign(e) => &e.attrs,
+        syn::Expr::Async(e) => &e.attrs,
+        syn::Expr::Await(e) => &e.attrs,
+        syn::Expr::Binary(e) => &e.attrs,
+        syn::Expr::Block(e) => &e.attrs,
+        syn::Expr::Break(e) => &e.attrs,
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::Cast(e) => &e.attrs,
+        syn::Expr::Closure(e) => &e.attrs,
+        syn::Expr::Const(e) => &e.attrs,
+        syn::Expr::Continue(e) => &e.attrs,
+        syn::Expr::Field(e) => &e.attrs,
+        syn::Expr::ForLoop(e) => &e.attrs,
+        syn::Expr::Group(e) => &e.attrs,
+        syn::Expr::If(e) => &e.attrs,
+        syn::Expr::Index(e) => &e.attrs,
+        syn::Expr::Infer(e) => &e.attrs,
+        syn::Expr::Let(e) => &e.attrs,
+        syn::Expr::Lit(e) => &e.attrs,
+        syn::Expr::Loop(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Match(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Paren(e) => &e.attrs,
+        syn::Expr::Path(e) => &e.attrs,
+        syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::RawAddr(e) => &e.attrs,
+        syn::Expr::Reference(e) => &e.attrs,
+        syn::Expr::Repeat(e) => &e.attrs,
+        syn::Expr::Return(e) => &e.attrs,
+        syn::Expr::Struct(e) => &e.attrs,
+        syn::Expr::Try(e) => &e.attrs,
+        syn::Expr::TryBlock(e) => &e.attrs,
+        syn::Expr::Tuple(e) => &e.attrs,
+        syn::Expr::Unary(e) => &e.attrs,
+        syn::Expr::Unsafe(e) => &e.attrs,
+        syn::Expr::While(e) => &e.attrs,
+        syn::Expr::Yield(e) => &e.attrs,
+
+        _ => &[],
+    }
+}
+
 /// Whether the `#[cfg(...)]` attributes leave an item in a production build.
 ///
 /// Only `test` is known to be off, and `not`, `all` and `any` combine it. Other
@@ -478,46 +559,34 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
         }
     }
 
-    // A test-only item of any kind can hold a fixture model. Skip it whole.
-    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        if production_enabled(&item.attrs) {
-            syn::visit::visit_item_fn(self, item);
+    // A test-only item or expression can hold a fixture model. Skip it whole.
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if production_enabled(item_attrs(item)) {
+            syn::visit::visit_item(self, item);
         }
     }
 
-    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        if production_enabled(&item.attrs) {
-            syn::visit::visit_item_impl(self, item);
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if production_enabled(trait_item_attrs(item)) {
+            syn::visit::visit_trait_item(self, item);
         }
     }
 
-    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
-        if production_enabled(&item.attrs) {
-            syn::visit::visit_item_trait(self, item);
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if production_enabled(impl_item_attrs(item)) {
+            syn::visit::visit_impl_item(self, item);
         }
     }
 
-    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
-        if production_enabled(&item.attrs) {
-            syn::visit::visit_item_const(self, item);
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if production_enabled(expr_attrs(expr)) {
+            syn::visit::visit_expr(self, expr);
         }
     }
 
-    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-        if production_enabled(&item.attrs) {
-            syn::visit::visit_item_static(self, item);
-        }
-    }
-
-    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        if production_enabled(&item.attrs) {
-            syn::visit::visit_impl_item_fn(self, item);
-        }
-    }
-
-    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
-        if production_enabled(&item.attrs) {
-            syn::visit::visit_trait_item_fn(self, item);
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if production_enabled(&local.attrs) {
+            syn::visit::visit_local(self, local);
         }
     }
 
@@ -2553,6 +2622,28 @@ mod tests {
             #[cfg(test)] const K: () = { #[model] struct Z { #[id] id: i64, #[encrypted] h: String } };
             #[cfg(test)] static S: () = { #[model] struct Q { #[id] id: i64, #[encrypted] i: String } };
             #[cfg(test)] trait TT { fn e() { #[model] struct R { #[id] id: i64, #[encrypted] j: String } } }
+            "#,
+        )
+        .expect("parse");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// Blocks, locals and associated consts can be test-only too.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_expressions_and_consts() {
+        let found = parse_encrypted_columns(
+            r#"
+            fn f() {
+                #[cfg(test)] { #[model] struct U { #[id] id: i64, #[encrypted] a: String } }
+                #[cfg(test)] let _x = { #[model] struct V { #[id] id: i64, #[encrypted] b: String } };
+            }
+            struct X;
+            impl X {
+                #[cfg(test)] const C: () = { #[model] struct W { #[id] id: i64, #[encrypted] c: String } };
+            }
+            trait T {
+                #[cfg(test)] const D: () = { #[model] struct Y { #[id] id: i64, #[encrypted] d: String } };
+            }
             "#,
         )
         .expect("parse");
