@@ -264,11 +264,12 @@ bound is applied by shortening the record's TTL at write time; for
 the literal value you configured (a legal hold can then stop the sweep — the
 independent `expires_at` cleanup could not have been stopped).
 
-The built-in in-memory stores (`idempotency`, `webhook_replay`, and `job_tracking` on the
-`local` jobs backend) stop serving expired records at the window. They remove
-them only on later writes. A quiet process can hold expired records in memory
-past the window. Use `redis` to remove them on time. The report says so. An app that
-installs its own store must check that store itself.
+The built-in in-memory stores (`webhook_replay`, `idempotency`, and
+`job_tracking` on the `local` jobs backend) and the database `idempotency` store
+stop serving expired records at the window. They remove them only on later
+writes. A quiet process can keep expired records past the window. Use `redis` to
+remove them on time. The report says so. An app that installs its own store
+must check that store itself.
 
 ### One exception: webhook replay protection
 

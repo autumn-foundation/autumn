@@ -673,7 +673,7 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
     );
     if evicts_lazily(dataset, config) {
         note.push_str(
-            ". With the built-in in-memory store, expired records are not served. The store \
+            ". With the built-in store, expired records are not served. The store \
              removes them only on later writes. A quiet process can keep them past the \
              window. Use redis to remove them on time",
         );
@@ -687,12 +687,13 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
     note
 }
 
-/// `true` when the dataset uses a process-local store. That store removes
-/// expired records only on later writes.
+/// `true` when the dataset uses a built-in store that removes expired records
+/// only on later writes.
 fn evicts_lazily(dataset: RetentionDataset, config: &AutumnConfig) -> bool {
     match dataset {
+        // The memory and database stores both sweep on every 128th write.
         RetentionDataset::Idempotency => {
-            config.idempotency.backend == crate::config::IdempotencyBackend::Memory
+            config.idempotency.backend != crate::config::IdempotencyBackend::Redis
         }
         RetentionDataset::WebhookReplay => {
             config.security.webhooks.replay.backend == crate::webhook::WebhookReplayBackend::Memory
@@ -1509,10 +1510,7 @@ mod tests {
             RetentionDataset::JobTracking,
         ] {
             let note = backend_ttl_note(dataset, &config, 60);
-            assert!(
-                note.contains("built-in in-memory store"),
-                "{dataset}: {note}"
-            );
+            assert!(note.contains("built-in store"), "{dataset}: {note}");
             assert!(note.contains("quiet process"), "{dataset}: {note}");
         }
     }
@@ -1546,10 +1544,10 @@ mod tests {
     }
 
     #[test]
-    fn database_and_sqlite_backends_do_not_warn() {
+    fn the_database_idempotency_store_warns_and_sqlite_jobs_do_not() {
         let mut config = AutumnConfig::default();
         config.idempotency.backend = crate::config::IdempotencyBackend::Database;
-        assert!(!evicts_lazily(RetentionDataset::Idempotency, &config));
+        assert!(evicts_lazily(RetentionDataset::Idempotency, &config));
         config.jobs.backend = "sqlite".to_owned();
         assert!(!evicts_lazily(RetentionDataset::JobTracking, &config));
     }
