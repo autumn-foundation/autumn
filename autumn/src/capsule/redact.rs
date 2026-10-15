@@ -950,6 +950,12 @@ pub(crate) fn record_userinfo_components(userinfo: &str, values: &mut RedactedVa
     let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
     retain(user);
     retain(password);
+    // The spelling the URL parser serialises (`p w` -> `p%20w`), which is what
+    // an error message quoting the normalised URL carries.
+    if let Ok(parsed) = url::Url::parse(&format!("http://{userinfo}@host/")) {
+        retain(parsed.username());
+        retain(parsed.password().unwrap_or_default());
+    }
 }
 
 /// Mask the query string of a recorded outbound URL by parameter name.
@@ -2377,6 +2383,14 @@ mod tests {
         fn userinfo_behind_leading_control_characters_is_still_found() {
             assert_eq!(url_userinfo("\n https://a:b@h/p"), Some("a:b".to_owned()));
             assert_eq!(hide_url_userinfo("\nhttps:a:b@h/p"), "https:[FILTERED]@h/p");
+        }
+
+        #[test]
+        fn url_userinfo_retains_the_parser_serialised_spelling() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc:p w", &mut values);
+            assert!(values.contains(b"p w"));
+            assert!(values.contains(b"p%20w"));
         }
 
         #[test]
