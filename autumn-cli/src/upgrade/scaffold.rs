@@ -688,7 +688,7 @@ fn root_owners(root: &Path) -> RootOwners {
     // that YAML could read as syntax.
     let workflows = if workspace == git
         && relative_dir(&git, &absolute).is_some_and(|dir| safe_in_yaml(&dir))
-        && lists_member(&workspace, &absolute)
+        && is_cargo_member(&workspace, &absolute)
     {
         Owner::Above(git)
     } else {
@@ -697,40 +697,45 @@ fn root_owners(root: &Path) -> RootOwners {
     RootOwners { cargo, workflows }
 }
 
-/// Whether `[workspace] members` of `workspace` lists `member`.
+/// Whether Cargo counts `member` as a member of the workspace at `workspace`.
 ///
-/// The posture gate selects the member with `-p`. Cargo cannot resolve an
-/// excluded crate or a plain path dependency that way.
-fn lists_member(workspace: &Path, member: &Path) -> bool {
-    let Some(table) = std::fs::read_to_string(workspace.join("Cargo.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
+/// Asked of Cargo, not read from `Cargo.toml`: `members` globs, `exclude` and
+/// path dependencies in the workspace directory all decide it. The posture
+/// gate selects the member with `-p`, and Cargo cannot select an excluded
+/// crate. `--no-deps` needs no network. If Cargo fails, the answer is no.
+fn is_cargo_member(workspace: &Path, member: &Path) -> bool {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let Ok(output) = std::process::Command::new(cargo)
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(member.join("Cargo.toml"))
+        .output()
     else {
         return false;
     };
-    let patterns = |key: &str| -> Vec<String> {
-        table
-            .get("workspace")
-            .and_then(|w| w.get(key))
-            .and_then(toml::Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| entry.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let Some(rel) = relative_dir(workspace, member) else {
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
         return false;
     };
-    let members = patterns("members");
-    let exclude = patterns("exclude");
-    let members: Vec<&str> = members.iter().map(String::as_str).collect();
-    let exclude: Vec<&str> = exclude.iter().map(String::as_str).collect();
-    // Cargo takes `exclude` out of the membership a `members` glob gives.
-    crate::edge_scan::any_glob_matches(&members, &rel, false)
-        && !crate::edge_scan::any_glob_matches(&exclude, &rel, true)
+    let same = |value: Option<&str>, expected: &Path| {
+        value
+            .and_then(|path| Path::new(path).canonicalize().ok())
+            .is_some_and(|path| path == expected)
+    };
+    let manifest = member.join("Cargo.toml");
+    same(metadata["workspace_root"].as_str(), workspace)
+        && metadata["packages"].as_array().is_some_and(|packages| {
+            packages
+                .iter()
+                .any(|package| same(package["manifest_path"].as_str(), &manifest))
+        })
 }
 
 /// The `/`-separated path from `ancestor` down to `descendant`.
@@ -3081,6 +3086,7 @@ mod tests {
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
         );
         write(&root, "autumn.toml", "[server]\n");
+        write(&root, "src/lib.rs", "");
         match git_marker {
             Some("dir") => fs::create_dir(root.join(".git")).unwrap(),
             Some(file) => write(&root, ".git", file),
@@ -3141,9 +3147,14 @@ mod tests {
         let dir = |rel: &str| outer.path().join(rel);
         fs::create_dir_all(dir(git_at).join(".git")).unwrap();
         fs::create_dir_all(dir(ws_at)).unwrap();
+        let listed = Path::new(member_at)
+            .strip_prefix(ws_at)
+            .unwrap_or_else(|_| Path::new(member_at))
+            .to_string_lossy()
+            .into_owned();
         fs::write(
             dir(ws_at).join("Cargo.toml"),
-            "[workspace]\nmembers = [\"*/*\", \"*\"]\n",
+            format!("[workspace]\nmembers = [\"{listed}\"]\n"),
         )
         .unwrap();
         let root = dir(member_at);
@@ -3154,6 +3165,7 @@ mod tests {
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
         );
         write(&root, "autumn.toml", "[server]\n");
+        write(&root, "src/lib.rs", "");
         (outer, root)
     }
 
@@ -3184,6 +3196,21 @@ mod tests {
         )
         .unwrap();
         assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_path_dependency_in_the_workspace_is_a_member() {
+        // Cargo makes it an implicit member, so `-p demo` works.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[package]\nname = \"top\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\ndemo = { path = \"app\" }\n\n[workspace]\nmembers = []\n",
+        )
+        .unwrap();
+        write(outer.path(), "src/lib.rs", "");
+        assert_scope(&plan(&root, "0.7.0"), Some("../"), Some("../"));
     }
 
     #[test]

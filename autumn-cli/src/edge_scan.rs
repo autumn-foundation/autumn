@@ -1529,7 +1529,7 @@ fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> 
 /// deeper, like `crates/group/app` — treating an ancestor workspace as
 /// covering a package one glob-segment further than any real Cargo build
 /// would ever agree it does (Codex review on #2739, round 25, P1).
-pub fn any_glob_matches(patterns: &[&str], rel: &str, allow_subtree_match: bool) -> bool {
+fn any_glob_matches(patterns: &[&str], rel: &str, allow_subtree_match: bool) -> bool {
     let rel_segments: Vec<&str> = rel.split('/').collect();
     patterns.iter().any(|pattern| {
         let pattern_segments: Vec<&str> = pattern.split('/').collect();
