@@ -775,6 +775,8 @@ apply-time error.
   `#![cfg(test)]`) is not a production registration. Other `cfg` predicates are
   unknown and count as on. Files that a `#[path]` module loads resolve their own
   child modules from the physical file name, not from the declaring module.
+  A `mod x;` declared inside a function body is not followed, so a test-only
+  function that loads a file this way does not exclude that file.
 - **Source scans read every file in `src/`.** A `.rs` file that no `mod` declares
   still counts as production code. An old `#[model]` with an `#[encrypted]`
   column in such a file marks that column encrypted. Delete the file, or gate it

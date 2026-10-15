@@ -383,6 +383,18 @@ pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
         syn::Item::Type(i) => &i.attrs,
         syn::Item::Union(i) => &i.attrs,
         syn::Item::Struct(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::ForeignItem`, or none for a kind without any.
+pub fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(i) => &i.attrs,
+        syn::ForeignItem::Static(i) => &i.attrs,
+        syn::ForeignItem::Type(i) => &i.attrs,
+        syn::ForeignItem::Macro(i) => &i.attrs,
         _ => &[],
     }
 }
@@ -636,6 +648,12 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
         if production_enabled(&arm.attrs) {
             syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if production_enabled(foreign_item_attrs(item)) {
+            syn::visit::visit_foreign_item(self, item);
         }
     }
 
@@ -2747,6 +2765,7 @@ mod tests {
             fn param(#[cfg(test)] x: [(); { #[model] struct M { #[id] id: i64, #[encrypted] q: String } 0 }]) {}
             struct GP<#[cfg(test)] T = [(); { #[model] struct N { #[id] id: i64, #[encrypted] r: String } 0 }]>(T);
             fn clo() { let _ = |#[cfg(test)] x: [(); { #[model] struct CL { #[id] id: i64, #[encrypted] s: String } 0 }]| {}; }
+            #[cfg(test)] extern "C" { static FX: [u8; { #[model] struct FM { #[id] id: i64, #[encrypted] t: String } 0 }]; }
             struct TY;
             impl TY { #[cfg(test)] type A = [(); { #[model] struct J { #[id] id: i64, #[encrypted] o: String } 0 }]; }
             trait TT2 { #[cfg(test)] type B = [(); { #[model] struct K { #[id] id: i64, #[encrypted] p: String } 0 }]; }

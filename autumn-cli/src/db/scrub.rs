@@ -2371,6 +2371,13 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
         }
     }
 
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if crate::schema::parse::production_enabled(crate::schema::parse::foreign_item_attrs(item))
+        {
+            syn::visit::visit_foreign_item(self, item);
+        }
+    }
+
     fn visit_pat(&mut self, pat: &'ast syn::Pat) {
         if crate::schema::parse::production_enabled(crate::schema::parse::pat_attrs(pat)) {
             syn::visit::visit_pat(self, pat);
@@ -2661,7 +2668,12 @@ fn pair_endpoints(
     port_list: Option<String>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, u16)> {
-    let fallback = env("PGPORT").and_then(|p| p.parse().ok()).unwrap_or(5432);
+    // An explicit empty port is the compiled-in default, not `PGPORT`.
+    let fallback = if port_list.is_some() {
+        5432
+    } else {
+        env("PGPORT").and_then(|p| p.parse().ok()).unwrap_or(5432)
+    };
     let items: Vec<Option<u16>> = port_list
         .filter(|l| !l.is_empty())
         .map(|l| l.split(',').map(|v| v.trim().parse().ok()).collect())
@@ -9002,6 +9014,11 @@ mod tests {
             fn c() { let _ = |#[cfg(test)] x: [(); { ModelRegistration::anonymize("users"); 0 }]| {}; }
         "#;
         assert!(extract_anonymize_tables(closure).unwrap().is_empty());
+        let foreign = r#"
+            #[cfg(test)] extern "C" { static X: [u8; { ModelRegistration::anonymize("users"); 0 }]; }
+            extern "C" { #[cfg(test)] static Y: [u8; { ModelRegistration::anonymize("users"); 0 }]; }
+        "#;
+        assert!(extract_anonymize_tables(foreign).unwrap().is_empty());
     }
 
     #[test]
@@ -10581,6 +10598,17 @@ mod tests {
             "postgres://prod",
             &format!("postgres://{me}@prod/{me}"),
             &env
+        ));
+        let pgport = env_of(&[("PGPORT", "6543")]);
+        assert!(same_database_in(
+            "host=prod port='' dbname=app",
+            "host=prod port=5432 dbname=app",
+            &pgport
+        ));
+        assert!(same_database_in(
+            "host=prod dbname=app",
+            "host=prod port=6543 dbname=app",
+            &pgport
         ));
         let empty_db = env_of(&[("PGDATABASE", "")]);
         assert!(same_database_in(
