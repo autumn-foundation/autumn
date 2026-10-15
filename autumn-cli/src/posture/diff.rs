@@ -15,10 +15,10 @@
 //!    for every POST *and* deletes those routes from the csrf dimension.
 //! 2. **Each finding carries a [`Finding::fingerprint`]**: the security-relevant
 //!    delta, escaped, and the only field besides kind/method/path that reaches
-//!    the acknowledgment digest. Human-facing `before`/`after` text stays out of
-//!    it, so a later *narrowing* on an already-acknowledged route does not
-//!    invalidate the acknowledgment, and no crafted route path can make one
-//!    finding hash like two.
+//!    the exact acknowledgment digest. Human-facing `before`/`after` text stays
+//!    out of it, and no crafted route path can make one finding hash like two.
+//!    A marker with a ceiling (see [`super::ceiling`]) drops the fingerprint of
+//!    route findings and orders the route posture instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -4578,22 +4578,12 @@ mod tests {
         );
     }
 
-    /// **Any** later change to the route's posture re-asks for the
-    /// acknowledgment, including one that narrows it.
+    /// The exact digest re-asks after **any** later change to the route's
+    /// posture, narrowing included.
     ///
-    /// This asserted the opposite until the whole-posture binding landed, and
-    /// the reversal is deliberate rather than a broken test. The two properties
-    /// cannot both hold under a digest compared for equality: an acknowledgment
-    /// must not survive a constraint being *removed* after it was given, and
-    /// the digest is a function of the head posture alone, so it cannot tell a
-    /// constraint that appeared from one that vanished. Something has to give,
-    /// and re-asking after a narrowing costs a reviewer one comment on a diff
-    /// that shows exactly why, while the alternative loses a widening in
-    /// silence.
-    ///
-    /// Expressing "no wider than what I approved" needs the marker to carry the
-    /// approved posture ordinally rather than as a hash — a change to the
-    /// acknowledgment format, tracked in #2497.
+    /// A digest compared for equality cannot tell a constraint that appeared
+    /// from one that vanished, so it errs safe. A marker with a ceiling (#2497,
+    /// see `ceiling.rs`) is the way to allow narrowing.
     #[test]
     fn any_later_posture_change_re_asks_for_the_acknowledgment() {
         let base = routes_only(&route("/admin", "GET", "gated", &["admin"], &[], false));

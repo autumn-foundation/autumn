@@ -6,7 +6,7 @@
 //! Verification then asks one question: is the route, now, no wider than that?
 //!
 //! ```text
-//! /ack-posture 3f2a91c0d47b5e6a ceiling=GET|%2Fadmin|public|0:|0:|0|on|0:|0  reason
+//! /ack-posture 3f2a91c0d47b5e6a ceiling=GET|/admin|public|0:|0:|0|on|0:|0  reason
 //! ```
 //!
 //! Narrowing passes. Dropping a constraint re-blocks. Findings that name no

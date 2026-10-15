@@ -156,8 +156,9 @@ pub fn markdown(report: &Report<'_>) -> String {
             out,
             "To acknowledge these exact changes, comment on this pull request with:\n\n\
              ```\n{ACK_PHRASE} {}\n```\n\n\
-             The digest names this set of widenings: unrelated pushes keep it valid, and a \
-             *new* widening needs a new acknowledgment.\n\n",
+             It approves these findings, and no wider posture on these routes. Unrelated \
+             pushes and narrowing keep it valid. A new or wider widening needs a new \
+             acknowledgment.\n\n",
             report.marker
         );
     }

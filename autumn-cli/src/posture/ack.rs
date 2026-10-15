@@ -7,11 +7,14 @@
 //! /ack-posture 3f2a91c0d47b5e6a  widening /admin/users on purpose, launch week
 //! ```
 //!
-//! The digest binds the acknowledgment to **the exact set of widening
-//! findings** it was written for. That is what makes the marker survive
-//! unrelated pushes (the set is unchanged, so the digest is unchanged) while
-//! re-blocking the moment a later commit widens something new (a new set is a
-//! new digest, and no comment carries it yet).
+//! The digest binds the acknowledgment to **the set of widening findings** it
+//! was written for. An unrelated push keeps it valid. A new widening needs a
+//! new digest, and no comment carries it yet.
+//!
+//! A widened route also gets a `ceiling=` token. It holds the approved posture
+//! of that route (see [`super::ceiling`]), so the marker means "no wider than
+//! this": narrowing keeps it valid, and removing a constraint re-blocks. A bare
+//! digest still means "exactly this".
 //!
 //! Everything parsed here came from a pull-request comment, which is to say
 //! from anyone who can type. Two lines of defense: this parser is strict about

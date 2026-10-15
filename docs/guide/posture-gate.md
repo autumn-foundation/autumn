@@ -19,7 +19,7 @@ of the app reachable by more callers than before.
 
 To acknowledge these exact changes, comment on this pull request with:
 
-    /ack-posture 4f8a1c0d9e2b7a35
+    /ack-posture 4f8a1c0d9e2b7a35 ceiling=GET|/admin/users|public|0:|0:|0|absent|0:|0
 ```
 
 That comment is the only way past the gate, and it is recorded on the pull
@@ -291,22 +291,29 @@ Rules worth knowing:
 - **Re-running.** Posting the comment does not re-run the check: `pull_request`
   does not fire on comments. After commenting, re-run the *Security posture*
   check from the Checks tab, or push a commit.
-- **What it binds to.** The digest is computed over the *exact set of widening
-  findings*, and each one carries the whole posture of the route it names —
-  classification, roles, scopes, policy, CSRF, `#[authorize]` bindings. Push ten
-  more commits that touch none of those and the acknowledgment stays valid.
-  Widen something **new** and the digest changes, no comment carries it, and the
-  gate blocks again.
+- **What it binds to.** The report prints a marker with a `ceiling=` token.
+  Paste it as is. The token holds the approved posture of each widened route:
+  classification, roles, scopes, policy, CSRF, `#[authorize]` bindings and
+  mTLS. The gate asks one question: is the route, now, **no wider than that**?
 
-  The route's *whole* posture, because otherwise a second constraint can be
-  added and then quietly withdrawn: acknowledge "public, behind a new `mfa`
-  scope", drop `mfa` next push, and against the base the diff still shows only
-  the original widening. The cost is that a later change which **narrows** that
-  route also re-asks — the digest cannot tell a constraint that appeared from
-  one that vanished. Re-acknowledging costs a comment on a diff that shows
-  exactly what moved; the alternative loses a widening in silence.
-  [#2497](https://github.com/autumn-foundation/autumn/issues/2497) tracks the
-  format change that would satisfy both.
+  - Narrowing keeps the acknowledgment valid. Add a policy check after you
+    acknowledged a public route, and the gate does not ask again.
+  - Removing a constraint blocks again. Acknowledge "public, behind a new `mfa`
+    scope", drop `mfa` on the next push, and the route is wider than the
+    ceiling.
+  - Unrelated pushes keep it valid. A **new** widening needs a new
+    acknowledgment.
+  - The marker digest covers the ceiling text. A truncated or edited paste does
+    not match.
+
+  Rules use the same widening rules as the diff: roles are OR-ed, scopes are
+  AND-ed, an open classification is the widest. A finding that names no single
+  route at head (a build change, a header, a CSRF exemption prefix) has no
+  posture to order, so it stays bound to the exact set.
+
+  For a strict marker, paste the bare digest without `ceiling=`
+  (`/ack-posture 4f8a1c0d9e2b7a35`). A bare digest means "exactly this": any
+  later change to the route, narrowing included, asks again.
 - **One file per comment.** The workflow writes each comment to its own file
   and passes the directory as `--ack-dir`. The diff parses each file alone, so
   an unclosed code fence in one comment cannot change another, and no comment
