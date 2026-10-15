@@ -2221,16 +2221,54 @@ fn wait_until_booted(proc: &mut Child, ready_file: Option<&Path>, cap: Duration)
         return BootWait::Ready;
     };
     let start = std::time::Instant::now();
+    let mut told = false;
     loop {
         if ready_file.exists() {
             return BootWait::Ready;
         }
         match proc.try_wait() {
             Ok(Some(_)) => return BootWait::Exited,
-            Ok(None) if start.elapsed() < cap => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) if start.elapsed() < cap => {
+                // A long wait with no output looks like a hang.
+                if !told && start.elapsed() >= BOOT_WAIT_NOTICE_AFTER {
+                    eprintln!("{}", boot_wait_notice(cap));
+                    told = true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             Ok(None) | Err(_) => return BootWait::TimedOut,
         }
     }
+}
+
+/// How long a stop waits for a booting app before it says what it is doing.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const BOOT_WAIT_NOTICE_AFTER: Duration = Duration::from_secs(10);
+
+/// What a stop tells the developer while it waits for a booting app.
+///
+/// An `autumn-web` that is too old to report when it is up never ends the wait
+/// early, so the notice also says how to fix that.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn boot_wait_notice(cap: Duration) -> String {
+    format!(
+        "  The app is still starting. Waiting for it before it is stopped, up to {} \
+         minutes. If this app uses an old autumn-web that never reports it is up, \
+         run `cargo update -p autumn-web`.",
+        cap.as_secs().div_ceil(60)
+    )
 }
 
 /// The warning printed when the app was force-stopped because its `autumn-web`
@@ -2882,6 +2920,13 @@ mod tests {
                 "`{alias}` must load .env, got {budget:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_boot_wait_notice_names_the_limit_and_the_fix() {
+        let notice = boot_wait_notice(COOPERATIVE_STOP_BOOT_CAP);
+        assert!(notice.contains("15 minutes"), "{notice}");
+        assert!(notice.contains("cargo update -p autumn-web"), "{notice}");
     }
 
     #[test]
