@@ -1440,6 +1440,7 @@ impl Analyzer {
             }
             self.shadowed_macros.extend(names);
             tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
+            spawn_renames(&import.tree, &mut self.spawn_aliases);
             diesel_imports(
                 &import.tree,
                 &mut Vec::new(),
@@ -1673,6 +1674,15 @@ impl Analyzer {
             Expr::Repeat(rep) => self.bind_container_callables(name, [&*rep.expr]),
             Expr::Struct(s) => {
                 self.bind_container_callables(name, s.fields.iter().map(|f| &f.expr));
+            }
+            // `(|| tokio::spawn)()` is whatever the closure body yields.
+            Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
+                if let Some(closure) = immediately_invoked_closure(&call.func) {
+                    let yielded = value_tails(&closure.body)
+                        .into_iter()
+                        .chain(return_values(&closure.body));
+                    self.bind_container_callables(name, yielded);
+                }
             }
             Expr::Call(call) => self.bind_container_callables(name, call.args.iter()),
             // `&tokio::spawn` is the same function item.
@@ -1961,14 +1971,24 @@ impl Analyzer {
     /// Bind an `if let` / `while let` pattern to the handle its scrutinee
     /// carries, for the duration of the guarded block.
     fn bind_let_condition(&mut self, cond: &Expr) -> Vec<Shadow> {
-        let Expr::Let(l) = cond else {
-            return Vec::new();
-        };
-        let handle = self.container_handle(&l.expr);
-        let saved = self.enter_binding_scope(&l.pat, handle.as_ref());
-        self.mark_pattern_unread(&l.pat, &l.expr);
-        self.bind_pattern_callables(&l.pat, &l.expr);
-        saved
+        match cond {
+            Expr::Let(l) => {
+                let handle = self.container_handle(&l.expr);
+                let saved = self.enter_binding_scope(&l.pat, handle.as_ref());
+                self.mark_pattern_unread(&l.pat, &l.expr);
+                self.bind_pattern_callables(&l.pat, &l.expr);
+                saved
+            }
+            // `if let A = a && let B = b && ready`: every `let` in the chain
+            // binds for the guarded block.
+            Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+                let mut saved = self.bind_let_condition(&b.left);
+                saved.extend(self.bind_let_condition(&b.right));
+                saved
+            }
+            Expr::Paren(p) => self.bind_let_condition(&p.expr),
+            _ => Vec::new(),
+        }
     }
 
     /// A pattern bound from an expression that holds an unread future may
@@ -4012,6 +4032,22 @@ fn use_leaf_names(tree: &syn::UseTree, out: &mut HashSet<String>) {
 }
 
 /// Collect the names a `use` brings in from `tokio::time` / `tokio::task`.
+/// `use tokio::spawn as detach;` makes `detach` a detached task launcher.
+fn spawn_renames(tree: &syn::UseTree, out: &mut HashSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) => spawn_renames(&path.tree, out),
+        syn::UseTree::Rename(rename) if SPAWN_FNS.contains(&rename.ident.to_string().as_str()) => {
+            out.insert(rename.rename.to_string());
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                spawn_renames(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn tokio_inert_imports(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut HashSet<String>) {
     match tree {
         syn::UseTree::Path(path) => {
@@ -7879,6 +7915,35 @@ mod tests {
             r"async fn h() -> R {
                 let run = loop { break tokio::spawn; };
                 run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias returned by an invoked closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = (|| tokio::spawn)();
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future bound in a let chain",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(ready: bool) -> R {
+                if let Some(fut) = Some(start_finance_job()) && ready { fut.await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "spawn imported under another name",
+            ExpectedKind::Rejected,
+            "detach",
+            r"async fn h() -> R {
+                use tokio::spawn as detach;
+                detach(async {});
                 Ok(())
             }",
         ),
