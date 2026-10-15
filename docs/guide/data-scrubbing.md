@@ -775,6 +775,11 @@ apply-time error.
   `#![cfg(test)]`) is not a production registration. Other `cfg` predicates are
   unknown and count as on. Files that a `#[path]` module loads resolve their own
   child modules from the physical file name, not from the declaring module.
+- **Source scans read every file in `src/`.** A `.rs` file that no `mod` declares
+  still counts as production code. An old `#[model]` with an `#[encrypted]`
+  column in such a file marks that column encrypted. Delete the file, or gate it
+  with `#[cfg(test)]`. The scan does not follow `mod` declarations from the
+  crate root, because `#[path]`, macro-made modules and `include!` hide models.
 - **`NULL`s stay `NULL`.** A scrub anonymizes values; it never invents them.
 - **It is atomic.** Every statement for one database runs in a single
   transaction, so a failure can never leave a half-scrubbed database behind —
