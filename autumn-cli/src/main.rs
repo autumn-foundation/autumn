@@ -8,6 +8,7 @@ mod agents;
 mod alert;
 mod assets;
 mod build;
+mod built_artifact;
 mod cache_audit;
 mod canary;
 mod capacity;

@@ -23,7 +23,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # CSR only — no `ssr` / `hydration`. Pure client-side mount into an existing
 # DOM element, which is all the island architecture needs.
-yew = { version = "0.21", default-features = false, features = ["csr"] }
+yew = { version = "0.23", default-features = false, features = ["csr"] }
 wasm-bindgen = "0.2"
 # js-sys: Math::random() drives all the simulation's stochasticity (no `rand`).
 js-sys = "0.3"

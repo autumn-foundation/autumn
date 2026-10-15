@@ -248,7 +248,7 @@ A `conflict` says which of four things it is:
 | `you changed this since it was scaffolded` | The file no longer matches the digest Autumn recorded for it. |
 | `no recorded baseline, so an edit cannot be ruled out` | Nothing was recorded for this file — see [Projects older than this feature](#projects-older-than-this-feature). |
 | `on disk but unreadable as text, so its contents are unknown` | It is not UTF-8, it is a directory, or the process cannot open it. What it holds is unknown, so it is untouchable. |
-| `a symlink; writing through it could write outside the project` | The path is a symbolic link. Writing through it would write wherever it points, which need not be inside the project — so the link is reported and left exactly as it is. |
+| `a symlink; writing through it could write outside the project` | The path is a symbolic link. Writing through it would write wherever it points, which need not be inside the project — so the link is reported and left exactly as it is. A link is a conflict even when its target matches this release. The verdict must not depend on a file outside the project. To keep a deliberate link, run `autumn upgrade --accept <path>`. |
 
 ### Finishing a conflict
 

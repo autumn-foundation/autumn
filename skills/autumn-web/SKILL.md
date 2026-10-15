@@ -2806,8 +2806,9 @@ capacity_contract = "capacity.lock"   # explicit max_concurrent_requests still w
 Each route in the contract also carries a resource shape (`db-bound`,
 `io-bound`, `compute-bound`) derived statically from the extractors its handler
 declares. Every contract failure — missing file, malformed document, a contract
-measured on a different host class — falls back to *unlimited*, never to a
-ceiling. See `docs/guide/capacity-contracts.md`.
+measured on a different host class or under a different profile — falls back
+to the profile default, never to a lower ceiling. Calibrate under the profile
+you deploy (`autumn calibrate --profile`). See `docs/guide/capacity-contracts.md`.
 
 ## Resilience: deadlines and retry budgets (#3058)
 

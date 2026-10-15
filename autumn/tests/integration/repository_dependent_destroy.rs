@@ -3347,14 +3347,12 @@ async fn hard_revisit_reprobes_restrict_before_child_hook_and_fk_failure() {
         "the hard-path restrict probe must return a typed 409, not a raw FK 500"
     );
 
-    // The leaf `before_delete` hook fired EXACTLY ONCE — on the soft branch — and
-    // NOT a second time on the hard branch (the 409 preempted it). Before the fix it
-    // fired twice (soft branch + a second time before the FK failure).
+    // The leaf `before_delete` hook never fires. The hard-path restrict is found
+    // by the up-front probe (#2427), so the 409 precedes every hook.
     assert_eq!(
         AtomicUsize::load(&DHR_LEAF_HOOK_FIRED, Ordering::SeqCst),
-        1,
-        "the leaf before_delete must not fire again on the hard revisit — the \
-         restrict 409 must precede it"
+        0,
+        "the up-front probe must return the restrict 409 before any hook fires"
     );
 
     // Whole transaction rolled back: the root is NOT soft-deleted and the leaf is

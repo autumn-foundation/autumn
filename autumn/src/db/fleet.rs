@@ -19,7 +19,8 @@
 //!   ◄── FleetDatabase (cheap clone of the pool)
 //!
 //! close(key)   — LRU past max_open, idle past idle_close, delete, shutdown
-//!   remove from the map  ──► pool.close() (new checkouts fail fast)
+//!   remove from the map  ──► stop workers (wait, bounded)
+//!   pool.close() (new checkouts fail fast)
 //!   wait for in-flight connections ──► on_close hooks (final replication ship)
 //! ```
 //!
@@ -95,6 +96,10 @@ pub const DEFAULT_MIN_RESIDENCY: Duration = Duration::from_secs(2);
 
 /// How often a drain checks whether the last in-flight connection is back.
 const DRAIN_POLL: Duration = Duration::from_millis(20);
+
+/// How long a close waits for the workers of one database to stop. Workers
+/// of different databases stop together, so this also bounds a shutdown.
+pub const WORKER_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The table that records which database a file is.
 const IDENTITY_TABLE: &str = "_autumn_fleet_identity";
@@ -241,9 +246,12 @@ fn io_error(op: &'static str) -> impl FnOnce(std::io::Error) -> FleetError {
 /// open.
 ///
 /// An explicit [`DatabaseFleet::close`], [`DatabaseFleet::delete`] or
-/// [`DatabaseFleet::restore`] does not wait for leases: once it runs, the
-/// pool refuses new checkouts and the next [`DatabaseFleet::open`] opens the
-/// database fresh.
+/// [`DatabaseFleet::restore`] does not wait for leases. [`DatabaseFleet::delete`]
+/// and [`DatabaseFleet::restore`] stop the workers and close the pool at once.
+/// [`DatabaseFleet::close`] first lets the workers finish their current hook
+/// (for at most [`WORKER_QUIESCE_TIMEOUT`]), then closes the pool. After
+/// that the pool refuses new checkouts and the next [`DatabaseFleet::open`]
+/// opens the database fresh.
 #[derive(Clone)]
 pub struct FleetDatabase {
     key: FleetDbKey,
@@ -253,6 +261,15 @@ pub struct FleetDatabase {
     /// Counts the holders of this database. The fleet's own copy is one; any
     /// more and the database is in use, so it is never closed.
     lease: Arc<()>,
+    /// Background work to stop before the pool closes. `None` once the stop
+    /// has begun: a later registration is stopped at once.
+    workers: Arc<Mutex<Option<Vec<Worker>>>>,
+}
+
+/// A task registered with [`FleetDatabase::register_worker`].
+struct Worker {
+    stop: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl FleetDatabase {
@@ -286,6 +303,60 @@ impl FleetDatabase {
     #[must_use]
     pub const fn closed(&self) -> &CancellationToken {
         &self.closed
+    }
+
+    /// Register background work that uses this database's pool. Before the
+    /// pool closes, the fleet cancels `stop` and awaits `handle` (for at most
+    /// [`WORKER_QUIESCE_TIMEOUT`]), so the work can finish its current step
+    /// while the pool still hands out connections.
+    ///
+    /// Keep `stop` apart from [`closed`](Self::closed): that token means the
+    /// pool is closed.
+    pub fn register_worker(&self, stop: CancellationToken, handle: tokio::task::JoinHandle<()>) {
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(workers) = workers.as_mut() {
+            workers.push(Worker { stop, handle });
+        } else {
+            // Too late to settle: the pool is about to close.
+            stop.cancel();
+            handle.abort();
+        }
+    }
+
+    /// Stop the registered workers. With `settle`, wait for them within the
+    /// timeout; without it, abort them now.
+    async fn quiesce_workers(&self, settle: bool) {
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        for worker in &workers {
+            worker.stop.cancel();
+        }
+        if !settle {
+            for worker in &workers {
+                worker.handle.abort();
+            }
+            return;
+        }
+        let key = &self.key;
+        let aborts: Vec<_> = workers.iter().map(|w| w.handle.abort_handle()).collect();
+        let settle = futures::future::join_all(workers.into_iter().map(|w| w.handle));
+        if tokio::time::timeout(WORKER_QUIESCE_TIMEOUT, settle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(database = %key, "a fleet worker did not stop in time; aborting it");
+            // A detached task would ack against a closed pool.
+            for abort in aborts {
+                abort.abort();
+            }
+        }
     }
 }
 
@@ -1241,6 +1312,7 @@ impl DatabaseFleet {
             pool,
             closed: CancellationToken::new(),
             lease: Arc::new(()),
+            workers: Arc::new(Mutex::new(Some(Vec::new()))),
         };
         // The file is complete here — published fully migrated, restored, or
         // already there — so a failure below closes the pool and never
@@ -1248,6 +1320,7 @@ impl DatabaseFleet {
         let applied = match self.prepare(&db).await {
             Ok(applied) => applied,
             Err(error) => {
+                db.quiesce_workers(true).await;
                 db.closed.cancel();
                 let closer = db.pool.clone();
                 let _ = crate::time::spawn_blocking(move || closer.close()).await;
@@ -1308,6 +1381,8 @@ impl DatabaseFleet {
                     if let Err(detail) = hook.on_open(&opened) {
                         // Undo the hooks that did start (a replicator that
                         // registered) before refusing the open.
+                        // Stop the workers first, as `drain` does.
+                        tokio::runtime::Handle::current().block_on(opened.quiesce_workers(true));
                         for hook in started {
                             hook.on_close(&opened);
                         }
@@ -1481,16 +1556,22 @@ impl DatabaseFleet {
                 key: key.clone(),
                 drain,
             };
-            fleet.drain(&key, db).await;
+            fleet.drain(&key, db, true).await;
         });
     }
 
     /// Close one database: refuse new checkouts, wait for the in-flight ones,
     /// then run the `on_close` hooks.
-    async fn drain(&self, key: &FleetDbKey, db: Option<FleetDatabase>) {
+    ///
+    /// `settle` lets the database's workers finish their step first, so a
+    /// hook is acked. A delete or restore passes `false`: the data goes away,
+    /// and the pool must stop stale holders at once.
+    async fn drain(&self, key: &FleetDbKey, db: Option<FleetDatabase>, settle: bool) {
         let Some(db) = db else {
             return;
         };
+        // Workers settle first: their last ack needs a live pool.
+        db.quiesce_workers(settle).await;
         db.closed.cancel();
         // `close` drops the idle connections, and dropping a `SQLite`
         // connection can checkpoint: keep that I/O off the async workers.
@@ -1549,7 +1630,7 @@ impl DatabaseFleet {
                 key: key.clone(),
                 drain,
             };
-            self.drain(&key, db).await;
+            self.drain(&key, db, true).await;
         } else {
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(drain) = pending {
@@ -1600,9 +1681,8 @@ impl DatabaseFleet {
             ended.await;
         }
         let keys: Vec<FleetDbKey> = self.lock_state().open.keys().cloned().collect();
-        for key in keys {
-            self.close(&key).await;
-        }
+        // Together, so the worker timeout is paid once, not per database.
+        futures::future::join_all(keys.iter().map(|key| self.close(key))).await;
         loop {
             let pending: Vec<Arc<Drain>> = self.lock_state().draining.values().cloned().collect();
             if pending.is_empty() {
@@ -1732,7 +1812,7 @@ impl DatabaseFleet {
             drain,
         };
         let db = self.take_database(entry).await;
-        self.drain(&key, db).await;
+        self.drain(&key, db, false).await;
         // Hooks let go of the files first (a parked replicator holds one open).
         for hook in self.hooks() {
             hook.release(&key);
@@ -1920,7 +2000,7 @@ impl DatabaseFleet {
                     drain,
                 };
                 let db = self.take_database(entry).await;
-                self.drain(&key, db).await;
+                self.drain(&key, db, false).await;
                 for hook in self.hooks() {
                     hook.release(&key);
                 }
@@ -3759,6 +3839,167 @@ mod tests {
         assert!(table_exists(&db, "_autumn_version_history").await);
     }
 
+    /// A worker that, once told to stop, finishes one last step that needs
+    /// the pool (an ack) after `release` fires.
+    struct SettlingWorker {
+        release: Arc<Notify>,
+        acked: Arc<AtomicBool>,
+        hang: bool,
+    }
+
+    impl FleetLifecycle for SettlingWorker {
+        fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
+            let stop = CancellationToken::new();
+            let (pool, release, acked, hang) = (
+                db.pool().clone(),
+                Arc::clone(&self.release),
+                Arc::clone(&self.acked),
+                self.hang,
+            );
+            let task_stop = stop.clone();
+            let handle = tokio::spawn(async move {
+                task_stop.cancelled().await;
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                release.notified().await;
+                acked.store(pool.get().await.is_ok(), Ordering::SeqCst);
+            });
+            db.register_worker(stop, handle);
+            Ok(())
+        }
+    }
+
+    fn settling(hang: bool) -> (Arc<SettlingWorker>, Arc<Notify>, Arc<AtomicBool>) {
+        let worker = Arc::new(SettlingWorker {
+            release: Arc::new(Notify::new()),
+            acked: Arc::new(AtomicBool::new(false)),
+            hang,
+        });
+        (
+            worker.clone(),
+            Arc::clone(&worker.release),
+            Arc::clone(&worker.acked),
+        )
+    }
+
+    #[tokio::test]
+    async fn close_lets_a_worker_settle_before_the_pool_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let (worker, release, acked) = settling(false);
+        fleet.add_lifecycle(worker);
+        let key = FleetDbKey::Slot(21);
+        let db = fleet.open(&key).await.unwrap();
+        let closing = {
+            let (fleet, key) = (fleet.clone(), key.clone());
+            tokio::spawn(async move { fleet.close(&key).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !db.pool().is_closed(),
+            "the pool stays open while the worker runs"
+        );
+        assert!(!db.closed().is_cancelled());
+        release.notify_one();
+        closing.await.unwrap();
+        assert!(
+            acked.load(Ordering::SeqCst),
+            "the worker got a connection to settle"
+        );
+        assert!(db.pool().is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_gives_up_on_a_worker_that_never_settles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let (worker, _release, acked) = settling(true);
+        fleet.add_lifecycle(worker);
+        let key = FleetDbKey::Slot(22);
+        let db = fleet.open(&key).await.unwrap();
+        let began = tokio::time::Instant::now();
+        fleet.close(&key).await;
+        assert!(
+            db.pool().is_closed(),
+            "a stuck worker cannot block the close"
+        );
+        assert!(began.elapsed() >= WORKER_QUIESCE_TIMEOUT);
+        assert!(!acked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn delete_stops_workers_at_once_instead_of_letting_them_settle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let (worker, _release, acked) = settling(false);
+        fleet.add_lifecycle(worker);
+        let key = FleetDbKey::Slot(29);
+        let db = fleet.open(&key).await.unwrap();
+        let deleted = tokio::time::timeout(Duration::from_secs(5), fleet.delete(&key))
+            .await
+            .expect("a delete does not wait for a worker");
+        assert!(deleted.unwrap());
+        assert!(db.pool().is_closed());
+        assert!(!acked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_worker_registered_after_the_stop_began_is_stopped_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(30);
+        let db = fleet.open(&key).await.unwrap();
+        fleet.close(&key).await;
+        let stop = CancellationToken::new();
+        let task_stop = stop.clone();
+        let handle = tokio::spawn(async move { task_stop.cancelled().await });
+        let probe = handle.abort_handle();
+        db.register_worker(stop.clone(), handle);
+        assert!(stop.is_cancelled());
+        tokio::task::yield_now().await;
+        assert!(probe.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_all_pays_the_worker_timeout_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let (worker, _release, _acked) = settling(true);
+        fleet.add_lifecycle(worker);
+        for slot in 25..28 {
+            fleet.open(&FleetDbKey::Slot(slot)).await.unwrap();
+        }
+        let began = tokio::time::Instant::now();
+        fleet.close_all().await;
+        assert!(
+            began.elapsed() < WORKER_QUIESCE_TIMEOUT * 2,
+            "three stuck workers cost one timeout, not three"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_all_waits_for_workers_of_every_database_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let (worker, release, acked) = settling(false);
+        fleet.add_lifecycle(worker);
+        let first = fleet.open(&FleetDbKey::Slot(23)).await.unwrap();
+        let second = fleet.open(&FleetDbKey::Slot(24)).await.unwrap();
+        let closing = {
+            let fleet = fleet.clone();
+            tokio::spawn(async move { fleet.close_all().await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!first.pool().is_closed() && !second.pool().is_closed());
+        // One permit per worker: `notify_waiters` would be lost to a late one.
+        release.notify_one();
+        release.notify_one();
+        closing.await.unwrap();
+        assert!(acked.load(Ordering::SeqCst));
+        assert!(first.pool().is_closed() && second.pool().is_closed());
+    }
+
     #[derive(Default)]
     struct Recorder {
         opened: AtomicUsize,
@@ -3884,6 +4125,11 @@ mod tests {
         }
     }
 
+    /// Bound for "is not stuck" checks. A real hang still trips it. A slow
+    /// Windows runner, which builds a database and runs its migrations in
+    /// this time, does not.
+    const NOT_STUCK: Duration = Duration::from_secs(30);
+
     /// Cancel `call` after `after`, as a request timeout does.
     async fn cancelled<T>(after: Duration, call: impl Future<Output = T>) {
         assert!(
@@ -3931,13 +4177,13 @@ mod tests {
         assert!(!fleet.exists(&key), "the delete ran to the end");
         assert_eq!(fleet.stats().deleted_total, 1);
         // A slot fleet creates on demand: the key opens again, empty.
-        let fresh = tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
+        let fresh = tokio::time::timeout(NOT_STUCK, fleet.open(&key))
             .await
             .expect("open is not stuck on a stranded drain")
             .unwrap();
         assert!(!table_exists(&fresh, "notes").await);
         drop(fresh);
-        tokio::time::timeout(Duration::from_secs(5), fleet.close_all())
+        tokio::time::timeout(NOT_STUCK, fleet.close_all())
             .await
             .expect("close_all does not wait on a stranded drain");
     }
@@ -3956,11 +4202,11 @@ mod tests {
         drop(db);
         settle(&fleet).await;
         assert_eq!(recorder.closed.load(Ordering::SeqCst), 1);
-        tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
+        tokio::time::timeout(NOT_STUCK, fleet.open(&key))
             .await
             .expect("open is not stuck on a stranded drain")
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), fleet.close_all())
+        tokio::time::timeout(NOT_STUCK, fleet.close_all())
             .await
             .expect("close_all returns");
     }
@@ -4338,7 +4584,7 @@ mod tests {
             .expect("the opened database");
         assert!(db.path().is_file());
         opener.await.unwrap().unwrap();
-        fleet.drain(&taken, Some(db)).await;
+        fleet.drain(&taken, Some(db), true).await;
         fleet.finish_drain(&taken, &drain);
     }
 

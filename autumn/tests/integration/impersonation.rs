@@ -1403,3 +1403,350 @@ async fn the_rate_limit_principal_is_the_operator_while_impersonating() {
         "the operator spends their own budget, never the customer's"
     );
 }
+
+// ── Extra identity keys (issue #2347, item 2) ─────────────────
+
+/// Declares the extra identity keys the target carries.
+struct WithEmailKey(Vec<(String, String)>);
+
+impl ImpersonationPolicy for WithEmailKey {
+    fn can_impersonate<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+
+    fn target_session_values<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
+        let values = self
+            .0
+            .iter()
+            .map(|(key, value)| (key.clone(), Some(value.clone())))
+            .collect();
+        Box::pin(async move { values })
+    }
+}
+
+#[autumn_web::post("/login-admin-with-email")]
+async fn login_admin_with_email(session: Session) -> &'static str {
+    session.insert("user_id", "admin-1").await;
+    session.insert("role", "admin").await;
+    session.insert("user_email", "admin@example.com").await;
+    "ok"
+}
+
+#[autumn_web::get("/email")]
+async fn email(session: Session) -> String {
+    session
+        .get("user_email")
+        .await
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn extra_keys_app(values: Vec<(String, String)>) -> TestClientAlias {
+    TestApp::new()
+        .routes(routes![
+            login_admin,
+            login_admin_with_email,
+            begin,
+            stop,
+            email
+        ])
+        .state_initializer(move |state| {
+            state.insert_extension(ImpersonationGate::custom(WithEmailKey(values)));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
+        .build()
+}
+
+#[tokio::test]
+async fn declared_identity_keys_follow_the_swap_and_are_restored() {
+    let client = extra_keys_app(vec![("user_email".into(), "target@example.com".into())]);
+    client
+        .post("/login-admin-with-email")
+        .send()
+        .await
+        .assert_ok();
+
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+    assert_eq!(
+        client.get("/email").send().await.text(),
+        "target@example.com"
+    );
+
+    client.post("/stop-impersonating").send().await.assert_ok();
+    assert_eq!(
+        client.get("/email").send().await.text(),
+        "admin@example.com"
+    );
+}
+
+#[tokio::test]
+async fn an_identity_key_the_operator_lacked_is_removed_on_end() {
+    let client = extra_keys_app(vec![("user_email".into(), "target@example.com".into())]);
+    client.post("/login-admin").send().await.assert_ok();
+
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+    assert_eq!(
+        client.get("/email").send().await.text(),
+        "target@example.com"
+    );
+
+    client.post("/stop-impersonating").send().await.assert_ok();
+    assert_eq!(client.get("/email").send().await.text(), "-");
+}
+
+#[tokio::test]
+async fn a_declared_reserved_or_auth_key_is_refused_before_any_swap() {
+    for key in impersonation::RESERVED_SESSION_KEYS
+        .into_iter()
+        .chain(["user_id"])
+    {
+        let client = extra_keys_app(vec![(key.into(), "x".into())]);
+        client.post("/login-admin").send().await.assert_ok();
+
+        client
+            .post("/impersonate")
+            .form("user_id=user-9")
+            .send()
+            .await
+            .assert_status(500);
+        // Nothing moved: the operator is still the operator.
+        client
+            .post("/stop-impersonating")
+            .send()
+            .await
+            .assert_status(400);
+    }
+}
+
+#[autumn_web::post("/clear-record")]
+async fn clear_record(session: Session) -> &'static str {
+    impersonation::clear(&session).await;
+    "ok"
+}
+
+#[autumn_web::get("/identity-stash")]
+async fn identity_stash(session: Session) -> String {
+    session
+        .get(impersonation::IMPERSONATOR_IDENTITY_SESSION_KEY)
+        .await
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+#[tokio::test]
+async fn clear_removes_the_identity_stash() {
+    let client = TestApp::new()
+        .routes(routes![
+            login_admin_with_email,
+            begin,
+            stop,
+            email,
+            clear_record,
+            identity_stash
+        ])
+        .state_initializer(|state| {
+            state.insert_extension(ImpersonationGate::custom(WithEmailKey(vec![(
+                "user_email".into(),
+                "target@example.com".into(),
+            )])));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
+        .build();
+    client
+        .post("/login-admin-with-email")
+        .send()
+        .await
+        .assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+    assert_ne!(client.get("/identity-stash").send().await.text(), "-");
+
+    client.post("/clear-record").send().await.assert_ok();
+    assert_eq!(client.get("/identity-stash").send().await.text(), "-");
+    // The target's value must not outlive the record.
+    assert_eq!(client.get("/email").send().await.text(), "-");
+}
+
+#[tokio::test]
+async fn a_repeated_identity_key_still_restores_the_operators_value() {
+    let client = extra_keys_app(vec![
+        ("user_email".into(), "first@example.com".into()),
+        ("user_email".into(), "target@example.com".into()),
+    ]);
+    client
+        .post("/login-admin-with-email")
+        .send()
+        .await
+        .assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+    client.post("/stop-impersonating").send().await.assert_ok();
+    assert_eq!(
+        client.get("/email").send().await.text(),
+        "admin@example.com"
+    );
+}
+
+/// Declares the email key for one target only.
+struct EmailForNine;
+
+impl ImpersonationPolicy for EmailForNine {
+    fn can_impersonate<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+
+    fn target_session_values<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
+        let values = if target.user_id() == "user-9" {
+            vec![("user_email".to_owned(), Some("nine@example.com".to_owned()))]
+        } else {
+            Vec::new()
+        };
+        Box::pin(async move { values })
+    }
+}
+
+/// A login that does not call `clear`, so the old record and stash stay.
+#[autumn_web::post("/login-carol-with-email")]
+async fn login_carol_with_email(session: Session) -> &'static str {
+    session.rotate_id().await;
+    session.insert("user_id", "carol").await;
+    session.insert("user_email", "carol@example.com").await;
+    "ok"
+}
+
+#[tokio::test]
+async fn a_stale_identity_stash_leaves_no_values_for_the_next_operator() {
+    let client = TestApp::new()
+        .routes(routes![
+            login_admin_with_email,
+            login_carol_with_email,
+            begin,
+            stop,
+            email
+        ])
+        .state_initializer(|state| {
+            state.insert_extension(ImpersonationGate::custom(EmailForNine));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
+        .build();
+    client
+        .post("/login-admin-with-email")
+        .send()
+        .await
+        .assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+    // The operator walks away; carol signs in without `clear`.
+    client
+        .post("/login-carol-with-email")
+        .send()
+        .await
+        .assert_ok();
+    // The policy declares no extra keys for this target.
+    client
+        .post("/impersonate")
+        .form("user_id=user-8")
+        .send()
+        .await
+        .assert_ok();
+    client.post("/stop-impersonating").send().await.assert_ok();
+
+    // Fail closed: the stale stash named `user_email`, so the key is removed.
+    // The old target's value must not show, and it must not come back.
+    assert_eq!(client.get("/email").send().await.text(), "-");
+}
+
+/// Declares `user_email` as absent for the target.
+struct NoEmailForTarget;
+
+impl ImpersonationPolicy for NoEmailForTarget {
+    fn can_impersonate<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+
+    fn target_session_values<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
+        Box::pin(async { vec![("user_email".to_owned(), None)] })
+    }
+}
+
+#[tokio::test]
+async fn an_absent_target_value_removes_the_key_and_end_restores_it() {
+    let client = TestApp::new()
+        .routes(routes![login_admin_with_email, begin, stop, email])
+        .state_initializer(|state| {
+            state.insert_extension(ImpersonationGate::custom(NoEmailForTarget));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
+        .build();
+    client
+        .post("/login-admin-with-email")
+        .send()
+        .await
+        .assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+    // The operator's email must not show while impersonating.
+    assert_eq!(client.get("/email").send().await.text(), "-");
+
+    client.post("/stop-impersonating").send().await.assert_ok();
+    assert_eq!(
+        client.get("/email").send().await.text(),
+        "admin@example.com"
+    );
+}

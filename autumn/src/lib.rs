@@ -142,6 +142,8 @@ pub mod circuit_breaker;
 // must-never-be-torn data respectively). Crate-private — an internal helper,
 // not part of the public API.
 mod fs_atomic;
+// Case-insensitive media-type match shared by the form gates (issue #3267).
+mod media_type;
 // Compile-time data classification (issue #1654): carries a "personal data"
 // classification on the *type* of a `#[model]` column and gates the `Json`
 // response sink on it, so a leak is a build failure rather than a production

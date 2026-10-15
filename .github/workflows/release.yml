@@ -18,8 +18,9 @@ name: Release
 # the tagged commit; this workflow is `workflow_run`-triggered and so runs in
 # default-branch context, where the recorded ref would be the default branch.
 # The attestation binds the file's digest, and the step below only renames it,
-# so it still verifies against the published asset. The CLI archives are
-# attested by cli-release.yml — see its note about the same ref caveat.
+# so it still verifies against the published asset. The CLI archives are built
+# and attested the same way: the Publish Gate's `cli-binaries` job calls
+# cli-release.yml. The `binaries` job below only downloads and uploads them.
 #
 # See docs/guide/supply-chain.md.
 on:
@@ -96,17 +97,51 @@ jobs:
           files: autumn-${{ steps.tag.outputs.name }}.cdx.json
 
   binaries:
-    name: Build & attach CLI binaries
+    name: Attach CLI binaries
     needs: release
-    # A job-level `permissions:` block REPLACES the workflow-level one, and a
-    # called reusable workflow can only DOWNGRADE the caller's token — the
-    # `permissions:` inside cli-release.yml cannot add scopes back. Without the
-    # two below, its attestation step gets no OIDC token, fails, and (running
-    # before the upload) leaves the release with no CLI binaries at all.
+    runs-on: ubuntu-latest
+    # A job-level `permissions:` block REPLACES the workflow-level one.
+    # `actions: read` lets the download read the gate run's artifacts.
+    # `attestations: read` lets `gh attestation verify` fetch the bundles.
     permissions:
       contents: write
-      id-token: write
-      attestations: write
-    uses: ./.github/workflows/cli-release.yml
-    with:
-      tag: ${{ needs.release.outputs.tag }}
+      actions: read
+      attestations: read
+    steps:
+      # The archives were built and attested by the Publish Gate. Nothing is
+      # rebuilt here, so the attestation stays valid for the uploaded bytes.
+      - name: Download the attested CLI archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: autumn-*
+          merge-multiple: true
+          path: cli-archives
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # An archive and its checksum for each of the five targets. A short
+      # download must stop the job: a release without binaries breaks
+      # `scripts/install.sh` and the `releases/latest/download/...` URLs.
+      - name: Upload CLI archives to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(cli-archives/autumn-*.tar.gz cli-archives/autumn-*.zip cli-archives/autumn-*.sha256)
+          if [[ "${#assets[@]}" -ne 10 ]]; then
+            echo "error: expected 10 CLI assets, found ${#assets[@]}" >&2
+            ls -la cli-archives >&2 || true
+            exit 1
+          fi
+          # Check each file against its attestation. This proves the bytes came
+          # from the tag build of `cli-release.yml`.
+          for f in "${assets[@]}"; do
+            gh attestation verify "$f" \
+              --repo "$GITHUB_REPOSITORY" \
+              --source-ref "refs/tags/$TAG" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/cli-release.yml"
+          done
+          (cd cli-archives && sha256sum -c -- *.sha256)
+          gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"

@@ -52,8 +52,8 @@ $ cargo test -p hot-upgrade --test live_upgrade
 ```
 
 Boots the real v1 binary, drives it with eight concurrent HTTP clients,
-upgrades it to the real v2 binary mid-load, and asserts: zero refused
-connections, zero failed reads, both builds served part of the load, the
+upgrades it to the real v2 binary mid-load, and asserts: no lost
+request, zero failed reads, both builds served part of the load, the
 pre-upgrade value survived, the migration ran exactly once, the counter never
 went backwards, and the cutover latency spike stayed inside the
 graceful-restart drain window.

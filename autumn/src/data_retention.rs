@@ -530,8 +530,8 @@ pub async fn run_retention(
     let config = state.config_arc();
     let mut reports = Vec::with_capacity(datasets.len());
     for dataset in datasets {
-        let report = run_one_dataset(state, &config, dataset, options.dry_run).await;
-        audit_sweep(state, &report).await;
+        let mut report = run_one_dataset(state, &config, dataset, options.dry_run).await;
+        audit_sweep(state, &mut report).await;
         reports.push(report);
     }
     Ok(reports)
@@ -1180,7 +1180,12 @@ struct SweptDataset {
 /// but a dataset held back by a **legal hold** *is* recorded even though
 /// nothing was deleted: "the policy wanted to delete this and did not" is
 /// exactly what a reviewer needs to see.
-async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
+///
+/// If the write fails, the error text is added to
+/// [`RetentionDatasetReport::error`]. Rows can already be gone, so the CLI
+/// exits non-zero and the task fails. The text starts with "audit record" to
+/// separate it from a sweep error.
+async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
     let is_legal_hold = report
         .skipped
         .as_deref()
@@ -1189,18 +1194,6 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
     if report.dry_run || (!swept && !is_legal_hold) {
         return;
     }
-
-    tracing::info!(
-        target: "autumn.audit",
-        dataset = %report.dataset,
-        cutoff = report.cutoff.as_deref().unwrap_or("-"),
-        eligible_rows = report.eligible_rows.unwrap_or(0),
-        rows_removed = report.rows_removed,
-        truncated = report.truncated,
-        skipped = report.skipped.as_deref().unwrap_or(""),
-        error = report.error.as_deref().unwrap_or(""),
-        "retention_sweep"
-    );
 
     let status = if report.error.is_some() {
         crate::audit::AuditStatus::Failure
@@ -1229,15 +1222,58 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
     }
 
     if let Err(error) = crate::audit::write_from_state(state, event).await {
-        tracing::warn!(
+        tracing::error!(
             error = %error,
             dataset = %report.dataset,
+            rows_removed = report.rows_removed,
             "retention sweep audit record could not be written"
         );
+        let audit_failure = format!("audit record not written: {error}");
+        report.error = Some(match report.error.take() {
+            Some(sweep_failure) => format!("{sweep_failure}; {audit_failure}"),
+            None => audit_failure,
+        });
     }
+
+    // Emitted last, so the fallback trail carries an audit-write failure too.
+    tracing::info!(
+        target: "autumn.audit",
+        dataset = %report.dataset,
+        cutoff = report.cutoff.as_deref().unwrap_or("-"),
+        eligible_rows = report.eligible_rows.unwrap_or(0),
+        rows_removed = report.rows_removed,
+        truncated = report.truncated,
+        skipped = report.skipped.as_deref().unwrap_or(""),
+        error = report.error.as_deref().unwrap_or(""),
+        "retention_sweep"
+    );
 }
 
 // ── Scheduled task (AC #2) ───────────────────────────────────────────────
+
+/// Turn dataset errors into one task error.
+///
+/// The caller runs this after all datasets finish, so one failure does not
+/// stop the others. The scheduler records the task as failed.
+fn fail_on_dataset_errors(reports: &[RetentionDatasetReport]) -> AutumnResult<()> {
+    let failures: Vec<String> = reports
+        .iter()
+        .filter_map(|report| {
+            report
+                .error
+                .as_deref()
+                .map(|error| format!("{}: {error}", report.dataset))
+        })
+        .collect();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(crate::AutumnError::internal_server_error_msg(format!(
+        "retention sweep failed for {} dataset(s): {}",
+        failures.len(),
+        failures.join("; ")
+    )))
+}
 
 /// The recurring in-process sweep, or `None` when no dataset declares a
 /// window.
@@ -1261,16 +1297,7 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
         handler: |state| {
             Box::pin(async move {
                 let reports = run_retention(&state, &RetentionRunOptions::default()).await?;
-                for report in &reports {
-                    if let Some(error) = report.error.as_deref() {
-                        tracing::warn!(
-                            dataset = %report.dataset,
-                            error,
-                            "framework retention sweep failed for one dataset"
-                        );
-                    }
-                }
-                Ok(())
+                fail_on_dataset_errors(&reports)
             })
         },
     })
@@ -1279,6 +1306,155 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::audit::{AuditError, AuditEvent, AuditLogger, AuditSink};
+    use std::sync::Arc;
+
+    struct FailingSink;
+
+    impl AuditSink for FailingSink {
+        fn write(
+            &self,
+            _event: AuditEvent,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AuditError>> + Send + '_>>
+        {
+            Box::pin(async { Err(AuditError::new("disk full")) })
+        }
+    }
+
+    fn held_report() -> RetentionDatasetReport {
+        RetentionDatasetReport {
+            dataset: "job_history".to_owned(),
+            description: String::new(),
+            enforcement: "sweep".to_owned(),
+            window_secs: Some(86_400),
+            source: "[retention]".to_owned(),
+            cutoff: Some("2026-01-01T00:00:00+00:00".to_owned()),
+            eligible_rows: Some(3),
+            rows_removed: 3,
+            truncated: false,
+            dry_run: false,
+            skipped: None,
+            duration_ms: 0,
+            error: None,
+        }
+    }
+
+    fn state_with_sink(sink: impl AuditSink) -> AppState {
+        let state = AppState::for_test();
+        state.insert_extension(AuditLogger::new().with_sink(Arc::new(sink)));
+        state
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_sets_the_report_error() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        audit_sweep(&state, &mut report).await;
+        let error = report.error.expect("audit failure must reach the report");
+        assert!(error.contains("audit record"), "{error}");
+        assert!(error.contains("disk full"), "{error}");
+        assert_eq!(report.rows_removed, 3, "removed rows stay reported");
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buf").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_trace_carries_the_audit_write_failure() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        audit_sweep(&state, &mut report).await;
+        let output = String::from_utf8(buf.0.lock().expect("buf").clone()).expect("utf8");
+        let line = output
+            .lines()
+            .find(|line| line.contains("retention_sweep"))
+            .expect("sweep trace line");
+        assert!(line.contains("audit record not written"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_legal_hold_audit_write_sets_the_report_error() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        report.eligible_rows = None;
+        report.rows_removed = 0;
+        report.skipped = Some("legal hold: tax records".to_owned());
+        audit_sweep(&state, &mut report).await;
+        assert!(report.error.is_some(), "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_keeps_the_sweep_error() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        report.error = Some("statement timeout".to_owned());
+        audit_sweep(&state, &mut report).await;
+        let error = report.error.expect("error");
+        assert!(error.contains("statement timeout"), "{error}");
+        assert!(error.contains("disk full"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_written_audit_record_leaves_the_report_clean() {
+        let state = AppState::for_test();
+        let mut report = held_report();
+        audit_sweep(&state, &mut report).await;
+        assert_eq!(report.error, None);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_never_fails_on_the_audit_sink() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        report.dry_run = true;
+        audit_sweep(&state, &mut report).await;
+        assert_eq!(report.error, None);
+    }
+
+    #[test]
+    fn fail_on_dataset_errors_passes_when_clean() {
+        assert!(fail_on_dataset_errors(&[held_report()]).is_ok());
+    }
+
+    #[test]
+    fn fail_on_dataset_errors_names_every_failed_dataset() {
+        let mut first = held_report();
+        first.error = Some("timeout".to_owned());
+        let mut second = held_report();
+        second.dataset = "commit_hooks".to_owned();
+        second.error = Some("denied".to_owned());
+        let ok = held_report();
+        let message = fail_on_dataset_errors(&[first, ok, second])
+            .expect_err("a failed dataset must fail the task")
+            .to_string();
+        assert!(message.contains("job_history"), "{message}");
+        assert!(message.contains("commit_hooks"), "{message}");
+        assert!(message.contains("timeout"), "{message}");
+    }
 
     #[test]
     fn resolve_datasets_defaults_to_every_dataset() {
