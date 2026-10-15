@@ -53,6 +53,8 @@ pub struct Acknowledgment {
     pub digest: String,
     /// Whatever the author wrote after the digest, when they wrote anything.
     pub reason: Option<String>,
+    /// The `ceiling=` payload, when the marker carries one.
+    pub ceiling: Option<String>,
 }
 
 /// The digest of a set of widening findings.
@@ -474,6 +476,7 @@ fn parse_marker(line: &str) -> Option<Acknowledgment> {
     Some(Acknowledgment {
         digest,
         reason: (!reason.is_empty()).then(|| reason.to_owned()),
+        ceiling: None,
     })
 }
 
@@ -535,6 +538,34 @@ mod tests {
         assert_eq!(short(&d).len(), SHORT_DIGEST_LEN);
         assert!(d.starts_with(&short(&d)));
         assert!(short(&d).chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── ceiling token ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parses_a_ceiling_token_and_keeps_the_reason() {
+        let acks = parse_acks("/ack-posture 0123456789abcdef ceiling=GET|%2Fa|x launch week");
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].digest, "0123456789abcdef");
+        assert_eq!(acks[0].ceiling.as_deref(), Some("GET|%2Fa|x"));
+        assert_eq!(acks[0].reason.as_deref(), Some("launch week"));
+    }
+
+    #[test]
+    fn a_bare_marker_has_no_ceiling() {
+        let acks = parse_acks("/ack-posture 0123456789abcdef ceiling-ish reason");
+        assert_eq!(acks[0].ceiling, None);
+        assert_eq!(acks[0].reason.as_deref(), Some("ceiling-ish reason"));
+    }
+
+    /// A marker that tried to carry a ceiling and failed is not a bare marker:
+    /// dropping the ceiling would turn "no wider than" into "exactly this".
+    #[test]
+    fn a_malformed_ceiling_token_voids_the_marker() {
+        for bad in ["ceiling=", "ceiling=a`b", "ceiling=<x>", "ceiling=a\u{e9}"] {
+            let line = format!("/ack-posture 0123456789abcdef {bad}");
+            assert!(parse_acks(&line).is_empty(), "{bad}");
+        }
     }
 
     // ── parsing ─────────────────────────────────────────────────────────────
