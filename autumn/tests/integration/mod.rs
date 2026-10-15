@@ -139,6 +139,8 @@ mod failure_capsule_capture;
 mod failure_capsule_db;
 #[cfg(all(feature = "reporting", feature = "http-client", feature = "cache-moka"))]
 mod failure_capsule_effects;
+#[cfg(all(feature = "reporting", feature = "http-client", feature = "cache-moka"))]
+mod failure_capsule_url_userinfo;
 #[cfg(all(
     feature = "reporting",
     feature = "db",
