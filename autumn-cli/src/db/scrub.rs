@@ -2781,27 +2781,30 @@ fn conninfo_endpoint(
     raw: &str,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(Vec<(String, u16)>, String)> {
-    let values: BTreeMap<String, String> = conninfo_pairs(raw)?.into_iter().collect();
+    // libpq takes the last nonempty occurrence of a repeated keyword.
+    let values: BTreeMap<String, String> = conninfo_pairs(raw)?
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    let env = |key: &str| env(key).filter(|v| !v.is_empty());
     // The database defaults to the user name when none is given.
     let name = values
         .get("dbname")
-        .filter(|n| !n.is_empty())
         .cloned()
         .or_else(|| env("PGDATABASE"))
         .or_else(|| values.get("user").cloned())
-        .or_else(|| env("PGUSER"))
-        .filter(|n| !n.is_empty())?;
+        .or_else(|| env("PGUSER"))?;
     // `hostaddr` is the network address libpq connects to.
     let host_list = values
         .get("hostaddr")
         .cloned()
-        .or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty()))
+        .or_else(|| env("PGHOSTADDR"))
         .or_else(|| values.get("host").cloned())
-        .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
+        .or_else(|| env("PGHOST"))
         .unwrap_or_default();
     let hosts: Vec<String> = host_list.split(',').map(normalize_host).collect();
     let own = vec![None; hosts.len()];
-    let endpoints = pair_endpoints(hosts, own, values.get("port").cloned(), env);
+    let endpoints = pair_endpoints(hosts, own, values.get("port").cloned(), &env);
     Some((endpoints, name))
 }
 
@@ -10413,6 +10416,22 @@ mod tests {
             matches!(err, ScrubError::EncryptedEnvelopeTooLong { limit: 63, .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn empty_keyword_and_environment_values_are_ignored() {
+        let env = env_of(&[]);
+        assert!(same_database_in(
+            "host=prod hostaddr=10.0.0.5 hostaddr='' dbname=app",
+            "host=10.0.0.5 dbname=app",
+            &env
+        ));
+        let empty_db = env_of(&[("PGDATABASE", "")]);
+        assert!(same_database_in(
+            "host=prod user=app",
+            "host=prod dbname=app",
+            &empty_db
+        ));
     }
 
     #[test]
