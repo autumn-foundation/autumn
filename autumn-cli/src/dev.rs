@@ -1965,17 +1965,45 @@ static CHILD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
     )
 )]
 fn begin_child_paths() -> Option<ChildPaths> {
-    let dir = dev_state_dir()?;
-    if !state_dir_is_usable(dir) {
-        return None;
-    }
-    let generation = CHILD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    let paths = child_paths_in(dir, std::process::id(), run_nonce(), generation);
-    let previous = CHILD_PATHS.lock().ok()?.replace(paths.clone());
+    next_child_paths(
+        &CHILD_PATHS,
+        &CHILD_GENERATION,
+        dev_state_dir(),
+        std::process::id(),
+        run_nonce(),
+    )
+}
+
+/// [`begin_child_paths`] over explicit state, so it can be tested.
+///
+/// The last child is forgotten first. If setup fails below, the new child gets
+/// no marker paths, and a stop must not use the old child's.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn next_child_paths(
+    slot: &std::sync::Mutex<Option<ChildPaths>>,
+    generation: &std::sync::atomic::AtomicU64,
+    dir: Option<&Path>,
+    pid: u32,
+    nonce: u128,
+) -> Option<ChildPaths> {
+    let previous = slot.lock().ok()?.take();
     if let Some(previous) = previous {
         let _ = std::fs::remove_file(previous.signal);
         let _ = std::fs::remove_file(previous.ready);
     }
+    let dir = dir?;
+    if !state_dir_is_usable(dir) {
+        return None;
+    }
+    let number = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let paths = child_paths_in(dir, pid, nonce, number);
+    *slot.lock().ok()? = Some(paths.clone());
     Some(paths)
 }
 
@@ -2986,6 +3014,48 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").unwrap();
         assert!(!state_dir_is_usable(&blocker));
         assert!(!state_dir_is_usable(&blocker.join("nested")));
+    }
+
+    #[test]
+    fn a_failed_setup_forgets_the_last_childs_paths() {
+        // The next child gets no marker paths. A stop must then use the hard
+        // stop, not wait on the last child's removed ready file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("autumn");
+        let slot = std::sync::Mutex::new(None);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+
+        let first = next_child_paths(&slot, &generation, Some(&dir), 7, 1).expect("first child");
+        assert_eq!(*slot.lock().unwrap(), Some(first.clone()));
+        std::fs::write(&first.signal, b"").unwrap();
+        std::fs::write(&first.ready, b"30\n").unwrap();
+
+        // The directory stops being usable: a regular file takes its place.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert_eq!(next_child_paths(&slot, &generation, Some(&dir), 7, 1), None);
+        assert_eq!(*slot.lock().unwrap(), None, "the old paths must be gone");
+
+        // With no state directory at all, the result is the same.
+        assert_eq!(next_child_paths(&slot, &generation, None, 7, 1), None);
+        assert_eq!(*slot.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn a_new_child_removes_the_last_childs_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("autumn");
+        let slot = std::sync::Mutex::new(None);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+
+        let first = next_child_paths(&slot, &generation, Some(&dir), 7, 1).unwrap();
+        std::fs::write(&first.signal, b"").unwrap();
+        std::fs::write(&first.ready, b"30\n").unwrap();
+        let second = next_child_paths(&slot, &generation, Some(&dir), 7, 1).unwrap();
+
+        assert_ne!(first, second);
+        assert!(!first.signal.exists() && !first.ready.exists());
+        assert_eq!(*slot.lock().unwrap(), Some(second));
     }
 
     #[test]
