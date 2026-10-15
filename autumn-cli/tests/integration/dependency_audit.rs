@@ -651,6 +651,10 @@ fn scaffold_flavors() -> Vec<&'static [&'static str]> {
         &["--bundled-pg"],
         &["--with-i18n", "--with-seed"],
         &["--api", "--with-i18n"],
+        &["--api", "--with-seed"],
+        &["--api", "--with-i18n", "--with-seed"],
+        &["--daemon", "--with-i18n"],
+        &["--bundled-pg", "--with-i18n"],
     ]
 }
 
