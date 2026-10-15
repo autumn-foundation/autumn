@@ -2429,6 +2429,10 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- serve::tests::ready_payload \
             | tee "$RUNNER_TEMP/cli-ready-payload-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-ready-payload-cov.log"
+          # Issue #2497: same gap for `posture::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: \
+            | tee "$RUNNER_TEMP/cli-posture-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-posture-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
