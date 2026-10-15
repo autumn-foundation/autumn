@@ -503,7 +503,10 @@ async fn shutdown_does_not_wait_for_a_make_service_that_is_not_ready() {
     let _stream = TcpStream::connect(addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     stop.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), server)
+    // Setup gets the 2 s fresh-connection grace after the signal, then the
+    // connection closes. A server that waited on the stuck service would
+    // never return.
+    tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .expect("serve returns after the signal")
         .unwrap()
