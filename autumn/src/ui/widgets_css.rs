@@ -101,4 +101,27 @@ mod tests {
             );
         }
     }
+
+    /// Wayfinder audit (keyboard walkthrough, tier 1): four widget rules
+    /// (`.autumn-field__input`, `.autumn-submit:focus`, `.autumn-search__input`,
+    /// `.autumn-autocomplete__input`) set `outline: none` and signalled focus
+    /// with `border-color` + `box-shadow` only. Forced-colors mode (Windows
+    /// High Contrast) strips `box-shadow`, so keyboard users lost the focus
+    /// indicator on every form field, the submit button, search and
+    /// autocomplete (WCAG 2.4.7). A transparent outline is repainted in the
+    /// system focus colour under forced-colors and is invisible otherwise.
+    #[test]
+    fn no_widget_rule_drops_the_outline_outright() {
+        let offenders: Vec<usize> = WIDGETS_COMPONENT_CSS
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == "outline: none;")
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "`outline: none` at widgets.css lines {offenders:?} leaves no focus \
+             indicator under forced-colors mode; use `outline: 2px solid transparent`"
+        );
+    }
 }
