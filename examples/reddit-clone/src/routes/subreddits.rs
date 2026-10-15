@@ -590,10 +590,10 @@ autumn_web::paths![list, create_form, create, show];
 mod tests {
     use super::*;
 
-    // ── #2454: a rejected form opens with a focused error summary ──
+    // #2454: a rejected form shows an error summary
 
     #[test]
-    fn a_rejected_community_opens_with_an_error_summary() {
+    fn rejected_community_shows_error_summary() {
         use autumn_web::form::IntoChangeset as _;
         let mut changeset = CreateSubredditForm {
             name: "***".to_owned(),

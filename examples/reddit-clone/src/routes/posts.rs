@@ -508,7 +508,7 @@ fn submit_form_markup(
             ]))
             (form.form_tag(&paths::submit(), "post", html! {
                 @if let Some(sub) = fixed_sub {
-                    input type="hidden" name="subreddit_id" value=(sub.id);
+                    input type="hidden" id="subreddit_id" name="subreddit_id" value=(sub.id);
                 } @else {
                     div {
                         (field_errors("subreddit_id", form))
@@ -614,7 +614,7 @@ fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
     }
 }
 
-/// Tag chips for a post. Shows `Tag::name`, the author's own spelling.
+/// Tag chips for a post. Shows the author's spelling (`Tag::name`).
 fn tag_chips_markup<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
     let tags: Vec<&Tag> = tags.into_iter().collect();
     html! {
@@ -630,10 +630,20 @@ fn tag_chips_markup<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
     }
 }
 
-/// The manage-tags input value. Uses names, so a re-save keeps the spelling.
+/// Value of the manage-tags input. It uses names, so a save keeps the spelling.
+///
+/// `parse_tag_names` splits on `,` and newline and drops names that are too
+/// long or have no letter or number. A stored name that would not survive
+/// that falls back to its slug, so a save does not detach the tag.
 fn tags_field_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
     tags.into_iter()
-        .map(|tag| tag.name.as_str())
+        .map(|tag| {
+            let name = tag.name.trim();
+            let survives = !name.contains([',', '\n'])
+                && contains_letter_or_number(name)
+                && name.chars().count() <= MAX_TAG_NAME_LEN;
+            if survives { name } else { tag.slug.as_str() }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1822,7 +1832,7 @@ mod tests {
         );
     }
 
-    // ── #2454: tags show the author's spelling, not the slug ───────
+    // #2454: tags show the name, not the slug
 
     fn tag(name: &str) -> Tag {
         Tag {
@@ -1859,6 +1869,19 @@ mod tests {
     #[test]
     fn no_tags_render_no_chip_row() {
         assert!(tag_chips_markup(&[]).into_string().is_empty());
+    }
+
+    #[test]
+    fn a_stored_name_that_would_not_survive_a_save_falls_back_to_its_slug() {
+        let odd = Tag {
+            id: 2,
+            name: "a, b".to_owned(),
+            slug: "a-b".to_owned(),
+        };
+        let field = tags_field_value(&[tag("Web Dev"), odd]);
+
+        assert_eq!(field, "Web Dev, a-b");
+        assert_eq!(parse_tag_names(&field).slug_order.len(), 2);
     }
 
     #[test]
@@ -1920,10 +1943,10 @@ mod tests {
         );
     }
 
-    // ── #2454: a rejected form opens with a focused error summary ──
+    // #2454: a rejected form shows an error summary
 
     #[test]
-    fn a_rejected_submission_opens_with_an_error_summary() {
+    fn rejected_submission_shows_error_summary() {
         let rendered = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
 
         assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
@@ -1938,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_edit_opens_with_an_error_summary() {
+    fn rejected_edit_shows_error_summary() {
         let form = EditPostForm {
             title: String::new(),
             body: String::new(),

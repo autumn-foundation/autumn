@@ -108,11 +108,12 @@ pub fn layout(
 
 /// Error summary for the top of a rejected form.
 ///
-/// A full-page 422 moves no focus, and a `role="alert"` region present at load
-/// is usually not announced. So the summary takes focus itself: `tabindex="-1"`
-/// makes the `div` focusable, `autofocus` focuses it on load. Each entry links
-/// to its field by id. `fields` pairs a field name with its label, in form
-/// order. Renders nothing when no listed field has an error.
+/// A 422 page does not move focus. Screen readers often skip a `role="alert"`
+/// region that exists at page load. So the summary takes focus itself.
+/// `tabindex="-1"` makes the `div` focusable. `autofocus` focuses it on load.
+/// Each entry links to its field by id.
+/// `fields` lists (field name, label) pairs in form order.
+/// It renders nothing if no listed field has an error.
 pub fn error_summary<T>(form: &ChangesetForm<T>, fields: &[(&str, &str)]) -> Markup {
     let entries: Vec<(&str, &str, &str)> = fields
         .iter()
@@ -125,7 +126,7 @@ pub fn error_summary<T>(form: &ChangesetForm<T>, fields: &[(&str, &str)]) -> Mar
     let count = entries.len();
     html! {
         @if count > 0 {
-            div id="error-summary" tabindex="-1" autofocus
+            div id="error-summary" role="group" tabindex="-1" autofocus
                 aria-labelledby="error-summary-title"
                 class="mb-4 rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700" {
                 h2 id="error-summary-title" class="font-semibold mb-1" {
@@ -168,9 +169,9 @@ pub fn layout_with_seo(
 ) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
-        // `lang="en"` describes the page chrome, which is English. User
-        // content may use any script; it stays under this tag because no
-        // detector tags it per element.
+        // `lang="en"` is for the page chrome, which is English.
+        // User content can use any script. No detector tags it per element,
+        // so it stays under this tag.
         html lang="en" {
             head {
                 meta charset="utf-8";
@@ -390,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_form_has_no_error_summary() {
+    fn valid_form_shows_no_error_summary() {
         let form = rejected(&[]);
 
         let rendered = error_summary(&form, &[("title", "Title")]).into_string();
@@ -399,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn the_error_summary_takes_focus_on_render() {
+    fn error_summary_has_autofocus() {
         let form = rejected(&[("title", "Title is required")]);
 
         let rendered = error_summary(&form, &[("title", "Title")]).into_string();
@@ -407,6 +408,7 @@ mod tests {
         assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
         assert!(rendered.contains(r#"tabindex="-1""#), "{rendered}");
         assert!(rendered.contains("autofocus"), "{rendered}");
+        assert!(rendered.contains(r#"role="group""#), "{rendered}");
     }
 
     #[test]

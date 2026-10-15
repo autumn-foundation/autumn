@@ -1,8 +1,8 @@
-//! The app's `#[ignore]`d Docker suites must run in CI (issue #2454).
+//! The app's `#[ignore]`d Docker tests must run in CI (issue #2454).
 //!
-//! `cargo test --workspace` compiles them and skips them. ci.yml's Docker step
-//! must sweep them with a bare `--ignored` run, so a new suite needs no
-//! workflow edit.
+//! `cargo test --workspace` compiles them but skips them.
+//! The ci.yml Docker step must run them with a bare `--ignored`.
+//! Then a new test needs no workflow edit.
 
 use std::path::Path;
 
@@ -11,36 +11,33 @@ fn ci_yml() -> String {
     std::fs::read_to_string(path).expect("read ci.yml")
 }
 
-/// The command lines of the step's reddit-clone sweep.
+/// The reddit-clone run in the step: its subshell, log check and error line.
 fn sweep(ci: &str) -> Option<String> {
     let start = ci.find("cargo test -p reddit-clone --lib --tests")?;
-    let rest = &ci[start..];
-    let end = rest.find("\n          #").unwrap_or(rest.len());
-    Some(rest[..end].to_owned())
+    let begin = ci[..start].rfind("(\n").unwrap_or(start);
+    let end = ci[start..].find("exit 1; }")? + start;
+    Some(ci[begin..end].to_owned())
 }
 
 #[test]
-fn ci_sweeps_the_ignored_suites_of_this_app() {
+fn ci_runs_the_ignored_tests_of_this_app() {
     let ci = ci_yml();
     let sweep = sweep(&ci).expect("ci.yml must run `cargo test -p reddit-clone --lib --tests`");
 
-    assert!(sweep.contains("--ignored"), "sweep must pass --ignored");
-    assert!(
-        sweep.contains("--test-threads=1"),
-        "suites share one job runtime, so the sweep must run serially"
-    );
-    assert!(
-        sweep.contains("reddit-clone-docker-sweep.log"),
-        "sweep must keep its log for the pass-count check"
-    );
-    assert!(
-        ci.contains("no reddit-clone Docker tests ran"),
-        "sweep needs a pass-count check: an empty filter exits 0"
-    );
+    for needle in [
+        "--ignored",
+        "--test-threads=1",
+        "set -o pipefail",
+        "tee ",
+        "grep -qE",
+        "no reddit-clone Docker test ran",
+    ] {
+        assert!(sweep.contains(needle), "sweep lacks `{needle}`:\n{sweep}");
+    }
 }
 
 #[test]
-fn the_sweep_has_suites_to_run() {
+fn the_app_has_ignored_tests_to_run() {
     let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let ignored = std::fs::read_dir(tests)
         .expect("read tests dir")
@@ -53,6 +50,6 @@ fn the_sweep_has_suites_to_run() {
 
     assert!(
         ignored >= 5,
-        "expected the Docker suites in tests/ — did the layout change? found {ignored}"
+        "expected the Docker tests in tests/ — did the layout change? found {ignored}"
     );
 }
