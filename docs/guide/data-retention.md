@@ -264,6 +264,11 @@ bound is applied by shortening the record's TTL at write time; for
 the literal value you configured (a legal hold can then stop the sweep — the
 independent `expires_at` cleanup could not have been stopped).
 
+In-memory stores (`idempotency`, `webhook_replay`, and `job_tracking` on the
+`local` jobs backend) stop serving expired records at the window. They remove
+them only on later writes. A quiet process can hold expired records in memory
+past the window. Use `redis` to remove them on time. The report says so.
+
 ### One exception: webhook replay protection
 
 A replay marker's lifetime *is* the replay-rejection window — once the marker
