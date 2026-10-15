@@ -2341,6 +2341,13 @@ jobs:
             --test integration_tests -- --ignored idempotency_ \
             | tee "$RUNNER_TEMP/idempotency-pg-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-cov.log"
+          # Issue #3262: the Postgres experiment store's snapshot, refresh and
+          # write paths run only in these Docker tests of the consolidated
+          # binary. A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored experiments_pg_integration:: \
+            | tee "$RUNNER_TEMP/experiments-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/experiments-pg-cov.log"
           # Issue #2875: the Postgres tracking store's database-clock expiry
           # runs only in these Docker tests. Check the count: a filter that
           # matches nothing exits 0.
@@ -2391,10 +2398,12 @@ jobs:
             | tee "$RUNNER_TEMP/cli-schema-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-cov.log"
           # Issue #2344: same gap for `upgrade::` and `git_root::`. Issue #2386:
-          # same gap for `sbom::`. No other lane instruments the `autumn` bin
+          # same gap for `sbom::`. Issue #2442: same gap for the `serve::`
+          # shutdown-budget tests. No other lane instruments the `autumn` bin
           # unit tests, so their patch coverage reads as 0%. Check the count: a
           # filter that matches nothing exits 0.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- upgrade:: git_root:: sbom:: \
+            serve::tests::shutdown_budget \
             | tee "$RUNNER_TEMP/cli-upgrade-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-upgrade-cov.log"
           # Issue #2366: same gap for `db::scrub::`. Its classifier is unit
@@ -2411,6 +2420,10 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- built_artifact:: \
             | tee "$RUNNER_TEMP/cli-built-artifact-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-built-artifact-cov.log"
+          # Issue #2448: same gap for `new::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- new:: \
+            | tee "$RUNNER_TEMP/cli-new-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-new-cov.log"
           # Issue #2458: same gap for the `serve` ready-file parser tests. Check
           # the count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- serve::tests::ready_payload \
@@ -2926,30 +2939,6 @@ jobs:
       # workflow file invalid, so every job in this file silently stops running.
       # They are exported from the first step instead.
       CARGO_TARGET_DIR: ${{ github.workspace }}\target
-      # The MSVC linker blows its PDB public-symbol limit linking the scaffolded
-      # `--bundled-pg` app with default debug info:
-      #
-      #   LNK4318: Very long symbol name encountered while producing debug information
-      #   LINK : fatal error LNK4319: A PDB limit was hit while adding public symbols
-      #
-      # autumn-web's full dependency graph plus `managed-pg-bundled` (which
-      # embeds the Postgres binaries) produces more public symbols in one debug
-      # binary than a PDB can hold. This is a real limit a Windows developer can
-      # hit too — it is documented as a Windows detail in
-      # docs/guide/platform-support.md and tracked for a product-level fix — so
-      # it is named here rather than silently configured around.
-      #
-      # Dropping debug info is a legitimate build configuration and does not
-      # weaken what this job gates: the journey still scaffolds, builds, boots a
-      # managed cluster, reloads, and shuts down. It only means a crash here
-      # yields a backtrace without line numbers.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      # Second, independent mitigation for the same limit. `/DEBUG:LongSymbolTruncate`
-      # is what the linker itself recommends in the LNK4318 warning that precedes
-      # the fatal LNK4319, so this exact toolchain supports it. Belt and braces
-      # deliberately: a Windows CI cycle costs ~35 minutes, and the previous
-      # single-remedy attempt did not hold.
-      RUSTFLAGS: "-Clink-arg=/DEBUG:LongSymbolTruncate"
     steps:
       - uses: actions/checkout@v7
       # Pinned to the exact MSRV, not `@stable` (2026-09-28 finding, 🚦
@@ -3009,6 +2998,11 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "AUTUMN_MANAGED_PG_DATA_DIR=$env:RUNNER_TEMP\tier1-pg"
 
       - name: Build the CLI
+        # Env is set on this step only. A job-wide CARGO_PROFILE_DEV_DEBUG or
+        # RUSTFLAGS would override the scaffold's own dev profile (issue #2448)
+        # and hide a broken fix.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo build -p autumn-cli --bin autumn
 
       - name: "Journey: autumn new (managed Postgres)"
@@ -3029,19 +3023,8 @@ jobs:
           $webPath = ("$env:GITHUB_WORKSPACE\autumn" -replace '\\', '/')
           Add-Content -Path "tier1_app\Cargo.toml" -Value "`n[patch.crates-io]`nautumn-web = { path = `"$webPath`" }`n"
 
-          # Drop debug info for this build. autumn-web's graph plus
-          # `managed-pg-bundled` overflows the MSVC PDB public-symbol limit
-          # (LNK4319) — see docs/guide/platform-support.md and issue #2448,
-          # which tracks scaffolding this so users never meet it.
-          #
-          # Written into the MANIFEST, not left to `CARGO_PROFILE_DEV_DEBUG`
-          # alone: that variable is set job-wide and verifiably works locally
-          # (it drops `-Cdebuginfo` for the package and its dependencies), yet
-          # the failing Windows link still carried `/DEBUG` and debug-bearing
-          # autumn_web objects. A manifest profile cannot be missed, and
-          # `package."*"` covers every dependency explicitly rather than by
-          # inheritance.
-          Add-Content -Path "tier1_app\Cargo.toml" -Value "`n[profile.dev]`ndebug = 0`n`n[profile.dev.package.`"*`"]`ndebug = 0`n"
+          # The scaffold sets [profile.dev] debug = "line-tables-only" (issue
+          # #2448). Do not override it here: this job must test the scaffold.
           Write-Host "--- generated Cargo.toml tail ---"
           Get-Content "tier1_app\Cargo.toml" -Tail 12 | Write-Host
 

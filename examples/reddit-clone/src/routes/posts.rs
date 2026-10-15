@@ -98,7 +98,7 @@ pub async fn front_page(
     // A/B experiment: compact list (control) vs. card layout (treatment).
     // The Experiments extractor resolves the actor from the session automatically
     // (logged-in users → user_id; anonymous → stable per-session key).
-    let compact_layout = exps.assign("feed_layout").unwrap_or_default() == "compact";
+    let compact_layout = exps.assign_async("feed_layout").await.unwrap_or_default() == "compact";
 
     // Hot posts across all subreddits. Instead of a hand-written two-way join,
     // load the page of posts, then `preload` their author + subreddit. This is

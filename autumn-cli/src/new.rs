@@ -43,6 +43,7 @@ pub mod templates {
     pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
     pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
     pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
+    pub const CARGO_CONFIG: &str = include_str!("templates/cargo-config.toml.tmpl");
 }
 
 /// Variables substituted into project and starter template files.
@@ -275,6 +276,14 @@ fn generate_inner(
     fs::write(
         project_dir.join("deny.toml"),
         render_deny_toml(&render(templates::DENY_TOML), opts),
+    )?;
+
+    // Linker remedy for the Windows PDB symbol limit (issue #2448). Written
+    // here, not as a framework-owned file: the app author may extend it.
+    fs::create_dir_all(project_dir.join(".cargo"))?;
+    fs::write(
+        project_dir.join(".cargo/config.toml"),
+        templates::CARGO_CONFIG,
     )?;
 
     let main_template = if opts.with_api {
@@ -2036,6 +2045,95 @@ mod tests {
         GenerateOptions {
             with_daemon: true,
             ..GenerateOptions::default()
+        }
+    }
+
+    /// Windows PDB files cap public symbols (LNK4319, issue #2448). Every
+    /// starter shape must set a reduced dev profile, for the app and for its
+    /// dependencies.
+    #[test]
+    fn every_generated_shape_scaffolds_reduced_dev_debug_info() {
+        let shapes = [
+            ("shape-default", GenerateOptions::default()),
+            ("shape-bundled", bundled_pg_opts()),
+            ("shape-daemon", daemon_opts()),
+            (
+                "shape-seed",
+                GenerateOptions {
+                    with_seed: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+            (
+                "shape-api-i18n",
+                GenerateOptions {
+                    with_api: true,
+                    with_i18n: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+            (
+                "shape-api",
+                GenerateOptions {
+                    with_api: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+        ];
+        for (name, opts) in shapes {
+            let tmp = TempDir::new().unwrap();
+            generate_with(name, tmp.path(), opts).unwrap();
+            let raw = fs::read_to_string(tmp.path().join(name).join("Cargo.toml")).unwrap();
+            let doc: toml::Table = raw.parse().unwrap();
+            let dev = doc
+                .get("profile")
+                .and_then(|p| p.get("dev"))
+                .unwrap_or_else(|| panic!("{name}: no [profile.dev]: {raw}"));
+            assert_eq!(
+                dev["debug"].as_str(),
+                Some("line-tables-only"),
+                "{name}: {raw}"
+            );
+            assert_eq!(
+                dev["package"]["*"]["debug"].as_str(),
+                Some("line-tables-only"),
+                "{name}: dependencies need their own setting: {raw}"
+            );
+        }
+    }
+
+    /// The profile alone does not clear LNK4319 on Windows (issue #2448).
+    /// Every shape also needs the linker's own remedy for MSVC targets.
+    #[test]
+    fn every_generated_shape_scaffolds_long_symbol_truncate() {
+        let shapes = [
+            ("lst-default", GenerateOptions::default()),
+            ("lst-bundled", bundled_pg_opts()),
+            ("lst-daemon", daemon_opts()),
+            (
+                "lst-api",
+                GenerateOptions {
+                    with_api: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+        ];
+        for (name, opts) in shapes {
+            let tmp = TempDir::new().unwrap();
+            generate_with(name, tmp.path(), opts).unwrap();
+            let path = tmp.path().join(name).join(".cargo/config.toml");
+            let raw = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{name}: no .cargo/config.toml: {e}"));
+            let doc: toml::Table = raw.parse().unwrap();
+            for triple in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+                let flags = doc["target"][triple]["rustflags"].as_array().unwrap();
+                assert!(
+                    flags
+                        .iter()
+                        .any(|f| f.as_str() == Some("-Clink-arg=/DEBUG:LongSymbolTruncate")),
+                    "{name}: {triple} lacks LongSymbolTruncate: {raw}"
+                );
+            }
         }
     }
 

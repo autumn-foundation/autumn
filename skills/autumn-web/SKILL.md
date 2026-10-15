@@ -420,10 +420,12 @@ for `String` (`text/plain; charset=utf-8`) and `Vec<u8>`
 a route whose own extension says otherwise (`/theme.css`, `/logo.png`) those two
 exact values are replaced by the extension type (recorded, so ISR still guards
 the route). That stops a `-> String` stylesheet from being served as plain text and dropped by `nosniff`.
-The two are indistinguishable in the response, so if you genuinely want one of
-them on such a route, declare it distinctly (bare `text/plain`, or
-`application/octet-stream` with a parameter) and it is recorded; to force a
-download prefer `Content-Disposition: attachment`. Extensions outside Autumn's
+The two are indistinguishable in the response. To keep one on such a route,
+declare it on the attribute:
+`#[static_get("/logo.png", content_type = "application/octet-stream")]`.
+That type is recorded and served as written, and it also covers routes whose
+type is hard to set through `IntoResponse`. It applies to the pre-rendered page
+only. To force a download prefer `Content-Disposition: attachment`. Extensions outside Autumn's
 asset table (`.pdf`, `.zip`) are unaffected.
 
 Return `Markup` (or `Html<String>`) for HTML pages: on an extensionless route a
@@ -1970,6 +1972,11 @@ backend-conditionally rather than assuming Postgres.
   only on `Ok(None)`. A store error serves last-known values; set a fallback
   with `FeatureFlagService::with_default` and register it with
   `AppBuilder::with_flag_service`.
+- `PgExperimentStore` works the same way (issue #3262): `get` reads a snapshot
+  and never connects on a Tokio worker. In async handlers, call
+  `Experiments::assign_async` (or `ExperimentService::assign_async`), not
+  `assign`: the per-actor lookups still connect, and `assign_async` runs them
+  on the blocking pool.
 - `DatabaseConfig::effective_primary_postgres_url()` is the screen to branch on
   (`effective_primary_url()` returns the target whatever backend it names).
 - `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite`

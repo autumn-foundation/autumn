@@ -349,7 +349,7 @@ OWNERS = {
     "service": "service.rs",
     "sim_test": "sim_test.rs",
     # NOT a route alias either: `StaticGetAttrs::parse` accepts `params`,
-    # `revalidate` and `seo` and nothing else, and `static_get_macro` never
+    # `revalidate`, `content_type` and `seo` and nothing else, and `static_get_macro` never
     # hands `attr` to `route::route_macro` — it only borrows
     # `crate::parse::SeoAttrArgs` for the nested `seo(...)` group. Registering
     # the shared route parser made `timeout_ms`, `api_version` and `name` look
@@ -2865,7 +2865,7 @@ def self_test():
     check(
         "static_get accepts exactly its own grammar",
         sorted(accepted["static_get"]),
-        ["crate", "params", "revalidate", "seo"],
+        ["content_type", "crate", "params", "revalidate", "seo"],
     )
     check(
         "markdown: a route-only key on static_get is caught",

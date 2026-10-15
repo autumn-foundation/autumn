@@ -54,6 +54,7 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");
     t.compile_fail("tests/compile-fail/static_get_params_no_placeholders.rs");
     t.compile_fail("tests/compile-fail/static_get_seo_unknown_key.rs");
+    t.compile_fail("tests/compile-fail/static_get_content_type_empty.rs");
 
     // Edge-lane refusals (#1790). Always available: `#[edge]` is re-exported
     // unconditionally (a route can be *marked* without the `edge` feature), and
@@ -622,6 +623,7 @@ fn compile_pass_tests_a() {
     t.pass("tests/compile-pass/main_runtime_args.rs");
     t.pass("tests/compile-pass/main_runtime_current_thread.rs");
     t.pass("tests/compile-pass/static_get_basic.rs");
+    t.pass("tests/compile-pass/static_get_content_type.rs");
     t.pass("tests/compile-pass/static_routes_basic.rs");
     t.pass("tests/compile-pass/static_get_parameterized.rs");
 

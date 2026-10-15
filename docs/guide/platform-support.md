@@ -47,29 +47,41 @@ LNK4318: Very long symbol name encountered while producing debug information
 LINK : fatal error LNK4319: A PDB limit was hit while adding public symbols
 ```
 
-It is a linker limit, not a code error. Reduce the debug info for the dev
-profile in your project's `Cargo.toml`:
+It is a linker limit, not a code error. `autumn new` already scaffolds two
+fixes (default, `--api`, `--daemon`, `--bundled-pg`). The first is a dev
+profile in `Cargo.toml`, for your app and for its dependencies:
 
 ```toml
 [profile.dev]
-debug = "line-tables-only"   # or `0` if that is still too much
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"
 ```
 
-`line-tables-only` keeps backtraces useful (file and line, no variable
-inspection) at a fraction of the symbol count. Autumn's own `windows-tier1` CI
-job builds with `debug = 0` for this reason.
+`line-tables-only` keeps file and line in backtraces. It removes variable
+inspection in a debugger. To get full debug info back, set `debug = true` in
+both tables.
 
-Set it in the **manifest**, not via `CARGO_PROFILE_DEV_DEBUG`. That environment
-variable does drop debug info, but autumn's CI hit the limit again with it set,
-so the manifest profile — plus `[profile.dev.package."*"]` to cover
-dependencies explicitly — is the reliable spelling. If you still hit LNK4319,
-add the linker's own remedy:
+The second is the linker's own remedy, in `.cargo/config.toml`. It applies to
+Windows MSVC targets only:
 
 ```toml
-# .cargo/config.toml
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-Clink-arg=/DEBUG:LongSymbolTruncate"]
 ```
+
+This is a `link.exe` option, the default MSVC linker. If you use `lld-link`,
+delete the file: `lld-link` rejects the flag. Cargo applies target rustflags
+to every profile, so release builds on Windows use the flag too.
+
+Less debug info alone does not clear the limit: the public symbols stay in
+the PDB. Do not rely on `CARGO_PROFILE_DEV_DEBUG`. Autumn's CI hit the limit
+with that variable set. If the build still fails, set `debug = 0` in both
+profile tables.
+
+Projects made with an older `autumn new` do not have these files. Add them
+yourself. Autumn's `windows-tier1` CI job builds the scaffold as it is.
 
 ### Three other Windows details worth knowing
 
@@ -107,10 +119,14 @@ The wait is your app's **own** budget, not a fixed one: `autumn dev` reads the
 same profile-aware `prestop_grace_secs + shutdown_timeout_secs` that
 `autumn serve stop` uses, and adds 75 seconds of headroom. The headroom covers
 the managed-Postgres stop that runs after the drain (60 seconds, plus 15 seconds
-of margin). So
-an app that legitimately takes 35 seconds to drain is not cut off at ten. Only
-once that budget elapses does `autumn dev` force-stop it — **and print a warning
-saying the hooks may not have run.** Degraded, but never silent.
+of margin). So an app that legitimately takes 35 seconds to drain is not cut off
+at ten. Once that budget elapses, `autumn dev` force-stops the app — **and
+prints a warning saying the hooks may not have run.** Degraded, but never silent.
+
+If the app is still starting, `autumn dev` waits for it to finish. The app reads
+the stop request only after it starts. Startup includes managed Postgres
+`initdb` and migrations. The budget starts when the app is up. If no ready
+signal comes after 15 minutes, `autumn dev` uses the normal budget anyway.
 
 ## Tier 2 — supported via WSL2
 

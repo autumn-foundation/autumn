@@ -718,7 +718,13 @@ apply-time error.
   has its own waiver,
   `--allow-source-overwrite`, rather than riding on `--force`: the staging drill
   always passes `--force`, so a guard `--force` waived would be inert in exactly
-  the workflow it exists for.
+  the workflow it exists for. The guard compares the control URL and every
+  `[[database.shards]]` URL of each protected profile. It skips the config
+  overlay of the profile you scrub, because that overlay names the destination.
+  It never skips the profile that the artifact came from. To restore a `prod`
+  artifact with `--profile prod`, you must pass `--allow-source-overwrite`.
+  A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host from
+  the `hostaddr` or `host` parameter. If both are missing, it uses `PGHOST`.
 - **A refusal writes nothing.** Classification completes before a single row is
   touched. The one exception is `--artifact`: the restore has to run before the
   scrub can read the schema it created, so a refusal *after* a restore leaves

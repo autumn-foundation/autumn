@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use super::StaticManifest;
 use super::isr_coordinator::{IsrCoordinator, LocalIsrCoordinator, isr_window_key};
+use super::{ManifestEntry, StaticManifest};
 
 /// Per-route ISR state, tracking whether a regeneration is in flight
 /// and when the last regeneration attempt occurred.
@@ -233,6 +233,50 @@ pub fn resolved_content_type(
     http::HeaderValue::from_static(derived)
 }
 
+/// The `Content-Type` to serve for a manifest `entry` (#2403).
+///
+/// A declared type is served as is. An inferred one goes through
+/// [`resolved_content_type`]. An app that serves `dist/` itself must use this
+/// function to match Autumn.
+#[must_use]
+pub fn resolved_entry_content_type(
+    entry: &ManifestEntry,
+    route_path: &str,
+    file_path: &Path,
+) -> http::HeaderValue {
+    if entry.content_type_explicit
+        && let Some(declared) = usable_recorded_content_type(entry.content_type.as_deref())
+        && let Ok(value) = http::HeaderValue::from_str(declared)
+    {
+        return value;
+    }
+    resolved_content_type(entry.content_type.as_deref(), route_path, file_path)
+}
+
+/// The type ISR must see in a fresh response for `entry`, or `None` for no check.
+///
+/// A usable declared type is pinned by the route attribute, so the handler
+/// header cannot desync from it and needs no guard.
+fn isr_expected_content_type(
+    entry: &ManifestEntry,
+    route_path: &str,
+    file_path: &Path,
+) -> Option<String> {
+    let usable = usable_recorded_content_type(entry.content_type.as_deref());
+    if entry.content_type_explicit {
+        // An unusable declared value is ignored when serving, so guard the
+        // type that is served instead.
+        return match usable {
+            Some(_) => None,
+            None => resolved_content_type(None, route_path, file_path)
+                .to_str()
+                .ok()
+                .map(str::to_owned),
+        };
+    }
+    usable.map(|recorded| effective_content_type(recorded, route_path).to_owned())
+}
+
 impl StaticFileLayer {
     /// Try to load a `StaticFileLayer` from a `dist/` directory.
     ///
@@ -372,13 +416,11 @@ impl StaticFileLayer {
                 // Only a value the serve path would actually honour: an
                 // unusable one is ignored there, so treating it as the ISR
                 // expectation would refuse every regeneration forever.
-                usable_recorded_content_type(entry.content_type.as_deref())
-                    .map(|recorded| effective_content_type(recorded, request_path)),
+                isr_expected_content_type(entry, request_path, &file_path).as_deref(),
             );
         }
 
-        let content_type =
-            resolved_content_type(entry.content_type.as_deref(), request_path, &file_path);
+        let content_type = resolved_entry_content_type(entry, request_path, &file_path);
 
         Some(ResolvedStatic {
             file_path,
@@ -1887,6 +1929,7 @@ mod tests {
             revalidate: Some(1),
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
         crate::static_gen::render_static_routes(string_router(), &[meta], &dist_dir)
             .await
@@ -1909,6 +1952,128 @@ mod tests {
         regenerate_page(&json_router, "/theme.css", &dest, recorded.as_deref())
             .await
             .expect_err("JSON must not overwrite the stylesheet");
+    }
+
+    // ── #2403: an explicit entry is served and guarded as declared ───────────
+
+    fn explicit_entry(content_type: &str, revalidate: Option<u64>) -> ManifestEntry {
+        ManifestEntry::new("logo.png/index.html")
+            .with_revalidate(revalidate)
+            .with_content_type(Some(content_type.to_owned()))
+            .with_content_type_explicit(true)
+    }
+
+    #[test]
+    fn explicit_generic_type_is_served_as_declared() {
+        let entry = explicit_entry("application/octet-stream", None);
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        assert_eq!(value, "application/octet-stream");
+    }
+
+    #[test]
+    fn explicit_entry_with_an_unusable_type_still_falls_back() {
+        let entry = explicit_entry("   ", None);
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        assert_eq!(value, "image/png");
+    }
+
+    #[test]
+    fn explicit_entry_with_a_non_ascii_type_falls_back() {
+        let entry = explicit_entry("image/p\u{e9}ng", None);
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        assert_eq!(value, "image/png");
+    }
+
+    /// The runtime byte rule the macro copies: tab and `0x20..0x7f`.
+    #[test]
+    fn legal_content_type_bytes_match_the_macro_rule() {
+        for b in 0..=255u8 {
+            let expected = b == b'\t' || (0x20..0x7f).contains(&b);
+            assert_eq!(is_legal_content_type_byte(b), expected, "byte {b:#x}");
+        }
+    }
+
+    /// Whole path: build with a declared type, serve through the layer, then
+    /// ISR with a handler that sets another header.
+    #[tokio::test]
+    async fn declared_type_survives_serving_and_isr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist_dir = dir.path().join("dist");
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "text/plain")], "b")
+        }));
+        let meta = crate::static_gen::StaticRouteMeta {
+            path: "/logo.png",
+            name: "logo",
+            revalidate: Some(3600),
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: Some("application/octet-stream"),
+        };
+        crate::static_gen::render_static_routes(router.clone(), &[meta], &dist_dir)
+            .await
+            .expect("render");
+
+        let layer = StaticFileLayer::new(&dist_dir).expect("layer");
+        let hit = layer.resolve_entry("/logo.png").expect("hit");
+        assert_eq!(hit.content_type, "application/octet-stream");
+
+        let manifest = StaticManifest::load(&dist_dir.join("manifest.json")).expect("manifest");
+        let entry = &manifest.routes["/logo.png"];
+        let expected = isr_expected_content_type(entry, "/logo.png", &hit.file_path);
+        regenerate_page(&router, "/logo.png", &hit.file_path, expected.as_deref())
+            .await
+            .expect("an explicit entry regenerates whatever the handler header says");
+    }
+
+    #[test]
+    fn inferred_generic_type_is_still_remapped() {
+        let value = resolved_content_type(
+            Some("application/octet-stream"),
+            "/logo.png",
+            Path::new("logo.png/index.html"),
+        );
+        assert_eq!(value, "image/png");
+    }
+
+    /// ISR skips the type guard for an explicit entry: the route attribute
+    /// pins the header, so the handler's own header is irrelevant.
+    #[test]
+    fn isr_does_not_guard_the_type_of_an_explicit_entry() {
+        let entry = explicit_entry("application/octet-stream", Some(1));
+        let file = Path::new("logo.png/index.html");
+        assert_eq!(isr_expected_content_type(&entry, "/logo.png", file), None);
+    }
+
+    /// An explicit flag with no usable type serves the derived type, so ISR
+    /// must guard that same type.
+    #[test]
+    fn isr_guards_the_fallback_type_of_an_unusable_explicit_entry() {
+        let file = Path::new("logo.png/index.html");
+        for bad in [None, Some(""), Some("   "), Some("image/p\u{e9}ng")] {
+            let entry = ManifestEntry::new("logo.png/index.html")
+                .with_content_type(bad.map(str::to_owned))
+                .with_content_type_explicit(true);
+            assert_eq!(
+                isr_expected_content_type(&entry, "/logo.png", file).as_deref(),
+                Some("image/png"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn isr_still_guards_the_type_of_an_inferred_entry() {
+        let entry = ManifestEntry::new("theme.css/index.html")
+            .with_content_type(Some("text/plain; charset=utf-8".to_owned()));
+        assert_eq!(
+            isr_expected_content_type(&entry, "/theme.css", Path::new("theme.css/index.html"))
+                .as_deref(),
+            Some("text/css; charset=utf-8")
+        );
     }
 
     #[test]
@@ -2091,6 +2256,7 @@ mod tests {
                 revalidate: Some(1),
                 params_fn: None,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
+                content_type: None,
             }],
             &dist,
         )
@@ -2188,6 +2354,7 @@ mod tests {
             revalidate: Some(1),
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
 
         // Old behavior: the build records the post-layer type ...

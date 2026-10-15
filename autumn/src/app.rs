@@ -2734,6 +2734,11 @@ impl AppBuilder {
     /// [`Experiments`]: crate::experiments::Experiments
     /// [`ExperimentStore`]: crate::experiments::ExperimentStore
     /// [`InMemoryExperimentStore`]: crate::experiments::InMemoryExperimentStore
+    ///
+    /// When the app installs the service, it calls
+    /// [`ExperimentStore::preload`](crate::experiments::ExperimentStore::preload) once and waits up to 10 seconds for it,
+    /// before job workers, startup hooks and requests. A failed preload logs a
+    /// warning; it does not stop startup.
     #[must_use]
     pub fn with_experiment_store<S>(self, store: S) -> Self
     where
@@ -2741,6 +2746,7 @@ impl AppBuilder {
     {
         let service = crate::experiments::ExperimentService::new(Arc::new(store) as Arc<_>);
         self.state_initializer(move |state| {
+            crate::experiments::preload_blocking(&service, crate::feature_flags::PRELOAD_WAIT);
             state.insert_extension(service);
         })
     }
@@ -2883,6 +2889,7 @@ impl AppBuilder {
         let service = crate::experiments::ExperimentService::new(Arc::new(store) as Arc<_>)
             .with_exposure_sink(sink);
         self.state_initializer(move |state| {
+            crate::experiments::preload_blocking(&service, crate::feature_flags::PRELOAD_WAIT);
             state.insert_extension(service);
         })
     }
@@ -17938,6 +17945,32 @@ mod tests {
     }
 
     #[test]
+    fn experiment_store_preloads_before_later_state_initializers() {
+        let store = Arc::new(crate::experiments::ProbeStore::default());
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let (seen_in, probe) = (Arc::clone(&seen), Arc::clone(&store));
+        let builder = app()
+            .with_experiment_store(Arc::clone(&store))
+            .state_initializer(move |_| {
+                let preloads = probe.preloads.load(std::sync::atomic::Ordering::SeqCst);
+                seen_in.store(preloads, std::sync::atomic::Ordering::SeqCst);
+            });
+        run_state_initializers(builder.state_initializers, &AppState::for_test());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn experiment_store_with_sink_preloads_too() {
+        let store = Arc::new(crate::experiments::ProbeStore::default());
+        let builder = app().with_experiment_store_and_sink(
+            Arc::clone(&store),
+            Arc::new(crate::experiments::NoOpExposureSink),
+        );
+        run_state_initializers(builder.state_initializers, &AppState::for_test());
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn static_builds_run_state_initializers_before_router_build() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let build_mode_start = source
@@ -19043,6 +19076,7 @@ mod tests {
             revalidate: None,
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         }
     }
 
@@ -19626,6 +19660,7 @@ mod tests {
                 revalidate: None,
                 params_fn: None,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
+                content_type: None,
             }],
             &dist,
         )
@@ -19736,6 +19771,7 @@ mod tests {
                     revalidate: None,
                     params_fn: None,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
+                    content_type: None,
                 }],
                 &dist,
             )
@@ -19864,6 +19900,7 @@ mod tests {
                 revalidate: None,
                 params_fn: None,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
+                content_type: None,
             }],
             &dist,
         )
@@ -20856,6 +20893,7 @@ mod tests {
                     revalidate: None,
                     params_fn: None,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
+                    content_type: None,
                 }],
                 &dist,
             )
@@ -21057,6 +21095,7 @@ mod tests {
             revalidate: None,
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         }];
         let builder = app().static_routes(metas);
         assert_eq!(builder.static_metas.len(), 1);
