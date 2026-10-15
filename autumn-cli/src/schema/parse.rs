@@ -598,6 +598,12 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
         }
     }
 
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if production_enabled(&field.attrs) {
+            syn::visit::visit_field(self, field);
+        }
+    }
+
     fn visit_variant(&mut self, variant: &'ast syn::Variant) {
         if production_enabled(&variant.attrs) {
             syn::visit::visit_variant(self, variant);
