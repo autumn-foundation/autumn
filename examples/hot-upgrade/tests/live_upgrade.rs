@@ -717,10 +717,7 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         // Pin the production drain budget. The `dev` profile uses 1 s, which is
         // shorter than the load window. The drain watchdog then exits 1 (#2372,
         // #2492). `wait_for_exit` still bounds the wait.
-        .env(
-            "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
-            PREDECESSOR_DRAIN_BUDGET_SECS.to_string(),
-        )
+        .envs([drain_budget_env()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
@@ -1045,6 +1042,14 @@ const POST_CUTOVER_LOAD: Duration = Duration::from_millis(3_500);
 /// exit 1 while load continues (issue #2492).
 const PREDECESSOR_DRAIN_BUDGET_SECS: u64 = 30;
 
+/// The env var and value that set the predecessor's drain budget.
+fn drain_budget_env() -> (&'static str, String) {
+    (
+        "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
+        PREDECESSOR_DRAIN_BUDGET_SECS.to_string(),
+    )
+}
+
 /// Why the predecessor's exit is a failure, or `None` for a clean exit 0.
 /// `None` input means it did not exit in time.
 fn exit_failure(exit: Option<std::process::ExitStatus>) -> Option<String> {
@@ -1069,12 +1074,12 @@ mod predecessor_exit_tests {
     use std::process::ExitStatus;
 
     #[test]
-    fn the_drain_budget_outlasts_the_post_cutover_load() {
+    fn the_spawn_env_sets_a_drain_budget_longer_than_the_post_cutover_load() {
         // Issue #2492: a shorter budget makes the watchdog exit 1 mid-load.
-        assert!(
-            Duration::from_secs(PREDECESSOR_DRAIN_BUDGET_SECS) > POST_CUTOVER_LOAD,
-            "the predecessor must be able to drain while load continues"
-        );
+        let (key, value) = drain_budget_env();
+        assert_eq!(key, "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS");
+        let secs: u64 = value.parse().expect("whole seconds");
+        assert!(Duration::from_secs(secs) > POST_CUTOVER_LOAD);
     }
 
     #[test]
