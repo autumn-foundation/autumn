@@ -5940,6 +5940,32 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
     }
 }
 
+/// The part of a crate version that must match for two versions to be
+/// compatible. It is the major version. Before 1.0 it is `0.minor`. Before 0.1
+/// it is `0.0.patch`. A prerelease matches only the same exact version, so it
+/// is the full version.
+fn compat_version(major: &str, minor: &str, patch: &str, pre: &str) -> String {
+    match (major, minor) {
+        _ if !pre.is_empty() => format!("{major}.{minor}.{patch}-{pre}"),
+        ("0", "0") => format!("0.0.{patch}"),
+        ("0", _) => format!("0.{minor}"),
+        _ => major.to_string(),
+    }
+}
+
+/// [`compat_version`] of the crate in compilation. Cargo sets these variables
+/// for the defining crate. The macro runs in that compilation.
+fn classified_compat_version() -> String {
+    let var = |name| std::env::var(name).unwrap_or_default();
+    let number = |name| std::env::var(name).unwrap_or_else(|_| "0".to_string());
+    compat_version(
+        &number("CARGO_PKG_VERSION_MAJOR"),
+        &number("CARGO_PKG_VERSION_MINOR"),
+        &number("CARGO_PKG_VERSION_PATCH"),
+        &var("CARGO_PKG_VERSION_PRE"),
+    )
+}
+
 /// An identifier's name with any raw-identifier prefix removed (`r#type` ->
 /// `type`), matching the DB column and the key callers pass to the
 /// field-name-driven accessors.
@@ -9067,6 +9093,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // One zero-sized marker per classified column. It names the field inside the
     // compiler diagnostic when a leak is attempted, keys a `declassify!` boundary
     // to exactly one column, and publishes the manifest row.
+    let compat_suffix = format!("@{}", classified_compat_version());
     let classified_items: Vec<TokenStream> = classified_columns
         .iter()
         .map(|(ident, col, marker)| {
@@ -9084,12 +9111,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 impl ::autumn_web::classify::ClassifiedField for #marker {
                     const MODEL: &'static str = stringify!(#name);
-                    // Module-qualified, because the manifest keys on this: two
-                    // linked crates can each define a `Customer` with a
-                    // classified `email`, and the bare name would merge them
-                    // into one row.
+                    // The path has module and crate version. The manifest
+                    // keys on it. Two linked crates, or two incompatible
+                    // versions of one crate, can each define a `Customer`
+                    // with a classified `email`. A bare name or module path
+                    // would merge them into one row.
                     const MODEL_PATH: &'static str =
-                        concat!(module_path!(), "::", stringify!(#name));
+                        concat!(module_path!(), #compat_suffix, "::", stringify!(#name));
                     const FIELD: &'static str = #col;
                     const CLASSIFICATION: ::autumn_web::classify::Classification =
                         ::autumn_web::classify::Classification::PersonalData;
@@ -9098,7 +9126,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::inventory::submit! {
                     ::autumn_web::classify::manifest::ClassifiedFieldDescriptor {
                         model: stringify!(#name),
-                        model_path: concat!(module_path!(), "::", stringify!(#name)),
+                        model_path: concat!(module_path!(), #compat_suffix, "::", stringify!(#name)),
                         field: #col,
                         classification: ::autumn_web::classify::Classification::PersonalData,
                     }
@@ -16813,13 +16841,42 @@ mod tests {
         );
         assert!(
             generated.contains("module_path !"),
-            "the manifest identity must be module-qualified so two `Customer`s \
-             in different crates cannot share a row: {generated}"
+            "the manifest identity must have module path and crate version so \
+             two `Customer`s cannot share a row: {generated}"
+        );
+        // This crate is the defining crate here, so its own version is the oracle.
+        let version = compat_version(
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+            env!("CARGO_PKG_VERSION_PATCH"),
+            env!("CARGO_PKG_VERSION_PRE"),
+        );
+        assert_eq!(
+            generated.matches(&format!("\"@{version}\"")).count(),
+            2,
+            "marker and descriptor must both carry the crate version: {generated}"
         );
         assert!(
             generated.contains("Classification :: PersonalData"),
             "{generated}"
         );
+    }
+
+    #[test]
+    fn compat_version_keeps_only_the_semver_incompatible_part() {
+        // A patch or compatible bump must not change the manifest key.
+        assert_eq!(compat_version("2", "7", "3", ""), "2");
+        assert_eq!(compat_version("1", "0", "9", ""), "1");
+        // Before 1.0 a minor bump is the breaking one.
+        assert_eq!(compat_version("0", "8", "4", ""), "0.8");
+        // Before 0.1 each patch release is incompatible.
+        assert_eq!(compat_version("0", "0", "1", ""), "0.0.1");
+        assert_eq!(compat_version("0", "0", "2", ""), "0.0.2");
+        // Cargo matches a prerelease only with the same exact version.
+        assert_eq!(compat_version("1", "0", "0", "alpha.1"), "1.0.0-alpha.1");
+        assert_eq!(compat_version("1", "0", "0", "beta.1"), "1.0.0-beta.1");
+        assert_eq!(compat_version("1", "1", "0", "alpha.1"), "1.1.0-alpha.1");
+        assert_eq!(compat_version("0", "8", "0", "rc.1"), "0.8.0-rc.1");
     }
 
     #[test]

@@ -11764,7 +11764,9 @@ fn dialable_endpoint(addr: &str) -> String {
 /// endpoint is `<transport> <address>` split on the FIRST space only, so a Unix
 /// socket path containing spaces survives the round trip. An empty endpoint
 /// emits no second line at all, rather than a blank one a reader could mistake
-/// for an address.
+/// for an address. The last line, `capability shutdown-signal`, shows that the
+/// app watches the shutdown-signal file; see
+/// [`serve_ready_advertises_shutdown_signal`].
 ///
 /// Public because it *is* the wire format between the app and its supervisor:
 /// `autumn-cli`'s `parse_ready_payload` round-trips against this exact function,
@@ -11774,9 +11776,26 @@ fn dialable_endpoint(addr: &str) -> String {
 pub fn serve_ready_payload(drain_budget_secs: u64, bound_endpoint: &str) -> String {
     let endpoint = bound_endpoint.trim();
     if endpoint.is_empty() {
-        return drain_budget_secs.to_string();
+        return format!("{drain_budget_secs}\n{SHUTDOWN_SIGNAL_CAPABILITY_LINE}");
     }
-    format!("{drain_budget_secs}\n{endpoint}")
+    format!("{drain_budget_secs}\n{endpoint}\n{SHUTDOWN_SIGNAL_CAPABILITY_LINE}")
+}
+
+/// The ready-file line that says this app watches `AUTUMN_SHUTDOWN_SIGNAL_FILE`.
+///
+/// Written only after the watcher is armed. A supervisor that finds a ready file
+/// without it and without an endpoint line knows the app predates the signal
+/// file (#2458). An older supervisor reads `capability` as an unknown transport
+/// and ignores the line. Only `autumn dev` on non-Unix reads it; elsewhere the
+/// line is harmless.
+const SHUTDOWN_SIGNAL_CAPABILITY_LINE: &str = "capability shutdown-signal";
+
+/// Whether a ready file says the app drains when asked through the signal file.
+#[must_use]
+pub fn serve_ready_advertises_shutdown_signal(payload: &str) -> bool {
+    payload
+        .lines()
+        .any(|line| line.trim() == SHUTDOWN_SIGNAL_CAPABILITY_LINE)
 }
 
 /// Prepare a Unix-socket path for binding: remove a *stale* socket left by a
@@ -16873,10 +16892,46 @@ mod tests {
 
     #[test]
     fn serve_ready_payload_never_emits_a_bare_newline_for_an_unknown_endpoint() {
-        // An empty endpoint must not leave a blank second line a reader could
-        // mistake for an address.
+        // An empty endpoint must not leave a blank line a reader could mistake
+        // for an address. The capability line fills line two.
         let payload = serve_ready_payload(7, "");
-        assert_eq!(payload.lines().count(), 1, "{payload:?}");
+        assert!(payload.lines().all(|l| !l.trim().is_empty()), "{payload:?}");
+        assert_eq!(
+            payload.lines().nth(1),
+            Some(SHUTDOWN_SIGNAL_CAPABILITY_LINE)
+        );
+    }
+
+    #[test]
+    fn serve_ready_payload_advertises_the_shutdown_signal_capability() {
+        for endpoint in ["tcp 127.0.0.1:3000", ""] {
+            let payload = serve_ready_payload(35, endpoint);
+            assert!(
+                serve_ready_advertises_shutdown_signal(&payload),
+                "{payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capability_line_never_displaces_the_endpoint_line() {
+        let payload = serve_ready_payload(35, "tcp 127.0.0.1:3000");
+        assert_eq!(payload.lines().nth(1), Some("tcp 127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn a_budget_only_ready_file_does_not_advertise_the_capability() {
+        // An app that predates the signal protocol still wrote this much.
+        for old in ["35", "35\n", "35\ntcp 127.0.0.1:3000", ""] {
+            assert!(!serve_ready_advertises_shutdown_signal(old), "{old:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrelated_capability_is_not_the_shutdown_signal() {
+        assert!(!serve_ready_advertises_shutdown_signal(
+            "35\ncapability other"
+        ));
     }
 
     // ── Cooperative external shutdown (#1616) ──────────────────────────────
