@@ -478,6 +478,49 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
         }
     }
 
+    // A test-only item of any kind can hold a fixture model. Skip it whole.
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if production_enabled(&item.attrs) {
+            syn::visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if production_enabled(&item.attrs) {
+            syn::visit::visit_item_impl(self, item);
+        }
+    }
+
+    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+        if production_enabled(&item.attrs) {
+            syn::visit::visit_item_trait(self, item);
+        }
+    }
+
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        if production_enabled(&item.attrs) {
+            syn::visit::visit_item_const(self, item);
+        }
+    }
+
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        if production_enabled(&item.attrs) {
+            syn::visit::visit_item_static(self, item);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if production_enabled(&item.attrs) {
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if production_enabled(&item.attrs) {
+            syn::visit::visit_trait_item_fn(self, item);
+        }
+    }
+
     fn visit_item_struct(&mut self, item_struct: &'ast syn::ItemStruct) {
         if !production_enabled(&item_struct.attrs) {
             return;
@@ -2491,6 +2534,29 @@ mod tests {
         )
         .expect("parse");
         assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A test-only item of any kind can hold a fixture model.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_items_of_every_kind() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[cfg(test)] fn a() { #[model] struct U { #[id] id: i64, #[encrypted] email: String } }
+            #[cfg(test)] impl X { fn b() { #[model] struct V { #[id] id: i64, #[encrypted] e: String } } }
+            struct X;
+            impl X {
+                #[cfg(test)] fn c() { #[model] struct W { #[id] id: i64, #[encrypted] f: String } }
+            }
+            trait T {
+                #[cfg(test)] fn d() { #[model] struct Y { #[id] id: i64, #[encrypted] g: String } }
+            }
+            #[cfg(test)] const K: () = { #[model] struct Z { #[id] id: i64, #[encrypted] h: String } };
+            #[cfg(test)] static S: () = { #[model] struct Q { #[id] id: i64, #[encrypted] i: String } };
+            #[cfg(test)] trait TT { fn e() { #[model] struct R { #[id] id: i64, #[encrypted] j: String } } }
+            "#,
+        )
+        .expect("parse");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// A file reached only through `#[cfg(test)] mod x;` is test code.
