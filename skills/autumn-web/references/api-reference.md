@@ -348,7 +348,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `versioned`/`ledgered` does not compile against a classified model, and durable
   commit hooks refuse the payload at runtime — both snapshot the whole record.
   Generated: the field marker + `classify::ClassifiedField` impl (with a
-  `module_path!()`-qualified `MODEL_PATH`), a
+  `MODEL_PATH` made from `module_path!()` and the crate version), a
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.

@@ -2,82 +2,52 @@ use axum::extract::ConnectInfo;
 use axum::http::Request;
 use std::net::{IpAddr, SocketAddr};
 
-// Clone class (issues #2452, #2929): this `TrustedProxy` is a byte-identical
-// duplicate of the private `crate::security::trusted_proxies::TrustedProxy` —
-// same CIDR parse/contains logic, down to the shift arithmetic. The two were
-// never the same decision made once: `trusted_proxies::TrustedProxy` is the
-// one actually wired into `ProxyResolver`/`TrustedProxiesLayer` and carries
-// the proptest fuzz harness added in #1690 (parse-never-panics, round-trip);
-// this copy has only example-based unit tests and, per an exhaustive grep,
-// zero production callers of its own — `extract_client_ip` below is never
-// invoked from framework code either. Fix a bug in one copy's CIDR matching
-// and the other stays stale unless someone remembers to mirror it by hand.
-// Deprecating or removing this dead copy touches a `pub` surface (semver,
-// changelog, migration guide), so it is a human decision, not a merge an
-// unattended run should make; this comment exists so the next person doesn't
-// mistake it for live code.
+use crate::security::trusted_proxies::CidrRange;
+
+/// A trusted-proxy CIDR range.
+///
+/// Nothing in the framework uses this type. Use
+/// [`ProxyResolver`](crate::security::ProxyResolver) instead.
+/// `ProxyResolver` uses the same matcher.
+#[deprecated(
+    since = "0.9.0",
+    note = "use `ProxyResolver`; this type will be removed in the next breaking release"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedProxy {
     pub network: IpAddr,
     pub prefix_len: u8,
 }
 
+#[allow(deprecated)]
 impl TrustedProxy {
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let (addr, prefix_len) = if let Some((addr, prefix)) = trimmed.split_once('/') {
-            let addr = addr.trim().parse::<IpAddr>().ok()?;
-            let prefix_len = prefix.trim().parse::<u8>().ok()?;
-            (addr, prefix_len)
-        } else {
-            let addr = trimmed.parse::<IpAddr>().ok()?;
-            let prefix_len = match addr {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            (addr, prefix_len)
-        };
-
-        let max_prefix = match addr {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-
-        (prefix_len <= max_prefix).then_some(Self {
-            network: addr,
-            prefix_len,
+        CidrRange::parse(value).map(|r| Self {
+            network: r.network,
+            prefix_len: r.prefix_len,
         })
     }
 
     #[must_use]
     pub fn contains(&self, ip: IpAddr) -> bool {
-        if self.prefix_len == 0 {
-            return matches!(
-                (self.network, ip),
-                (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
-            );
+        CidrRange {
+            network: self.network,
+            prefix_len: self.prefix_len,
         }
-
-        match (self.network, ip) {
-            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
-                let shift = 32_u8.saturating_sub(self.prefix_len);
-                (u32::from(network) >> shift) == (u32::from(candidate) >> shift)
-            }
-            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
-                let shift = 128_u8.saturating_sub(self.prefix_len);
-                (u128::from(network) >> shift) == (u128::from(candidate) >> shift)
-            }
-            (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
-        }
+        .contains(ip)
     }
 }
 
 /// Extract the originating client IP from a request, honoring the trusted-proxy policy.
+///
+/// Nothing in the framework uses this function. Use
+/// [`ProxyResolver`](crate::security::ProxyResolver) instead.
+#[deprecated(
+    since = "0.9.0",
+    note = "use `ProxyResolver`; this function will be removed in the next breaking release"
+)]
+#[allow(deprecated)]
 pub fn extract_client_ip<B>(
     req: &Request<B>,
     trust_forwarded_headers: bool,
@@ -133,6 +103,7 @@ pub fn extract_client_ip<B>(
     peer_ip
 }
 
+#[allow(deprecated)]
 fn client_ip_from_x_forwarded_for(
     header: &str,
     peer_ip: Option<IpAddr>,
@@ -166,6 +137,7 @@ fn client_ip_from_x_forwarded_for(
     None
 }
 
+#[allow(deprecated)]
 fn is_trusted_proxy(ip: IpAddr, trusted_proxies: &[TrustedProxy]) -> bool {
     trusted_proxies
         .iter()
@@ -173,6 +145,7 @@ fn is_trusted_proxy(ip: IpAddr, trusted_proxies: &[TrustedProxy]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -272,6 +245,54 @@ mod tests {
 
         let proxy6 = TrustedProxy::parse("2001:db8::/32").unwrap();
         assert!(!proxy6.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    // One CIDR rule: the deprecated type must agree with `CidrRange`.
+    mod single_matcher {
+        use super::*;
+        use crate::security::trusted_proxies::CidrRange;
+        use proptest::prelude::*;
+
+        fn spec() -> impl Strategy<Value = String> {
+            let ip = prop_oneof![
+                any::<u32>().prop_map(|n| std::net::Ipv4Addr::from(n).to_string()),
+                any::<u128>().prop_map(|n| std::net::Ipv6Addr::from(n).to_string()),
+            ];
+            (ip, proptest::option::of(0u16..=200), "[ \t]{0,2}").prop_map(|(ip, p, pad)| {
+                p.map_or_else(
+                    || format!("{pad}{ip}{pad}"),
+                    |p| format!("{pad}{ip}/{p}{pad}"),
+                )
+            })
+        }
+
+        fn candidate() -> impl Strategy<Value = IpAddr> {
+            prop_oneof![
+                any::<u32>().prop_map(|n| IpAddr::from(std::net::Ipv4Addr::from(n))),
+                any::<u128>().prop_map(|n| IpAddr::from(std::net::Ipv6Addr::from(n))),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            #[test]
+            fn parse_agrees_with_cidr_range(s in prop_oneof![spec(), ".*"]) {
+                let old = TrustedProxy::parse(&s).map(|p| (p.network, p.prefix_len));
+                let new = CidrRange::parse(&s).map(|p| (p.network, p.prefix_len));
+                prop_assert_eq!(old, new);
+            }
+
+            #[test]
+            fn contains_agrees_with_cidr_range(s in spec(), ip in candidate()) {
+                let old = TrustedProxy::parse(&s);
+                let new = CidrRange::parse(&s);
+                prop_assert_eq!(old.is_some(), new.is_some());
+                if let (Some(old), Some(new)) = (old, new) {
+                    prop_assert_eq!(old.contains(ip), new.contains(ip));
+                }
+            }
+        }
     }
 
     fn make_req_with_peer(ip: &str) -> Request<()> {

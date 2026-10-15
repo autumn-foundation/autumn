@@ -146,8 +146,8 @@ Two behaviours differ, both deliberate:
   request a drain; the runtime then runs the same graceful shutdown a signal
   triggers on Unix, so `on_shutdown` hooks — including managed Postgres teardown
   — actually run. The wait is the app's own configured budget
-  (`prestop_grace_secs + shutdown_timeout_secs`) plus headroom for the hooks
-  that run after the drain, not a fixed constant. If the app misses it,
+  (`prestop_grace_secs + shutdown_timeout_secs`) plus headroom for the
+  managed-Postgres stop that runs after the drain, not a fixed constant. If the app misses it,
   `autumn dev` force-stops it and prints a warning saying the hooks may not have
   run. If a user reports that warning, the app is genuinely hanging in shutdown;
   it is not a false alarm. The variable is honored on non-Unix targets only.

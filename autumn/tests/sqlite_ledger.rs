@@ -71,6 +71,23 @@ mod schema {
     }
 
     autumn_web::reexports::diesel::table! {
+        lg_renamed_notes (id) {
+            id -> Int8,
+            title -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
+        lg_sealed_notes (id) {
+            id -> Int8,
+            body -> Text,
+            secret -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
         lg_vault_notes (id) {
             id -> Int8,
             body -> Text,
@@ -125,7 +142,7 @@ mod schema {
 
 use schema::{
     lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_invoices, lg_movable_invoices,
-    lg_secret_notes, lg_tenant_invoices, lg_vault_notes,
+    lg_renamed_notes, lg_sealed_notes, lg_secret_notes, lg_tenant_invoices, lg_vault_notes,
 };
 
 #[autumn_web::model(table = "lg_invoices")]
@@ -211,6 +228,76 @@ pub struct LgEffectiveNote {
     ledgered(valid_time = "effective_at")
 )]
 pub trait LgEffectiveNoteRepository {}
+
+/// A model at snapshot schema version 2. Version 1 called `title` `subject` (#2326).
+#[autumn_web::model(table = "lg_renamed_notes")]
+#[derive(PartialEq, Eq)]
+pub struct LgRenamedNote {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+/// Convert a version 1 snapshot. A `legacy_flag` marks a shape with no rule.
+fn upcast_lg_renamed_note(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+    if from < 2 {
+        let object = snapshot
+            .as_object_mut()
+            .ok_or("the snapshot is not an object")?;
+        if object.contains_key("legacy_flag") {
+            return Err("a legacy shape with no rule".to_string());
+        }
+        let subject = object
+            .remove("subject")
+            .ok_or("the snapshot has no `subject`")?;
+        object.insert("title".to_string(), subject);
+    }
+    Ok(())
+}
+
+#[autumn_web::repository(
+    LgRenamedNote,
+    table = "lg_renamed_notes",
+    soft_delete,
+    ledgered(schema_version = 2, upcast = upcast_lg_renamed_note)
+)]
+pub trait LgRenamedNoteRepository {}
+
+/// A model at snapshot schema version 2 with an encrypted column. Version 1
+/// called the column `hidden` (#2326).
+#[autumn_web::model(table = "lg_sealed_notes")]
+pub struct LgSealedNote {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    #[encrypted]
+    pub secret: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+fn upcast_lg_sealed_note(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+    if from < 2 {
+        let object = snapshot
+            .as_object_mut()
+            .ok_or("the snapshot is not an object")?;
+        let hidden = object
+            .remove("hidden")
+            .ok_or("the snapshot has no `hidden`")?;
+        object.insert("secret".to_string(), hidden);
+    }
+    Ok(())
+}
+
+#[autumn_web::repository(
+    LgSealedNote,
+    table = "lg_sealed_notes",
+    soft_delete,
+    ledgered(schema_version = 2, upcast = upcast_lg_sealed_note)
+)]
+pub trait LgSealedNoteRepository {}
 
 // ── A hard-deleting parent cascading into a ledgered child ───────────
 //
@@ -405,6 +492,17 @@ async fn boot_pool_without_high_water(db_name: &str) -> SqlitePool {
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  body TEXT NOT NULL, \
                  internal_note TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            "CREATE TABLE lg_renamed_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 title TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            "CREATE TABLE lg_sealed_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 body TEXT NOT NULL, \
+                 secret TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
             "CREATE TABLE lg_effective_notes (\
@@ -4041,4 +4139,368 @@ async fn a_duplicate_key_snapshot_is_reported_as_not_canonical() {
     let report = repo.ledger_verify(id).await.expect("verify reports it");
     let broken = report.broken.expect("duplicate key");
     assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
+}
+
+// ── #2326: schema versions and upcasting ─────────────────────────────
+
+/// Rewrite a record's chain as an older writer would have written it.
+///
+/// `edit` changes each snapshot. Then every revision is re-linked and re-hashed,
+/// and the high-water mark follows. So `ledger_verify` sees a valid chain.
+async fn age_chain(
+    pool: &SqlitePool,
+    table: &str,
+    revisions: Vec<autumn_web::ledger::LedgerRevision>,
+    mut edit: impl FnMut(i64, &mut serde_json::Map<String, serde_json::Value>),
+) {
+    let record_id = revisions[0].record_id;
+    let mut previous: Option<String> = None;
+    for mut revision in revisions {
+        edit(
+            revision.seq,
+            revision.snapshot.as_object_mut().expect("object"),
+        );
+        revision.prev_hash.clone_from(&previous);
+        revision.hash = revision.compute_hash();
+        previous = Some(revision.hash.clone());
+        let mut conn = pool.get().await.expect("conn");
+        let changed = diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ?, prev_hash = ?, hash = ? \
+             WHERE table_name = ? AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&revision.snapshot))
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(revision.prev_hash)
+        .bind::<diesel::sql_types::Text, _>(revision.hash)
+        .bind::<diesel::sql_types::Text, _>(table)
+        .bind::<diesel::sql_types::BigInt, _>(record_id)
+        .bind::<diesel::sql_types::BigInt, _>(revision.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("rewrite the revision");
+        assert_eq!(changed, 1, "exactly one stored revision is rewritten");
+    }
+    resync_high_water_mark(pool, table, record_id).await;
+}
+
+/// Version 2 wrote `title`. Make a snapshot look like version 1 wrote it.
+fn as_version_one(snapshot: &mut serde_json::Map<String, serde_json::Value>) {
+    snapshot.remove(autumn_web::ledger::SNAPSHOT_SCHEMA_KEY);
+    let title = snapshot.remove("title").expect("title");
+    snapshot.insert("subject".to_string(), title);
+}
+
+async fn write_note_chain(repo: &PgLgRenamedNoteRepository) -> i64 {
+    let created = repo
+        .save(&NewLgRenamedNote {
+            title: "a".to_string(),
+        })
+        .await
+        .expect("insert");
+    for title in ["b", "c"] {
+        tick().await;
+        repo.update(
+            created.id,
+            &UpdateLgRenamedNote {
+                title: Patch::Set(title.to_string()),
+            },
+        )
+        .await
+        .expect("update");
+    }
+    created.id
+}
+
+#[tokio::test]
+async fn a_versioned_model_stamps_its_schema_version_into_each_revision() {
+    let pool = boot_pool("lg_schema_stamp").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(revisions.len(), 3);
+    for revision in &revisions {
+        assert_eq!(
+            revision.snapshot[autumn_web::ledger::SNAPSHOT_SCHEMA_KEY],
+            serde_json::json!(2),
+            "revision {}",
+            revision.seq
+        );
+    }
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+
+    // A model that never declared a version writes no marker.
+    let plain = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let plain_id = write_three_revisions(&plain).await;
+    let first = plain.ledger_revisions(plain_id).await.expect("revisions");
+    assert!(
+        first[0]
+            .snapshot
+            .get(autumn_web::ledger::SNAPSHOT_SCHEMA_KEY)
+            .is_none(),
+        "a version 1 model keeps its snapshots as they were"
+    );
+}
+
+#[tokio::test]
+async fn a_revision_written_under_an_older_schema_is_converted_by_the_hook() {
+    let pool = boot_pool("lg_schema_upcast").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let first_at = revisions[0].recorded_at;
+    age_chain(&pool, "lg_renamed_notes", revisions, |seq, snapshot| {
+        if seq == 1 {
+            as_version_one(snapshot);
+        }
+    })
+    .await;
+
+    let then = repo
+        .ledger_as_of(id, first_at)
+        .await
+        .expect("an old revision still reads")
+        .expect("state");
+    assert_eq!(then.title, "a", "the renamed field carries its value");
+    let latest = repo
+        .ledger_as_of(id, now())
+        .await
+        .expect("a current revision reads")
+        .expect("state");
+    assert_eq!(latest.title, "c");
+}
+
+#[tokio::test]
+async fn verify_does_not_accuse_a_record_whose_head_predates_a_schema_change() {
+    let pool = boot_pool("lg_schema_verify").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    // Every revision, the head too, was written by version 1.
+    age_chain(&pool, "lg_renamed_notes", revisions, |_, snapshot| {
+        as_version_one(snapshot);
+    })
+    .await;
+
+    // Note: this test alone does not prove that verify runs the hook.
+    // `verify_still_sees_a_changed_value_after_a_schema_change` does.
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "a deploy is not tampering: {report:?}");
+}
+
+/// A column the head never recorded is not compared, when the model declares a
+/// newer schema version than the head. A deploy then is not tampering.
+#[tokio::test]
+async fn verify_ignores_a_column_added_after_the_head_was_written() {
+    let pool = boot_pool("lg_schema_new_column").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    // Version 1 had no `deleted_at`. The live row has it.
+    age_chain(&pool, "lg_renamed_notes", revisions, |_, snapshot| {
+        as_version_one(snapshot);
+        assert!(snapshot.remove("deleted_at").is_some());
+    })
+    .await;
+
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+}
+
+/// Without a schema version bump, a column the head lacks is a difference. So an
+/// out-of-band edit to it is found. It must not hide behind the tolerance that a
+/// declared schema change earns.
+#[tokio::test]
+async fn verify_is_strict_for_a_head_at_the_current_schema_version() {
+    let pool = boot_pool("lg_schema_strict").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    // The marker stays at 2. Only `deleted_at` is missing from the snapshots.
+    age_chain(&pool, "lg_renamed_notes", revisions, |_, snapshot| {
+        assert!(snapshot.remove("deleted_at").is_some());
+    })
+    .await;
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a column the head lacks is a difference at the current version");
+    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+}
+
+/// Delete and restore revisions carry the schema version, like any other.
+#[tokio::test]
+async fn delete_and_restore_revisions_carry_the_schema_version() {
+    let pool = boot_pool("lg_schema_delete_restore").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool);
+    let id = write_note_chain(&repo).await;
+    repo.delete_by_id(id).await.expect("soft delete");
+    repo.restore(id).await.expect("restore");
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(
+        revisions.iter().map(|r| r.op).collect::<Vec<_>>(),
+        vec![
+            VersionOp::Insert,
+            VersionOp::Update,
+            VersionOp::Update,
+            VersionOp::Delete,
+            VersionOp::Update,
+        ]
+    );
+    for revision in &revisions {
+        assert_eq!(
+            revision.snapshot[autumn_web::ledger::SNAPSHOT_SCHEMA_KEY],
+            serde_json::json!(2),
+            "revision {} ({:?})",
+            revision.seq,
+            revision.op
+        );
+    }
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
+/// The hook runs before the key check, so it can rename an encrypted column.
+/// The envelope moves as it is, and it still decrypts.
+#[tokio::test]
+async fn a_hook_can_rename_an_encrypted_column() {
+    let pool = boot_pool("lg_schema_sealed").await;
+    let repo = PgLgSealedNoteRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&NewLgSealedNote {
+            body: "public".to_string(),
+            secret: "the secret".to_string(),
+        })
+        .await
+        .expect("insert");
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    let first_at = revisions[0].recorded_at;
+    age_chain(&pool, "lg_sealed_notes", revisions, |_, snapshot| {
+        snapshot.remove(autumn_web::ledger::SNAPSHOT_SCHEMA_KEY);
+        let envelope = snapshot.remove("secret").expect("secret");
+        snapshot.insert("hidden".to_string(), envelope);
+    })
+    .await;
+
+    let then = repo
+        .ledger_as_of(created.id, first_at)
+        .await
+        .expect("the renamed column still decrypts")
+        .expect("state");
+    assert_eq!(then.secret, "the secret");
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+}
+
+#[tokio::test]
+async fn verify_still_sees_a_changed_value_after_a_schema_change() {
+    let pool = boot_pool("lg_schema_still_sees").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    age_chain(&pool, "lg_renamed_notes", revisions, |_, snapshot| {
+        as_version_one(snapshot);
+    })
+    .await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query("UPDATE lg_renamed_notes SET title = 'edited' WHERE id = ?")
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut *conn)
+            .await
+            .expect("edit the live row out of band");
+    }
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("an out-of-band edit is still found");
+    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+}
+
+#[tokio::test]
+async fn a_hook_that_refuses_a_shape_is_a_schema_error_and_verify_stays_quiet() {
+    let pool = boot_pool("lg_schema_hook_refuses").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let first_at = revisions[0].recorded_at;
+    age_chain(&pool, "lg_renamed_notes", revisions, |seq, snapshot| {
+        as_version_one(snapshot);
+        if seq == 1 {
+            snapshot.insert("legacy_flag".to_string(), serde_json::json!(true));
+        }
+    })
+    .await;
+
+    let err = repo
+        .ledger_as_of(id, first_at)
+        .await
+        .expect_err("the hook refuses revision 1");
+    let text = err.to_string();
+    assert!(text.contains("a legacy shape with no rule"), "{text}");
+    assert!(text.contains("current model schema"), "{text}");
+    assert!(
+        !text.contains("unreadable"),
+        "schema trouble is not tamper evidence: {text}"
+    );
+    // The chain itself is sound.
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
+#[tokio::test]
+async fn a_revision_from_a_newer_model_reports_both_versions() {
+    let pool = boot_pool("lg_schema_newer").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let first_at = revisions[0].recorded_at;
+    // A newer deploy renamed `title` again and wrote version 9.
+    age_chain(&pool, "lg_renamed_notes", revisions, |seq, snapshot| {
+        if seq == 1 {
+            snapshot.insert(
+                autumn_web::ledger::SNAPSHOT_SCHEMA_KEY.to_string(),
+                serde_json::json!(9),
+            );
+            let title = snapshot.remove("title").expect("title");
+            snapshot.insert("heading".to_string(), title);
+        }
+    })
+    .await;
+
+    let text = repo
+        .ledger_as_of(id, first_at)
+        .await
+        .expect_err("the model cannot read version 9")
+        .to_string();
+    assert!(text.contains("schema version 9"), "{text}");
+    assert!(text.contains("model is at 2"), "{text}");
+    assert!(text.contains("newer"), "{text}");
+}
+
+#[tokio::test]
+async fn a_diff_across_a_schema_boundary_compares_both_sides_in_the_current_shape() {
+    let pool = boot_pool("lg_schema_boundary_diff").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let (from, to) = (revisions[0].recorded_at, revisions[2].recorded_at);
+    // Revision 1 predates the rename. Revisions 2 and 3 do not.
+    age_chain(&pool, "lg_renamed_notes", revisions, |seq, snapshot| {
+        if seq == 1 {
+            as_version_one(snapshot);
+        }
+    })
+    .await;
+
+    let diff = repo
+        .ledger_diff(id, from, to)
+        .await
+        .expect("diff is defined");
+    assert_eq!((diff.from_seq, diff.to_seq), (Some(1), Some(3)));
+    let fields: Vec<&str> = diff.changes.iter().map(|c| c.column.as_str()).collect();
+    assert_eq!(fields, vec!["title"], "only the real change: {fields:?}");
 }
