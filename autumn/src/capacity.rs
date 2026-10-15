@@ -36,6 +36,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config::normalize_profile_name;
+
 /// Schema version of the `capacity.lock` document.
 ///
 /// A contract declaring a *higher* version is rejected rather than
@@ -542,6 +544,19 @@ impl CapacityContract {
         }
         (self.envelope.admission_limit > 0).then_some(self.envelope.admission_limit)
     }
+
+    /// Whether the contract was calibrated under the `running` profile.
+    ///
+    /// Both names go through [`normalize_profile_name`], so `production` and
+    /// `PROD` compare equal. An unnamed running profile cannot be compared,
+    /// so it counts as a match. A blank contract profile never matches a named one.
+    #[must_use]
+    pub(crate) fn calibrated_under(&self, running: Option<&str>) -> bool {
+        let Some(running) = running.and_then(normalize_profile_name) else {
+            return true;
+        };
+        normalize_profile_name(&self.calibration.profile).is_some_and(|own| own == running)
+    }
 }
 
 /// Resolve the ceiling from an app's `[server]` settings.
@@ -562,27 +577,42 @@ pub fn resolve_configured_admission_limit(
 }
 
 /// [`resolve_configured_admission_limit`] with a profile default ceiling
-/// (#3057). See [`resolve_admission_limit_with_default`] for the precedence.
+/// (#3057). It does not check the calibrated profile. For that, use
+/// [`resolve_configured_admission_limit_for_profile`].
 #[must_use]
 pub fn resolve_configured_admission_limit_with_default(
     explicit: Option<usize>,
     contract_path: Option<&str>,
     profile_default: Option<usize>,
 ) -> AdmissionLimit {
+    resolve_configured_admission_limit_for_profile(explicit, contract_path, profile_default, None)
+}
+
+/// [`resolve_configured_admission_limit_with_default`] that also checks the
+/// contract was calibrated under `running_profile` (#2418).
+#[must_use]
+pub fn resolve_configured_admission_limit_for_profile(
+    explicit: Option<usize>,
+    contract_path: Option<&str>,
+    profile_default: Option<usize>,
+    running_profile: Option<&str>,
+) -> AdmissionLimit {
     let path = contract_path.filter(|p| !p.is_empty());
     if explicit.is_some() || path.is_none() {
-        return resolve_admission_limit_with_default(
+        return resolve_admission_limit_for_profile(
             explicit,
             None,
             &HostProfile::EMPTY,
             profile_default,
+            running_profile,
         );
     }
-    resolve_admission_limit_with_default(
+    resolve_admission_limit_for_profile(
         explicit,
         path.map(Path::new),
         &HostProfile::detect(),
         profile_default,
+        running_profile,
     )
 }
 
@@ -700,6 +730,22 @@ pub fn resolve_admission_limit_with_default(
     host: &HostProfile,
     profile_default: Option<usize>,
 ) -> AdmissionLimit {
+    resolve_admission_limit_for_profile(explicit, contract_path, host, profile_default, None)
+}
+
+/// [`resolve_admission_limit_with_default`] that also checks the profile (#2418).
+///
+/// If the contract was calibrated under a different profile than
+/// `running_profile`, it gives no limit. The function then returns the
+/// fallback, as it does for a host mismatch. `None` skips the check.
+#[must_use]
+pub fn resolve_admission_limit_for_profile(
+    explicit: Option<usize>,
+    contract_path: Option<&Path>,
+    host: &HostProfile,
+    profile_default: Option<usize>,
+    running_profile: Option<&str>,
+) -> AdmissionLimit {
     let fallback = profile_default
         .filter(|n| *n > 0)
         .map_or(AdmissionLimit::Unlimited, AdmissionLimit::ProfileDefault);
@@ -727,6 +773,18 @@ pub fn resolve_admission_limit_with_default(
             return fallback;
         }
     };
+
+    if !contract.calibrated_under(running_profile) {
+        tracing::warn!(
+            path = %path.display(),
+            contract_profile = %contract.calibration.profile,
+            running_profile = running_profile.unwrap_or_default(),
+            fallback = fallback.source(),
+            "capacity contract was calibrated under another profile, so \
+             the fallback admission limit applies"
+        );
+        return fallback;
+    }
 
     if let Some(limit) = contract.admission_limit_for_host(host) {
         AdmissionLimit::Contract(limit)
@@ -1147,6 +1205,113 @@ mod tests {
         assert_eq!(
             resolve_configured_admission_limit_with_default(Some(0), None, Some(320)),
             AdmissionLimit::Unlimited
+        );
+    }
+
+    // ── calibrated profile (#2418) ──────────────────────────────────────
+
+    fn local_contract_under(profile: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let mut contract = sample_contract();
+        contract.host = HostProfile::detect();
+        contract.calibration.profile = profile.to_owned();
+        write_contract(&contract)
+    }
+
+    #[test]
+    fn a_contract_calibrated_under_another_profile_fails_open() {
+        let (_dir, path) = local_contract_under("staging");
+        let host = HostProfile::detect();
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, Some(320), Some("prod")),
+            AdmissionLimit::ProfileDefault(320)
+        );
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some("prod")),
+            AdmissionLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn a_contract_calibrated_under_the_running_profile_is_enforced() {
+        let (_dir, path) = local_contract_under("prod");
+        let host = HostProfile::detect();
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, Some(320), Some("prod")),
+            AdmissionLimit::Contract(64)
+        );
+    }
+
+    #[test]
+    fn profile_aliases_and_case_compare_equal() {
+        let (_dir, path) = local_contract_under("production");
+        let host = HostProfile::detect();
+        for running in ["prod", "PROD", " production "] {
+            assert_eq!(
+                resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some(running)),
+                AdmissionLimit::Contract(64),
+                "{running}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_profile_names_must_match_exactly() {
+        let (_dir, path) = local_contract_under("staging");
+        let host = HostProfile::detect();
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some("staging")),
+            AdmissionLimit::Contract(64)
+        );
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some("Staging")),
+            AdmissionLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn a_blank_calibrated_profile_matches_no_named_profile() {
+        let (_dir, path) = local_contract_under("  ");
+        let host = HostProfile::detect();
+        assert_eq!(
+            resolve_admission_limit_for_profile(None, Some(&path), &host, None, Some("prod")),
+            AdmissionLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn an_unknown_runtime_profile_skips_the_profile_check() {
+        let (_dir, path) = local_contract_under("staging");
+        let host = HostProfile::detect();
+        for running in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                resolve_admission_limit_for_profile(None, Some(&path), &host, None, running),
+                AdmissionLimit::Contract(64),
+                "{running:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_configured_wrapper_checks_the_profile() {
+        let (_dir, path) = local_contract_under("staging");
+        let path = path.to_str().expect("utf-8 path");
+        assert_eq!(
+            resolve_configured_admission_limit_for_profile(
+                None,
+                Some(path),
+                Some(320),
+                Some("prod")
+            ),
+            AdmissionLimit::ProfileDefault(320)
+        );
+        assert_eq!(
+            resolve_configured_admission_limit_for_profile(
+                None,
+                Some(path),
+                Some(320),
+                Some("staging")
+            ),
+            AdmissionLimit::Contract(64)
         );
     }
 }

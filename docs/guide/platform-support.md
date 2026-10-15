@@ -105,17 +105,16 @@ takes on Unix, so your hooks run and the cluster stops cleanly.
 
 The wait is your app's **own** budget, not a fixed one: `autumn dev` reads the
 same profile-aware `prestop_grace_secs + shutdown_timeout_secs` that
-`autumn serve stop` uses, and adds 60 seconds of headroom for the `on_shutdown`
-hooks that run after the drain (sized to the managed-Postgres stop ceiling). So
-an app that legitimately takes 35 seconds to drain is not cut off at ten. Once
-that budget elapses, `autumn dev` force-stops the app — **and prints a warning
-saying the hooks may not have run.** Degraded, but never silent.
+`autumn serve stop` uses, and adds 75 seconds of headroom. The headroom covers
+the managed-Postgres stop that runs after the drain (60 seconds, plus 15 seconds
+of margin). So an app that legitimately takes 35 seconds to drain is not cut off
+at ten. Once that budget elapses, `autumn dev` force-stops the app — **and
+prints a warning saying the hooks may not have run.** Degraded, but never silent.
 
 If the app is still starting, `autumn dev` waits for it to finish. The app reads
 the stop request only after it starts. Startup includes managed Postgres
-`initdb` and migrations. The budget starts when the app is up. If the app is
-no ready signal comes after 15 minutes, `autumn dev` uses the normal budget
-anyway.
+`initdb` and migrations. The budget starts when the app is up. If no ready
+signal comes after 15 minutes, `autumn dev` uses the normal budget anyway.
 
 ## Tier 2 — supported via WSL2
 
