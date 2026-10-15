@@ -282,6 +282,14 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
     let mut masked = String::with_capacity(text.len());
     let mut cursor = 0_usize;
     while let Some(rest) = text.get(cursor..).filter(|rest| !rest.is_empty()) {
+        // A placeholder an earlier pass wrote is not a secret to hide: with
+        // `FILTER` in the set it would be rewritten to `[[FILTERED]ED]`, which
+        // no longer matches the live text on replay.
+        if rest.starts_with(FILTERED_PLACEHOLDER) {
+            masked.push_str(FILTERED_PLACEHOLDER);
+            cursor = cursor.saturating_add(FILTERED_PLACEHOLDER.len());
+            continue;
+        }
         let matched = needles.iter().find(|(needle, whole_token_only)| {
             rest.starts_with(*needle)
                 && (!*whole_token_only || stands_alone(text, cursor, needle, rest))
@@ -2198,6 +2206,17 @@ mod tests {
             assert!(!final_url.contains("hunter2pw"), "{final_url}");
             assert!(keys.contains("http[0].url:userinfo"), "{keys:?}");
             assert!(keys.contains("http[0].final_url:<echo>"), "{keys:?}");
+        }
+
+        #[test]
+        fn a_credential_inside_the_placeholder_does_not_corrupt_the_masked_url() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://svc:FILTER@api.example/start")],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            let url = &effects.http.first().expect("one exchange").url;
+            assert_eq!(url, "https://[FILTERED]@api.example/start");
         }
 
         #[test]
