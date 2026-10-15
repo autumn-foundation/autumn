@@ -9089,6 +9089,24 @@ mod tests {
             "postgres://prod.example:6543/app",
             &|k| (k == "PGPORT").then(|| "6543".to_owned())
         ));
+        // The effective user names the database: `user` parameter, URL user, then
+        // `PGUSER`.
+        let pguser = |k: &str| (k == "PGUSER").then(|| "alice".to_owned());
+        assert!(same_database_with(
+            "postgres://prod.example/?dbname=&user=bob",
+            "postgres://prod.example/bob",
+            &pguser
+        ));
+        assert!(same_database_with(
+            "postgres://carol@prod.example/?dbname=",
+            "postgres://prod.example/carol",
+            &pguser
+        ));
+        assert!(same_database_with(
+            "postgres://prod.example/?dbname=",
+            "postgres://prod.example/alice",
+            &pguser
+        ));
         // With no `dbname`, `PGDATABASE` or user, the OS login names the database.
         assert!(same_database_with(
             "postgres://prod.example/?dbname=",
