@@ -443,6 +443,21 @@ impl RouteInfo {
     }
 }
 
+/// Classify a route mounted in a scoped group. Only a route with no other
+/// answer takes the group's declared layer guard.
+fn classify_in_group(
+    group: &ScopedGroup,
+    route: &Route,
+) -> (RouteClassification, Vec<String>, Vec<String>, bool, bool) {
+    let (mut classification, roles, scopes, policy) =
+        classify(&group.source, &route.api_doc, route.repository.as_ref());
+    let layer_guarded = group.layer_guarded && classification == RouteClassification::Unclassified;
+    if layer_guarded {
+        classification = RouteClassification::Gated;
+    }
+    (classification, roles, scopes, policy, layer_guarded)
+}
+
 /// Derive a route's security classification (and carried posture) from its
 /// registration source and macro-expanded [`ApiDoc`](crate::openapi::ApiDoc).
 ///
@@ -686,14 +701,8 @@ pub fn collect_route_infos(
             let full_path = join_scope_path(&group.prefix, route.path);
             let (api_version, status, sunset_opt_out) =
                 resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
-            let (mut classification, roles, scopes, policy) =
-                classify(&group.source, &route.api_doc, route.repository.as_ref());
-            // Only a route with no other answer takes the group's declared guard.
-            let layer_guarded =
-                group.layer_guarded && classification == RouteClassification::Unclassified;
-            if layer_guarded {
-                classification = RouteClassification::Gated;
-            }
+            let (classification, roles, scopes, policy, layer_guarded) =
+                classify_in_group(group, route);
             let pools = pools_of(&route.api_doc, route.repository.as_ref());
             infos.push(RouteInfo {
                 method: route.method.to_string(),

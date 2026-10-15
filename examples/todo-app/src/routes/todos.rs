@@ -53,7 +53,9 @@ use autumn_web::form::{ChangesetForm, method_input};
 use autumn_web::pagination::{Page, PageRequest};
 use autumn_web::prelude::{HxRequest, IntoResponse, StatusCode, Validate};
 use autumn_web::security::CsrfToken;
-use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, public};
+use autumn_web::{
+    AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, public,
+};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
