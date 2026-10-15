@@ -1474,7 +1474,12 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
         if let Some(proc) = child.as_mut() {
             let _ = proc.kill();
             let _ = proc.wait();
-            eprintln!("{}", unreachable_warning("cargo metadata is unreadable"));
+            eprintln!(
+                "{}",
+                unreachable_warning(
+                    "cargo metadata is unreadable, or the target directory is not writable"
+                )
+            );
         }
         *child = None;
         return;
@@ -1917,6 +1922,26 @@ fn run_nonce() -> u128 {
     })
 }
 
+/// Whether `dir` can hold the marker files: it exists, or can be made, and a
+/// file can be written in it. Live reload only warns when its own setup in the
+/// same directory fails, so this is checked before the app is told to use it.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn state_dir_is_usable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!("dev-probe.{}", std::process::id()));
+    let usable = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    usable
+}
+
 /// The paths of the running child, if one was started.
 static CHILD_PATHS: std::sync::Mutex<Option<ChildPaths>> = std::sync::Mutex::new(None);
 
@@ -1934,6 +1959,9 @@ static CHILD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 )]
 fn begin_child_paths() -> Option<ChildPaths> {
     let dir = dev_state_dir()?;
+    if !state_dir_is_usable(dir) {
+        return None;
+    }
     let generation = CHILD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let paths = child_paths_in(dir, std::process::id(), run_nonce(), generation);
     let previous = CHILD_PATHS.lock().ok()?.replace(paths.clone());
@@ -2928,6 +2956,29 @@ mod tests {
         // The OS reuses process ids. A later run with the same id must not
         // reach the files an unclean exit left behind.
         assert_ne!(first, child_paths_in(dir, 42, 6, 1), "same id, later run");
+    }
+
+    #[test]
+    fn a_writable_state_dir_is_usable_and_is_created_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("target").join("autumn");
+        assert!(state_dir_is_usable(&dir));
+        assert!(dir.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the probe file must not stay"
+        );
+    }
+
+    #[test]
+    fn a_state_dir_that_cannot_exist_is_not_usable() {
+        // `<target>/autumn` is a regular file, so nothing can live in it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("autumn");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        assert!(!state_dir_is_usable(&blocker));
+        assert!(!state_dir_is_usable(&blocker.join("nested")));
     }
 
     #[test]
