@@ -2568,8 +2568,12 @@ mod tests {
 
     #[test]
     fn the_stop_budget_reads_dotenv_from_the_package_dir_not_the_cli_cwd() {
-        // A real shell variable wins over `.env`, which would hide the effect.
-        if std::env::var_os("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS").is_some() {
+        // A real shell variable wins over `.env`, and `AUTUMN_DOTENV` or the
+        // profile can turn `.env` loading off. Either would hide the effect.
+        if ["AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "AUTUMN_DOTENV"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        {
             return;
         }
         let tmp = tempfile::TempDir::new().unwrap();
