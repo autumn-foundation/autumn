@@ -1314,6 +1314,7 @@ impl Analyzer {
         // A `use` in this block ends with it. So does a local `fn`, whose name
         // covers the whole block, so it hides an import before its own line.
         let imports = self.tokio_imports.clone();
+        let spawn_before = self.spawn_aliases.clone();
         let macros = self.shadowed_macros.clone();
         let diesel = (self.diesel_roots.clone(), self.diesel_fns.clone());
         for stmt in &block.stmts {
@@ -1367,6 +1368,19 @@ impl Analyzer {
             self.unshadow(saved);
         }
         self.tokio_imports = imports;
+        // A `use tokio::spawn as detach;` ends with its block. A name that was
+        // already a spawn alias outside stays one.
+        let mut renamed = HashSet::new();
+        for stmt in &block.stmts {
+            if let Stmt::Item(syn::Item::Use(import)) = stmt {
+                spawn_renames(&import.tree, &mut renamed);
+            }
+        }
+        for name in renamed {
+            if !spawn_before.contains(&name) {
+                self.spawn_aliases.remove(&name);
+            }
+        }
         self.shadowed_macros = macros;
         (self.diesel_roots, self.diesel_fns) = diesel;
     }
@@ -8717,6 +8731,27 @@ mod tests {
             }",
         );
         assert!(!out.contains("allows_unbounded_write"), "{out}");
+    }
+
+    #[test]
+    fn a_renamed_spawn_import_ends_with_its_block() {
+        let after_block = error_of(
+            GRANT,
+            r"async fn h(detach: Callback) -> R {
+                { use tokio::spawn as detach; }
+                detach(async {});
+                Ok(())
+            }",
+        );
+        assert!(after_block.is_none(), "{after_block:?}");
+        let inside = error_of(
+            GRANT,
+            r"async fn h() -> R {
+                { use tokio::spawn as detach; detach(async {}); }
+                Ok(())
+            }",
+        );
+        assert!(inside.is_some_and(|e| e.contains("detach")));
     }
 
     #[test]
