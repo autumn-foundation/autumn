@@ -5,10 +5,9 @@
 //! `SIGUSR2`, and proves the properties the issue asks for:
 //!
 //! * no request is lost across the cutover. A refused connect is retried for
-//!   `REFUSED_RETRY_BUDGET`, up to `MAX_TOLERATED_REFUSALS` per run. An
-//!   mid-flight reset (`ECONNRESET`/`ECONNABORTED`) is never retried: one
-//!   reset fails the run (#2372). Many refusals fail the
-//!   run rather than being masked;
+//!   `REFUSED_RETRY_BUDGET`, up to `MAX_TOLERATED_REFUSALS` per run. A
+//!   mid-flight reset (`ECONNRESET`/`ECONNABORTED`) is never retried. One
+//!   reset fails the run (#2372);
 //! * a `503` from the successor's startup barrier is retried for up to
 //!   `STARTUP_BARRIER_BUDGET`. A successor that never becomes ready fails the run;
 //! * a value written before the upgrade is readable after it (from the *new*
