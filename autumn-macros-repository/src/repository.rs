@@ -58,6 +58,9 @@ fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> syn::Result<Vec<
     Ok(cols)
 }
 
+use autumn_macros_support::cascade::{
+    CASCADE_LEVELS, CascadeLeg, any_const, cascade_level, level_name,
+};
 use autumn_macros_support::naming::infer_table_name;
 
 pub(crate) fn to_snake_case(name: &str) -> String {
@@ -555,47 +558,62 @@ fn dependent_child_repositories(config: &RepoConfig) -> Vec<(syn::Path, bool)> {
     children.into_iter().map(|(_, p, r)| (p, r)).collect()
 }
 
-/// The const expression behind `__AUTUMN_CASCADE_MODELS`.
+/// The `__AUTUMN_CASCADE_{k}` consts: the models a delete also writes, at each
+/// depth.
 ///
 /// A `dependent(..)` clause is authoritative when present, as it is at run
 /// time. A `restrict` leg writes nothing. A `destroy` leg runs the child's own
-/// cascade, so the child's list is joined in. A repository that cascades into
-/// itself adds nothing and must not name itself.
-fn cascade_models_expr(config: &RepoConfig, pg_name: &Ident) -> TokenStream {
+/// cascade. A repository that cascades into itself adds nothing. Each level
+/// reads only the level below it, so a cascade that loops is no const cycle.
+fn cascade_levels(config: &RepoConfig, pg_name: &Ident) -> TokenStream {
+    let level_consts = |any: TokenStream, expr_of: &dyn Fn(usize) -> TokenStream| {
+        let levels = (0..CASCADE_LEVELS).map(|k| {
+            let name = level_name(k);
+            let expr = expr_of(k);
+            quote! {
+                #[doc(hidden)]
+                pub const #name: ::autumn_web::agent_authority::CascadeLevel = #expr;
+            }
+        });
+        quote! {
+            #[doc(hidden)]
+            pub const __AUTUMN_CASCADE_ANY: bool = #any;
+            #(#levels)*
+        }
+    };
     if config.dependents.is_empty() {
         let model = &config.model_name;
-        return quote! {{
+        // The inherent consts of `#[model]` win over the trait defaults.
+        let any = quote! {{
             use ::autumn_web::repository::AutumnDependents as _;
-            #model::DEPENDENT_MODELS
+            #model::DEPENDENT_CASCADE_ANY
         }};
+        return level_consts(any, &|k| {
+            let name = format_ident!("DEPENDENT_CASCADE_{}", k);
+            quote! {{
+                use ::autumn_web::repository::AutumnDependents as _;
+                #model::#name
+            }}
+        });
     }
-    let mut parts: Vec<TokenStream> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+    let mut legs: Vec<CascadeLeg> = Vec::new();
     for dep in config
         .dependents
         .iter()
         .filter(|dep| dep.action != DependentAction::Restrict)
     {
         let child = &dep.child_repo;
-        if child.is_ident(pg_name) || seen.contains(&quote!(#child).to_string()) {
+        let rendered = quote!(#child).to_string();
+        if child.is_ident(pg_name) || legs.iter().any(|l| l.child.to_string() == rendered) {
             continue;
         }
-        seen.push(quote!(#child).to_string());
-        parts.push(quote! { &[#child::__AUTUMN_MODEL_IDENT] });
-        if dep.action == DependentAction::Destroy {
-            parts.push(quote! { #child::__AUTUMN_CASCADE_MODELS });
-        }
+        legs.push(CascadeLeg {
+            model: quote! { #child::__AUTUMN_MODEL_IDENT },
+            child: quote! { #child },
+            destroy: dep.action == DependentAction::Destroy,
+        });
     }
-    if parts.is_empty() {
-        return quote! { &[] };
-    }
-    quote! {{
-        const PARTS: &[&[&::core::primitive::str]] = &[#(#parts),*];
-        const N: usize = ::autumn_web::agent_authority::cascade_len(PARTS);
-        const JOINED: [&::core::primitive::str; N] =
-            ::autumn_web::agent_authority::cascade_union::<N>(PARTS);
-        &JOINED
-    }}
+    level_consts(any_const(&legs), &|k| cascade_level(&legs, k))
 }
 
 /// Write methods that run the `dependent(...)` cascade.
@@ -853,7 +871,7 @@ fn generate_coherence_items(
     // type name. The guess is wrong for the supported escape hatch where they
     // differ — `#[repository(Comment)] trait ModerationRepository` — and a wrong
     // model means the cascade intersects nothing and the audit reports clean.
-    let cascade_models = cascade_models_expr(config, pg_name);
+    let cascade_consts = cascade_levels(config, pg_name);
     let published_model = quote! {
         impl #pg_name {
             /// The model this repository writes, for the cache-coherence
@@ -875,13 +893,7 @@ fn generate_coherence_items(
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str = #model_ident;
 
-            /// Every other model a `delete_by_id` / `delete_many` on this
-            /// repository also writes through `dependent` cascades. The grant
-            /// check of an agent-operable delete reads it. A repository
-            /// `dependent(..)` clause wins over the model's own associations.
-            #[doc(hidden)]
-            pub const __AUTUMN_CASCADE_MODELS: &'static [&'static ::core::primitive::str] =
-                #cascade_models;
+            #cascade_consts
         }
     };
 
@@ -23322,14 +23334,16 @@ mod tests {
     fn a_repository_publishes_the_models_its_delete_writes() {
         let generated =
             repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
-        assert!(
-            generated.contains("const __AUTUMN_CASCADE_MODELS"),
-            "{generated}"
-        );
-        assert!(
-            generated.contains("Post :: DEPENDENT_MODELS"),
-            "with no `dependent(..)` clause the model's own list is used: {generated}"
-        );
+        for level in 0..4 {
+            assert!(
+                generated.contains(&format!("const __AUTUMN_CASCADE_{level}")),
+                "{generated}"
+            );
+            assert!(
+                generated.contains(&format!("Post :: DEPENDENT_CASCADE_{level}")),
+                "with no `dependent(..)` clause the model's own levels are used: {generated}"
+            );
+        }
     }
 
     #[test]
@@ -23349,7 +23363,7 @@ mod tests {
             "{generated}"
         );
         assert!(
-            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_MODELS"),
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
             "destroy runs the child's own cascade: {generated}"
         );
         assert!(
@@ -23357,7 +23371,7 @@ mod tests {
             "nullify writes the child: {generated}"
         );
         assert!(
-            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE_MODELS"),
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE"),
             "{generated}"
         );
         assert!(
@@ -23377,7 +23391,7 @@ mod tests {
         )
         .to_string();
         assert!(
-            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_MODELS"),
+            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE"),
             "{generated}"
         );
     }
@@ -23450,7 +23464,7 @@ mod tests {
         assert_eq!(
             generated
                 .matches(
-                    "PostEditor . allows_writes_all (PgPostRepository :: __AUTUMN_CASCADE_MODELS)"
+                    "PostEditor . allows_writes_all (PgPostRepository :: __AUTUMN_CASCADE_3 . models)"
                 )
                 .count(),
             1,
@@ -29558,7 +29572,9 @@ mod tests {
             ("plain", quote! { Post }, 81_000),
             ("soft_delete", quote! { Post, soft_delete }, 89_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
-            ("api", quote! { Post, api = "/posts" }, 95_000),
+            // Raised from 95_000 (#2451): each repository publishes its
+            // cascade consts. Understood and intended.
+            ("api", quote! { Post, api = "/posts" }, 96_000),
             ("searchable", quote! { Post, searchable }, 98_000),
             ("versioned", quote! { Post, versioned = true }, 128_000),
             // Raised from 201_000 (#2490): `ledger_as_of_at`/`ledger_diff_at`

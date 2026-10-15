@@ -957,10 +957,9 @@ pub fn excluded_dimensions() -> Vec<Excluded> {
             dimension: "rate".to_string(),
             eventual_provenance: "runtime-only".to_string(),
             runtime_caveat: "enforced at runtime by the MCP dispatcher, per process: a call over \
-                             the cap is refused. With N instances the real cap is up to N times \
-                             the declared one, and a route called without MCP is not metered. \
-                             How often a running process is called is not a fact a compiler can \
-                             ever settle."
+                             the cap is refused. N instances allow up to N times the declared \
+                             cap. A route called without MCP is not counted. A compiler cannot \
+                             know how often a process is called."
                 .to_string(),
         },
         Excluded {

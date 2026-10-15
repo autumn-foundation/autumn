@@ -503,6 +503,13 @@ const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
     ("agent_authority_repository_grant_unlisted_model", true),
     // A delete also writes the models its `dependent(...)` cascade names.
     ("agent_authority_repository_cascade_unlisted_child", true),
+    // The generated delete tool is checked against the cascade too.
+    (
+        "agent_authority_repository_grant_cascade_unlisted_child",
+        true,
+    ),
+    // A cascade that loops cannot be listed, so a governed delete is refused.
+    ("agent_authority_repository_cascade_cycle", true),
 ];
 
 /// The `#[agent_operable]` fixtures get their own `TestCases` for the same

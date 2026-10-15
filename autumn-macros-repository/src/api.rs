@@ -18,6 +18,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Ident;
 
+use autumn_macros_support::cascade::CASCADE_LEVELS;
+
 use crate::repository::{McpExpose, RepoConfig, to_snake_case};
 
 /// What `repository_macro` must hand to the API emitter.
@@ -1273,6 +1275,14 @@ fn governed_route(
         quote! {}
     };
     // A delete also writes the models its `dependent(...)` cascade names.
+    let too_deep = format!(
+        "agent authority: the generated delete tool of this repository starts a `dependent(...)` \
+         cascade that is deeper than {} levels, or that loops.\n\nGrant `{}` cannot cover \
+         what Autumn cannot list. Make a leg `restrict`, or drop `grant = ...` from the \
+         repository. See docs/guide/agent-authority.md.",
+        CASCADE_LEVELS,
+        path_text(grant),
+    );
     let cascade_assertion = if route == "delete" {
         let message = format!(
             "agent authority: the generated delete tool of this repository also writes the \
@@ -1284,9 +1294,10 @@ fn governed_route(
         );
         quote! {
             const _: () = ::core::assert!(
-                #grant.allows_writes_all(#pg_name::__AUTUMN_CASCADE_MODELS),
+                #grant.allows_writes_all(#pg_name::__AUTUMN_CASCADE_3.models),
                 #message
             );
+            const _: () = ::core::assert!(!#pg_name::__AUTUMN_CASCADE_3.more, #too_deep);
         }
     } else {
         quote! {}

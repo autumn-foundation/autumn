@@ -470,6 +470,27 @@ const fn tail_eq(haystack: &[u8], start: usize, needle: &str) -> bool {
 
 // ── Models a delete cascades into ───────────────────────────────────
 
+/// What a type publishes about the models a delete also writes, at one depth.
+///
+/// Generated repositories and models fill it. The grant check of an
+/// agent-operable delete reads it.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct CascadeLevel {
+    /// Models reachable within this depth.
+    pub models: &'static [&'static str],
+    /// Whether the cascade goes deeper than this level covers, or loops.
+    pub more: bool,
+}
+
+impl CascadeLevel {
+    /// A type with no cascade.
+    pub const NONE: Self = Self {
+        models: &[],
+        more: false,
+    };
+}
+
 /// The total length of `parts`, for sizing [`cascade_union`].
 #[doc(hidden)]
 #[must_use]

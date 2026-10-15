@@ -24,6 +24,18 @@ mod schema {
         }
     }
     autumn_web::reexports::diesel::table! {
+        aa_cycle_as (id) {
+            id -> Int8,
+            b_id -> Nullable<Int8>,
+        }
+    }
+    autumn_web::reexports::diesel::table! {
+        aa_cycle_bs (id) {
+            id -> Int8,
+            a_id -> Nullable<Int8>,
+        }
+    }
+    autumn_web::reexports::diesel::table! {
         aa_ok_categories (id) {
             id -> Int8,
             parent_id -> Nullable<Int8>,
@@ -33,7 +45,7 @@ mod schema {
 }
 
 use autumn_web::prelude::*;
-use schema::{aa_ok_audits, aa_ok_categories, aa_ok_comments, aa_ok_posts};
+use schema::{aa_cycle_as, aa_cycle_bs, aa_ok_audits, aa_ok_categories, aa_ok_comments, aa_ok_posts};
 
 #[autumn_web::model]
 #[has_many(AaOkComment, fk = "post_id", dependent = destroy)]
@@ -67,6 +79,30 @@ pub struct AaOkCategory {
     pub parent_id: Option<i64>,
     pub name: String,
 }
+
+/// Two models that cascade into each other. The runtime breaks the loop. The
+/// build must still compile.
+#[autumn_web::model]
+#[has_many(AaCycleB, fk = "a_id", dependent = destroy)]
+pub struct AaCycleA {
+    #[id]
+    pub id: i64,
+    pub b_id: Option<i64>,
+}
+
+#[autumn_web::model]
+#[has_many(AaCycleA, fk = "b_id", dependent = destroy)]
+pub struct AaCycleB {
+    #[id]
+    pub id: i64,
+    pub a_id: Option<i64>,
+}
+
+#[autumn_web::repository(AaCycleA)]
+pub trait AaCycleARepository {}
+
+#[autumn_web::repository(AaCycleB)]
+pub trait AaCycleBRepository {}
 
 #[autumn_web::repository(AaOkPost)]
 pub trait AaOkPostRepository {}
@@ -111,7 +147,11 @@ async fn remove_category(categories: PgAaOkCategoryRepository, id: i64) -> Autum
 }
 
 fn main() {
-    assert_eq!(PgAaOkPostRepository::__AUTUMN_CASCADE_MODELS, ["AaOkComment"]);
-    assert!(PgAaOkCommentRepository::__AUTUMN_CASCADE_MODELS.is_empty());
-    assert!(PgAaOkCategoryRepository::__AUTUMN_CASCADE_MODELS.is_empty());
+    let post = PgAaOkPostRepository::__AUTUMN_CASCADE_3;
+    assert_eq!(post.models, ["AaOkComment"]);
+    assert!(!post.more, "a shallow cascade is fully listed");
+    assert!(PgAaOkCommentRepository::__AUTUMN_CASCADE_3.models.is_empty());
+    assert!(PgAaOkCategoryRepository::__AUTUMN_CASCADE_3.models.is_empty());
+    // A loop is never fully listed, so a governed delete through it is refused.
+    assert!(PgAaCycleARepository::__AUTUMN_CASCADE_3.more);
 }

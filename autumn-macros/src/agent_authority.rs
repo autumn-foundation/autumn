@@ -68,6 +68,7 @@
 //!
 //! See `docs/guide/agent-authority.md` for the user-facing guide.
 
+use autumn_macros_support::cascade::CASCADE_LEVELS;
 use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
@@ -4519,6 +4520,22 @@ fn sql_write_tables(tokens: &[String], words: &[String], at: usize) -> Option<Ve
         // `name *` includes the descendants; it names no further table.
         rest.next_if(|t| t.as_str() == "*");
     }
+    // Only option words may follow the list. Anything else is a name the
+    // reader did not understand, or a second statement: refuse. `TRUNCATE ..
+    // CASCADE` also empties every table that references the list, so it is
+    // refused too.
+    for token in rest {
+        let word = token.to_ascii_uppercase();
+        let cascade_ok = keyword == "DROP" && word == "CASCADE";
+        if !cascade_ok
+            && !matches!(
+                word.as_str(),
+                "RESTART" | "CONTINUE" | "IDENTITY" | "RESTRICT"
+            )
+        {
+            return None;
+        }
+    }
     Some(tables)
 }
 
@@ -5708,11 +5725,18 @@ pub fn agent_operable_macro(attr: TokenStream, item: TokenStream) -> TokenStream
              allow.\n\nAdd every dependent model to the grant's `writes: [...]`, make the \
              association `restrict`, or move the delete out of the agent-operable handler. {GUIDE}"
         );
+        let too_deep = format!(
+            "agent authority: `{action}` deletes through the `{human}` repository, whose \
+             `dependent(...)` cascade is deeper than {CASCADE_LEVELS} levels, or loops.\n\n\
+             Grant `{grant_name}` cannot cover what Autumn cannot list. Make a leg \
+             `restrict`, or move the delete out of the agent-operable handler. {GUIDE}"
+        );
         quote_spanned! { *span=>
             const _: () = ::core::assert!(
-                #grant.allows_writes_all(#repo::__AUTUMN_CASCADE_MODELS),
+                #grant.allows_writes_all(#repo::__AUTUMN_CASCADE_3.models),
                 #message
             );
+            const _: () = ::core::assert!(!#repo::__AUTUMN_CASCADE_3.more, #too_deep);
         }
     });
 
@@ -9246,7 +9270,7 @@ mod tests {
                 format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
             let expansion = expand(GRANT, &handler);
             assert!(
-                expansion.contains("PgRefundRepository :: __AUTUMN_CASCADE_MODELS"),
+                expansion.contains("PgRefundRepository :: __AUTUMN_CASCADE_3 . models"),
                 "{call}: {expansion}"
             );
             assert!(
@@ -9293,6 +9317,14 @@ mod tests {
             Some(vec!["a".into()])
         );
         assert_eq!(tables("TRUNCATE a *, b *"), two);
+        assert_eq!(tables("DROP TABLE a, b CASCADE"), two);
+        // `TRUNCATE .. CASCADE` reaches tables it does not name.
+        assert_eq!(tables("TRUNCATE a CASCADE"), None);
+        // A name the reader does not understand, or a second statement.
+        assert_eq!(tables("TRUNCATE public . a, secrets"), None);
+        assert_eq!(tables("TRUNCATE \"my table\", secrets"), None);
+        assert_eq!(tables("TRUNCATE temp, payouts"), None);
+        assert_eq!(tables("DROP TABLE a; DROP TABLE b"), None);
         // An entry that is not a plain name cannot be read: refuse.
         assert_eq!(tables("TRUNCATE a, $1"), None);
     }

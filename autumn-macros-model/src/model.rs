@@ -18,6 +18,7 @@ use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
+use autumn_macros_support::cascade::{CASCADE_LEVELS, CascadeLeg, any_const, cascade_level};
 use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
 use autumn_macros_support::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
@@ -2266,38 +2267,44 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
     }
 }
 
-/// The inherent `DEPENDENT_MODELS` const: every model a delete of `model_ident`
-/// also writes. A `restrict` leg writes nothing. A `destroy` leg also runs the
-/// child's own cascade, so the child repository's list is joined in. A model
-/// that cascades into itself adds nothing new, and naming itself would make
-/// the const refer to itself.
+/// The inherent `DEPENDENT_CASCADE_{k}` consts: the models a delete of
+/// `model_ident` also writes, at each depth. A `restrict` leg writes nothing. A
+/// `destroy` leg also runs the child's own cascade. A model that cascades into
+/// itself adds nothing new. Each level reads only the level below it, so a
+/// cascade that loops cannot make the consts depend on each other.
 fn emit_dependent_models(model_ident: &syn::Ident, deps: &[&Association]) -> TokenStream {
-    let mut parts: Vec<TokenStream> = Vec::new();
-    for assoc in deps {
-        let action = assoc.dependent.expect("filtered to Some by the caller");
-        if action == DependentAction::Restrict || assoc.target == *model_ident {
-            continue;
-        }
-        let target = assoc.target.to_string();
-        parts.push(quote! { &[#target] });
-        if action == DependentAction::Destroy {
+    let legs: Vec<CascadeLeg> = deps
+        .iter()
+        .filter_map(|assoc| {
+            let action = assoc.dependent.expect("filtered to Some by the caller");
+            if action == DependentAction::Restrict || assoc.target == *model_ident {
+                return None;
+            }
+            let target = assoc.target.to_string();
             let child_repo = format_ident!("Pg{}Repository", assoc.target);
-            parts.push(quote! { #child_repo::__AUTUMN_CASCADE_MODELS });
-        }
-    }
-    if parts.is_empty() {
+            Some(CascadeLeg {
+                model: quote! { #target },
+                child: quote! { #child_repo },
+                destroy: action == DependentAction::Destroy,
+            })
+        })
+        .collect();
+    if legs.is_empty() {
         return quote! {};
     }
+    let levels = (0..CASCADE_LEVELS).map(|k| {
+        let name = format_ident!("DEPENDENT_CASCADE_{}", k);
+        let level = cascade_level(&legs, k);
+        quote! {
+            #[doc(hidden)]
+            pub const #name: ::autumn_web::agent_authority::CascadeLevel = #level;
+        }
+    });
+    let any = any_const(&legs);
     quote! {
-        /// Every model a delete of this model also writes. Read by the
-        /// agent-authority grant check; framework plumbing.
         #[doc(hidden)]
-        pub const DEPENDENT_MODELS: &'static [&'static str] = {
-            const PARTS: &[&[&str]] = &[#(#parts),*];
-            const N: usize = ::autumn_web::agent_authority::cascade_len(PARTS);
-            const JOINED: [&str; N] = ::autumn_web::agent_authority::cascade_union::<N>(PARTS);
-            &JOINED
-        };
+        pub const DEPENDENT_CASCADE_ANY: bool = #any;
+        #(#levels)*
     }
 }
 
@@ -13974,10 +13981,12 @@ mod tests {
             }
         };
         let generated = model_macro(quote! {}, item).to_string();
-        assert!(
-            generated.contains("const DEPENDENT_MODELS"),
-            "expected an inherent DEPENDENT_MODELS const: {generated}"
-        );
+        for level in 0..4 {
+            assert!(
+                generated.contains(&format!("const DEPENDENT_CASCADE_{level}")),
+                "expected level {level}: {generated}"
+            );
+        }
         assert!(generated.contains("\"Comment\""), "{generated}");
         assert!(
             generated.contains("\"Like\""),
@@ -13988,11 +13997,11 @@ mod tests {
             "restrict only probes and writes nothing: {generated}"
         );
         assert!(
-            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_MODELS"),
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
             "a destroy child cascades into its own dependents: {generated}"
         );
         assert!(
-            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE_MODELS"),
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE"),
             "nullify runs no cascade of its own: {generated}"
         );
     }
@@ -14009,13 +14018,33 @@ mod tests {
         };
         let generated = model_macro(quote! {}, item).to_string();
         assert!(
-            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_MODELS"),
-            "a model that cascades into itself must not reference itself: {generated}"
+            !generated.contains("DEPENDENT_CASCADE"),
+            "a model that cascades only into itself publishes nothing: {generated}"
         );
     }
 
     #[test]
-    fn a_model_without_dependents_emits_no_dependent_models() {
+    fn a_level_never_reads_its_own_level_of_another_type() {
+        // Level k reads level k - 1 only, so a cascade that loops through two
+        // models is no const cycle.
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            struct Post {
+                #[id]
+                id: i64,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        let level_three = generated
+            .split("const DEPENDENT_CASCADE_3")
+            .nth(1)
+            .expect("level 3");
+        assert!(level_three.contains("__AUTUMN_CASCADE_2"), "{level_three}");
+        assert!(!level_three.contains("__AUTUMN_CASCADE_3"), "{level_three}");
+    }
+
+    #[test]
+    fn a_model_without_dependents_emits_no_cascade_levels() {
         let item: TokenStream = quote! {
             struct Post {
                 #[id]
@@ -14024,7 +14053,7 @@ mod tests {
             }
         };
         let generated = model_macro(quote! {}, item).to_string();
-        assert!(!generated.contains("DEPENDENT_MODELS"), "{generated}");
+        assert!(!generated.contains("DEPENDENT_CASCADE"), "{generated}");
     }
 
     #[test]

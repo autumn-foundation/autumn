@@ -1725,9 +1725,9 @@ const MAX_ARGUMENT_NAMES_BYTES: usize = 512;
 /// audit row that cannot name who acted is still a row that must be greppable.
 const ANONYMOUS_AGENT: &str = "agent:anonymous";
 
-/// Decide whether a call may run: it must be inside its grant's `rate` cap, and
-/// its attempt record must be writable unless the action is provably reversible.
-/// Either refusal is the tool error text.
+/// Admit a call. It must be inside the `rate` cap. Its attempt record must be
+/// writable, unless the action is provably reversible. A refusal becomes the
+/// tool error text.
 async fn admit_call(server: &McpServer, tool: &McpTool, audit: &AgentAudit) -> Result<(), String> {
     if let Err(refusal) = check_rate_cap(server, tool) {
         audit.record_refusal(&server.state, &refusal).await;
@@ -1770,11 +1770,19 @@ fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
 /// Longest actor id an audit row keeps.
 const MAX_ACTOR_LEN: usize = 128;
 
-/// An actor id fit for an audit row: no control characters, capped in length.
+/// An actor id fit for an audit row: no control or invisible formatting
+/// characters, capped in length.
 fn clean_actor(actor: &str) -> Option<String> {
+    // Zero-width and bidirectional marks can disguise one id as another.
+    let invisible = |c: char| {
+        matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+        )
+    };
     let clean: String = actor
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !invisible(*c))
         .take(MAX_ACTOR_LEN)
         .collect();
     (!clean.is_empty()).then_some(clean)
@@ -4534,6 +4542,10 @@ mod tests {
         assert_eq!(clean_actor("user-42").as_deref(), Some("user-42"));
         assert_eq!(clean_actor("a\nb\r\u{0}c").as_deref(), Some("abc"));
         assert_eq!(clean_actor("\n"), None);
+        assert_eq!(
+            clean_actor("ad\u{202E}min\u{200B}").as_deref(),
+            Some("admin")
+        );
         assert_eq!(clean_actor(&"x".repeat(500)).map(|a| a.len()), Some(128));
     }
 

@@ -175,7 +175,7 @@ Keys may appear in any order. Every key except `reversibility` is optional.
 | `outbound` | absolute URL prefixes, and `"alias:<name>"` for a named client | `[]` | prefix match that must end at a path boundary (`/`, `?`, `#`, end), so `…/v1/refunds` never authorises `…/v1/refunds-evil` |
 | `webhooks` | topic strings | `[]` | exact match on the topic — a fan-out delivers to subscriber-supplied URLs, so it can only be granted by topic |
 | `jobs` | job type idents or `"job_name"` strings | `[]` | exact match |
-| `rate` | `"<n>/<s\|sec\|min\|hour\|day>"` | none | **grammar** validated at compile time. The MCP dispatcher enforces it for the whole grant (one bucket per grant), **per process**. A call over the cap is refused and audited |
+| `rate` | `"<n>/<s\|sec\|min\|hour\|day>"` | none | **grammar** validated at compile time. The MCP dispatcher enforces it. One bucket serves the whole grant. The count is per process. A call over the cap is refused and audited |
 | `spend` | `"<decimal> <ISO 4217>"`, e.g. `"500.00 USD"` | none | **grammar** validated at compile time; **declared only** |
 | `reversibility` | `reversible` \| `compensable` \| `irreversible` | **required** | must sit at or above the floor the proved effects impose (below) |
 
@@ -466,9 +466,11 @@ authority under a manifest that says otherwise.
   `repo.delete_many(&ids)` also write every model the `dependent(...)`
   cascade names, except `restrict` legs. A `destroy` child adds its own
   children. The grant must list each one in `writes`, or the build fails. A
-  model that cascades into itself adds nothing. The check reads a constant the
-  generated repository publishes, so a repository from a hand-written trait is
-  refused as an unresolvable handle.
+  model that cascades into itself adds nothing. The check reads constants the
+  generated repository publishes. Autumn lists a cascade up to 4 levels deep.
+  A deeper cascade, or one that loops, is refused. Make a leg `restrict` to
+  fix it. A repository from a hand-written trait is refused as an unresolvable
+  handle.
 
 Each fails with a diagnostic naming the call site, both sides of the
 disagreement, and the annotation that resolves it.
@@ -567,6 +569,8 @@ malformed annotation, or a grant key it will not silently drop.
 | `agent_authority_unknown_grant_key` | an invented grant key | `macro` — refused, never silently dropped |
 | `agent_authority_repository_unlisted_write` | the unlisted write against a real `#[repository]` | `E0080` — subject resolved through `__AUTUMN_MODEL_IDENT`, so it holds across crates |
 | `agent_authority_repository_grant_unlisted_model` | `#[repository(.., mcp, grant = X)]` where `X` does not list the model | `E0080` — the generated create, update and delete tools write the model |
+| `agent_authority_repository_grant_cascade_unlisted_child` | `#[repository(.., mcp, grant = X)]` where `X` omits a model the delete cascade writes | `E0080` — the generated delete tool is checked against the cascade |
+| `agent_authority_repository_cascade_cycle` | `delete_by_id` through a cascade that loops | `E0080` — Autumn cannot list every model a loop reaches |
 | `agent_authority_repository_cascade_unlisted_child` | `delete_by_id` where the grant omits a model the `dependent(...)` cascade writes | `E0080` — the delete also writes the cascaded models, grandchildren included |
 
 The macro also carries a seeded corpus of 26+ escape shapes as unit tests
@@ -655,7 +659,7 @@ reads the document back — the same shape as
     {
       "dimension": "rate",
       "eventual_provenance": "runtime-only",
-      "runtime_caveat": "enforced at runtime by the MCP dispatcher, per process: a call over the cap is refused. With N instances the real cap is up to N times the declared one, and a route called without MCP is not metered. How often a running process is called is not a fact a compiler can ever settle."
+      "runtime_caveat": "enforced at runtime by the MCP dispatcher, per process: a call over the cap is refused. N instances allow up to N times the declared cap. A route called without MCP is not counted. A compiler cannot know how often a process is called."
     },
     {
       "dimension": "outbound",
@@ -692,11 +696,15 @@ what keeps a row from claiming more than it knows:
   routes through a named client. Inside an agent-operable handler something
   does — every client root is tracked and a non-literal URL is a build error —
   so the literal half earns `provable` here that it cannot earn app-wide.
-- **`spend` is declared, full stop.** Its grammar is checked and it is
-  recorded; nothing meters it. No code reports what a call costs.
+- **`spend` is declared only.** Autumn checks its grammar and records it.
+  Nothing counts it. No code reports what a call costs.
 - **`rate` is enforced at runtime, not proved.** The MCP dispatcher refuses a
-  call over the grant's cap. The count is per process. A route called without
-  MCP is not metered.
+  call over the grant's cap. The count is per process and per MCP mount. A
+  route called without MCP is not counted. A tool without a grant is not
+  counted. The check runs before the route's own auth, so a call that the route
+  rejects still uses a token. Secure the `/mcp` endpoint. Each refused call
+  writes one `refused` audit event, so add an envelope `[rate_limit]` against
+  floods.
 
 `excluded` is this document's **dimension-caveat** list rather than the posture
 manifest's excluded-dimension list: it names each dimension the manifest
@@ -704,17 +712,20 @@ records but this slice does not fully enforce, and each entry carries an
 `eventual_provenance` (what the dimension could eventually claim) and a
 `runtime_caveat` (what is and is not true about it today). The caveat lives
 **in the document** rather than in this guide, so a reader hits it in the same
-object as the claim it qualifies. Six entries ship in this slice: `rate` and
-`spend` (`runtime-only` — `rate` is metered per process, `spend` is not metered), `outbound` and `jobs`
-(`provable` with a caveat — the literal URL and the enqueue are proven; a
-runtime-resolved host and whatever the job itself goes on to do are not),
-`cascading_deletes` and `generated_repository_tools` (both `provable` with a
-caveat — a delete through a generated repository is checked against its
-`dependent(...)` cascade at compile time, but the manifest's write set does
-not list the cascaded models, and a database `ON DELETE CASCADE` is not seen; and
-`#[repository(api, mcp)]` tools are governed only with `grant = X`; without it,
-and for `expose_all_as_mcp` tools, they surface under `ungoverned_tools`
-rather than being gated).
+object as the claim it qualifies. Six entries ship in this slice:
+
+- `rate` and `spend` (`runtime-only`). The dispatcher counts `rate` per process.
+  Nothing counts `spend`.
+- `outbound` and `jobs` (`provable` with a caveat). Autumn proves the literal
+  URL and the enqueue. It does not prove a host resolved at run time, or what
+  the job does.
+- `cascading_deletes` (`provable` with a caveat). A delete through a generated
+  repository is checked against its `dependent(...)` cascade at compile time.
+  The manifest write set does not list the cascaded models. A database
+  `ON DELETE CASCADE` is not seen.
+- `generated_repository_tools` (`provable` with a caveat). A
+  `#[repository(api, mcp)]` tool is governed only with `grant = X`. Other
+  tools, and `expose_all_as_mcp` tools, appear under `ungoverned_tools`.
 
 ### `ungoverned_tools`, and the CI gate
 
@@ -876,8 +887,11 @@ that one of them was a newline or someone's national insurance number.
 > `agent:anonymous` on an outcome means no principal was established anywhere.
 > To name the actor on the attempt event too, authenticate the endpoint itself
 > (see [Secure the endpoint, not just the handler](#secure-the-endpoint-not-just-the-handler)).
-> The dispatcher removes control characters from the id and keeps at most 128
-> characters.
+> The dispatcher removes control and invisible formatting characters from the
+> id and keeps at most 128 characters. The refused event, like the attempt
+> event, is written before dispatch and reads `agent:anonymous` for a route
+> guard principal. The id is the user id or token principal id. It is not an
+> email address.
 
 ### `correlation_id` vs `request_id`
 
@@ -981,8 +995,8 @@ generated MCP tools with grant `PostEditor`. `grant` needs `mcp`.
 Deliberately out of scope for now:
 
 - **Spend metering.** `spend` is validated for grammar and recorded; nothing
-  meters it. Treat it as a reviewable declaration, not a limit. `rate` is
-  enforced by the MCP dispatcher, per process, not across instances. Rate
+  meters it. Treat it as a declaration for review, not a limit. The MCP
+  dispatcher enforces `rate` per process, not across instances. Rate
   limiting is still
   [`[rate_limit]`](rate-limiting.md)'s job.
 - **Generated repository CRUD tools without a grant.** `#[repository(.., mcp,

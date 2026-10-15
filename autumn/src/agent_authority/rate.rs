@@ -1,8 +1,8 @@
 //! Runtime enforcement of a grant's `rate` cap.
 //!
 //! The MCP dispatcher asks [`RateLimiter::check`] before each governed tool
-//! call. Each grant has one token bucket. State is per process: with N
-//! instances the real cap is up to N times the declared one.
+//! call. Each grant has one token bucket. State is per MCP mount and per
+//! process. N instances allow up to N times the declared cap.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -19,7 +19,7 @@ pub struct RateCap {
     pub period_secs: u32,
 }
 
-/// The largest count a bucket holds. Beyond this a float loses whole calls.
+/// The largest count a bucket holds. A larger count loses precision as a float.
 const MAX_COUNT: f64 = 1e15;
 
 /// Parse a `rate` string that passed [`rate_is_wellformed`](super::rate_is_wellformed).

@@ -758,11 +758,24 @@ pub trait AutumnDependents {
         &[]
     }
 
-    /// Every model a delete of this model also writes, through `dependent`
-    /// associations that are not `restrict`, children of `destroy` children
-    /// included. Defaults to none; `#[model]` shadows it with an inherent
-    /// const. Read by the agent-authority grant check.
-    const DEPENDENT_MODELS: &'static [&'static str] = &[];
+    /// The models a delete of this model also writes, through `dependent`
+    /// associations that are not `restrict`, at depth 0 to 3. Each defaults to
+    /// none; `#[model]` shadows them with inherent consts. Read by the
+    /// agent-authority grant check.
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_ANY: bool = false;
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_0: crate::agent_authority::CascadeLevel =
+        crate::agent_authority::CascadeLevel::NONE;
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_1: crate::agent_authority::CascadeLevel =
+        crate::agent_authority::CascadeLevel::NONE;
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_2: crate::agent_authority::CascadeLevel =
+        crate::agent_authority::CascadeLevel::NONE;
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_3: crate::agent_authority::CascadeLevel =
+        crate::agent_authority::CascadeLevel::NONE;
 }
 
 // Blanket fallback — any type without an inherent `dependents()` (i.e. a model
