@@ -603,8 +603,11 @@ fn cascade_levels(config: &RepoConfig, pg_name: &Ident) -> TokenStream {
         .filter(|dep| dep.action != DependentAction::Restrict)
     {
         let child = &dep.child_repo;
-        // `crate::models::PgNodeRepository` is this repository too.
-        if child.segments.last().is_some_and(|s| s.ident == *pg_name) {
+        // Only the bare name is proven to be this repository. A qualified path
+        // can name another repository with the same type name, and a macro
+        // cannot resolve paths. Keeping that leg can only refuse a governed
+        // delete. Skipping it could hide a model.
+        if child.is_ident(pg_name) {
             continue;
         }
         let rendered = quote!(#child).to_string();
@@ -23408,17 +23411,24 @@ mod tests {
     }
 
     #[test]
-    fn a_qualified_path_to_itself_does_not_name_itself() {
+    fn a_qualified_path_is_never_taken_for_the_repository_itself() {
+        // `plugin::PgCommentRepository` can be another repository with the same
+        // name. A macro cannot resolve paths, so it keeps the leg: a missed
+        // model would be a hole, a kept leg only refuses a governed delete.
         let generated = repository_macro(
             quote! {
                 Comment,
-                dependent(crate::models::PgCommentRepository, fk = "parent_id", on_delete = destroy)
+                dependent(plugin::PgCommentRepository, fk = "parent_id", on_delete = destroy)
             },
             quote! { pub trait CommentRepository {} },
         )
         .to_string();
         assert!(
-            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE"),
+            generated.contains("plugin :: PgCommentRepository :: __AUTUMN_MODEL_IDENT"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("plugin :: PgCommentRepository :: __AUTUMN_CASCADE_0"),
             "{generated}"
         );
     }

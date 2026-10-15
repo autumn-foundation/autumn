@@ -466,8 +466,10 @@ authority under a manifest that says otherwise.
   `repo.delete_many(&ids)` also write every model the `dependent(...)`
   cascade names, except `restrict` legs. A `destroy` child adds its own
   children. The grant must list each one in `writes`, or the build fails. A
-  model that cascades into itself adds nothing. The check reads constants the
-  generated repository publishes. Autumn lists a cascade up to 4 levels deep.
+  repository that cascades into itself adds nothing, if it names itself by its
+  bare type name. A qualified path is kept, because it may name another
+  repository. The check reads constants the generated repository publishes.
+  Autumn lists a cascade up to 4 levels deep.
   A deeper cascade, or one that loops, is refused. Make a leg `restrict` to
   fix it. A repository from a hand-written trait is refused as an unresolvable
   handle.
