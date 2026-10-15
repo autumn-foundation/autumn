@@ -335,11 +335,14 @@ fn register_watch_roots(cwd: &Path, member_dir: Option<&Path>) {
     let _ = WATCH_ROOTS.set(roots);
 }
 
-/// `path` without the first of `roots` that contains it, or `path` itself.
+/// `path` without the most specific of `roots` that contains it, or `path`
+/// itself. When roots nest, the member under the workspace, the longest one
+/// wins: it leaves the shortest remainder.
 fn strip_watch_root<'a>(path: &'a Path, roots: &[PathBuf]) -> &'a Path {
     roots
         .iter()
-        .find_map(|root| path.strip_prefix(root).ok())
+        .filter_map(|root| path.strip_prefix(root).ok())
+        .min_by_key(|rest| rest.components().count())
         .unwrap_or(path)
 }
 
@@ -3082,6 +3085,23 @@ mod tests {
         let inside = strip_watch_root(&event, &roots);
         assert_eq!(inside, Path::new(".env"));
         assert!(is_watched_dotenv_file(inside));
+    }
+
+    #[test]
+    fn the_most_specific_watch_root_wins_when_roots_nest() {
+        // The member sits under a hidden directory inside the workspace. Strip
+        // the member root, not the workspace root, or `.env` looks hidden.
+        let workspace = PathBuf::from("/work");
+        let member = workspace.join(".apps").join("api");
+        let event = member.join(".env");
+        for roots in [
+            vec![workspace.clone(), member.clone()],
+            vec![member, workspace],
+        ] {
+            let inside = strip_watch_root(&event, &roots);
+            assert_eq!(inside, Path::new(".env"), "roots: {roots:?}");
+            assert!(is_watched_dotenv_file(inside));
+        }
     }
 
     #[test]
