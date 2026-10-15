@@ -408,6 +408,10 @@ The command plans a root file only inside the member's own git repository:
 - A nested git repository or submodule is its own git root. Its workflows stay
   in the member, and the three Cargo files are out of scope.
 
+A member may still hold its own copy of a Cargo file, for example one that
+`autumn new` wrote. That copy shadows the root file. The report shows it as a
+conflict. The command does not delete it. Delete it yourself.
+
 The report says which files it plans. `--json` marks each root file with
 `"outside_project": true`.
 

@@ -434,6 +434,9 @@ pub enum ConflictReason {
     /// Set from the codemods' *plan*, so a preview says the same thing the
     /// apply it is previewing will.
     MigratedThisRun,
+    /// A Cargo config file sits in the member while the workspace root owns
+    /// it. Cargo reads the nearest copy, so this one shadows the root copy.
+    Shadows,
 }
 
 impl ConflictReason {
@@ -448,6 +451,7 @@ impl ConflictReason {
             Self::MigratedThisRun => {
                 "this run's app-code migrations rewrote it; reconcile it by hand"
             }
+            Self::Shadows => "shadows the workspace root copy; delete it",
         }
     }
 }
@@ -709,6 +713,29 @@ fn safe_in_yaml(text: &str) -> bool {
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// Cargo config files that sit in the member while the workspace root owns
+/// them. Each is a conflict: the member copy shadows the root copy, and the
+/// command never deletes a file.
+fn shadowing_copies(root: &Path) -> Vec<Entry> {
+    if !matches!(root_owners(root).cargo, Owner::Above(_)) {
+        return Vec::new();
+    }
+    CARGO_ROOT_OWNED
+        .iter()
+        .filter_map(|path| {
+            let current = read_current(root, path);
+            (current != OnDisk::Absent).then(|| Entry {
+                path: (*path).to_owned(),
+                status: Status::Conflict(ConflictReason::Shadows),
+                template: String::new(),
+                current,
+                diff: String::new(),
+                absolute: root.join(path),
+            })
+        })
+        .collect()
 }
 
 /// Whether `root` is a crate inside an enclosing Cargo workspace.
@@ -1257,7 +1284,12 @@ pub fn plan_after(
         scaffolded_by_newer,
         workspace_member: workspace_root_above(root).is_some(),
         entries: files
-            .map(|files| classify(root, &files, manifest.as_ref(), migrated))
+            .map(|files| {
+                let mut entries = classify(root, &files, manifest.as_ref(), migrated);
+                entries.extend(shadowing_copies(root));
+                entries.sort_by(|a, b| a.path.cmp(&b.path));
+                entries
+            })
             .unwrap_or_default(),
         guide: release_guide(&target),
         target,
@@ -3145,6 +3177,31 @@ mod tests {
         );
         apply(&mut report).expect("apply");
         assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_member_copy_of_a_root_cargo_file_is_a_shadow_conflict() {
+        // `autumn new` writes these. Adopting the project into a workspace
+        // leaves them behind, and Cargo reads the nearest copy.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        write(&root, "clippy.toml", "# local\n");
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "clippy.toml"),
+            &Status::Conflict(ConflictReason::Shadows)
+        );
+        assert!(report.drifted());
+        let mut report = report;
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(root.join("clippy.toml")).unwrap(),
+            "# local\n"
+        );
+
+        fs::remove_file(root.join("clippy.toml")).unwrap();
+        let report = plan(&root, "0.7.0");
+        assert!(!offered_paths(&report).contains(&"clippy.toml"));
     }
 
     #[test]
