@@ -688,12 +688,34 @@ fn root_owners(root: &Path) -> RootOwners {
     // that YAML could read as syntax.
     let workflows = if workspace == git
         && relative_dir(&git, &absolute).is_some_and(|dir| safe_in_yaml(&dir))
+        && lists_member(&workspace, &absolute)
     {
         Owner::Above(git)
     } else {
         Owner::OutOfScope
     };
     RootOwners { cargo, workflows }
+}
+
+/// Whether `[workspace] members` of `workspace` lists `member`.
+///
+/// The posture gate selects the member with `-p`. Cargo cannot resolve an
+/// excluded crate or a plain path dependency that way.
+fn lists_member(workspace: &Path, member: &Path) -> bool {
+    let listed = std::fs::read_to_string(workspace.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| {
+            let members = table.get("workspace")?.get("members")?.as_array()?.clone();
+            let patterns: Vec<String> = members
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect();
+            let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
+            let rel = relative_dir(workspace, member)?;
+            Some(crate::edge_scan::any_glob_matches(&patterns, &rel, false))
+        });
+    listed.unwrap_or(false)
 }
 
 /// The `/`-separated path from `ancestor` down to `descendant`.
@@ -3134,6 +3156,19 @@ mod tests {
             gate.template
                 .contains("POSTURE_MANIFEST: apps/demo/security-posture.json")
         );
+    }
+
+    #[test]
+    fn an_excluded_crate_gets_cargo_files_but_no_workflows() {
+        // `-p demo` cannot select a crate the workspace excludes.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"app\"]\n",
+        )
+        .unwrap();
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
     }
 
     #[test]

@@ -403,6 +403,8 @@ The command plans a root file only inside the member's own git repository:
 - If the workspace root is below the git root, it plans the three Cargo files
   only. The posture gate runs from the git root and cannot build the member
   there.
+- If `[workspace] members` does not list the crate (an excluded crate), it
+  plans the three Cargo files only. `-p` cannot select the crate.
 - If the member path has a space or other special character, it plans no
   workflow.
 - A nested git repository or submodule is its own git root. Its workflows stay
