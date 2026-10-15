@@ -671,6 +671,7 @@ pub fn collect_route_infos(
             roles,
             scopes,
             policy,
+            layer_guarded: false,
             module: module_of(&route.api_doc),
             location: source_location_of(&route.api_doc),
             authorize_bindings,
