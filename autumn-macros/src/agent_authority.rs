@@ -1624,6 +1624,20 @@ impl Analyzer {
 
     /// Remember a name bound to a closure, `spawn` or an effect verb.
     fn bind_callable(&mut self, name: &str, init: &Expr) {
+        // `async { tokio::spawn }.await` yields the block's tails and returns.
+        let mut peeled = init;
+        while let Expr::Paren(p) = peeled {
+            peeled = &p.expr;
+        }
+        if let Expr::Await(awaited) = peeled
+            && let Expr::Async(block) = &*awaited.base
+        {
+            let yielded = block_tail(&block.block)
+                .into_iter()
+                .chain(block_return_values(&block.block));
+            self.bind_container_callables(name, yielded);
+            return;
+        }
         match strip_transparent(init) {
             // Remembered so a transaction handed this closure by name is
             // still walked under the rollback rule (P2-1).
@@ -1867,7 +1881,7 @@ impl Analyzer {
                     base = &p.expr;
                 }
                 if let Expr::Async(block) = base {
-                    return self.block_tail_is_unread(&block.block);
+                    return self.async_block_yields_unread(&block.block);
                 }
             }
             _ => {}
@@ -1902,6 +1916,15 @@ impl Analyzer {
             }),
             _ => false,
         }
+    }
+
+    /// Does awaiting this async block yield an unread future, through its tail
+    /// or an explicit `return`?
+    fn async_block_yields_unread(&self, block: &Block) -> bool {
+        self.block_tail_is_unread(block)
+            || block_return_values(block)
+                .into_iter()
+                .any(|value| self.value_unread(value))
     }
 
     /// Note whether a `break` or `return` value is an unread future, while the
@@ -2918,7 +2941,7 @@ impl Analyzer {
         }
         if let Expr::Await(inner_await) = inner
             && let Expr::Async(block) = strip_transparent(&inner_await.base)
-            && self.block_tail_is_unread(&block.block)
+            && self.async_block_yields_unread(&block.block)
         {
             self.refuse_awaited(head.span());
             return;
@@ -4814,14 +4837,32 @@ fn return_values(body: &Expr) -> Vec<&Expr> {
     returns.0
 }
 
-/// The expressions a block, `if` or `match` can evaluate to.
-fn value_tails(expr: &Expr) -> Vec<&Expr> {
-    fn block_tail(block: &Block) -> Vec<&Expr> {
-        match block.stmts.last() {
-            Some(Stmt::Expr(tail, None)) => value_tails(tail),
-            _ => Vec::new(),
+/// The tail of a block, followed through nested blocks, `if`s and `match`es.
+fn block_tail(block: &Block) -> Vec<&Expr> {
+    match block.stmts.last() {
+        Some(Stmt::Expr(tail, None)) => value_tails(tail),
+        _ => Vec::new(),
+    }
+}
+
+/// The values `return` hands out of a block, at any depth.
+fn block_return_values(block: &Block) -> Vec<&Expr> {
+    struct Returns<'ast>(Vec<&'ast Expr>);
+    impl<'ast> syn::visit::Visit<'ast> for Returns<'ast> {
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if let Some(value) = &node.expr {
+                self.0.push(value);
+            }
+            syn::visit::visit_expr_return(self, node);
         }
     }
+    let mut returns = Returns(Vec::new());
+    syn::visit::Visit::visit_block(&mut returns, block);
+    returns.0
+}
+
+/// The expressions a block, `if` or `match` can evaluate to.
+fn value_tails(expr: &Expr) -> Vec<&Expr> {
     match strip_transparent(expr) {
         Expr::Block(b) if b.label.is_some() => {
             let mut values = block_tail(&b.block);
@@ -7944,6 +7985,26 @@ mod tests {
             r"async fn h() -> R {
                 use tokio::spawn as detach;
                 detach(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias yielded by an awaited async block",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = async { tokio::spawn }.await;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned from an awaited async block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = async { return start_finance_job(); }.await;
+                fut.await?;
                 Ok(())
             }",
         ),
