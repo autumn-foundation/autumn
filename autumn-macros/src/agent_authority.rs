@@ -4387,7 +4387,8 @@ fn raw_sql_call(root: &Expr) -> Option<&ExprCall> {
 
 /// Read a raw SQL statement's kind and table. `None` when neither can be read.
 fn classify_sql(sql: &str) -> Option<SqlStatement> {
-    let words = sql_words(sql);
+    let tokens = sql_tokens(sql);
+    let words = words_of(&tokens);
     let first = words.first()?.to_ascii_uppercase();
     // `ON CONFLICT DO UPDATE` and `FOR [NO KEY] UPDATE` repeat a keyword
     // without naming a second table.
@@ -4413,9 +4414,10 @@ fn classify_sql(sql: &str) -> Option<SqlStatement> {
         if !writes.is_empty() {
             let mut tables = Vec::new();
             for at in writes {
-                let table = sql_table(&words, at)?;
-                if !tables.contains(&table) {
-                    tables.push(table);
+                for table in sql_write_tables(&tokens, &words, at)? {
+                    if !tables.contains(&table) {
+                        tables.push(table);
+                    }
                 }
             }
             return Some(SqlStatement::Write { tables });
@@ -4425,9 +4427,7 @@ fn classify_sql(sql: &str) -> Option<SqlStatement> {
         });
     }
     if SQL_WRITE_STATEMENTS.contains(&first.as_str()) {
-        return sql_table(&words, 0).map(|table| SqlStatement::Write {
-            tables: vec![table],
-        });
+        return sql_write_tables(&tokens, &words, 0).map(|tables| SqlStatement::Write { tables });
     }
     None
 }
@@ -4454,22 +4454,56 @@ fn is_lock_upsert_or_merge_action(words: &[String], at: usize) -> bool {
     }
 }
 
+/// Modifiers that sit between a keyword and the table name.
+const SQL_NAME_MODIFIERS: &[&str] = &[
+    "IF",
+    "EXISTS",
+    "NOT",
+    "ONLY",
+    "CONCURRENTLY",
+    "TEMP",
+    "TEMPORARY",
+    "UNLOGGED",
+    "TABLE",
+];
+
+/// Every table the write keyword at word `at` changes. `TRUNCATE a, b` and
+/// `DROP TABLE a, b` name a list; every other write names one table.
+fn sql_write_tables(tokens: &[String], words: &[String], at: usize) -> Option<Vec<String>> {
+    let first = sql_table(words, at)?;
+    let keyword = words[at].to_ascii_uppercase();
+    if !matches!(keyword.as_str(), "TRUNCATE" | "DROP") {
+        return Some(vec![first]);
+    }
+    // Map the word index back to its token, then walk `, name` pairs.
+    let mut seen = 0;
+    let start = tokens.iter().position(|token| {
+        let hit = token != "," && seen == at;
+        seen += usize::from(token != ",");
+        hit
+    })?;
+    let mut tables = vec![first];
+    let mut rest = tokens.iter().skip(start + 1).peekable();
+    while rest
+        .next_if(|t| SQL_NAME_MODIFIERS.contains(&t.to_ascii_uppercase().as_str()))
+        .is_some()
+    {}
+    rest.next();
+    while rest.next_if(|t| t.as_str() == ",").is_some() {
+        while rest
+            .next_if(|t| SQL_NAME_MODIFIERS.contains(&t.to_ascii_uppercase().as_str()))
+            .is_some()
+        {}
+        // A list entry that is not a plain name cannot be read: fail closed.
+        tables.push(normalise_table(rest.next()?)?);
+    }
+    Some(tables)
+}
+
 /// The table a statement acts on, read forward from its governing keyword.
 fn sql_table(words: &[String], from: usize) -> Option<String> {
     /// The keywords a table name follows.
     const ANCHORS: &[&str] = &["INTO", "UPDATE", "FROM", "TABLE"];
-    /// Modifiers that sit between the anchor and the name.
-    const SKIP: &[&str] = &[
-        "IF",
-        "EXISTS",
-        "NOT",
-        "ONLY",
-        "CONCURRENTLY",
-        "TEMP",
-        "TEMPORARY",
-        "UNLOGGED",
-        "TABLE",
-    ];
     let mut index = words
         .iter()
         .enumerate()
@@ -4482,7 +4516,7 @@ fn sql_table(words: &[String], from: usize) -> Option<String> {
         .unwrap_or(from + 1);
     while words
         .get(index)
-        .is_some_and(|word| SKIP.contains(&word.to_ascii_uppercase().as_str()))
+        .is_some_and(|word| SQL_NAME_MODIFIERS.contains(&word.to_ascii_uppercase().as_str()))
     {
         index += 1;
     }
@@ -4502,14 +4536,19 @@ fn normalise_table(word: &str) -> Option<String> {
     .then(|| name.to_string())
 }
 
-/// Split a statement into words, with comments removed and punctuation that
-/// can abut a table name treated as a separator.
-fn sql_words(sql: &str) -> Vec<String> {
-    strip_sql_comments(sql)
-        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
-        .filter(|word| !word.is_empty())
+/// Split a statement into tokens, with comments removed. Punctuation that can
+/// abut a table name is a separator; a comma stays as its own `,` token.
+fn sql_tokens(sql: &str) -> Vec<String> {
+    let text = strip_sql_comments(sql).replace(',', " , ");
+    text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ';'))
+        .filter(|token| !token.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+/// The tokens without commas.
+fn words_of(tokens: &[String]) -> Vec<String> {
+    tokens.iter().filter(|t| *t != ",").cloned().collect()
 }
 
 /// Remove `--` line comments and `/* … */` blocks, so neither can hide the
@@ -7264,6 +7303,149 @@ mod tests {
             }",
         ),
         (
+            "opaque macro bound by let with no handle",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let x = schedule!();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as the tail expression",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!()
+            }",
+        ),
+        (
+            "opaque macro under the try operator",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!()?;
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a call argument",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                keep(schedule!());
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a method receiver",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!().ok();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a return",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                return schedule!();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in an if condition",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                if schedule!() { noop(); }
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a match scrutinee",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                match schedule!() { _ => {} }
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a struct field",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = Wrapper { f: schedule!() };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a closure body",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let c = || schedule!(); c();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a block tail",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = { schedule!() };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a reference",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                keep(&schedule!());
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a let else",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let Some(v) = schedule!() else { return Ok(()) };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in an array",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = [schedule!()];
+                Ok(())
+            }",
+        ),
+        (
+            "raw truncate of two tables",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("TRUNCATE allowed, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "raw drop of two tables",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("DROP TABLE allowed, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
             "unread future handed to timeout",
             ExpectedKind::Rejected,
             "awaited call",
@@ -8999,6 +9181,23 @@ mod tests {
                 && !expansion.contains("EffectProvenance :: Syntactic"),
             "a proof must not demote a declaration: {expansion}"
         );
+    }
+
+    #[test]
+    fn a_table_list_records_every_table() {
+        let tables = |sql: &str| match classify_sql(sql) {
+            Some(SqlStatement::Write { tables }) => Some(tables),
+            _ => None,
+        };
+        let two = Some(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(tables("TRUNCATE TABLE ONLY a, b RESTART IDENTITY"), two);
+        assert_eq!(tables("DROP TABLE IF EXISTS a, \"b\" CASCADE"), two);
+        assert_eq!(
+            tables("TRUNCATE a RESTART IDENTITY"),
+            Some(vec!["a".into()])
+        );
+        // An entry that is not a plain name cannot be read: refuse.
+        assert_eq!(tables("TRUNCATE a, $1"), None);
     }
 
     #[test]
