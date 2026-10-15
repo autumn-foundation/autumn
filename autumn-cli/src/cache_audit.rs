@@ -282,6 +282,8 @@ mod tests {
             invalidates: Vec::new(),
             acknowledged_stale: None,
             location: "src/repositories.rs:20".to_string(),
+            cascades_into: None,
+            cascade_recurses: false,
         }
     }
 

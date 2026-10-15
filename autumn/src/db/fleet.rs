@@ -3016,6 +3016,11 @@ mod tests {
         count.n == 1
     }
 
+    /// How long a test waits for a call that must not hang. A stranded drain
+    /// hangs for ever, so a long bound still catches it. A short one fails on
+    /// a slow runner: a database create takes seconds on Windows CI.
+    const NOT_STUCK: Duration = Duration::from_secs(60);
+
     async fn settle(fleet: &DatabaseFleet) {
         for _ in 0..500 {
             if fleet.stats().draining == 0 {

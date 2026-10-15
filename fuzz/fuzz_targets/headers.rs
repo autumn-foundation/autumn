@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target: trusted-proxy / `X-Forwarded-*` header parsing.
 //!
-//! Drives `TrustedProxy::parse`, `ProxyResolver::parse_forwarded_ip`, and the
+//! Drives `CidrRange::parse`, `ProxyResolver::parse_forwarded_ip`, and the
 //! full resolver over arbitrary header values.
 
 use autumn::__fuzz;
