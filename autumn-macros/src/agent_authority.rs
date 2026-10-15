@@ -4489,6 +4489,7 @@ fn sql_write_tables(tokens: &[String], words: &[String], at: usize) -> Option<Ve
         .is_some()
     {}
     rest.next();
+    rest.next_if(|t| t.as_str() == "*");
     while rest.next_if(|t| t.as_str() == ",").is_some() {
         while rest
             .next_if(|t| SQL_NAME_MODIFIERS.contains(&t.to_ascii_uppercase().as_str()))
@@ -4496,6 +4497,8 @@ fn sql_write_tables(tokens: &[String], words: &[String], at: usize) -> Option<Ve
         {}
         // A list entry that is not a plain name cannot be read: fail closed.
         tables.push(normalise_table(rest.next()?)?);
+        // `name *` includes the descendants; it names no further table.
+        rest.next_if(|t| t.as_str() == "*");
     }
     Some(tables)
 }
@@ -7437,6 +7440,15 @@ mod tests {
             }"#,
         ),
         (
+            "raw truncate with an inheritance marker",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("TRUNCATE allowed *, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
             "raw drop of two tables",
             ExpectedKind::UnboundedWrite,
             "ledger",
@@ -9196,6 +9208,7 @@ mod tests {
             tables("TRUNCATE a RESTART IDENTITY"),
             Some(vec!["a".into()])
         );
+        assert_eq!(tables("TRUNCATE a *, b *"), two);
         // An entry that is not a plain name cannot be read: refuse.
         assert_eq!(tables("TRUNCATE a, $1"), None);
     }
