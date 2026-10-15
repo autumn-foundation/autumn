@@ -175,7 +175,7 @@ Keys may appear in any order. Every key except `reversibility` is optional.
 | `outbound` | absolute URL prefixes, and `"alias:<name>"` for a named client | `[]` | prefix match that must end at a path boundary (`/`, `?`, `#`, end), so `…/v1/refunds` never authorises `…/v1/refunds-evil` |
 | `webhooks` | topic strings | `[]` | exact match on the topic — a fan-out delivers to subscriber-supplied URLs, so it can only be granted by topic |
 | `jobs` | job type idents or `"job_name"` strings | `[]` | exact match |
-| `rate` | `"<n>/<s\|sec\|min\|hour\|day>"` | none | **grammar** validated at compile time; **declared only**, nothing meters it |
+| `rate` | `"<n>/<s\|sec\|min\|hour\|day>"` | none | **grammar** validated at compile time. The MCP dispatcher enforces it for the whole grant (one bucket per grant), **per process**. A call over the cap is refused and audited |
 | `spend` | `"<decimal> <ISO 4217>"`, e.g. `"500.00 USD"` | none | **grammar** validated at compile time; **declared only** |
 | `reversibility` | `reversible` \| `compensable` \| `irreversible` | **required** | must sit at or above the floor the proved effects impose (below) |
 
@@ -645,7 +645,7 @@ reads the document back — the same shape as
     {
       "dimension": "rate",
       "eventual_provenance": "runtime-only",
-      "runtime_caveat": "declared, not enforced in this slice: the cap is checked for grammar at compile time and recorded here, but nothing meters calls at runtime."
+      "runtime_caveat": "enforced at runtime by the MCP dispatcher, per process: a call over the cap is refused. With N instances the real cap is up to N times the declared one, and a route called without MCP is not metered. How often a running process is called is not a fact a compiler can ever settle."
     },
     {
       "dimension": "outbound",
@@ -682,8 +682,11 @@ what keeps a row from claiming more than it knows:
   routes through a named client. Inside an agent-operable handler something
   does — every client root is tracked and a non-literal URL is a build error —
   so the literal half earns `provable` here that it cannot earn app-wide.
-- **`rate` and `spend` are declared, full stop.** Their grammar is checked and
-  they are recorded; nothing meters them.
+- **`spend` is declared, full stop.** Its grammar is checked and it is
+  recorded; nothing meters it. No code reports what a call costs.
+- **`rate` is enforced at runtime, not proved.** The MCP dispatcher refuses a
+  call over the grant's cap. The count is per process. A route called without
+  MCP is not metered.
 
 `excluded` is this document's **dimension-caveat** list rather than the posture
 manifest's excluded-dimension list: it names each dimension the manifest
@@ -692,7 +695,7 @@ records but this slice does not fully enforce, and each entry carries an
 `runtime_caveat` (what is and is not true about it today). The caveat lives
 **in the document** rather than in this guide, so a reader hits it in the same
 object as the claim it qualifies. Six entries ship in this slice: `rate` and
-`spend` (`runtime-only` — declared, nothing meters them), `outbound` and `jobs`
+`spend` (`runtime-only` — `rate` is metered per process, `spend` is not metered), `outbound` and `jobs`
 (`provable` with a caveat — the literal URL and the enqueue are proven; a
 runtime-resolved host and whatever the job itself goes on to do are not),
 `cascading_deletes` and `generated_repository_tools` (both `provable` with a
@@ -951,9 +954,10 @@ required before any of this runs, and put a rate limit in front of it. See
 
 Deliberately out of scope for now:
 
-- **Runtime enforcement.** `rate` and `spend` are validated for grammar and
-  recorded; nothing meters them at request time. Treat them as reviewable
-  declarations, not as limits. Rate limiting is still
+- **Spend metering.** `spend` is validated for grammar and recorded; nothing
+  meters it. Treat it as a reviewable declaration, not a limit. `rate` is
+  enforced by the MCP dispatcher, per process, not across instances. Rate
+  limiting is still
   [`[rate_limit]`](rate-limiting.md)'s job.
 - **Generated repository CRUD tools.** `#[repository(api, mcp)]` and
   `expose_all_as_mcp` generate tools with no annotation site, so they surface

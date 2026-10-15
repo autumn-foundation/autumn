@@ -152,7 +152,7 @@ checked against the grant exactly like proved ones.
 record and fails on drift or on an ungoverned mutating MCP tool. Every MCP
 `tools/call` writes attempt and outcome audit events carrying a correlation
 id, the grant, the compile-known reversibility and the proved effects, with no
-per-handler wiring. `rate`/`spend` are declared and published, not enforced.
+per-handler wiring. `rate` is enforced by the MCP dispatcher (per process). `spend` is declared and published, not enforced.
 See `docs/guide/agent-authority.md`.
 
 ### Fake-data factories and bulk seeding (trunk-dev)

@@ -42,14 +42,15 @@
 //! The threat model is **drift detection, not an adversarial author** — the
 //! posture `docs/guide/security-posture-manifest.md` states for the security
 //! manifest and `classify` states for data flow. Two dimensions of the grant
-//! are *declared, not enforced* in this slice: `rate` and `spend` are validated
-//! for grammar at compile time and recorded in the manifest, but nothing meters
-//! them at runtime. [`manifest::AgentAuthorityManifest::excluded`] carries that
-//! caveat in the document itself rather than leaving it to the guide.
+//! are not compile-time facts. `rate` is enforced by the MCP dispatcher, per
+//! process. `spend` is *declared, not enforced*: nothing meters it.
+//! [`manifest::AgentAuthorityManifest::excluded`] carries that caveat in the
+//! document itself rather than leaving it to the guide.
 //!
 //! See `docs/guide/agent-authority.md`.
 
 pub mod manifest;
+pub(crate) mod rate;
 
 use serde::{Deserialize, Serialize};
 
@@ -262,8 +263,8 @@ pub struct Grant {
     pub webhooks: &'static [&'static str],
     /// Allowed job names or job type idents, matched exactly.
     pub jobs: &'static [&'static str],
-    /// Declared rate cap, e.g. `"10/min"`. Validated for grammar at compile
-    /// time; **not** enforced at runtime in this slice.
+    /// Rate cap, e.g. `"10/min"`. Validated for grammar at compile time. The
+    /// MCP dispatcher enforces it for the whole grant, per process.
     pub rate: Option<&'static str>,
     /// Declared spend cap, e.g. `"500.00 USD"`. Validated for grammar at
     /// compile time; **not** enforced at runtime in this slice.
@@ -1119,8 +1120,8 @@ macro_rules! __authority_grant_parse {
 /// be omitted — an omitted key denies its dimension. `writes`,
 /// `unbounded_writes` and `jobs` take idents (stringified) or string literals;
 /// `outbound` and `webhooks` take string literals only. `rate` and `spend` are
-/// checked for grammar at compile time and recorded in the manifest, but
-/// nothing meters them at runtime in this slice — see
+/// checked for grammar at compile time and recorded in the manifest. The MCP
+/// dispatcher enforces `rate`, per process. Nothing meters `spend` — see
 /// [`manifest::AgentAuthorityManifest::excluded`].
 ///
 /// An unknown key, a missing `reversibility`, a misspelled keyword and an

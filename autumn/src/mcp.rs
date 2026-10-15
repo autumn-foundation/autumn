@@ -316,6 +316,8 @@ pub struct McpServer {
     has_task_tools: bool,
     server_name: String,
     server_version: String,
+    /// Enforces each grant's `rate` cap. Per process.
+    rate_limiter: crate::agent_authority::rate::RateLimiter,
 }
 
 impl McpServer {
@@ -944,6 +946,7 @@ impl McpServer {
             has_task_tools,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            rate_limiter: crate::agent_authority::rate::RateLimiter::default(),
         }
     }
 }
@@ -1721,6 +1724,32 @@ const MAX_ARGUMENT_NAMES_BYTES: usize = 512;
 /// Actor recorded when no principal was resolved for the call. Never empty: an
 /// audit row that cannot name who acted is still a row that must be greppable.
 const ANONYMOUS_AGENT: &str = "agent:anonymous";
+
+/// Refuse a call that is over its grant's declared `rate` cap. A cap that
+/// cannot be read refuses every call: it must never mean "no cap".
+fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
+    let Some(grant) = tool.agent_authority.map(|a| a.grant) else {
+        return Ok(());
+    };
+    let Some(rate) = grant.rate else {
+        return Ok(());
+    };
+    let Some(cap) = crate::agent_authority::rate::parse_rate(rate) else {
+        return Err(format!(
+            "rate cap `{rate}` for grant {} cannot be read; the call is refused",
+            grant.name
+        ));
+    };
+    server
+        .rate_limiter
+        .check(grant.name, cap, server.state.clock().now())
+        .map_err(|wait| {
+            format!(
+                "rate cap {rate} for grant {} exceeded; retry in {wait}s",
+                grant.name
+            )
+        })
+}
 
 /// Longest actor id an audit row keeps.
 const MAX_ACTOR_LEN: usize = 128;
@@ -2555,6 +2584,12 @@ async fn serve_tools_call(
     // Agent-authority envelope (#1691). Resolved before dispatch so the
     // correlation id exists ahead of anything that can go wrong.
     let mut audit = AgentAudit::new(server, tool, &arguments, ctx);
+
+    // A grant's `rate` cap is enforced here, before anything is attempted.
+    if let Err(refusal) = check_rate_cap(server, tool) {
+        audit.record_refusal(&server.state, &refusal).await;
+        return reply(success(id, tool_error(&refusal)));
+    }
 
     // The last thing before the action runs: if this record cannot be written
     // and the action is not provably reversible, it does not run.

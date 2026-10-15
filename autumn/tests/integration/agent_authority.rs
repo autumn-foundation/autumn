@@ -689,6 +689,67 @@ async fn a_route_guarded_call_names_its_principal_in_the_outcome() {
     assert_eq!(events[1].actor_id, "user-42");
 }
 
+// ── Rate cap: enforced by the dispatcher, per grant ───────────────────
+
+static CAPPED_GRANT: Grant = Grant {
+    rate: Some("2/min"),
+    ..test_grant("RefundDrafter", Reversibility::Compensable)
+};
+static BAD_RATE_GRANT: Grant = Grant {
+    rate: Some("often"),
+    ..test_grant("BadRate", Reversibility::Compensable)
+};
+static CAPPED_AUTHORITY: AgentAuthority = test_authority("draft_refund", &CAPPED_GRANT);
+static BAD_RATE_AUTHORITY: AgentAuthority = test_authority("draft_refund", &BAD_RATE_GRANT);
+
+#[tokio::test]
+async fn a_call_over_the_grants_rate_cap_is_refused_and_audited() {
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![draft_refund], &CAPPED_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+    let args = serde_json::json!({ "body": { "memo": "r" } });
+
+    for _ in 0..2 {
+        let out = call_tool(&client, "draft_refund", args.clone()).await;
+        assert_ne!(out["result"]["isError"], true, "{out}");
+    }
+    let out = call_tool(&client, "draft_refund", args).await;
+    assert_eq!(out["result"]["isError"], true, "{out}");
+    let text = out["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("rate cap 2/min"), "{text}");
+    assert!(text.contains("RefundDrafter"), "{text}");
+
+    // Two attempts and two outcomes ran. The third call wrote one refusal.
+    let events = sink.agent_events();
+    assert_eq!(events.len(), 5, "{events:#?}");
+    let refusal = events.last().expect("refusal event");
+    assert_eq!(refusal.action, "agent.tool.draft_refund.refused");
+    assert!(meta(refusal, "refused_reason").contains("rate cap"));
+}
+
+#[tokio::test]
+async fn a_rate_cap_that_cannot_be_read_refuses_every_call() {
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![draft_refund], &BAD_RATE_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+    let out = call_tool(
+        &client,
+        "draft_refund",
+        serde_json::json!({ "body": { "memo": "r" } }),
+    )
+    .await;
+    assert_eq!(out["result"]["isError"], true, "{out}");
+    let events = sink.agent_events();
+    assert_eq!(events.len(), 1, "{events:#?}");
+    assert_eq!(events[0].action, "agent.tool.draft_refund.refused");
+}
+
 // ── 6: fail-closed when the attempt record cannot be written ──────────
 
 #[tokio::test]

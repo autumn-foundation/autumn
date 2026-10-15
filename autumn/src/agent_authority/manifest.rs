@@ -26,7 +26,7 @@
 //! [`AgentAuthorityManifest::unregistered_authorities`] catches the one
 //! remaining way a route could belong to neither list.
 //! [`AgentAuthorityManifest::excluded`] names each dimension that is declared
-//! but not enforced in this slice, with the caveat spelled out in the document
+//! but not proved at compile time, with the caveat spelled out in the document
 //! rather than left to the guide, and says whether the dimension could ever be
 //! proved at all. And [`ActionRow::asserted_effect_free`] carries every
 //! `#[agent_effect(none, …)]` hatch with its reason, so widening the blast
@@ -276,7 +276,7 @@ pub struct GrantSummary {
     pub reversibility: Reversibility,
     /// Whether it may leave its tenant.
     pub tenant_scope: TenantScope,
-    /// Declared rate cap. Declared only — see
+    /// Rate cap. The MCP dispatcher enforces it — see
     /// [`AgentAuthorityManifest::excluded`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate: Option<String>,
@@ -749,7 +749,7 @@ impl AgentAuthorityManifest {
                 );
             }
         }
-        let _ = write!(out, "\n\nRecorded, not enforced by this slice:");
+        let _ = write!(out, "\n\nNot proved at compile time:");
         for entry in &self.excluded {
             let _ = write!(
                 out,
@@ -956,10 +956,11 @@ pub fn excluded_dimensions() -> Vec<Excluded> {
         Excluded {
             dimension: "rate".to_string(),
             eventual_provenance: "runtime-only".to_string(),
-            runtime_caveat: "declared, not enforced in this slice: the cap is checked for grammar \
-                             at compile time and recorded here, but nothing meters calls at \
-                             runtime. How often a running process is called is not a fact a \
-                             compiler can ever settle."
+            runtime_caveat: "enforced at runtime by the MCP dispatcher, per process: a call over \
+                             the cap is refused. With N instances the real cap is up to N times \
+                             the declared one, and a route called without MCP is not metered. \
+                             How often a running process is called is not a fact a compiler can \
+                             ever settle."
                 .to_string(),
         },
         Excluded {
