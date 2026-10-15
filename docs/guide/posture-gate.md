@@ -167,31 +167,32 @@ required check as satisfied).
 
 ### If your app is a Cargo workspace member
 
-`autumn upgrade` will not write this workflow into a workspace *member* that
-is not its own git root. It does not write `ci.yml` there either. GitHub runs
-workflows from the git root only. A workflow in the member never runs, and
-seeding one would look like adoption while gating nothing.
-
-A nested git repository or submodule is its own git root. `autumn upgrade`
-reconciles its workflows as usual.
-
-Adopt it by hand at the root instead — three edits to the scaffolded file:
+`autumn upgrade --apply` writes the workflow at the **git root** and sets it up
+for your crate:
 
 ```yaml
 env:
-  # Point at the member's manifest.
   POSTURE_MANIFEST: apps/my-app/security-posture.json
-
-# …in the `manifest` job:
-      - name: Build this commit's posture manifest
-        # Select the member package.
-        run: autumn routes audit -p my-app $POSTURE_AUDIT_FLAGS --manifest "$POSTURE_MANIFEST"
+  POSTURE_AUDIT_FLAGS: --release -p my-app
 ```
 
-Everything else — the base read, the acknowledgment harvest, the diff, the
-verdict — works unchanged, because it only ever reads the manifest path.
-Teaching `autumn upgrade` to reconcile root files for a member is tracked
-separately.
+It writes `ci.yml` at the git root too, and runs it in the crate directory.
+Everything else in the gate works unchanged, because it only reads the manifest
+path.
+
+One repository holds one `posture-gate.yml`. If another crate already wrote it,
+`autumn upgrade` reports a conflict for yours and does not overwrite it. A
+second crate needs its own workflow. Copy the file, give it a new name, and set
+`POSTURE_MANIFEST` and `POSTURE_AUDIT_FLAGS` for that crate.
+
+A nested git repository or submodule is its own git root. Its workflow stays
+in the crate.
+
+The deploy workflows that `autumn release init` writes also read the manifest
+path from one variable, `POSTURE_MANIFEST`. When you move a deploy workflow to
+the git root, set it to the same path as above. If the file is missing, the
+deploy prints a `::warning::` and does not attest. The deploy does not fail, so
+apps that never adopted the gate still ship.
 
 ---
 

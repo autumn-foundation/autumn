@@ -556,6 +556,54 @@ fn a_workspace_member_is_not_seeded_with_files_the_workspace_root_owns() {
     assert!(root.join("Dockerfile").is_file());
 }
 
+/// Issue #2469: a member adopts the files its workspace owns, at the root.
+#[test]
+fn a_workspace_member_adopts_root_files_at_the_repository_root() {
+    let (tmp, root) = new_project("member", &[]);
+    let repo = tmp.path();
+    fs::create_dir(repo.join(".git")).unwrap();
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        manifest.replace("[workspace]\n", ""),
+    )
+    .unwrap();
+    for path in ["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"] {
+        fs::remove_file(root.join(path)).unwrap();
+    }
+    fs::remove_dir_all(root.join(".github")).unwrap();
+    fs::remove_dir_all(root.join(".autumn")).unwrap();
+
+    let output = run(&root, &["--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+
+    for path in ["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"] {
+        assert!(repo.join(path).is_file(), "{path} at the root");
+        assert!(!root.join(path).exists(), "{path} in the member");
+    }
+    assert!(!root.join(".github").exists());
+    let ci = fs::read_to_string(repo.join(".github/workflows/ci.yml")).unwrap();
+    assert!(ci.contains("working-directory: member"), "{ci}");
+    let gate = fs::read_to_string(repo.join(".github/workflows/posture-gate.yml")).unwrap();
+    assert!(
+        gate.contains("POSTURE_MANIFEST: member/security-posture.json"),
+        "{gate}"
+    );
+    assert!(
+        gate.contains("POSTURE_AUDIT_FLAGS: --release -p member"),
+        "{gate}"
+    );
+
+    // A second run has nothing left to do, and `--check` agrees.
+    let check = run(&root, &["--check"]);
+    assert!(check.status.success(), "{}", report(&check));
+}
+
 /// Issue #2495: `posture-gate.yml`'s verdict job now probes forward through
 /// a bounded run of candidate releases, for one run, only when the release
 /// pinned to this app's own `autumn-web` version is missing a command it

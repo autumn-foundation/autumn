@@ -383,25 +383,32 @@ hatch.
 ### Inside a Cargo workspace
 
 Your crate may sit inside an enclosing workspace. Then its own `Cargo.toml`
-has no `[workspace]` table. Some files are out of scope, and the report says
-so:
+has no `[workspace]` table. Some files belong to the workspace, not to the
+crate. `autumn upgrade` plans them at their owner, as `../` paths:
 
-- `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are resolved from the
-  nearest ancestor of the crate. A crate-local copy does not add to the
-  workspace's copy. It **shadows** it, and drops its lints and MSRV pin with no
-  diagnostic.
-- GitHub runs workflows from the **git root**, not the Cargo root. If the crate
-  is not its own git root, GitHub does not run its `.github/workflows/ci.yml`
-  and `posture-gate.yml`. They are out of scope.
+- `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` go to the
+  **workspace root**. Cargo resolves them from the nearest ancestor. A copy in
+  the crate **shadows** the workspace's copy and drops its lints and MSRV pin
+  with no diagnostic.
+- `ci.yml` and `posture-gate.yml` go to the **git root**. GitHub runs
+  workflows from there only. The command writes them for this crate: `ci.yml`
+  runs in the crate directory, and `posture-gate.yml` sets `POSTURE_MANIFEST`
+  to the crate's path and `-p <crate>` in `POSTURE_AUDIT_FLAGS`.
 
-A nested git repository or submodule is its own git root. GitHub runs its
-workflows, so `autumn upgrade` still reconciles them. The three Cargo files
-stay out of scope.
+A repository holds one copy of each root file. If another crate already wrote
+it, the file is a **conflict** for this crate and the command does not write
+it. Run `autumn upgrade --accept ../.github/workflows/ci.yml` to keep it. The
+digests of the root files are recorded in the crate's own
+`.autumn/scaffold.toml`.
 
-Everything genuinely per-crate — `autumn.toml`, `Dockerfile`, `.dockerignore`,
+A file is never planned outside the crate's own git repository. A nested git
+repository or submodule is its own git root. Its workflows stay in the crate,
+and the three Cargo files stay out of scope. A crate with no git repository
+gets no workflows. The report says so.
+
+Everything per-crate — `autumn.toml`, `Dockerfile`, `.dockerignore`,
 `build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled as
-usual. Reconcile the Cargo files at the workspace root and the workflows at
-the git root, if that root is itself an Autumn project.
+usual.
 
 `autumn new` writes a bare `[workspace]` table into every generated
 `Cargo.toml`, so a scaffolded project is its own workspace root wherever you

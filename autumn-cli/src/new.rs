@@ -466,6 +466,48 @@ pub fn framework_owned_files(
     files
 }
 
+/// Rewrite a rendered workflow for one workspace member.
+///
+/// `dir` is the member's path from the git root, `/`-separated. The caller must
+/// check that `package` and `dir` are safe to write into YAML.
+///
+/// `ci.yml` runs in the member directory, so `cargo` selects the member
+/// without a `-p` on each command. `posture-gate.yml` runs from the root: its
+/// variables carry the member path and package. `None` for any other file.
+#[must_use]
+pub fn member_workflow(path: &str, rendered: &str, package: &str, dir: &str) -> Option<String> {
+    match path {
+        ".github/workflows/ci.yml" => {
+            let with_dir = replace_anchor(
+                rendered,
+                "\njobs:\n",
+                &format!(
+                    "\n# Set by `autumn upgrade`: this app is a workspace member.\n\
+                     defaults:\n  run:\n    working-directory: {dir}\n\njobs:\n"
+                ),
+            );
+            Some(replace_anchor(
+                &with_dir,
+                "cargo fmt --all -- --check",
+                &format!("cargo fmt -p {package} -- --check"),
+            ))
+        }
+        ".github/workflows/posture-gate.yml" => {
+            let with_manifest = replace_anchor(
+                rendered,
+                "POSTURE_MANIFEST: security-posture.json\n",
+                &format!("POSTURE_MANIFEST: {dir}/security-posture.json\n"),
+            );
+            Some(replace_anchor(
+                &with_manifest,
+                "POSTURE_AUDIT_FLAGS: --release\n",
+                &format!("POSTURE_AUDIT_FLAGS: --release -p {package}\n"),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Anchors around the waiver that only a `--bundled-pg` app's tree can reach.
 const DENY_BUNDLED_PG_OPEN: &str = "    # >>> autumn:bundled-pg-waiver\n";
 const DENY_BUNDLED_PG_CLOSE: &str = "    # <<< autumn:bundled-pg-waiver\n";
@@ -2930,6 +2972,45 @@ mod tests {
             rust_version: "1.88.0",
         };
         framework_owned_files(&vars, opts)
+    }
+
+    /// A workflow rendered for the member `demo` at `apps/demo`.
+    fn member(path: &str) -> String {
+        let files = owned(GenerateOptions::default());
+        member_workflow(path, &files[path], "demo", "apps/demo").expect("a workflow")
+    }
+
+    #[test]
+    fn a_member_ci_workflow_runs_in_the_member_directory() {
+        let ci = member(".github/workflows/ci.yml");
+        assert!(
+            ci.contains("defaults:\n  run:\n    working-directory: apps/demo\n\njobs:"),
+            "{ci}"
+        );
+        assert!(ci.contains("cargo fmt -p demo -- --check"), "{ci}");
+        assert!(!ci.contains("cargo fmt --all"), "{ci}");
+    }
+
+    #[test]
+    fn a_member_posture_gate_names_its_manifest_and_package() {
+        let gate = member(".github/workflows/posture-gate.yml");
+        assert!(
+            gate.contains("POSTURE_MANIFEST: apps/demo/security-posture.json"),
+            "{gate}"
+        );
+        assert!(
+            gate.contains("POSTURE_AUDIT_FLAGS: --release -p demo"),
+            "{gate}"
+        );
+    }
+
+    #[test]
+    fn a_member_rewrite_leaves_other_files_alone() {
+        let files = owned(GenerateOptions::default());
+        assert_eq!(
+            member_workflow("Dockerfile", &files["Dockerfile"], "demo", "apps/demo"),
+            None
+        );
     }
 
     #[test]

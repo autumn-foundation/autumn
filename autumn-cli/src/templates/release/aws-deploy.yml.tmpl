@@ -52,6 +52,12 @@ on:
       - "v*"
   workflow_dispatch:
 
+env:
+  # The posture manifest's path from the repository root. A workspace member
+  # sets `<member dir>/security-posture.json`: `hashFiles` and `subject-path`
+  # ignore `working-directory`.
+  POSTURE_MANIFEST: security-posture.json
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -427,8 +433,14 @@ jobs:
       # as the attestations above: a Sigstore hiccup is a visible warning, not a
       # blocked deploy of code that shipped fine.
       - name: Attest the security posture manifest
-        if: hashFiles('security-posture.json') != ''
+        if: hashFiles(env.POSTURE_MANIFEST) != ''
         continue-on-error: true
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: security-posture.json
+          subject-path: ${{ env.POSTURE_MANIFEST }}
+
+      # Not a failure: an app that never adopted the posture gate must deploy.
+      # An app that did adopt it, with the wrong path, needs this message.
+      - name: Warn when the security posture manifest is missing
+        if: hashFiles(env.POSTURE_MANIFEST) == ''
+        run: echo "::warning::${POSTURE_MANIFEST} not found, so this release has no posture attestation. Ignore this if the app has not adopted the posture gate. If it has, set POSTURE_MANIFEST to the manifest path from the repository root."
