@@ -364,8 +364,8 @@ pub struct RouteInfo {
     /// (`#[authorize]`), carried for `Gated` routes.
     #[serde(default, skip_serializing_if = "is_false")]
     pub policy: bool,
-    /// The route is `Gated` only because its group was mounted with
-    /// `AppBuilder::scoped_guarded`: a declared guard, not a proven one.
+    /// The route is `Gated` only because its group uses
+    /// `AppBuilder::scoped_guarded`. The guard is declared, not proven.
     #[serde(default, skip_serializing_if = "is_false")]
     pub layer_guarded: bool,
     /// Module path of the handler (from `module_path!()`), used to name a
@@ -443,15 +443,18 @@ impl RouteInfo {
     }
 }
 
-/// Classify a route mounted in a scoped group. Only a route with no other
-/// answer takes the group's declared layer guard.
+/// Classify a route in a scoped group. Only an app route with no other
+/// classification takes the group's declared layer guard.
 fn classify_in_group(
     group: &ScopedGroup,
     route: &Route,
 ) -> (RouteClassification, Vec<String>, Vec<String>, bool, bool) {
     let (mut classification, roles, scopes, policy) =
         classify(&group.source, &route.api_doc, route.repository.as_ref());
-    let layer_guarded = group.layer_guarded && classification == RouteClassification::Unclassified;
+    // A plugin cannot vouch for its own routes.
+    let layer_guarded = group.layer_guarded
+        && group.source == RouteSource::User
+        && classification == RouteClassification::Unclassified;
     if layer_guarded {
         classification = RouteClassification::Gated;
     }
@@ -1332,8 +1335,8 @@ mod tests {
         }
     }
 
-    /// An unclassified route in a layer-guarded group is `Gated`, but flagged
-    /// as declared (not proven): the layer is not visible to the macros.
+    /// An unclassified route in a layer-guarded group is `Gated` and flagged
+    /// as declared. The macros cannot see the layer.
     #[test]
     fn layer_guarded_group_gates_an_unclassified_route() {
         let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
@@ -1352,7 +1355,7 @@ mod tests {
         assert!(!infos[0].layer_guarded);
     }
 
-    /// An explicit `#[public]` wins over the group: the manifest must not hide it.
+    /// An explicit `#[public]` wins over the group. The manifest must not hide it.
     #[test]
     fn layer_guard_does_not_override_public() {
         let doc = crate::openapi::ApiDoc {
@@ -1365,7 +1368,30 @@ mod tests {
         assert!(!infos[0].layer_guarded);
     }
 
-    /// A handler guard is proven, so it keeps its own, stronger claim.
+    /// A plugin cannot declare a guard for its own routes.
+    #[test]
+    fn layer_guard_is_ignored_for_plugin_groups() {
+        let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
+        let mut group = group_of(true, vec![route]);
+        group.source = RouteSource::Plugin("x".to_owned());
+        let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Unclassified);
+        assert!(!infos[0].layer_guarded);
+    }
+
+    /// The wire contract with `autumn routes audit`: `true` is sent, `false` is not.
+    #[test]
+    fn layer_guarded_serialises_only_when_true() {
+        let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
+        let mut infos = collect_route_infos(&[], &[], &[group_of(true, vec![route])], &[]).unwrap();
+        let json = serde_json::to_string(&infos[0]).unwrap();
+        assert!(json.contains(r#""layer_guarded":true"#), "{json}");
+        infos[0].layer_guarded = false;
+        let json = serde_json::to_string(&infos[0]).unwrap();
+        assert!(!json.contains("layer_guarded"), "{json}");
+    }
+
+    /// A handler guard is proven. It keeps its stronger claim.
     #[test]
     fn layer_guard_does_not_weaken_a_handler_guard() {
         let doc = crate::openapi::ApiDoc {

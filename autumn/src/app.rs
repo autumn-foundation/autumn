@@ -655,8 +655,8 @@ pub struct ScopedGroup {
     pub routes: Vec<Route>,
     /// Registration origin: user application or a named plugin.
     pub source: crate::route_listing::RouteSource,
-    /// The app declared that the group's layer authenticates its routes
-    /// (`AppBuilder::scoped_guarded`). A claim, not a proof.
+    /// The app declared that the layer of this group authenticates its routes
+    /// (`AppBuilder::scoped_guarded`). This is a claim, not a proof.
     pub layer_guarded: bool,
     /// Closure that applies the layer to a sub-router.
     pub apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
@@ -1285,13 +1285,15 @@ impl AppBuilder {
         self.push_scoped_group(prefix, layer, routes, false)
     }
 
-    /// Like [`scoped`](Self::scoped), but declare that `layer` authenticates
+    /// Like [`scoped`](Self::scoped). Also declares that `layer` authenticates
     /// every route in the group.
     ///
-    /// Use it for a guard that is a layer, not an attribute, such as
-    /// `RequireApiToken`. `autumn routes audit` then lists a route with no
-    /// `#[secured]` or `#[public]` as `gated` with `provenance: "declared"`.
-    /// A handler's own `#[public]` or `#[secured]` still wins.
+    /// Use it when a layer is the guard, such as `RequireApiToken`. Do not use
+    /// it with a layer that does not authenticate. That hides routes from the
+    /// default-deny audit.
+    /// `autumn routes audit` then lists each otherwise unclassified route in
+    /// the group as `gated`, with `provenance: "declared"`. A route that has
+    /// its own `#[public]` or `#[secured]` keeps that classification.
     ///
     /// The audit cannot check the claim. If the layer does not authenticate,
     /// the manifest is wrong.

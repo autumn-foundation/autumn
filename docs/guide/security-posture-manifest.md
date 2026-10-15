@@ -14,7 +14,7 @@ runtime. Reading the manifest starts with reading these tags.
   "schema_version": 5,
   "build": { "profile": "release", "features": [], "all_features": false, "no_default_features": false },
   "dimensions": {
-    "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]", "entries": [ … ] },
+    "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]; scoped_guarded", "entries": [ … ] },
     "csrf":             { "provenance": "declared",  "source": "config:security.csrf",     "entries": [ … ] },
     "security_headers": { "provenance": "declared",  "source": "config:security.headers",  "entries": [ … ] },
     "authorization_policies": {

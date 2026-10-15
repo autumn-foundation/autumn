@@ -94,8 +94,8 @@ pub struct AuditRoute {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub policy: bool,
-    /// Gated by a layer the app declared (`scoped_guarded`), not by a proven
-    /// guard. Absent on older dumps.
+    /// The route is gated by a layer that the app declared (`scoped_guarded`).
+    /// The macros did not prove the guard. Older dumps do not have this field.
     #[serde(default)]
     pub layer_guarded: bool,
     #[serde(default)]
@@ -282,7 +282,7 @@ pub struct ManifestRoute {
     pub location: Option<String>,
     /// How the classification was established. `"provable"` means it was
     /// derived from macro-expanded code (route + auth posture). `"declared"`
-    /// means the app claimed a guarding layer (`scoped_guarded`).
+    /// means the app claims a guard layer (`scoped_guarded`).
     pub provenance: &'static str,
 }
 
@@ -1179,8 +1179,8 @@ mod tests {
         }
     }
 
-    /// A layer-guarded route is `gated`, and its entry says `declared`:
-    /// the layer is a claim by the app, not a fact the macros proved (#2468).
+    /// A layer-guarded route is `gated` and its entry says `declared`. The
+    /// layer is a claim of the app. The macros did not prove it (#2468).
     #[test]
     fn layer_guarded_route_is_declared_not_provable() {
         let mut guarded = route("GET", "/api/todos", "list", "gated");
@@ -1192,6 +1192,19 @@ mod tests {
         assert_eq!(entries[0].provenance, "provable");
         assert_eq!(entries[1].path, "/api/todos");
         assert_eq!(entries[1].provenance, "declared");
+    }
+
+    /// The route dump from the app sets `layer_guarded`. The CLI must read it.
+    #[test]
+    fn audit_route_reads_layer_guarded_from_the_dump() {
+        let with: AuditRoute = serde_json::from_str(
+            r#"{"method":"GET","path":"/a","handler":"h","classification":"gated","layer_guarded":true}"#,
+        )
+        .unwrap();
+        assert!(with.layer_guarded);
+        let without: AuditRoute =
+            serde_json::from_str(r#"{"method":"GET","path":"/a","handler":"h"}"#).unwrap();
+        assert!(!without.layer_guarded);
     }
 
     #[test]

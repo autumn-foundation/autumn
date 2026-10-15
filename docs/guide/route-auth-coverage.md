@@ -71,8 +71,8 @@ also `gated` — its guard lives on the generated CRUD handler, not on a
 
 ### Guarded by a layer
 
-A guard can be a tower layer, not an attribute. `RequireApiToken` is one. Mount
-such a group with `scoped_guarded`, not `scoped`:
+A guard can be a tower layer instead of an attribute. `RequireApiToken` is a
+layer. Mount such a group with `scoped_guarded`, not `scoped`:
 
 ```rust
 app.scoped_guarded("/api", RequireApiToken::new(store), routes![list_todos])
@@ -80,10 +80,10 @@ app.scoped_guarded("/api", RequireApiToken::new(store), routes![list_todos])
 
 A route in the group with no `#[secured]` or `#[public]` is then `gated`, and
 its manifest entry has `"provenance": "declared"`. The audit cannot see inside
-the layer. It records your claim. A handler's own `#[public]` or `#[secured]`
+the layer. It records your claim and does not check it. A handler's own `#[public]` or `#[secured]`
 wins over the group.
 
-Do not use `#[public]` for these routes. They are not public.
+Do not use `#[public]` on these routes. They are not public.
 
 ### `public` — deliberately open routes
 

@@ -302,6 +302,31 @@ app that does not set `[cost]` behaves as before. `CostConfig` is
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### Routes: `ScopedGroup` and `RouteInfo` gain a `layer_guarded` field
+
+**Why:** `AppBuilder::scoped_guarded` (issue #2468) declares that a layer guards
+a route group. The route listing must record that claim. `ScopedGroup` and
+`RouteInfo` have public fields and are not `#[non_exhaustive]`, so a new field
+breaks a struct literal that names every field.
+
+**Before (`{X.Y}`):**
+
+```rust
+let info = RouteInfo { method, path, /* …every other field… */ };
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let info = RouteInfo { method, path, ..RouteInfo::default() };
+```
+
+`ScopedGroup` has no `Default`. Add `layer_guarded: false` to each literal. Most
+apps use `AppBuilder::scoped`, and need no change.
+
+**Automation:** `manual` — a codemod cannot know which fields a literal means to
+leave at their defaults.
+
 ### Config: `AutumnConfig` gains a `fault_injection` field
 
 **Why:** Staging fault injection (issue #3071) needs its own

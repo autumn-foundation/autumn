@@ -207,6 +207,10 @@ pub struct RouteEntry {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub policy: bool,
+    /// `declared` when a layer guard is the app's claim (`scoped_guarded`).
+    /// Absent or `provable` otherwise.
+    #[serde(default)]
+    pub provenance: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -387,6 +391,12 @@ impl MtlsEntry {
 }
 
 impl RouteEntry {
+    /// The guard is a declared layer, not a proven one.
+    #[must_use]
+    pub fn is_declared(&self) -> bool {
+        self.provenance == "declared"
+    }
+
     /// `(path, method)` — the identity of a mounted route. Handler name and
     /// source location are not part of it.
     #[must_use]
@@ -536,8 +546,10 @@ impl PostureManifest {
         {
             let roles: Vec<String> = r.role_set().into_iter().collect();
             let scopes: Vec<String> = r.scope_set().into_iter().collect();
+            // Only a declared guard, so a manifest without one keeps its digest.
+            let declared = if r.is_declared() { "\tprov=declared" } else { "" };
             lines.push(format!(
-                "route\t{}\t{}\t{}\troles={}\tscopes={}\tpolicy={}",
+                "route\t{}\t{}\t{}\troles={}\tscopes={}\tpolicy={}{declared}",
                 escape_field(&normalize_captures(&r.path)),
                 escape_field(&r.method),
                 escape_field(&r.classification),

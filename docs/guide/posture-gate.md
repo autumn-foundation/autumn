@@ -433,9 +433,11 @@ doesn't. It inherits every boundary of
   one binding removed and another added, and no manifest can tell that from a
   genuine loss. It blocks, and the report names the pairing so you can
   acknowledge it in one step.
-- **Middleware-imposed guards.** A route protected by a `RequireApiToken` layer
-  rather than by `#[secured]` is `unclassified` to `routes audit`, so it never
-  reaches this gate in the first place — `routes audit` fails on it first.
+- **Middleware-imposed guards.** A route guarded by a layer, such as
+  `RequireApiToken`, is `unclassified` to `routes audit`. The audit then fails
+  before this gate runs. Mount the group with `scoped_guarded` to declare the
+  guard. The route is then `gated` with `provenance: "declared"`. The audit
+  cannot check that claim, and neither can this gate. Review the layer.
 - **A build that lies.** The manifest comes from compiling the pull request, so
   a build script or procedural macro in the diff can influence what the app
   reports about itself. The gate isolates the *verdict* from that code (see
