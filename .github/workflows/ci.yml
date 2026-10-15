@@ -2278,12 +2278,22 @@ jobs:
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #3231: the SQLite commit-hook worker loop (stop token, claim
+          # heartbeat guard). No other lane measures it, so Codecov reads those
+          # lines as uncovered. Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_commit_hook_worker
           # Issue #2319: the ledger's chain reads, paged verify and out-of-band
           # refusals run against a real database. These two targets are the
           # Docker-free half; without them Codecov reads that code as uncovered.
           # Same package and features as the legs above, so no rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_ledger --test sqlite_ledger_out_of_band
+          # Issue #3267: the SQLite commit-hook worker's ack/nack retry runs
+          # only inside this suite. Without this leg Codecov reads it as
+          # uncovered. Same package and features as the legs above, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_commit_hook_worker
           # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
           # the cross-backend model suite. Without this lane Codecov reads them
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
@@ -2331,6 +2341,17 @@ jobs:
             --test integration_tests -- --ignored idempotency_ \
             | tee "$RUNNER_TEMP/idempotency-pg-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-cov.log"
+          # Issue #2875: the Postgres tracking store's database-clock expiry
+          # runs only in these Docker tests. Check the count: a filter that
+          # matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored pg_clock_skew:: \
+            | tee "$RUNNER_TEMP/tracking-clock-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-clock-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored pg_tracking_cleanup_deletes_expired_rows \
+            | tee "$RUNNER_TEMP/tracking-cleanup-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-cleanup-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
@@ -2381,6 +2402,10 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::scrub:: \
             | tee "$RUNNER_TEMP/cli-scrub-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scrub-cov.log"
+          # Issue #2374: same gap for `built_artifact::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- built_artifact:: \
+            | tee "$RUNNER_TEMP/cli-built-artifact-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-built-artifact-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -3303,6 +3328,11 @@ jobs:
             Stop-Process -Id $dev.Id -Force -ErrorAction SilentlyContinue
             Get-Process -Name 'tier1_app' -ErrorAction SilentlyContinue | Stop-Process -Force
             Get-Process -Name 'postgres' -ErrorAction SilentlyContinue | Stop-Process -Force
+            # `Stop-Process` returns before the process has gone. The next step
+            # starts Postgres on this data directory again, and that start fails
+            # while the old postmaster still holds it. Wait for the exit.
+            Get-Process -Name 'postgres', 'tier1_app' -ErrorAction SilentlyContinue |
+              Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
           }
 
       - name: "Journey: the daemon starts, is discoverable, and serves"
