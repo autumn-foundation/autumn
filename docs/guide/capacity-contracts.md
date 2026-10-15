@@ -122,8 +122,10 @@ profile are recorded and replayed:
   per-run random signing secret and loopback-only trusted hosts, scoped to that
   one throwaway process. Neither is performance-relevant, and anything already
   set in your environment is left alone.
-- `-p <member>` boots the child in *that package's* directory, so it reads its
-  own `autumn.toml` rather than the workspace root's.
+- The child starts in the directory of the package that owns the binary.
+  Without `-p`, that is the only workspace member that has a binary. The tool
+  looks for it from the working directory. The child reads that package's
+  `autumn.toml`, not the workspace root's.
 - The ladder speaks **plain HTTP over a reserved TCP port**.
   `server.unix_socket` is cleared for the calibration child, since the driver
   cannot dial one. In-process TLS is *not* switched off — doing so via the
@@ -291,16 +293,17 @@ Precedence, and the reasoning behind it:
 1. **An explicit `[server] max_concurrent_requests` always wins**, including an
    explicit `0` (today's spelling of "shedding off"). An operator who set a
    number by hand outranks a file committed months ago.
-2. Otherwise the contract, **but only** when it was measured on this host class
-   and records a non-zero limit.
+2. Otherwise the contract, **but only** when it was measured on this host class,
+   was calibrated under the running profile, and records a non-zero limit.
+   The tool normalizes profile names before it compares them (`production`
+   becomes `prod`). If the running profile has no name, it skips this check.
 3. Otherwise the profile default: primary pool size × 32, at least 256,
    under `prod` (#3057). Unlimited under every other profile.
 
 Every failure along the contract path — missing file, malformed document, a
-newer schema version, a contract from a different host class — degrades to
-**the profile default with a warning** (unlimited outside `prod`), never to a
-lower ceiling. Failing closed here would mean
-a typo'd path or a stale lockfile sheds every request on the way up, turning a
+newer schema version, a contract from a different host class or profile —
+degrades to **the profile default with a warning** (unlimited outside `prod`),
+never to a lower ceiling. Failing closed here would mean a typo'd path or a stale lockfile sheds every request on the way up, turning a
 capacity feature into an outage. The same reasoning covers a recorded limit of
 `0`: it is read as "no limit was proven", never as "shed everything".
 

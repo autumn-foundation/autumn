@@ -117,8 +117,9 @@ takes on Unix, so your hooks run and the cluster stops cleanly.
 
 The wait is your app's **own** budget, not a fixed one: `autumn dev` reads the
 same profile-aware `prestop_grace_secs + shutdown_timeout_secs` that
-`autumn serve stop` uses, and adds 60 seconds of headroom for the `on_shutdown`
-hooks that run after the drain (sized to the managed-Postgres stop ceiling). So
+`autumn serve stop` uses, and adds 75 seconds of headroom. The headroom covers
+the managed-Postgres stop that runs after the drain (60 seconds, plus 15 seconds
+of margin). So
 an app that legitimately takes 35 seconds to drain is not cut off at ten. Only
 once that budget elapses does `autumn dev` force-stop it — **and print a warning
 saying the hooks may not have run.** Degraded, but never silent.

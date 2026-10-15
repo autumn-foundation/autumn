@@ -298,6 +298,15 @@ fn write_contract(
     admission_limit: usize,
     host: autumn_web::capacity::HostProfile,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
+    write_contract_under(admission_limit, host, "test")
+}
+
+/// [`write_contract`] calibrated under `profile`.
+fn write_contract_under(
+    admission_limit: usize,
+    host: autumn_web::capacity::HostProfile,
+    profile: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let routes = vec![autumn_web::capacity::RouteShape {
         method: "GET".to_owned(),
         path: "/block".to_owned(),
@@ -321,7 +330,11 @@ fn write_contract(
             saturation_concurrency: admission_limit,
             admission_limit,
         },
-        calibration: autumn_web::capacity::Calibration::default(),
+        // Calibrated under the profile the test app runs as (#2418).
+        calibration: autumn_web::capacity::Calibration {
+            profile: profile.to_owned(),
+            ..autumn_web::capacity::Calibration::default()
+        },
         routes,
     };
 
@@ -415,6 +428,90 @@ async fn a_contract_from_another_host_class_does_not_throttle_this_process() {
     GATE_STALE.notify_waiters();
     held.await.unwrap().assert_ok();
     second.await.unwrap().assert_ok();
+}
+
+static GATE_PROFILE: LazyLock<Notify> = LazyLock::new(Notify::new);
+static ENTERED_PROFILE: AtomicUsize = AtomicUsize::new(0);
+
+#[get("/block")]
+async fn block_other_profile_contract() -> &'static str {
+    ENTERED_PROFILE.fetch_add(1, Ordering::SeqCst);
+    GATE_PROFILE.notified().await;
+    "released"
+}
+
+/// A contract calibrated under another profile must not throttle this one
+/// (#2418). A profile change moves the pool and middleware, so the measured
+/// envelope does not describe this process.
+#[tokio::test]
+async fn a_contract_calibrated_under_another_profile_does_not_throttle() {
+    let _guard = install_capture().1;
+    let (_dir, path) =
+        write_contract_under(1, autumn_web::capacity::HostProfile::detect(), "staging");
+
+    let client = Arc::new(
+        TestApp::new()
+            .config(config_with_contract(&path))
+            .routes(routes![block_other_profile_contract])
+            .build(),
+    );
+
+    let held = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get("/block").send().await })
+    };
+    wait_for_entered(&ENTERED_PROFILE, 1).await;
+
+    let second = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get("/block").send().await })
+    };
+    wait_for_entered(&ENTERED_PROFILE, 2).await;
+
+    GATE_PROFILE.notify_waiters();
+    held.await.unwrap().assert_ok();
+    second.await.unwrap().assert_ok();
+}
+
+/// The public resolvers agree on the profile rule.
+#[test]
+fn the_public_resolvers_check_the_calibrated_profile() {
+    use autumn_web::capacity::{
+        AdmissionLimit, HostProfile, resolve_admission_limit_for_profile,
+        resolve_admission_limit_with_default, resolve_configured_admission_limit,
+        resolve_configured_admission_limit_for_profile,
+        resolve_configured_admission_limit_with_default,
+    };
+    let _guard = install_capture().1;
+    let host = HostProfile::detect();
+    let (_dir, path) = write_contract_under(7, host.clone(), "staging");
+    let text = path.to_str().expect("utf-8 path");
+
+    assert_eq!(
+        resolve_admission_limit_for_profile(None, Some(&path), &host, Some(9), Some("prod")),
+        AdmissionLimit::ProfileDefault(9)
+    );
+    assert_eq!(
+        resolve_admission_limit_for_profile(None, Some(&path), &host, Some(9), Some("staging")),
+        AdmissionLimit::Contract(7)
+    );
+    assert_eq!(
+        resolve_configured_admission_limit_for_profile(None, Some(text), Some(9), Some("prod")),
+        AdmissionLimit::ProfileDefault(9)
+    );
+    // The unchecked entry points keep their old behavior.
+    assert_eq!(
+        resolve_admission_limit_with_default(None, Some(&path), &host, Some(9)),
+        AdmissionLimit::Contract(7)
+    );
+    assert_eq!(
+        resolve_configured_admission_limit_with_default(None, Some(text), Some(9)),
+        AdmissionLimit::Contract(7)
+    );
+    assert_eq!(
+        resolve_configured_admission_limit(None, Some(text)),
+        AdmissionLimit::Contract(7)
+    );
 }
 
 #[tokio::test]

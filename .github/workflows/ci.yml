@@ -2391,10 +2391,12 @@ jobs:
             | tee "$RUNNER_TEMP/cli-schema-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-cov.log"
           # Issue #2344: same gap for `upgrade::` and `git_root::`. Issue #2386:
-          # same gap for `sbom::`. No other lane instruments the `autumn` bin
+          # same gap for `sbom::`. Issue #2442: same gap for the `serve::`
+          # shutdown-budget tests. No other lane instruments the `autumn` bin
           # unit tests, so their patch coverage reads as 0%. Check the count: a
           # filter that matches nothing exits 0.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- upgrade:: git_root:: sbom:: \
+            serve::tests::shutdown_budget \
             | tee "$RUNNER_TEMP/cli-upgrade-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-upgrade-cov.log"
           # Issue #2366: same gap for `db::scrub::`. Its classifier is unit
@@ -2402,6 +2404,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::scrub:: \
             | tee "$RUNNER_TEMP/cli-scrub-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scrub-cov.log"
+          # Issue #2418: same gap for `routes::`. Binary resolution is unit
+          # tested, and no other lane instruments it. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- routes::tests:: \
+            | tee "$RUNNER_TEMP/cli-routes-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-routes-cov.log"
           # Issue #2374: same gap for `built_artifact::`. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- built_artifact:: \
             | tee "$RUNNER_TEMP/cli-built-artifact-cov.log"
@@ -2410,6 +2417,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- new:: \
             | tee "$RUNNER_TEMP/cli-new-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-new-cov.log"
+          # Issue #2458: same gap for the `serve` ready-file parser tests. Check
+          # the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- serve::tests::ready_payload \
+            | tee "$RUNNER_TEMP/cli-ready-payload-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-ready-payload-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -3302,6 +3314,11 @@ jobs:
             Stop-Process -Id $dev.Id -Force -ErrorAction SilentlyContinue
             Get-Process -Name 'tier1_app' -ErrorAction SilentlyContinue | Stop-Process -Force
             Get-Process -Name 'postgres' -ErrorAction SilentlyContinue | Stop-Process -Force
+            # `Stop-Process` returns before the process has gone. The next step
+            # starts Postgres on this data directory again, and that start fails
+            # while the old postmaster still holds it. Wait for the exit.
+            Get-Process -Name 'postgres', 'tier1_app' -ErrorAction SilentlyContinue |
+              Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
           }
 
       - name: "Journey: the daemon starts, is discoverable, and serves"

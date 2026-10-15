@@ -334,7 +334,7 @@ would the GET and the host discards the body for you.
 
 | Ceiling | What it bounds | What happens at the edge |
 |---|---|---|
-| `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — the module's data and element segments, which every request re-instantiates, and the request frame itself, which is cloned and base64-expanded into the guest's stdin — at 64 bytes per unit | 504 on the plugin's prefix |
+| `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — the module's data and element segments, which every request re-instantiates, and the request frame itself, which is cloned and base64-expanded into the guest's stdin — at 64 bytes per unit. Each byte the guest writes to stdout also costs one unit, because the host parses it | 504 on the plugin's prefix |
 | `memory_bytes` | one instance's linear memory | the guest's `memory.grow` fails; usually a trap, then 502 |
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
 | `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |

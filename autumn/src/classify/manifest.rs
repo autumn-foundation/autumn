@@ -44,8 +44,8 @@ pub const DATA_FLOW_MANIFEST_MARKER: &str = "[autumn:data-flow] ";
 pub struct ClassifiedFieldDescriptor {
     /// The model type's name, for display.
     pub model: &'static str,
-    /// The model type's module-qualified path -- the join key, so two crates
-    /// that each define a `Customer` cannot share one manifest row.
+    /// The model type's path: module, crate version, and name. It is the join
+    /// key. Two crates, or two versions of one crate, cannot share a row.
     pub model_path: &'static str,
     /// The column's Rust field name.
     pub field: &'static str,
@@ -61,7 +61,7 @@ inventory::collect!(ClassifiedFieldDescriptor);
 pub struct DeclassificationDescriptor {
     /// The model the released column belongs to, for display.
     pub model: &'static str,
-    /// That model's module-qualified path -- the join key.
+    /// That model's path (module, crate version, name). It is the join key.
     pub model_path: &'static str,
     /// The released column's field name.
     pub field: &'static str,
@@ -95,8 +95,9 @@ pub struct ReachableSink {
 pub struct ClassifiedFieldFlow {
     /// The model type's name, for display.
     pub model: String,
-    /// The model type's module-qualified path, which is what makes this row
-    /// distinct from a same-named model in another module or crate.
+    /// The model type's path (module, crate version, name). It makes this row
+    /// differ from a same-named model in another module, crate, or crate
+    /// version.
     pub model_path: String,
     /// The column's Rust field name.
     pub field: String,
@@ -129,9 +130,10 @@ impl DataFlowManifest {
         fields: &[ClassifiedFieldDescriptor],
         releases: &[DeclassificationDescriptor],
     ) -> Self {
-        // Keyed on the module-qualified path, not the bare name: two linked
-        // crates can each define a `Customer` with a classified `email`, and
-        // merging them would hide one model's column behind the other's row.
+        // Key on the full path, not the bare name. Two linked crates can each
+        // define a `Customer` with a classified `email`. So can two versions
+        // of one crate. A merge would hide one model's column behind the
+        // row of the other.
         let mut rows: BTreeMap<(&str, &str), ClassifiedFieldFlow> = BTreeMap::new();
         for descriptor in fields {
             rows.entry((descriptor.model_path, descriptor.field))
@@ -426,6 +428,40 @@ mod tests {
         assert!(summary.contains("billing::Customer.email"), "{summary}");
         assert!(summary.contains("support::Customer.email"), "{summary}");
         assert!(summary.contains("2 models"), "{summary}");
+    }
+
+    #[test]
+    fn two_versions_of_one_crate_stay_separate_rows() {
+        let manifest = DataFlowManifest::build(
+            &[
+                field_in("mycrate::Customer@1", "Customer", "email"),
+                field_in("mycrate::Customer@2", "Customer", "email"),
+            ],
+            &[],
+        );
+        assert_eq!(manifest.fields.len(), 2, "{manifest:?}");
+        let summary = manifest.summary();
+        assert!(summary.contains("mycrate::Customer@1.email"), "{summary}");
+        assert!(summary.contains("mycrate::Customer@2.email"), "{summary}");
+    }
+
+    #[test]
+    fn a_boundary_for_one_version_does_not_apply_to_the_other() {
+        let mut v2 = release("Customer", "email", "support_lookup");
+        v2.model_path = "mycrate::Customer@2";
+        let manifest = DataFlowManifest::build(
+            &[
+                field_in("mycrate::Customer@1", "Customer", "email"),
+                field_in("mycrate::Customer@2", "Customer", "email"),
+            ],
+            &[v2],
+        );
+        let v1_row = manifest
+            .fields
+            .iter()
+            .find(|f| f.model_path == "mycrate::Customer@1")
+            .expect("v1 row");
+        assert!(v1_row.reachable_sinks.is_empty(), "{manifest:?}");
     }
 
     #[test]

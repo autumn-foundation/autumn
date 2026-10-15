@@ -149,14 +149,14 @@ impl std::fmt::Display for Sink {
 pub trait ClassifiedField: 'static {
     /// The model type's name, e.g. `"Customer"`. For display.
     const MODEL: &'static str;
-    /// The model type's module-qualified path, e.g.
-    /// `"my_app::models::customer::Customer"`.
+    /// The model type's path, with the crate version, for example
+    /// `"my_app::models::customer@2::Customer"`.
     ///
-    /// This, not [`MODEL`](Self::MODEL), is the manifest's identity for the
-    /// column: two crates (or two modules) can each define a `Customer` with a
-    /// classified `email`, and keying on the bare name would merge them into one
-    /// row -- hiding an added classified column, or attributing one model's
-    /// reachable sinks to the other's.
+    /// The manifest uses this, not [`MODEL`](Self::MODEL), as the column
+    /// identity. Two crates, modules, or crate versions can each define a
+    /// `Customer` with a classified `email`. A bare name would merge them into
+    /// one row. That hides an added classified column. It can also give the
+    /// reachable sinks of one model to the other.
     const MODEL_PATH: &'static str;
     /// The column's Rust field name, e.g. `"email"`.
     const FIELD: &'static str;
@@ -265,7 +265,7 @@ impl<T, F: ClassifiedField> Classified<T, F> {
         F::MODEL
     }
 
-    /// The module-qualified path of the model this column belongs to.
+    /// The path of the model this column belongs to. It has the crate version.
     #[must_use]
     pub const fn model_path() -> &'static str {
         F::MODEL_PATH
@@ -436,8 +436,8 @@ impl<F: ClassifiedField> std::fmt::Debug for Declassification<F> {
 pub struct DeclassificationRecord {
     /// The model the column belongs to.
     pub model: &'static str,
-    /// That model's module-qualified path -- its identity, where `model` is its
-    /// display name.
+    /// That model's path, with the crate version. It is the model identity.
+    /// `model` is the display name.
     pub model_path: &'static str,
     /// The column's field name.
     pub field: &'static str,
