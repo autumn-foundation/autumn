@@ -392,6 +392,10 @@ authority under a manifest that says otherwise.
   that `format!` and `vec!` are *not* inert here even though they cost no
   query in [query budgets](query-budgets.md): `vec!` can carry a handle and
   `format!` launders URLs. Only pure logging, assertion and template macros are inert.
+- **A macro Autumn cannot read, awaited or used as a statement** —
+  `schedule!().await?`, `schedule!();`. Its expansion can enqueue a job with
+  no handle in its tokens. Add `#[agent_effect(...)]`. Logging, assertion,
+  `bail!`, `ensure!` and template macros are inert.
 - **A body-local `macro_rules!` naming a handle** — it is hygienic at its
   *definition* site, so it performs that handle's effects wherever it is
   invoked, and the invocation (`wipe!()`) mentions nothing to see.
@@ -408,6 +412,22 @@ authority under a manifest that says otherwise.
 - **A `dyn Trait`, `impl Trait` or fn-generic parameter** — any method call on
   one is opaque. (`Json<T>`, `Path<T>`, `Query<T>`, `Form<T>` and friends are
   never handles, so they never trigger this.)
+- **A table the analysis cannot resolve** — `diesel::update(x)`,
+  `diesel::delete(x)` or `diesel::insert_into(x)` where `x` is not
+  `<table>::table` (or a `let` bound to it). The grant names the table, so
+  Autumn must know it. Autumn reads `use diesel as orm;` and
+  `use diesel::delete as remove;` only when they sit inside the handler. A
+  macro cannot see a module-level `use`, so write `diesel::` in the handler.
+- **Branches** — Autumn joins the paths of an `if`, `match` or loop. A handle
+  cleared on one path stays a handle on the other. Two kinds of handle on one
+  name are refused where used.
+- **A macro or import defined outside the handler** — Autumn reads only what
+  the handler body itself defines. It takes `format!`, `vec!`, `println!` and
+  the like to be the standard macros of those names. A `macro_rules!` at module
+  scope that reuses one of those names is invisible to it, so do not shadow a
+  standard macro name with a macro that does anything but build a value.
+- **A data-changing CTE** — every table it writes, and the main statement's
+  table, counts as an unbounded write.
 - **A detached task** — `tokio::spawn` and its relatives, as above.
 - **An awaited call the analysis cannot read** — `start_finance_job().await`,
   `svc.kick_off().await`, or a future bound to a name and awaited later. This
@@ -426,11 +446,17 @@ authority under a manifest that says otherwise.
 
   | Allowed | Why |
   |---|---|
-  | `sleep`, `sleep_until`, `yield_now`, `timeout` | scheduling, not work. `timeout` *awaits the future it is handed*, so that future is judged at the `await` instead — `timeout(d, start_finance_job()).await` is still refused |
-  | a chain whose root binding is named `session`, `flash`, `cache`, `cookies`, `cookie_jar` or `csrf` | request-local plumbing; it stores no rows a grant governs |
-  | a chain whose root parameter is typed `Session`, `Flash`, `CookieJar`, `PrivateCookieJar`, `SignedCookieJar`, `Csrf`, `CsrfToken` or `Cache…` — through any extractor wrapping it | the same allowance, for a parameter that is named something else |
-  | `.commit()` / `.rollback()` | these end a transaction rather than acting through it |
+  | `tokio::time::sleep`, `sleep_until`, `timeout`, `tokio::task::yield_now`. Write the `tokio` path, or import the name with `use` in the handler. A glob import is read. A `use … as` rename is not | They schedule. They do no work. A bare `sleep(d)` can be any function. `timeout` awaits its argument, so Autumn judges that argument at the `await`: `timeout(d, start_finance_job()).await` is refused |
+  | a chain whose root parameter is typed `Session`, `Flash`, `CookieJar`, `PrivateCookieJar`, `SignedCookieJar`, `Csrf`, `CsrfToken` or `Cache…` — even inside an extractor such as `Extension<…>` | They hold request-local state and store no rows. The type decides, never the binding name |
+  | `.commit()` / `.rollback()` on a transaction: the `tx` / `tx_with` callback parameter, or `db.begin()` | They end a transaction. They do not act on data. `billing.commit()` is refused |
   | a call rooted at `autumn_web` whose function is `__`-prefixed | the guard prologue `#[secured]`, `#[authorize]`, `#[step_up]` and `#[throttle]` prepend when they stack with this macro — the framework refusing the request, not the handler acting. A `Self::__autumn_…` call is *not* covered: that is a generated repository method |
+
+  An awaited call whose callee is not a path is refused. Examples:
+  `(choose())().await`, `callbacks[0]().await`. A closure that is called at
+  once is the exception.
+
+  A call through a name bound to an effect verb
+  (`let schedule = NotifyFinanceJob::enqueue;`) is read as that verb.
 
   Everything else is discharged the usual way: declare what the call does with
   `#[agent_effect(...)]`, or — when it is verified to do nothing an agent's
@@ -690,6 +716,11 @@ rather than merged silently.
 autumn agents manifest --release --manifest agent-authority.json   # to record
 autumn agents manifest --release --check agent-authority.json      # in CI
 ```
+
+Two routes can share one `operation_id`. The server keeps the first route as
+the tool and skips the others. The manifest does the same. It marks each
+skipped route `exposure: "not-exposed"` with `caveat: "duplicate-operation-id"`.
+Give each route its own `operation_id` to expose both.
 
 `--check` fails on drift **and** on any MCP-exposed *mutating* tool (anything
 but `GET`/`HEAD`) with no envelope. A read-only ungoverned tool is warned
