@@ -705,6 +705,7 @@ fn root_owners(root: &Path) -> RootOwners {
 /// crate. `--no-deps` needs no network. If Cargo fails, the answer is no.
 fn is_cargo_member(workspace: &Path, member: &Path) -> bool {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let manifest = plain(member).join("Cargo.toml");
     let Ok(output) = std::process::Command::new(cargo)
         .args([
             "metadata",
@@ -713,7 +714,7 @@ fn is_cargo_member(workspace: &Path, member: &Path) -> bool {
             "1",
             "--manifest-path",
         ])
-        .arg(member.join("Cargo.toml"))
+        .arg(&manifest)
         .output()
     else {
         return false;
@@ -727,15 +728,26 @@ fn is_cargo_member(workspace: &Path, member: &Path) -> bool {
     let same = |value: Option<&str>, expected: &Path| {
         value
             .and_then(|path| Path::new(path).canonicalize().ok())
-            .is_some_and(|path| path == expected)
+            .is_some_and(|path| plain(&path) == plain(expected))
     };
-    let manifest = member.join("Cargo.toml");
     same(metadata["workspace_root"].as_str(), workspace)
         && metadata["packages"].as_array().is_some_and(|packages| {
             packages
                 .iter()
                 .any(|package| same(package["manifest_path"].as_str(), &manifest))
         })
+}
+
+/// `path` without the `\\?\` prefix Windows adds to a canonical path.
+///
+/// Cargo can fail to match a member found through a path dependency when its
+/// manifest path has that prefix. On other systems this returns `path` as it is.
+fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// The `/`-separated path from `ancestor` down to `descendant`.
@@ -3403,7 +3415,7 @@ mod tests {
 
     #[test]
     fn a_member_in_a_directory_yaml_could_misread_gets_no_workflows() {
-        // The directory is written into the workflow. `a: b` or `x # y` would
+        // The directory is written into the workflow. A space, `:` or `#` would
         // change what the YAML means.
         let outer = TempDir::new().unwrap();
         fs::create_dir(outer.path().join(".git")).unwrap();
@@ -3412,7 +3424,7 @@ mod tests {
             "[workspace]\nmembers = [\"*\"]\n",
         )
         .unwrap();
-        let root = outer.path().join("my app: x");
+        let root = outer.path().join("my app");
         fs::create_dir_all(&root).unwrap();
         write(
             &root,
