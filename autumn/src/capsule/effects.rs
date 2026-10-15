@@ -571,8 +571,12 @@ impl ReplayEffects {
     /// logged and the caller must fail the call rather than dial the peer.
     #[must_use]
     pub(crate) fn next_http(&self, request: &OutboundRequest<'_>) -> Option<HttpEffect> {
-        let (method, url) = (request.method, request.url);
-        self.observe_live_userinfo(url);
+        let (method, raw_url) = (request.method, request.url);
+        self.observe_live_userinfo(raw_url);
+        // The URL parser ignores ASCII tab/CR/LF, so two spellings that differ
+        // only by those are one URL: compare and report the parser's view.
+        let live = crate::capsule::redact::parser_view(raw_url);
+        let url = live.as_ref();
         let Ok(mut seam) = self.http.lock() else {
             return None;
         };
@@ -597,7 +601,9 @@ impl ReplayEffects {
             });
             return None;
         };
-        if !next.method.eq_ignore_ascii_case(method) || !matches_redacted(&next.url, url) {
+        if !next.method.eq_ignore_ascii_case(method)
+            || !matches_redacted(&crate::capsule::redact::parser_view(&next.url), url)
+        {
             let expected = describe_http(&next.method, &next.url);
             drop(seam);
             let actual = describe_http(method, url);
@@ -1318,6 +1324,9 @@ impl ReplayEffects {
     /// [`Self::observe_text`] for a URL, which also decomposes a masked
     /// userinfo the way capture retained it (user, password, decoded forms).
     fn observe_url(&self, recorded: &str, actual: &str) {
+        let recorded = crate::capsule::redact::parser_view(recorded);
+        let actual = crate::capsule::redact::parser_view(actual);
+        let (recorded, actual) = (recorded.as_ref(), actual.as_ref());
         self.observe_text(recorded, actual);
         if crate::capsule::redact::url_userinfo(recorded).as_deref() == Some("[FILTERED]") {
             self.observe_live_userinfo(actual);

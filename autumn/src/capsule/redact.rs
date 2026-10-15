@@ -643,9 +643,13 @@ pub fn redact_effects(
     // the filter pass does. Replay refuses a capsule with masked input
     // (#2351 item 8).
     for (index, exchange) in effects.http.iter_mut().enumerate() {
-        exchange.url = mask_url_echoes(&exchange.url, values);
+        let (masked_url, host_masked) = mask_url_echoes(&exchange.url, values);
+        if host_masked {
+            keys.insert(format!("http[{index}].url:<host-echo>"));
+        }
+        exchange.url = masked_url;
         if let Some(final_url) = exchange.final_url.as_mut() {
-            let masked = mask_url_echoes(final_url, values);
+            let (masked, _) = mask_url_echoes(final_url, values);
             if masked != *final_url {
                 keys.insert(format!("http[{index}].final_url:<echo>"));
             }
@@ -864,7 +868,7 @@ fn authority_bounds(url: &str) -> Option<(usize, usize)> {
 /// `url` as the URL parser reads it: ASCII tab and newline characters are
 /// removed wherever they appear, so `https:\t//user:secret@host` is the
 /// credentialed URL it looks like. Text this returns is what gets recorded.
-fn parser_view(url: &str) -> Cow<'_, str> {
+pub(crate) fn parser_view(url: &str) -> Cow<'_, str> {
     if url.contains(['\t', '\n', '\r']) {
         Cow::Owned(
             url.chars()
@@ -895,24 +899,22 @@ fn split_userinfo(url: &str) -> Option<(String, String, String)> {
     ))
 }
 
-/// [`mask_echoes`] over everything after a URL's authority.
+/// [`mask_echoes`] over a whole URL, and whether it reached the host.
 ///
-/// The scheme and host are structure, not payload: a retained credential that
-/// happens to equal a host label (`payments:secret@payments.example`) must not
-/// turn the destination into a wildcard replay would then match against any
-/// host.
-fn mask_url_echoes(url: &str, redacted: &RedactedValues) -> String {
-    // Deliberately not read through `parser_view`: a URL without credentials is
-    // recorded verbatim (replay matches it against the live string), and one
-    // with credentials was already normalised when its userinfo was masked.
-    match authority_bounds(url) {
-        Some((_, end)) => format!(
-            "{}{}",
-            url.get(..end).unwrap_or_default(),
-            mask_echoes(url.get(end..).unwrap_or_default(), redacted)
-        ),
-        None => mask_echoes(url, redacted),
-    }
+/// A secret seeded from elsewhere in the request can appear in a hostname
+/// (`https://tenant-secret.example/`); it is masked there like anywhere else.
+/// The host then stops being a literal destination, so the caller records a
+/// redaction key that makes the capsule non-replayable instead of letting the
+/// placeholder act as a wildcard that matches any host.
+fn mask_url_echoes(url: &str, redacted: &RedactedValues) -> (String, bool) {
+    let host_masked = authority_bounds(url).is_some_and(|(start, end)| {
+        let authority = url.get(start..end).unwrap_or_default();
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        mask_echoes(host, redacted) != host
+    });
+    (mask_echoes(url, redacted), host_masked)
 }
 
 /// The `user:password` of an absolute URL's authority, if it has one.
@@ -2371,14 +2373,15 @@ mod tests {
         }
 
         #[test]
-        fn a_credential_equal_to_a_host_label_does_not_wildcard_the_host() {
+        fn a_credential_equal_to_a_host_label_masks_the_host_and_blocks_replay() {
             let mut effects = CapsuleEffects {
                 http: vec![exchange("https://payments:secret@payments.example/x")],
                 ..CapsuleEffects::default()
             };
-            redact(&mut effects);
+            let keys = redact(&mut effects);
             let url = &effects.http.first().expect("one exchange").url;
-            assert_eq!(url, "https://[FILTERED]@payments.example/x");
+            assert_eq!(url, "https://[FILTERED]@[FILTERED].example/x");
+            assert!(keys.contains("http[0].url:<host-echo>"), "{keys:?}");
         }
 
         #[test]
