@@ -887,7 +887,7 @@ that one of them was a newline or someone's national insurance number.
 > `agent:anonymous` on an outcome means no principal was established anywhere.
 > To name the actor on the attempt event too, authenticate the endpoint itself
 > (see [Secure the endpoint, not just the handler](#secure-the-endpoint-not-just-the-handler)).
-> The dispatcher removes control and invisible formatting characters from the
+> The dispatcher removes anything but letters, digits and id punctuation from the
 > id and keeps at most 128 characters. The refused event, like the attempt
 > event, is written before dispatch and reads `agent:anonymous` for a route
 > guard principal. The id is the user id or token principal id. It is not an

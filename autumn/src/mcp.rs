@@ -1770,22 +1770,24 @@ fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
 /// Longest actor id an audit row keeps.
 const MAX_ACTOR_LEN: usize = 128;
 
-/// An actor id fit for an audit row: no control or invisible formatting
-/// characters, capped in length.
+/// An actor id fit for an audit row: letters, digits and plain id punctuation
+/// only, capped in length.
+///
+/// An allowlist, because line separators, zero-width marks and bidirectional
+/// marks are not control characters, and a list of them is never complete.
 fn clean_actor(actor: &str) -> Option<String> {
-    // Zero-width and bidirectional marks can disguise one id as another.
-    let invisible = |c: char| {
-        matches!(
-            c,
-            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
-        )
-    };
     let clean: String = actor
         .chars()
-        .filter(|c| !c.is_control() && !invisible(*c))
+        .filter(|c| {
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '_' | '.' | ':' | '@' | '+' | '/' | '=' | '#' | '~' | ' '
+                )
+        })
         .take(MAX_ACTOR_LEN)
         .collect();
-    (!clean.is_empty()).then_some(clean)
+    (!clean.trim().is_empty()).then_some(clean)
 }
 
 /// The tool error returned when a non-reversible action cannot be recorded.
@@ -4538,13 +4540,21 @@ mod tests {
     }
 
     #[test]
-    fn an_actor_id_loses_control_characters_and_is_capped() {
+    fn an_actor_id_keeps_only_id_characters_and_is_capped() {
         assert_eq!(clean_actor("user-42").as_deref(), Some("user-42"));
         assert_eq!(clean_actor("a\nb\r\u{0}c").as_deref(), Some("abc"));
         assert_eq!(clean_actor("\n"), None);
         assert_eq!(
             clean_actor("ad\u{202E}min\u{200B}").as_deref(),
             Some("admin")
+        );
+        // Line separators and soft or joining marks are not control characters.
+        assert_eq!(clean_actor("a\u{2028}b\u{2029}c").as_deref(), Some("abc"));
+        assert_eq!(clean_actor("a\u{2060}b\u{00AD}c").as_deref(), Some("abc"));
+        // Ordinary ids keep their punctuation.
+        assert_eq!(
+            clean_actor("agent:key_1.x@example.com").as_deref(),
+            Some("agent:key_1.x@example.com")
         );
         assert_eq!(clean_actor(&"x".repeat(500)).map(|a| a.len()), Some(128));
     }
