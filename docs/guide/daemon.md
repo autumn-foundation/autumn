@@ -181,6 +181,8 @@ all** (drops the `db` feature and the migration wiring), so the binary links no
 Postgres client. This is the recommended shape for a local-first tool that
 doesn't need persistence.
 
+`--daemon` does not accept `--with`. Plugins enable the `db` feature again.
+
 ### Managed local Postgres (opt-in)
 
 For apps that use `#[model]` / `#[repository]`, `autumn new --bundled-pg`

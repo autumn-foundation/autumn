@@ -314,8 +314,16 @@ fn still_referenced(
     super::install::explicit_target_sources(root)
         .into_iter()
         .find(|path| {
-            std::fs::read_to_string(path)
-                .is_ok_and(|src| markers.iter().any(|marker| src.contains(marker.as_str())))
+            // The post-removal text wins over disk, as in the first scan.
+            let src = overrides.get(path).map_or_else(
+                || {
+                    std::fs::read_to_string(path)
+                        .ok()
+                        .map(std::borrow::Cow::Owned)
+                },
+                |src| Some(std::borrow::Cow::Borrowed(src.as_str())),
+            );
+            src.is_some_and(|src| markers.iter().any(|marker| src.contains(marker.as_str())))
         })
 }
 
@@ -1259,6 +1267,27 @@ autumn-plugin-live-feed = "0.3.1"
                 .is_some_and(|kept| kept.reason().contains("server.rs")),
             "{dependency_retained:?}"
         );
+    }
+
+    /// #2476: a `[[bin]]` that names `src/main.rs` makes the explicit-target
+    /// scan read that file. It must see the file without the mount this
+    /// command removes, not the copy on disk.
+    #[test]
+    fn an_explicit_main_target_does_not_retain_the_mount_being_removed() {
+        let cargo = format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            removed,
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(dependency_retained.is_none(), "{dependency_retained:?}");
+        assert!(removed.contains(&Wire::Dependency), "{removed:?}");
     }
 
     /// A sibling module of such a target counts too — the target's own tree is

@@ -5379,18 +5379,22 @@ fn run_command(command: Commands) {
                 );
                 wire_scaffold_plugins_into(&name, &plugins);
             } else {
+                let opts = new::GenerateOptions {
+                    with_i18n,
+                    with_seed,
+                    // --bundled-pg is a daemon flavor that keeps the database.
+                    with_daemon: daemon || bundled_pg,
+                    with_bundled_pg: bundled_pg,
+                    with_api: api,
+                };
+                // Before the preflight: it queries the network, and a
+                // contradictory request must fail first.
+                if let Err(err) = new::check_with_plugins(opts, with.len()) {
+                    eprintln!("Error: {err}");
+                    std::process::exit(1);
+                }
                 let plugins = resolve_scaffold_plugins(&with, Some(plugin::first_party_version()));
-                new::run(
-                    &name,
-                    new::GenerateOptions {
-                        with_i18n,
-                        with_seed,
-                        // --bundled-pg is a daemon flavor that keeps the database.
-                        with_daemon: daemon || bundled_pg,
-                        with_bundled_pg: bundled_pg,
-                        with_api: api,
-                    },
-                );
+                new::run(&name, opts);
                 wire_scaffold_plugins_into(&name, &plugins);
             }
         }
