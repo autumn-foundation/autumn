@@ -84,6 +84,11 @@ async fn outbound_url_userinfo_credential_is_masked_in_the_capsule() {
     assert!(
         !raw.contains(SENTINEL_PASS) && !raw.contains(SENTINEL_USER),
         "URL userinfo credential reached the capsule on disk: {:?}",
-        capsule.effects.http.iter().map(|e| &e.url).collect::<Vec<_>>()
+        capsule
+            .effects
+            .http
+            .iter()
+            .map(|e| &e.url)
+            .collect::<Vec<_>>()
     );
 }

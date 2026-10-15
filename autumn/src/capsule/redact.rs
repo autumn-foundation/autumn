@@ -779,6 +779,48 @@ pub fn redact_effects(
     }
 }
 
+/// Blank the `user:password@` of an absolute URL's authority.
+///
+/// The whole userinfo goes: a username is as often the credential (an API key
+/// sent as the user) as the password is. Both spellings (raw and
+/// percent-decoded) are retained so an echo elsewhere in the capsule is masked
+/// and so replay can match the placeholder against the live URL.
+fn mask_url_userinfo(
+    url: &str,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+    location: &str,
+) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest.get(..end).unwrap_or_default();
+    let tail = rest.get(end..).unwrap_or_default();
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return url.to_owned();
+    };
+    if userinfo.is_empty() {
+        return url.to_owned();
+    }
+    keys.insert(format!("{location}:userinfo"));
+    let mut retain = |part: &str| {
+        if part.is_empty() {
+            return;
+        }
+        values.insert(part.as_bytes());
+        let decoded = percent_encoding::percent_decode_str(part).decode_utf8_lossy();
+        if decoded != part {
+            values.insert(decoded.as_bytes());
+        }
+    };
+    retain(userinfo);
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    retain(user);
+    retain(password);
+    format!("{scheme}://{FILTERED_PLACEHOLDER}@{host}{tail}")
+}
+
 /// Mask the query string of a recorded outbound URL by parameter name.
 ///
 /// Splices the masked query back onto the original prefix rather than
@@ -792,6 +834,12 @@ fn redact_url_query(
     keys: &mut BTreeSet<String>,
     location: &str,
 ) -> String {
+    // Userinfo (`https://user:secret@host/..`) is the same downstream
+    // credential an `Authorization: Basic` header carries — the HTTP client
+    // turns it into one — so it is masked like that header, not left in the
+    // clear because it lives in the authority instead of a header or query.
+    let url = mask_url_userinfo(url, values, keys, location);
+    let url = url.as_str();
     let Some(split) = url.find('?') else {
         return url.to_owned();
     };
