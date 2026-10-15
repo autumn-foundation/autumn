@@ -317,6 +317,37 @@ fn package_dir_from(member_dir: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The directories `autumn dev` watches: the project root, and the selected
+/// member when it is elsewhere.
+static WATCH_ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record the watched roots, in the plain and the canonical form: the watcher
+/// may report either.
+fn register_watch_roots(cwd: &Path, member_dir: Option<&Path>) {
+    let mut roots = Vec::new();
+    for dir in std::iter::once(cwd).chain(member_dir) {
+        roots.push(dir.to_path_buf());
+        if let Ok(canonical) = dir.canonicalize() {
+            roots.push(canonical);
+        }
+    }
+    roots.dedup();
+    let _ = WATCH_ROOTS.set(roots);
+}
+
+/// `path` without the first of `roots` that contains it, or `path` itself.
+fn strip_watch_root<'a>(path: &'a Path, roots: &[PathBuf]) -> &'a Path {
+    roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path)
+}
+
+/// [`strip_watch_root`] for the roots of this run.
+fn relative_to_watch_root(path: &Path) -> &Path {
+    strip_watch_root(path, WATCH_ROOTS.get().map_or(&[], Vec::as_slice))
+}
+
 /// The member directory to watch for `.env` edits, if it is not the project
 /// root, which is already watched.
 fn member_dir_to_watch(member_dir: &Path, cwd: &Path) -> Option<PathBuf> {
@@ -728,6 +759,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
     let normalized_dirs = sanitize_custom_watch_dirs(load_dev_config(Path::new(AUTUMN_TOML)));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let custom_watch_dirs = resolve_custom_watch_dirs(&normalized_dirs, &cwd);
+    register_watch_roots(&cwd, member_dir.as_deref());
 
     // Set up file watcher
     let (tx, rx) = mpsc::channel();
@@ -1492,6 +1524,9 @@ fn classify_change(
     if !matches!(kind, DebouncedEventKind::Any) {
         return ChangeEffect::Ignore;
     }
+    // Judge the path inside the project, not the directories above it. A
+    // workspace under `~/.worktrees/` is not a hidden project.
+    let path = relative_to_watch_root(path);
 
     // A root-level dotenv file the config loader reads (`.env`, `.env.local`,
     // `.env.<profile>`, `.env.<profile>.local`) must restart the server so an
@@ -3031,6 +3066,37 @@ mod tests {
         let member = root.path().join("api");
         std::fs::create_dir(&member).unwrap();
         assert_eq!(member_dir_to_watch(&member, root.path()), Some(member));
+    }
+
+    #[test]
+    fn a_dotenv_under_a_hidden_ancestor_is_judged_inside_the_watch_root() {
+        // The workspace lives under a dot-prefixed directory. Judged by its
+        // full path, the member `.env` would be ignored as a hidden file.
+        let member = PathBuf::from("/home/alice/.worktrees/project/api");
+        let roots = vec![member.clone()];
+        let event = member.join(".env");
+        assert!(
+            !is_watched_dotenv_file(&event),
+            "the full path is rejected, which is the bug"
+        );
+        let inside = strip_watch_root(&event, &roots);
+        assert_eq!(inside, Path::new(".env"));
+        assert!(is_watched_dotenv_file(inside));
+    }
+
+    #[test]
+    fn a_hidden_directory_inside_the_watch_root_is_still_ignored() {
+        let root = PathBuf::from("/home/alice/.worktrees/project");
+        let event = root.join(".git").join(".env");
+        assert!(!is_watched_dotenv_file(strip_watch_root(&event, &[root])));
+    }
+
+    #[test]
+    fn a_path_outside_every_watch_root_is_left_alone() {
+        let roots = vec![PathBuf::from("/work/api")];
+        let event = Path::new("/elsewhere/.env");
+        assert_eq!(strip_watch_root(event, &roots), event);
+        assert_eq!(strip_watch_root(event, &[]), event);
     }
 
     #[test]
