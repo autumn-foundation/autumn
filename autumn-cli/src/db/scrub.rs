@@ -2581,16 +2581,25 @@ fn database_endpoint(
         .or_else(|| os_user(env))?;
     // Named query parameters apply after the authority, so they win. `hostaddr`
     // is the network address libpq connects to; `host` is then only a name.
-    let named = merge_hosts(
-        query("hostaddr").or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty())),
-        query("host").or_else(|| {
-            listed
-                .is_empty()
-                .then(|| env("PGHOST").filter(|v| !v.is_empty()))
-                .flatten()
-        }),
-    );
-    let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if let Some(list) = named {
+    let addr = query("hostaddr").or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty()));
+    let fallback_hosts = query("host").or_else(|| {
+        if listed.is_empty() {
+            env("PGHOST").filter(|v| !v.is_empty())
+        } else if addr.is_some() {
+            // The authority hosts name the empty `hostaddr` items.
+            Some(
+                listed
+                    .iter()
+                    .map(|(host, _)| host.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        } else {
+            None
+        }
+    });
+    let merged = merge_hosts(addr, fallback_hosts);
+    let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if let Some(list) = merged {
         let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
         let ports = if listed.len() == hosts.len() {
             listed.iter().map(|(_, p)| *p).collect()
@@ -10488,6 +10497,11 @@ mod tests {
             "postgres:///app?hostaddr=,10.0.0.5",
             "postgres://a/app",
             &pghost
+        ));
+        assert!(same_database_in(
+            "postgres://a,b/app?hostaddr=,10.0.0.5",
+            "postgres://a/app",
+            &env
         ));
         assert_eq!(merge_hosts(None, Some("h".into())), Some("h".into()));
         assert_eq!(merge_hosts(Some(",x".into()), None), Some(",x".into()));

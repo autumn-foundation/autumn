@@ -391,7 +391,7 @@ pub fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
     match item {
         syn::TraitItem::Fn(i) => &i.attrs,
         syn::TraitItem::Const(i) => &i.attrs,
-
+        syn::TraitItem::Type(i) => &i.attrs,
         _ => &[],
     }
 }
@@ -401,7 +401,7 @@ pub fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
     match item {
         syn::ImplItem::Fn(i) => &i.attrs,
         syn::ImplItem::Const(i) => &i.attrs,
-
+        syn::ImplItem::Type(i) => &i.attrs,
         _ => &[],
     }
 }
@@ -2660,6 +2660,9 @@ mod tests {
                 #[cfg(test)] let _x = { #[model] struct V { #[id] id: i64, #[encrypted] b: String } };
             }
             enum EV { #[cfg(test)] V = { #[model] struct H { #[id] id: i64, #[encrypted] n: String } 0 } }
+            struct TY;
+            impl TY { #[cfg(test)] type A = [(); { #[model] struct J { #[id] id: i64, #[encrypted] o: String } 0 }]; }
+            trait TT2 { #[cfg(test)] type B = [(); { #[model] struct K { #[id] id: i64, #[encrypted] p: String } 0 }]; }
             #[cfg(test)] enum E { V = { #[model] struct G { #[id] id: i64, #[encrypted] m: String } 0 } }
             struct X;
             impl X {
