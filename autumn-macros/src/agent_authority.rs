@@ -1789,7 +1789,12 @@ impl Analyzer {
                         .as_ref()
                         .is_some_and(|(_, other)| self.is_unread_call(other))
             }
-            Expr::Match(m) => m.arms.iter().any(|arm| self.is_unread_call(&arm.body)),
+            Expr::Match(m) => m.arms.iter().any(|arm| {
+                self.tail_unread
+                    .get(&(std::ptr::from_ref(&*arm.body) as usize))
+                    .copied()
+                    .unwrap_or_else(|| self.is_unread_call(&arm.body))
+            }),
             _ => false,
         }
     }
@@ -2095,6 +2100,7 @@ impl Analyzer {
                     let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
                     let saved = self.enter_binding_scope(pat, scrutinee.as_ref());
                     self.mark_pattern_unread(pat, &m.expr);
+                    self.bind_pattern_callables(pat, &m.expr);
                     if let Some(guard) = guard {
                         self.expr(guard);
                     }
@@ -2103,6 +2109,10 @@ impl Analyzer {
                     } else {
                         self.expr(&arm.body);
                     }
+                    // Judge the arm's value while its own bindings exist.
+                    let yields = self.is_unread_call(&arm.body);
+                    self.tail_unread
+                        .insert(std::ptr::from_ref(&*arm.body) as usize, yields);
                     self.leave_binding_scope(saved);
                     let arm_state = self.bindings();
                     joined = Some(match joined {
@@ -2842,8 +2852,13 @@ impl Analyzer {
             Expr::Index(i) => self.awaited_is_readable(strip_transparent(&i.expr)),
             Expr::Unary(u) => self.awaited_is_readable(strip_transparent(&u.expr)),
             Expr::Reference(r) => self.awaited_is_readable(strip_transparent(&r.expr)),
-            // `(async move { … }).await`, `if …{…}.await` — the block's own
-            // statements are walked, so there is nothing unread here.
+            // `{ start() }.await`, `(if c { start() } else { other() }).await`
+            // polls whatever the tails yield.
+            Expr::Block(_) | Expr::If(_) | Expr::Match(_) | Expr::Unsafe(_) => {
+                !self.is_unread_call(head)
+            }
+            // `(async move { … }).await` — the block's own statements are
+            // walked, so there is nothing unread here.
             _ => true,
         }
     }
@@ -7512,6 +7527,34 @@ mod tests {
             r"async fn h() -> R {
                 let [run] = [tokio::spawn; 1];
                 run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias bound by a match pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                match (tokio::spawn,) { (run,) => { run(async {}); } }
+                Ok(())
+            }",
+        ),
+        (
+            "awaited if whose branches yield an opaque future",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(flag: bool) -> R {
+                (if flag { start_finance_job() } else { start_finance_job() }).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned through a match binding",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = match start_finance_job() { inner => inner };
+                fut.await?;
                 Ok(())
             }",
         ),
