@@ -427,7 +427,7 @@ mod imp {
             Some(raw) => vec![parse_key(&fleet, raw)?],
             None => rt.block_on(fleet.list()).map_err(|e| e.to_string())?,
         };
-        refuse_unknown_versions(&rt, &fleet, &keys)?;
+        let keys = refuse_unknown_versions(&rt, &fleet, keys)?;
         if target.replicated() {
             eprintln!(
                 "  \u{2139} [replication] is on. A migration of a database that a running \
@@ -435,7 +435,10 @@ mod imp {
             );
         }
 
-        if let (Some(_), [key]) = (key, keys.as_slice()) {
+        if let Some(raw) = key {
+            let [key] = keys.as_slice() else {
+                return Err(format!("{raw} does not exist."));
+            };
             let applied = rt.block_on(fleet.migrate(key)).map_err(|e| e.to_string())?;
             eprintln!("\u{2713} {key}: {applied} migration(s) applied.");
             return Ok(());
@@ -466,17 +469,23 @@ mod imp {
     /// Refuse to migrate when a database records a version that none of this
     /// command's sets has. Another set (a plugin's) migrates these databases,
     /// and the version map depends on it, so only boot can migrate them.
+    /// Returns the keys to migrate: those inspected, less those deleted since
+    /// the list.
     fn refuse_unknown_versions(
         rt: &tokio::runtime::Runtime,
         fleet: &DatabaseFleet,
-        keys: &[FleetDbKey],
-    ) -> Result<(), String> {
+        keys: Vec<FleetDbKey>,
+    ) -> Result<Vec<FleetDbKey>, String> {
         let known = fleet.known_migration_versions();
+        let mut checked = Vec::with_capacity(keys.len());
         let mut found = Vec::new();
         for key in keys {
-            // A file that cannot be read fails in the migration, with its reason.
-            let Ok(info) = rt.block_on(fleet.inspect(key)) else {
-                continue;
+            let info = match rt.block_on(fleet.inspect(&key)) {
+                Ok(info) => info,
+                // Deleted since the list: not migrated, so never recreated.
+                Err(FleetError::NotFound { .. }) => continue,
+                // Unchecked means unsafe: the check must not be skipped.
+                Err(e) => return Err(format!("could not check {key} before the migration: {e}")),
             };
             let unknown: Vec<String> = info
                 .applied_migrations
@@ -486,9 +495,10 @@ mod imp {
             if !unknown.is_empty() {
                 found.push(format!("{key}: {}", unknown.join(", ")));
             }
+            checked.push(key);
         }
         if found.is_empty() {
-            return Ok(());
+            return Ok(checked);
         }
         Err(format!(
             "These databases record migrations that are not in {MIGRATIONS_DIR}/ or the \

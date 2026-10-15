@@ -399,6 +399,27 @@ mod sqlite {
     }
 
     #[test]
+    fn fleet_migrate_stops_when_a_database_cannot_be_checked() {
+        let app = App::new("");
+        app.provision(&app.bare_fleet(), &["acme"], 0);
+        let junk = app.path("initech");
+        std::fs::create_dir_all(junk.parent().unwrap()).unwrap();
+        std::fs::write(&junk, b"not a database, not at all, no").unwrap();
+
+        let stderr = run_err(&app.dir, &["fleet", "migrate"]);
+        assert!(
+            stderr.contains("could not check tenant:initech"),
+            "{stderr}"
+        );
+        assert!(
+            !has_table(&app.path("acme"), "notes"),
+            "nothing was migrated"
+        );
+        let stderr = run_err(&app.dir, &["fleet", "migrate", "--key", "tenant:globex"]);
+        assert!(stderr.contains("tenant:globex does not exist"), "{stderr}");
+    }
+
+    #[test]
     fn fleet_refuses_a_control_database_inside_the_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("fleet");

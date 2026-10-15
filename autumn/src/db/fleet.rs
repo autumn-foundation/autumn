@@ -3208,13 +3208,28 @@ pub(crate) fn build_for_app(
 }
 
 /// `path` with every symlink resolved: the file itself when it exists, else
-/// its canonical parent plus the file name. `None` when the parent is missing
-/// too (then nothing under the root can alias it yet).
+/// the nearest directory on its way that exists, made canonical, plus the
+/// rest of the path. A directory not created yet is judged by where it would
+/// be created (as in `check_contained`). `None` when no ancestor exists.
 fn canonical_target(path: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(path).ok().or_else(|| {
-        let parent = std::fs::canonicalize(path.parent()?).ok()?;
-        Some(parent.join(path.file_name()?))
-    })
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Some(resolved);
+    }
+    let mut rest = Vec::new();
+    let mut dir = path;
+    loop {
+        rest.push(dir.file_name()?);
+        dir = dir.parent()?;
+        let existing = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(mut resolved) = std::fs::canonicalize(existing) {
+            resolved.extend(rest.iter().rev());
+            return Some(resolved);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4213,6 +4228,30 @@ mod tests {
         let err = fleet.check_control_outside_root(&[&inside]).unwrap_err();
         assert!(err.contains("control database"), "{err}");
         fleet.check_control_outside_root(&[&outside]).unwrap();
+    }
+
+    /// A control database under a directory not created yet, reached
+    /// through a symlinked root, is judged by where it would be created.
+    #[cfg(unix)]
+    #[test]
+    fn a_control_database_under_a_missing_directory_of_the_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let fleet = fleet(&alias, FleetMode::Slot, |_| {});
+        let control = format!("sqlite://{}", real.join("000/sub/control.db").display());
+        let err = fleet.check_control_outside_root(&[&control]).unwrap_err();
+        assert!(err.contains("control database"), "{err}");
+        assert_eq!(
+            canonical_target(Path::new("missing-dir/control.db")),
+            Some(
+                std::fs::canonicalize(".")
+                    .unwrap()
+                    .join("missing-dir/control.db")
+            )
+        );
     }
 
     #[test]
