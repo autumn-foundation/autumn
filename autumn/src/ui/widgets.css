@@ -127,7 +127,7 @@
     line-height: 1.5;
     color: var(--text);
     background-color: var(--surface);
-    outline: none;
+    outline: 2px solid transparent;
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
@@ -290,7 +290,7 @@
 }
 
 .autumn-submit:focus {
-    outline: none;
+    outline: 2px solid transparent;
     box-shadow: 0 0 0 3px var(--primary-light);
 }
 
@@ -326,7 +326,7 @@
     background-repeat: no-repeat;
     background-position: 0.625rem center;
     background-size: 1rem 1rem;
-    outline: none;
+    outline: 2px solid transparent;
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
@@ -359,7 +359,7 @@
     font-size: 0.875rem;
     color: var(--text);
     background-color: var(--surface);
-    outline: none;
+    outline: 2px solid transparent;
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
