@@ -5021,7 +5021,7 @@ const GENERATED_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
             OR to_jsonb(att)->>'attidentity' = 'a')";
 
 /// Every materialized view in `public`, by name, OID and population state, and
-/// every ordinary view by definition hash. The refresh list and its order are
+/// every ordinary view in any user schema by definition hash. The refresh list and its order are
 /// drawn from the probe. A view created, recreated (new OID), or replaced in
 /// place would keep stale rows or reorder the refreshes.
 const PUBLIC_MATVIEWS: &str = "SELECT rel.relname || ':' || rel.oid::text || ':' || rel.relispopulated::text AS name \
@@ -5029,9 +5029,10 @@ const PUBLIC_MATVIEWS: &str = "SELECT rel.relname || ':' || rel.oid::text || ':'
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind = 'm' \
      UNION ALL \
-     SELECT rel.relname || ':view:' || md5(pg_get_viewdef(rel.oid)) AS name \
+     SELECT ns.nspname || '.' || rel.relname || ':view:' || md5(pg_get_viewdef(rel.oid)) AS name \
      FROM pg_class rel \
-     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace \
+       AND ns.nspname <> 'information_schema' AND ns.nspname !~ '^pg_' \
      WHERE rel.relkind = 'v'";
 
 /// Every live column of those tables.
@@ -5308,7 +5309,8 @@ fn probe_database_facts(
     // `pg_depend` cannot find them: a column that an expression or predicate
     // reads is an auto dependency, like a plain key column. The stored node
     // trees name each column as `varattno N`. Match on that, as
-    // `PARTITION_KEY_COLUMNS` does for expression partition keys.
+    // `PARTITION_KEY_COLUMNS` does for expression partition keys. `varattno 0`
+    // is a whole-row reference: it reads every column.
     let unique_expression_columns = pair_set(
         sql_query(
             "SELECT rel.relname AS tbl, att.attname AS col \
@@ -5320,7 +5322,7 @@ fn probe_database_facts(
              WHERE i.indisunique \
                AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL) \
                AND (coalesce(i.indexprs::text, '') || ' ' || coalesce(i.indpred::text, '')) \
-                   ~ ('[^[:alnum:]_]varattno ' || att.attnum || '[^0-9]')",
+                   ~ ('[^[:alnum:]_]varattno (0|' || att.attnum || ')[^0-9]')",
         )
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
@@ -5356,7 +5358,7 @@ fn probe_database_facts(
                AND att.attnum > 0 AND NOT att.attisdropped \
              WHERE i.indisexclusion \
                AND (coalesce(i.indexprs::text, '') || ' ' || coalesce(i.indpred::text, '')) \
-                   ~ ('[^[:alnum:]_]varattno ' || att.attnum || '[^0-9]')"
+                   ~ ('[^[:alnum:]_]varattno (0|' || att.attnum || ')[^0-9]')"
         ))
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
@@ -8984,6 +8986,12 @@ mod tests {
     fn the_matview_snapshot_changes_when_a_view_is_recreated() {
         assert!(PUBLIC_MATVIEWS.contains("rel.oid"));
         assert!(PUBLIC_MATVIEWS.contains("pg_get_viewdef"));
+    }
+
+    #[test]
+    fn the_view_snapshot_covers_views_outside_public() {
+        assert!(PUBLIC_MATVIEWS.contains("ns.nspname || '.'"));
+        assert!(PUBLIC_MATVIEWS.contains("!~ '^pg_'"));
     }
 
     #[test]
