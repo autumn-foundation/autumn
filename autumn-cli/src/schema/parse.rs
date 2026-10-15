@@ -379,7 +379,9 @@ pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
         syn::Item::Const(i) => &i.attrs,
         syn::Item::Static(i) => &i.attrs,
         syn::Item::Trait(i) => &i.attrs,
-
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
         _ => &[],
     }
 }
@@ -2651,6 +2653,7 @@ mod tests {
                 let _r = R { #[cfg(test)] f: { #[model] struct B { #[id] id: i64, #[encrypted] l: String } } };
                 #[cfg(test)] let _x = { #[model] struct V { #[id] id: i64, #[encrypted] b: String } };
             }
+            #[cfg(test)] enum E { V = { #[model] struct G { #[id] id: i64, #[encrypted] m: String } 0 } }
             struct X;
             impl X {
                 #[cfg(test)] const C: () = { #[model] struct W { #[id] id: i64, #[encrypted] c: String } };

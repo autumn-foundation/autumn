@@ -2577,7 +2577,12 @@ fn database_endpoint(
     // is the network address libpq connects to; `host` is then only a name.
     let named = merge_hosts(
         query("hostaddr").or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty())),
-        query("host"),
+        query("host").or_else(|| {
+            listed
+                .is_empty()
+                .then(|| env("PGHOST").filter(|v| !v.is_empty()))
+                .flatten()
+        }),
     );
     let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if let Some(list) = named {
         let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
@@ -2752,9 +2757,8 @@ fn conninfo_endpoint(
             .get("hostaddr")
             .cloned()
             .or_else(|| env("PGHOSTADDR")),
-        values.get("host").cloned(),
+        values.get("host").cloned().or_else(|| env("PGHOST")),
     )
-    .or_else(|| env("PGHOST"))
     .unwrap_or_default();
     let hosts: Vec<String> = host_list.split(',').map(normalize_host).collect();
     let own = vec![None; hosts.len()];
@@ -10448,6 +10452,17 @@ mod tests {
             "postgres:///app?host=a,b&hostaddr=,10.0.0.5",
             "postgres://a/app",
             &env
+        ));
+        let pghost = env_of(&[("PGHOST", "a,b")]);
+        assert!(same_database_in(
+            "hostaddr=,10.0.0.5 dbname=app",
+            "host=a dbname=app",
+            &pghost
+        ));
+        assert!(same_database_in(
+            "postgres:///app?hostaddr=,10.0.0.5",
+            "postgres://a/app",
+            &pghost
         ));
         assert_eq!(merge_hosts(None, Some("h".into())), Some("h".into()));
         assert_eq!(merge_hosts(Some(",x".into()), None), Some(",x".into()));
