@@ -14,8 +14,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::diff::Finding;
-use super::model::{PostureManifest, RouteKey};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+
+use super::diff::{Finding, authz_index, checks_at, csrf_index, mtls_index, route_index};
+use super::model::{PostureManifest, RouteKey, hex_digest, is_open, normalize_captures};
+use super::verify::marker_matches;
 
 /// One route's whole posture, in a form that can be ordered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +32,7 @@ pub struct RoutePosture {
     mtls: bool,
 }
 
-/// CSRF state of a route.
+/// CSRF state of a route. `Absent`: no row, as for a safe method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Csrf {
     On,
@@ -44,9 +47,134 @@ impl RoutePosture {
     /// classification widest, the rest booleans.
     #[must_use]
     pub fn no_wider_than(&self, ceiling: &Self) -> bool {
-        let _ = ceiling;
-        todo!("red phase")
+        let (open, ceiling_open) = (
+            is_open(&self.classification),
+            is_open(&ceiling.classification),
+        );
+        if open && !ceiling_open {
+            return false;
+        }
+        // A route that stopped being open is narrower, whatever its roles. The
+        // differ stops comparing roles, scopes and policy there too.
+        let local = (ceiling_open && !open)
+            || (self.roles_within(ceiling)
+                && ceiling.scopes.is_subset(&self.scopes)
+                && implies(ceiling.policy, self.policy));
+        local
+            && implies(ceiling.csrf == Csrf::On, self.csrf == Csrf::On)
+            && ceiling.checks.is_subset(&self.checks)
+            && implies(ceiling.mtls, self.mtls)
     }
+
+    /// No role list admits everyone authenticated, so it is the widest.
+    fn roles_within(&self, ceiling: &Self) -> bool {
+        ceiling.roles.is_empty() || (!self.roles.is_empty() && self.roles.is_subset(&ceiling.roles))
+    }
+
+    fn encode(&self, out: &mut String) {
+        let list = |items: &BTreeSet<String>| {
+            let items: Vec<String> = items.iter().map(|i| enc(i)).collect();
+            format!("{}:{}", items.len(), items.join(","))
+        };
+        let csrf = match self.csrf {
+            Csrf::On => "on",
+            Csrf::Off => "off",
+            Csrf::Absent => "absent",
+        };
+        let fields = [
+            enc(&self.classification),
+            list(&self.roles),
+            list(&self.scopes),
+            u8::from(self.policy).to_string(),
+            csrf.to_owned(),
+            list(&self.checks),
+            u8::from(self.mtls).to_string(),
+        ];
+        out.push_str(&fields.join("|"));
+    }
+
+    fn decode(fields: &[&str]) -> Option<Self> {
+        let [class, roles, scopes, policy, csrf, checks, mtls] = fields else {
+            return None;
+        };
+        Some(Self {
+            classification: dec(class)?,
+            roles: dec_list(roles)?,
+            scopes: dec_list(scopes)?,
+            policy: dec_flag(policy)?,
+            csrf: match *csrf {
+                "on" => Csrf::On,
+                "off" => Csrf::Off,
+                "absent" => Csrf::Absent,
+                _ => return None,
+            },
+            checks: dec_list(checks)?,
+            mtls: dec_flag(mtls)?,
+        })
+    }
+}
+
+/// `a` holds only if `b` does: a guard the ceiling has must still be there.
+const fn implies(a: bool, b: bool) -> bool {
+    !a || b
+}
+
+/// Everything outside this set is percent-encoded, so the separators used
+/// below (`| , ; :`) and whitespace can never appear inside a value.
+const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'/')
+    .remove(b'{')
+    .remove(b'}');
+
+fn enc(value: &str) -> String {
+    utf8_percent_encode(value, UNRESERVED).to_string()
+}
+
+/// Strict: a `%` must start a two-digit escape, and nothing outside the
+/// encoder's alphabet may appear.
+fn dec(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if !bytes.get(i + 1..i + 3)?.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
+                i += 3;
+            }
+            b if b.is_ascii_alphanumeric() || b"-._~/{}".contains(&b) => i += 1,
+            _ => return None,
+        }
+    }
+    percent_decode_str(value)
+        .decode_utf8()
+        .ok()
+        .map(std::borrow::Cow::into_owned)
+}
+
+fn dec_flag(value: &str) -> Option<bool> {
+    match value {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// `n:a,b,c` — the count tells `[]` from `[""]`.
+fn dec_list(value: &str) -> Option<BTreeSet<String>> {
+    let (count, items) = value.split_once(':')?;
+    let count: usize = count.parse().ok()?;
+    if count == 0 {
+        return items.is_empty().then(BTreeSet::new);
+    }
+    let parsed: Vec<String> = items.split(',').map(dec).collect::<Option<_>>()?;
+    let set: BTreeSet<String> = parsed.iter().cloned().collect();
+    (parsed.len() == count && set.len() == count).then_some(set)
 }
 
 /// Approved postures, by route.
@@ -65,14 +193,34 @@ impl Ceiling {
     /// The text form carried in a marker. Deterministic, no whitespace.
     #[must_use]
     pub fn encode(&self) -> String {
-        todo!("red phase")
+        let entries: Vec<String> = self
+            .routes
+            .iter()
+            .map(|((path, method), posture)| {
+                let mut entry = format!("{}|{}|", enc(method), enc(path));
+                posture.encode(&mut entry);
+                entry
+            })
+            .collect();
+        entries.join(";")
     }
 
     /// Parse [`Self::encode`] output. `None` for anything malformed.
     #[must_use]
     pub fn decode(text: &str) -> Option<Self> {
-        let _ = text;
-        todo!("red phase")
+        let mut routes = BTreeMap::new();
+        for entry in text.split(';') {
+            let fields: Vec<&str> = entry.split('|').collect();
+            let (method, path, rest) = match fields.as_slice() {
+                [method, path, rest @ ..] => (dec(method)?, dec(path)?, rest),
+                _ => return None,
+            };
+            let posture = RoutePosture::decode(rest)?;
+            if routes.insert((path, method), posture).is_some() {
+                return None;
+            }
+        }
+        Some(Self { routes })
     }
 }
 
@@ -81,6 +229,7 @@ impl Ceiling {
 pub struct Cover {
     /// Postures at head of the routes that widened.
     pub ceiling: Ceiling,
+    /// Digest of the findings, route findings reduced to kind and route.
     identity: String,
 }
 
@@ -88,22 +237,73 @@ pub struct Cover {
 /// (bound exactly), against the head manifest.
 #[must_use]
 pub fn cover(widening: &[&Finding], head: &PostureManifest) -> Cover {
-    let _ = (widening, head);
-    todo!("red phase")
+    let routes = route_index(head);
+    let csrf = csrf_index(head);
+    let bindings = authz_index(head);
+    let mtls = mtls_index(head);
+
+    let mut ceiling = Ceiling::default();
+    let mut lines = Vec::with_capacity(widening.len());
+    for finding in widening {
+        let key = (normalize_captures(&finding.path), finding.method.clone());
+        let Some(entry) = routes.get(&key) else {
+            lines.push(format!("exact\t{}", finding.canonical()));
+            continue;
+        };
+        let posture =
+            RoutePosture {
+                classification: entry.classification.clone(),
+                roles: entry.role_set(),
+                scopes: entry.scope_set(),
+                policy: entry.policy,
+                csrf: csrf.get(&key).map_or(Csrf::Absent, |(enforced, ..)| {
+                    if *enforced { Csrf::On } else { Csrf::Off }
+                }),
+                checks: checks_at(&key, &bindings).into_iter().collect(),
+                mtls: mtls.contains(&key),
+            };
+        // What the finding says about *how far* the route moved is the
+        // ceiling's job now; the identity keeps only which route and which kind.
+        let mut bare = (*finding).clone();
+        bare.fingerprint.clear();
+        lines.push(format!("ceiling\t{}", bare.canonical()));
+        ceiling.routes.insert(key, posture);
+    }
+    lines.sort();
+    lines.dedup();
+    Cover {
+        ceiling,
+        identity: hex_digest(lines.join("\n").as_bytes()),
+    }
 }
 
 impl Cover {
+    fn seal_of(&self, payload: &str) -> String {
+        hex_digest(format!("ceiling-v1\n{}\n{payload}", self.identity).as_bytes())
+    }
+
     /// The digest a ceiling marker carries for the current head.
+    ///
+    /// It covers the payload too, so a truncated or mistyped paste fails
+    /// instead of being read as a smaller ceiling.
     #[must_use]
     pub fn seal(&self) -> String {
-        todo!("red phase")
+        self.seal_of(&self.ceiling.encode())
     }
 
     /// Whether a marker (`digest` + `payload`) approves the current head.
     #[must_use]
     pub fn accepts(&self, payload: &str, digest: &str) -> bool {
-        let _ = (payload, digest);
-        todo!("red phase")
+        let Some(approved) = Ceiling::decode(payload) else {
+            return false;
+        };
+        marker_matches(&self.seal_of(&approved.encode()), digest)
+            && self.ceiling.routes.iter().all(|(key, now)| {
+                approved
+                    .routes
+                    .get(key)
+                    .is_some_and(|ceiling| now.no_wider_than(ceiling))
+            })
     }
 }
 
@@ -277,8 +477,14 @@ mod tests {
         let all = [
             Fixture::new("gated").roles(&["a"]).csrf(true),
             Fixture::new("gated").roles(&["a"]).csrf(false),
-            Fixture::new("gated").roles(&["a"]).csrf(true).checks(&["read"]),
-            Fixture::new("gated").roles(&["a"]).csrf(true).checks(&["write"]),
+            Fixture::new("gated")
+                .roles(&["a"])
+                .csrf(true)
+                .checks(&["read"]),
+            Fixture::new("gated")
+                .roles(&["a"])
+                .csrf(true)
+                .checks(&["write"]),
             Fixture::new("gated")
                 .roles(&["a"])
                 .csrf(true)

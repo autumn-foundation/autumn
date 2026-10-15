@@ -116,15 +116,27 @@ pub fn evaluate(
     let findings = base.map(|b| diff::diff(b, head)).unwrap_or_default();
     let widening = diff::widening(&findings);
     let ack_digest = ack::ack_digest(&widening);
+    let cover = ceiling::cover(&widening, head);
     // Only a widening can be acknowledged. Resolving a marker against a clean
     // run would let a stale comment sit on the pull request claiming to have
     // approved something nobody proposed.
     let acknowledged = if widening.is_empty() {
         None
     } else {
-        ack::matching(acks, &ack_digest).cloned()
+        ack::matching(acks, &ack_digest, &cover).cloned()
     };
-    let marker = ack::short(&ack_digest);
+    // Route widenings are bound by what they may not exceed; the rest, and a
+    // run with none, by the exact digest.
+    let marker = if cover.ceiling.is_empty() {
+        ack::short(&ack_digest)
+    } else {
+        format!(
+            "{} {}{}",
+            ack::short(&cover.seal()),
+            ack::CEILING_KEY,
+            cover.ceiling.encode()
+        )
+    };
     Evaluation {
         findings,
         ack_digest,
@@ -835,14 +847,14 @@ mod tests {
     fn a_bare_digest_still_re_asks_after_a_narrowing() {
         let base = admin_base();
         let first = manifest(&scoped("/admin", "public", &[], false));
-        let bare = format!(
+        let pasted_bare = format!(
             "{} {}",
             ack::ACK_PHRASE,
             ack::short(&evaluate(Some(&base), &first, &[]).ack_digest)
         );
-        assert!(!evaluate(Some(&base), &first, &ack::parse_acks(&bare)).blocked());
+        assert!(!evaluate(Some(&base), &first, &ack::parse_acks(&pasted_bare)).blocked());
         let narrowed = manifest(&scoped("/admin", "public", &[], true));
-        assert!(evaluate(Some(&base), &narrowed, &ack::parse_acks(&bare)).blocked());
+        assert!(evaluate(Some(&base), &narrowed, &ack::parse_acks(&pasted_bare)).blocked());
     }
 
     /// A finding that names no route at head has no posture to order, so it

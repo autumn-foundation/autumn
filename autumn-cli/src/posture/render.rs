@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use super::ack::{ACK_PHRASE, Acknowledgment, short};
+use super::ack::{ACK_PHRASE, Acknowledgment};
 use super::diff::{Finding, Severity};
 
 /// HTML marker the workflow greps for so it can *update* its comment instead of
@@ -309,8 +309,7 @@ pub fn json(report: &Report<'_>) -> String {
         ack_digest: report.ack_digest.clone(),
         // Only meaningful when something is actually waiting to be
         // acknowledged; on a clean run it would be the digest of the empty set.
-        ack_phrase: (counts.widening > 0)
-            .then(|| format!("{ACK_PHRASE} {}", report.marker)),
+        ack_phrase: (counts.widening > 0).then(|| format!("{ACK_PHRASE} {}", report.marker)),
         head_posture_digest: &report.head_posture_digest,
         acknowledged_by_digest: report.acknowledged.as_ref().map(|a| a.digest.as_str()),
         acknowledgment_reason: report
@@ -339,6 +338,7 @@ pub fn json(report: &Report<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::posture::ack::short;
 
     fn finding(kind: &'static str, severity: Severity, path: &str) -> Finding {
         Finding {

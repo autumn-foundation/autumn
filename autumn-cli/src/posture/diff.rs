@@ -228,7 +228,7 @@ fn effective_posture(
 }
 
 /// The routes that demand a verified client certificate, by `(path, method)`.
-fn mtls_index(m: &PostureManifest) -> BTreeSet<RouteKey> {
+pub(super) fn mtls_index(m: &PostureManifest) -> BTreeSet<RouteKey> {
     m.dimensions
         .mtls
         .entries
@@ -262,7 +262,7 @@ fn postures_of(
 }
 
 /// The `#[authorize]` checks one route performs, sorted and deduplicated.
-fn checks_at(key: &RouteKey, bindings: &BTreeMap<AuthzKey, String>) -> Vec<String> {
+pub(super) fn checks_at(key: &RouteKey, bindings: &BTreeMap<AuthzKey, String>) -> Vec<String> {
     let mut checks: Vec<String> = bindings
         .keys()
         .filter(|(path, method, _, _)| (path, method) == (&key.0, &key.1))
@@ -310,7 +310,7 @@ fn diff_build(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Find
 }
 
 /// Index routes by `(path, method)`. Parsing refuses a duplicate key.
-fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, RouteEntry> {
+pub(super) fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, RouteEntry> {
     m.dimensions
         .routes
         .entries
@@ -1158,9 +1158,9 @@ const fn plural(n: usize) -> &'static str {
 /// does not put one untouched binding on both sides of the set difference —
 /// which read as a removal, and blocked a pull request that changed nothing.
 /// The path as the author wrote it is the value, for the finding's text.
-type AuthzKey = (String, String, String, String);
+pub(super) type AuthzKey = (String, String, String, String);
 
-fn authz_index(m: &PostureManifest) -> BTreeMap<AuthzKey, String> {
+pub(super) fn authz_index(m: &PostureManifest) -> BTreeMap<AuthzKey, String> {
     m.dimensions
         .authorization_policies
         .entries
@@ -1599,7 +1599,7 @@ fn report_displaced_bindings(
 /// outright: the head entry matched no base entry, and the disappearance check
 /// below could not catch it either, because `routes_after` holds normalized
 /// keys. The path as the author wrote it rides along for the finding's text.
-fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool, String)> {
+pub(super) fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool, String)> {
     let mut index: BTreeMap<RouteKey, (bool, bool, String)> = BTreeMap::new();
     for e in &m.dimensions.csrf.entries {
         let key = (normalize_captures(&e.path), e.method.clone());

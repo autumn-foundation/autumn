@@ -26,6 +26,7 @@
 //! scaffolded workflow writes one file per comment and uses `--ack-dir`, which
 //! parses each file with [`parse_comment`]. That parser trusts no line.
 
+use super::ceiling::Cover;
 use super::diff::Finding;
 use super::model::hex_digest;
 
@@ -40,6 +41,9 @@ pub const ACK_PHRASE: &str = "/ack-posture";
 /// marker *inside* a fence (the gate's own posted report contains one) becomes
 /// live. Each body is parsed with its own fence state.
 pub const SOURCE_SEPARATOR: &str = "<!-- autumn:ack-source -->";
+
+/// The key of the optional token that carries a ceiling (see [`super::ceiling`]).
+pub const CEILING_KEY: &str = "ceiling=";
 
 /// How much of the digest the phrase carries. 64 bits is far more than enough
 /// to bind an acknowledgment to a finding set nobody is trying to collide, and
@@ -466,18 +470,41 @@ fn parse_marker(line: &str) -> Option<Acknowledgment> {
         return None;
     }
     let rest = rest.trim_start();
-    let (token, reason) = rest
-        .find(char::is_whitespace)
-        .map_or((rest, ""), |i| (&rest[..i], rest[i..].trim()));
+    let (token, rest) = split_token(rest);
     let digest = token.to_ascii_lowercase();
     if !is_digest(&digest) {
         return None;
     }
+    // An optional `ceiling=` token. One that is present but malformed voids the
+    // marker: reading it as a bare digest would turn "no wider than" into
+    // "exactly this" without telling anyone.
+    let rest = rest.trim_start();
+    let (next, after) = split_token(rest);
+    let (ceiling, reason) = match next.strip_prefix(CEILING_KEY) {
+        Some(payload) if is_payload(payload) => (Some(payload.to_owned()), after),
+        Some(_) => return None,
+        None => (None, rest),
+    };
+    let reason = reason.trim();
     Some(Acknowledgment {
         digest,
         reason: (!reason.is_empty()).then(|| reason.to_owned()),
-        ceiling: None,
+        ceiling,
     })
+}
+
+/// The first whitespace-delimited token and what follows it.
+fn split_token(text: &str) -> (&str, &str) {
+    text.find(char::is_whitespace)
+        .map_or((text, ""), |i| (&text[..i], &text[i..]))
+}
+
+/// Whether `payload` uses only the characters a ceiling is encoded with.
+fn is_payload(payload: &str) -> bool {
+    !payload.is_empty()
+        && payload
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~/{}%|,;:".contains(c))
 }
 
 /// Whether `candidate` is a plausible digest: hex, and long enough to be worth
@@ -487,20 +514,39 @@ fn is_digest(candidate: &str) -> bool {
     (8..=64).contains(&candidate.len()) && candidate.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Whether any harvested acknowledgment matches `digest`.
+/// Whether any harvested acknowledgment approves the current widening.
 ///
-/// A marker may carry the short form or the full digest; both are compared
-/// case-insensitively against the expected digest's corresponding prefix.
+/// A bare marker must match the `exact` digest, short form or full. A marker
+/// with a ceiling is judged by `cover`: same findings, and no route wider than
+/// the ceiling.
 #[must_use]
-pub fn matching<'a>(acks: &'a [Acknowledgment], digest: &str) -> Option<&'a Acknowledgment> {
-    acks.iter()
-        .find(|ack| super::verify::marker_matches(digest, &ack.digest))
+pub fn matching<'a>(
+    acks: &'a [Acknowledgment],
+    exact: &str,
+    cover: &Cover,
+) -> Option<&'a Acknowledgment> {
+    acks.iter().find(|ack| {
+        ack.ceiling.as_ref().map_or_else(
+            || super::verify::marker_matches(exact, &ack.digest),
+            |payload| cover.accepts(payload, &ack.digest),
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::posture::diff::Severity;
+
+    /// `matching` for bare markers: no widened route, so an empty cover.
+    fn matching<'a>(acks: &'a [Acknowledgment], digest: &str) -> Option<&'a Acknowledgment> {
+        let head = crate::posture::model::PostureManifest::parse(
+            r#"{"schema_version":3,"dimensions":{"routes":{"provenance":"provable","source":"m","entries":[]}},"excluded":[]}"#,
+            "t.json",
+        )
+        .expect("fixture parses");
+        super::matching(acks, digest, &crate::posture::ceiling::cover(&[], &head))
+    }
 
     fn finding(kind: &'static str, path: &str) -> Finding {
         Finding {
