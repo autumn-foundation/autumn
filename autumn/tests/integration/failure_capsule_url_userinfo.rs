@@ -43,14 +43,13 @@ fn capture_config(dir: &Path) -> AutumnConfig {
 
 async fn await_one_capsule(dir: &Path) -> PathBuf {
     for _ in 0..200 {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            if let Some(path) = entries
+        if let Ok(entries) = std::fs::read_dir(dir)
+            && let Some(path) = entries
                 .filter_map(Result::ok)
                 .map(|e| e.path())
                 .find(|p| p.extension().is_some_and(|ext| ext == "json"))
-            {
-                return path;
-            }
+        {
+            return path;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
