@@ -702,20 +702,35 @@ fn root_owners(root: &Path) -> RootOwners {
 /// The posture gate selects the member with `-p`. Cargo cannot resolve an
 /// excluded crate or a plain path dependency that way.
 fn lists_member(workspace: &Path, member: &Path) -> bool {
-    let listed = std::fs::read_to_string(workspace.join("Cargo.toml"))
+    let Some(table) = std::fs::read_to_string(workspace.join("Cargo.toml"))
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|table| {
-            let members = table.get("workspace")?.get("members")?.as_array()?.clone();
-            let patterns: Vec<String> = members
-                .iter()
-                .filter_map(|entry| entry.as_str().map(str::to_owned))
-                .collect();
-            let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
-            let rel = relative_dir(workspace, member)?;
-            Some(crate::edge_scan::any_glob_matches(&patterns, &rel, false))
-        });
-    listed.unwrap_or(false)
+    else {
+        return false;
+    };
+    let patterns = |key: &str| -> Vec<String> {
+        table
+            .get("workspace")
+            .and_then(|w| w.get(key))
+            .and_then(toml::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let Some(rel) = relative_dir(workspace, member) else {
+        return false;
+    };
+    let members = patterns("members");
+    let exclude = patterns("exclude");
+    let members: Vec<&str> = members.iter().map(String::as_str).collect();
+    let exclude: Vec<&str> = exclude.iter().map(String::as_str).collect();
+    // Cargo takes `exclude` out of the membership a `members` glob gives.
+    crate::edge_scan::any_glob_matches(&members, &rel, false)
+        && !crate::edge_scan::any_glob_matches(&exclude, &rel, true)
 }
 
 /// The `/`-separated path from `ancestor` down to `descendant`.
@@ -3166,6 +3181,18 @@ mod tests {
         fs::write(
             outer.path().join("Cargo.toml"),
             "[workspace]\nmembers = []\nexclude = [\"app\"]\n",
+        )
+        .unwrap();
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_member_glob_does_not_override_exclude() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\nexclude = [\"app\"]\n",
         )
         .unwrap();
         assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
