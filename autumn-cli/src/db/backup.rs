@@ -1395,6 +1395,10 @@ pub(super) fn artifact_labels(artifact: &Path) -> Option<Vec<String>> {
 /// manifest) or an unreadable/invalid manifest — callers treat absence as
 /// "unknown provenance", never as "safe".
 pub(super) fn artifact_source_profile(artifact: &Path) -> Option<String> {
+    // An offsite reference names its source profile.
+    if let Some(Ok(offsite)) = resolve_offsite_ref(false, &artifact.to_string_lossy()) {
+        return Some(offsite.profile);
+    }
     artifact
         .is_dir()
         .then(|| read_manifest(artifact).ok())
@@ -4809,6 +4813,15 @@ mod tests {
                 selector: OffsiteSelector::Exact("20260710T040506Z".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn an_offsite_reference_names_its_source_profile() {
+        assert_eq!(
+            artifact_source_profile(Path::new("offsite:prod/latest")).as_deref(),
+            Some("prod")
+        );
+        assert_eq!(artifact_source_profile(Path::new("offsite:bad")), None);
     }
 
     #[test]

@@ -2371,6 +2371,12 @@ impl<'ast> syn::visit::Visit<'ast> for AnonymizeScan {
         }
     }
 
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if crate::schema::parse::production_enabled(&field.attrs) {
+            syn::visit::visit_field_value(self, field);
+        }
+    }
+
     fn visit_local(&mut self, local: &'ast syn::Local) {
         if crate::schema::parse::production_enabled(&local.attrs) {
             syn::visit::visit_local(self, local);
@@ -2842,6 +2848,21 @@ fn without_userinfo(raw: &str) -> String {
     )
 }
 
+/// Refuse `--output` when the scrub covers only some configured targets.
+fn refuse_partial_output(
+    args: &ScrubArgs,
+    scrubbed: usize,
+    configured: usize,
+) -> Result<(), ScrubError> {
+    if args.output.is_some() && scrubbed < configured {
+        return Err(ScrubError::SourceScan {
+            detail: "--output needs every configured target, but the artifact restores only some"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// The write targets an artifact restore actually wrote to.
 ///
 /// A control-only or single-shard artifact leaves every other configured shard
@@ -3070,6 +3091,7 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
     let sources = load_source_classification(args)?;
 
     let mut targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
+    let configured = targets.len();
 
     let restored = if let Some(artifact) = &args.artifact {
         let artifact_profile = super::backup::artifact_source_profile(artifact);
@@ -3094,6 +3116,9 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
             || targets.clone(),
             |labels| restored_targets(targets.clone(), &labels),
         );
+        // `--output` backs up every configured target, so a partial artifact
+        // would package databases the scrub never touched.
+        refuse_partial_output(args, guarded.len(), configured)?;
         guard_configured_source(
             artifact_profile.as_deref(),
             &profile,
@@ -3115,6 +3140,7 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         // Scrub only what the restore wrote. A partial artifact leaves the
         // other configured shards live, and they are not ours to anonymize.
         targets = restored_targets(targets, &restored_labels);
+        refuse_partial_output(args, targets.len(), configured)?;
         if targets.is_empty() {
             return Err(ScrubError::SourceScan {
                 detail: "the restore reported no target it wrote to".to_owned(),
@@ -8885,6 +8911,21 @@ mod tests {
             fn k() { #[cfg(test)] println!("x"); #[cfg(test)] let _ = 1; }
         "#;
         assert!(extract_anonymize_tables(disabled).unwrap().is_empty());
+        let field = r#"
+            fn reg() -> R { R { #[cfg(test)] m: ModelRegistration::anonymize("users") } }
+        "#;
+        assert!(extract_anonymize_tables(field).unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_needs_every_configured_target() {
+        let with_output = ScrubArgs {
+            output: Some(PathBuf::from("out")),
+            ..ScrubArgs::default()
+        };
+        assert!(refuse_partial_output(&with_output, 1, 2).is_err());
+        assert!(refuse_partial_output(&with_output, 2, 2).is_ok());
+        assert!(refuse_partial_output(&ScrubArgs::default(), 1, 2).is_ok());
     }
 
     #[test]

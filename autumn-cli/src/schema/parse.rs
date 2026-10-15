@@ -590,6 +590,18 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
         }
     }
 
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if production_enabled(&arm.attrs) {
+            syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if production_enabled(&field.attrs) {
+            syn::visit::visit_field_value(self, field);
+        }
+    }
+
     fn visit_item_struct(&mut self, item_struct: &'ast syn::ItemStruct) {
         if !production_enabled(&item_struct.attrs) {
             return;
@@ -2635,6 +2647,8 @@ mod tests {
             r#"
             fn f() {
                 #[cfg(test)] { #[model] struct U { #[id] id: i64, #[encrypted] a: String } }
+                match 1 { #[cfg(test)] _ => { #[model] struct A { #[id] id: i64, #[encrypted] k: String } } }
+                let _r = R { #[cfg(test)] f: { #[model] struct B { #[id] id: i64, #[encrypted] l: String } } };
                 #[cfg(test)] let _x = { #[model] struct V { #[id] id: i64, #[encrypted] b: String } };
             }
             struct X;
