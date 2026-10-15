@@ -144,7 +144,7 @@ pub trait DnsProvider: Send + Sync {
             let mut errors = Vec::new();
             for record in records {
                 if let Err(e) = self.delete_txt(record).await {
-                    errors.push(e);
+                    errors.push(format!("{}: {e}", record.fqdn));
                 }
             }
             join_errors(&errors)
@@ -153,13 +153,23 @@ pub trait DnsProvider: Send + Sync {
 }
 
 /// `Ok` when `errors` is empty, else one error that lists them all.
+///
+/// The list is cut to [`MAX_JOINED_ERROR_CHARS`], because the text reaches
+/// `/actuator/health` and the alert destination.
 pub(crate) fn join_errors(errors: &[String]) -> Result<(), String> {
     if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
+        return Ok(());
     }
+    let joined = errors.join("; ");
+    if joined.chars().count() <= MAX_JOINED_ERROR_CHARS {
+        return Err(joined);
+    }
+    let cut: String = joined.chars().take(MAX_JOINED_ERROR_CHARS).collect();
+    Err(format!("{cut}…"))
 }
+
+/// The most text `join_errors` returns.
+const MAX_JOINED_ERROR_CHARS: usize = 4 * UPSTREAM_EXCERPT_CHARS;
 
 /// How much text copied from a DNS provider (an API error body, a hook's
 /// `stderr`) may reach an operator-facing message.
@@ -776,6 +786,7 @@ mod tests {
             .expect_err("missing secret_access_key");
         assert!(!err.contains("AKIAEXAMPLE"), "leaked: {err}");
     }
+
     /// #2478: the default batch removal attempts every record.
     #[tokio::test]
     async fn default_batch_removal_attempts_every_record() {
@@ -813,9 +824,18 @@ mod tests {
             .expect_err("two removals fail");
 
         assert_eq!(*provider.0.lock().unwrap(), ["bad1", "good", "bad2"]);
+        assert!(err.contains("a.example: bad1 failed"), "{err}");
         assert!(
             err.contains("bad1 failed") && err.contains("bad2 failed"),
             "{err}"
         );
+    }
+    #[test]
+    fn join_errors_joins_and_bounds_the_list() {
+        assert_eq!(join_errors(&[]), Ok(()));
+        assert_eq!(join_errors(&["a".into(), "b".into()]), Err("a; b".into()));
+        let long = "x".repeat(MAX_JOINED_ERROR_CHARS);
+        let err = join_errors(&[long.clone(), long]).unwrap_err();
+        assert_eq!(err.chars().count(), MAX_JOINED_ERROR_CHARS + 1);
     }
 }

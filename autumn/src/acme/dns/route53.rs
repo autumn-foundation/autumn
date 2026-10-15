@@ -287,7 +287,7 @@ impl Route53Provider {
                 if add {
                     return Err(e);
                 }
-                errors.push(e);
+                errors.push(format!("{fqdn}: {e}"));
             }
         }
         join_errors(&errors)
@@ -369,6 +369,7 @@ impl DnsProvider for Route53Provider {
 
     /// The mirror of [`upsert_txt_batch`](Self::upsert_txt_batch): removing two
     /// values at one name one at a time lets a stale read resurrect the first.
+    /// Removal is best-effort: a failed name does not stop the others.
     fn delete_txt_batch<'a>(
         &'a self,
         records: &'a [TxtRecord],
@@ -1776,6 +1777,7 @@ mod tests {
             </HostedZones></ListHostedZonesByNameResponse>";
         assert_eq!(hosted_zone_id_for(private_only, "myapp.com"), None);
     }
+
     /// #2478: one failed removal must not stop the rest of the batch.
     #[tokio::test]
     async fn a_failed_removal_does_not_abort_later_names() {
@@ -1905,5 +1907,43 @@ mod tests {
 
         provider.zone_id("myapp.com").await.unwrap_err();
         assert_eq!(transport.sent().len(), 1, "no follow-up request");
+    }
+
+    /// #2478: every failed name is reported, each with its name.
+    #[tokio::test]
+    async fn every_failed_removal_is_reported_with_its_name() {
+        let transport = RecordingTransport::new(&[(ZONE_LOOKUP, zone_hit())]).then(
+            RRSET_LIST,
+            500,
+            "<Error><Message>boom</Message></Error>",
+        );
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        let err = provider
+            .delete_txt_batch(&[
+                TxtRecord::new("a.myapp.com", "v1"),
+                TxtRecord::new("b.myapp.com", "v2"),
+            ])
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("a.myapp.com: ") && err.contains("b.myapp.com: "),
+            "{err}"
+        );
+        assert!(err.contains("; "), "{err}");
+    }
+
+    /// #2478: a cursor that differs in case still matches the name.
+    #[tokio::test]
+    async fn zone_lookup_matches_the_cursor_name_ignoring_case() {
+        let transport = RecordingTransport::new(&[(
+            ZONE_LOOKUP,
+            &zone_page("ZPRIVATE", true, Some(("MyApp.COM.", "ZNEXT"))),
+        )])
+        .then(ZONE_LOOKUP, 200, &zone_page("ZPUBLIC", false, None));
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        assert_eq!(provider.zone_id("myapp.com").await.unwrap(), "ZPUBLIC");
     }
 }

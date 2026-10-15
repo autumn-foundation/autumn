@@ -984,6 +984,8 @@ impl AcmeRenewalTask {
     /// what the caller reports, and turning a successful issuance into a failure
     /// because a leftover TXT record could not be deleted would be worse than
     /// the litter. The next order's publish is idempotent either way.
+    ///
+    /// Every record is attempted. All failures are logged together.
     async fn cleanup_dns01(dns: &DnsChallenge, published: &[TxtRecord]) {
         if published.is_empty() {
             return;
