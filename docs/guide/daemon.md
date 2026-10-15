@@ -182,6 +182,7 @@ Postgres client. This is the recommended shape for a local-first tool that
 doesn't need persistence.
 
 `--daemon` does not accept `--with`. Plugins enable the `db` feature again.
+Use `--bundled-pg` if you need plugins.
 
 ### Managed local Postgres (opt-in)
 

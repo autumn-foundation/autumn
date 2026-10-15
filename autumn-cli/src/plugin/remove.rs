@@ -1290,6 +1290,52 @@ autumn-plugin-live-feed = "0.3.1"
         assert!(removed.contains(&Wire::Dependency), "{removed:?}");
     }
 
+    /// A second use of the crate in the post-removal `main.rs` keeps it.
+    #[test]
+    fn an_explicit_main_target_that_still_uses_the_plugin_retains_it() {
+        let main =
+            format!("{SCAFFOLD_MAIN}\nfn extra() {{ let _ = autumn_admin_plugin::Other; }}\n");
+        let cargo = format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n");
+        let tmp = fake_project(&main, &cargo);
+
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(dependency_retained.is_some(), "{outcome:?}");
+    }
+
+    /// A sibling file under `src/` is still read from disk.
+    #[test]
+    fn an_explicit_main_target_with_a_using_sibling_module_retains_it() {
+        let cargo = format!("{SCAFFOLD_CARGO}\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+        std::fs::write(
+            tmp.path().join("src/extra.rs"),
+            "pub fn f() { let _ = autumn_admin_plugin::Other; }\n",
+        )
+        .unwrap();
+
+        let outcome = plan_remove(tmp.path(), admin()).unwrap();
+        let RemoveOutcome::Removed {
+            dependency_retained,
+            ..
+        } = &outcome
+        else {
+            panic!("expected Removed, got {outcome:?}");
+        };
+        assert!(
+            dependency_retained
+                .as_ref()
+                .is_some_and(|kept| kept.reason().contains("extra.rs")),
+            "{dependency_retained:?}"
+        );
+    }
+
     /// A sibling module of such a target counts too — the target's own tree is
     /// swept, not just the file the manifest names.
     #[test]

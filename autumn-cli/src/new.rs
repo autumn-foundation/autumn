@@ -153,10 +153,9 @@ pub struct GenerateOptions {
 pub fn check_with_plugins(opts: GenerateOptions, plugins: usize) -> Result<(), NewError> {
     if plugins > 0 && opts.with_daemon && !opts.with_bundled_pg {
         return Err(NewError::IncompatibleOptions(
-            "--daemon scaffolds a database-free app, so --with is not supported \
-             (plugins enable the database features again; use --bundled-pg for a \
-             daemon with a managed Postgres, or run `autumn plugin add` and check \
-             the features)"
+            "--daemon scaffolds a database-free app, so --with is not supported. \
+             Plugins enable the database features again. Use --bundled-pg for a \
+             daemon with a managed Postgres, or remove --with"
                 .to_owned(),
         ));
     }
