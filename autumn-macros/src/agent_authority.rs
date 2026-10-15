@@ -908,6 +908,9 @@ struct Analyzer {
     /// Whether a walked block's tail was an unread future, keyed by the
     /// block's address. Read before the block's own names are restored.
     tail_unread: HashMap<usize, bool>,
+    /// The callable meaning of a block tail, `break` or `return` value, read
+    /// while its block's own names were bound. Keyed like `tail_unread`.
+    callable_snaps: HashMap<usize, CallableSnap>,
     /// Names bound to a `<table>::table` value, and whether the value already
     /// bounds the write (`let target = refunds::table;`).
     tables: HashMap<String, (String, bool)>,
@@ -937,6 +940,14 @@ struct Shadow {
     table: Option<(String, bool)>,
     inert: bool,
     diesel_fn: Option<String>,
+}
+
+/// What a value is, as a callable, read while the names it uses were bound.
+#[derive(Clone)]
+struct CallableSnap {
+    spawn: bool,
+    alias: Option<syn::Path>,
+    ambiguous: bool,
 }
 
 /// Per-name state. Autumn copies it at a branch and joins the copies after.
@@ -1015,6 +1026,7 @@ impl Analyzer {
             inert_roots,
             unread_futures: HashSet::new(),
             tail_unread: HashMap::new(),
+            callable_snaps: HashMap::new(),
             tables: HashMap::new(),
             // The `tokio` crate is in scope until a name hides it.
             tokio_imports: HashSet::from(["tokio".to_string()]),
@@ -1368,6 +1380,9 @@ impl Analyzer {
         let tail = self.compute_tail_unread(block);
         self.tail_unread
             .insert(std::ptr::from_ref(block) as usize, tail);
+        if let Some(Stmt::Expr(tail_expr, None)) = block.stmts.last() {
+            self.record_callable(tail_expr);
+        }
         // Restore the block's names first. Their saved state may hold a
         // block-local import, which the reset below then removes.
         for saved in outer.into_iter().rev() {
@@ -1648,12 +1663,9 @@ impl Analyzer {
     /// Remember a name bound to a closure, `spawn` or an effect verb.
     fn bind_callable(&mut self, name: &str, init: &Expr) {
         // `async { tokio::spawn }.await` yields the block's tails and returns.
-        let mut peeled = init;
-        while let Expr::Paren(p) = peeled {
-            peeled = &p.expr;
-        }
+        let peeled = peel_wrappers(init);
         if let Expr::Await(awaited) = peeled
-            && let Expr::Async(block) = &*awaited.base
+            && let Expr::Async(block) = peel_wrappers(&awaited.base)
         {
             let yielded = block_tail(&block.block)
                 .into_iter()
@@ -1744,6 +1756,14 @@ impl Analyzer {
         elements: impl IntoIterator<Item = &'a Expr>,
     ) {
         for element in elements {
+            if let Some(snap) = self
+                .callable_snaps
+                .get(&(std::ptr::from_ref(element) as usize))
+                .cloned()
+            {
+                self.apply_snap(name, snap);
+                continue;
+            }
             let kept = self.fn_aliases.get(name).cloned();
             self.bind_callable(name, element);
             if let (Some(kept), Some(now)) = (kept, self.fn_aliases.get(name).cloned())
@@ -1893,18 +1913,11 @@ impl Analyzer {
     fn is_unread_call(&self, expr: &Expr) -> bool {
         // A bare async block is a future nothing has polled, so it holds no
         // unread call. Awaiting it polls the block and yields its tail.
-        let mut peeled = expr;
-        while let Expr::Paren(p) = peeled {
-            peeled = &p.expr;
-        }
+        let peeled = peel_wrappers(expr);
         match peeled {
             Expr::Async(_) => return false,
             Expr::Await(a) => {
-                let mut base = &*a.base;
-                while let Expr::Paren(p) = base {
-                    base = &p.expr;
-                }
-                if let Expr::Async(block) = base {
+                if let Expr::Async(block) = peel_wrappers(&a.base) {
                     return self.async_block_yields_unread(&block.block);
                 }
             }
@@ -1957,6 +1970,48 @@ impl Analyzer {
         let unread = self.carries_unread(value);
         self.tail_unread
             .insert(std::ptr::from_ref(value) as usize, unread);
+        self.record_callable(value);
+    }
+
+    /// Note what `value` is as a callable, while the names it uses are still
+    /// bound: `{ let f = tokio::spawn; f }` yields a spawn after `f` is gone.
+    fn record_callable(&mut self, value: &Expr) {
+        const SCRATCH: &str = "<value>";
+        self.bind_callable(SCRATCH, value);
+        let snap = CallableSnap {
+            spawn: self.spawn_aliases.remove(SCRATCH),
+            alias: self.fn_aliases.remove(SCRATCH),
+            ambiguous: self.ambiguous_fns.remove(SCRATCH),
+        };
+        self.closures.remove(SCRATCH);
+        if snap.spawn || snap.alias.is_some() || snap.ambiguous {
+            // The reader may hold the value or the expression under it.
+            for expr in [value, strip_transparent(value)] {
+                self.callable_snaps
+                    .insert(std::ptr::from_ref(expr) as usize, snap.clone());
+            }
+        }
+    }
+
+    /// Give `name` the callable meaning a snapshot recorded.
+    fn apply_snap(&mut self, name: &str, snap: CallableSnap) {
+        if snap.spawn {
+            self.spawn_aliases.insert(name.to_string());
+        }
+        if snap.ambiguous {
+            self.ambiguous_fns.insert(name.to_string());
+        }
+        if let Some(path) = snap.alias {
+            match self.fn_aliases.get(name) {
+                Some(kept) if path_string(kept) != path_string(&path) => {
+                    self.fn_aliases.remove(name);
+                    self.ambiguous_fns.insert(name.to_string());
+                }
+                _ => {
+                    self.fn_aliases.insert(name.to_string(), path);
+                }
+            }
+        }
     }
 
     /// A recorded `break` or `return` value, or a fresh reading of it.
@@ -2019,13 +2074,7 @@ impl Analyzer {
     /// carries, for the duration of the guarded block.
     fn bind_let_condition(&mut self, cond: &Expr) -> Vec<Shadow> {
         match cond {
-            Expr::Let(l) => {
-                let handle = self.container_handle(&l.expr);
-                let saved = self.enter_binding_scope(&l.pat, handle.as_ref());
-                self.mark_pattern_unread(&l.pat, &l.expr);
-                self.bind_pattern_callables(&l.pat, &l.expr);
-                saved
-            }
+            Expr::Let(l) => self.bind_let(l),
             // `if let A = a && let B = b && ready`: every `let` in the chain
             // binds for the guarded block.
             Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
@@ -2035,6 +2084,51 @@ impl Analyzer {
             }
             Expr::Paren(p) => self.bind_let_condition(&p.expr),
             _ => Vec::new(),
+        }
+    }
+
+    /// Walk an `if` / `while` condition and bind its `let`s. Returns the state
+    /// the other path starts from, and what the binding scope must restore.
+    /// A let chain binds as it is walked, so its names are in the state the
+    /// other path starts from. That can only make a later use of the same
+    /// name more careful.
+    fn enter_condition(&mut self, cond: &Expr) -> (Bindings, Vec<Shadow>) {
+        if is_let_chain(cond) {
+            let saved = self.walk_let_chain(cond);
+            (self.bindings(), saved)
+        } else {
+            self.expr(cond);
+            let before = self.bindings();
+            (before, self.bind_let_condition(cond))
+        }
+    }
+
+    fn bind_let(&mut self, l: &syn::ExprLet) -> Vec<Shadow> {
+        let handle = self.container_handle(&l.expr);
+        let saved = self.enter_binding_scope(&l.pat, handle.as_ref());
+        self.mark_pattern_unread(&l.pat, &l.expr);
+        self.bind_pattern_callables(&l.pat, &l.expr);
+        saved
+    }
+
+    /// Walk a let chain left to right, binding each `let` before the operands
+    /// after it: `if let Some(run) = x && run(..)` calls the `run` it bound.
+    fn walk_let_chain(&mut self, cond: &Expr) -> Vec<Shadow> {
+        match cond {
+            Expr::Let(l) => {
+                self.expr(&l.expr);
+                self.bind_let(l)
+            }
+            Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+                let mut saved = self.walk_let_chain(&b.left);
+                saved.extend(self.walk_let_chain(&b.right));
+                saved
+            }
+            Expr::Paren(p) => self.walk_let_chain(&p.expr),
+            other => {
+                self.expr(other);
+                Vec::new()
+            }
         }
     }
 
@@ -2235,12 +2329,10 @@ impl Analyzer {
                 self.join_with(before);
             }
             Expr::While(w) => {
-                self.expr(&w.cond);
-                let before = self.bindings();
                 // `while let Some(r) = opt { … }` — the binding *is* the
                 // handle the scrutinee carries, exactly as `for` already
                 // treats its pattern.
-                let saved = self.bind_let_condition(&w.cond);
+                let (before, saved) = self.enter_condition(&w.cond);
                 self.block(&w.body);
                 self.leave_binding_scope(saved);
                 self.join_with(before);
@@ -2252,11 +2344,9 @@ impl Analyzer {
             }
 
             Expr::If(i) => {
-                self.expr(&i.cond);
                 // An assignment in one arm is not made on the other path, so
                 // each arm starts from the same state and the two are joined.
-                let before = self.bindings();
-                let saved = self.bind_let_condition(&i.cond);
+                let (before, saved) = self.enter_condition(&i.cond);
                 self.block(&i.then_branch);
                 self.leave_binding_scope(saved);
                 let then_state = self.bindings();
@@ -2293,6 +2383,7 @@ impl Analyzer {
                     let yields = self.carries_unread(&arm.body);
                     self.tail_unread
                         .insert(std::ptr::from_ref(&*arm.body) as usize, yields);
+                    self.record_callable(&arm.body);
                     self.leave_binding_scope(saved);
                     let arm_state = self.bindings();
                     joined = Some(match joined {
@@ -2959,11 +3050,7 @@ impl Analyzer {
         let head = strip_transparent(base);
         // `(async { start() }.await).await`: the inner await yields the
         // block's tail, and the outer one polls it.
-        let mut inner = base;
-        while let Expr::Paren(p) = inner {
-            inner = &p.expr;
-        }
-        if let Expr::Await(inner_await) = inner
+        if let Expr::Await(inner_await) = peel_wrappers(base)
             && let Expr::Async(block) = strip_transparent(&inner_await.base)
             && self.async_block_yields_unread(&block.block)
         {
@@ -3940,6 +4027,31 @@ fn literal_of(expr: &Expr) -> Option<String> {
 
 /// Peel the wrappers that do not change what an expression *is*, so a method
 /// chain split by `.await?` is still walked as one chain.
+/// Is this `a && let P = e && b`: an `&&` chain with a `let` in it?
+fn is_let_chain(cond: &Expr) -> bool {
+    match cond {
+        Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+            matches!(&*b.left, Expr::Let(_))
+                || matches!(&*b.right, Expr::Let(_))
+                || is_let_chain(&b.left)
+                || is_let_chain(&b.right)
+        }
+        Expr::Paren(p) => is_let_chain(&p.expr),
+        _ => false,
+    }
+}
+
+/// Peel parentheses, groups and `?`, but not `.await`: the one wrapper that
+/// changes what a value is.
+fn peel_wrappers(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(p) => peel_wrappers(&p.expr),
+        Expr::Group(g) => peel_wrappers(&g.expr),
+        Expr::Try(t) => peel_wrappers(&t.expr),
+        other => other,
+    }
+}
+
 fn strip_transparent(expr: &Expr) -> &Expr {
     match expr {
         Expr::Await(a) => strip_transparent(&a.base),
@@ -8060,6 +8172,35 @@ mod tests {
             r"async fn h() -> R {
                 let pair = { (start_finance_job(), 0) };
                 pair.0.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias bound earlier in the same let chain",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                if let Some(run) = Some(tokio::spawn) && run(async {}).is_finished() {}
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias broken out by a local name",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = loop { let inner = tokio::spawn; break inner; };
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned through an awaited async block and a question mark",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = async { return Ok::<_, E>(start_finance_job()); }.await?;
+                fut.await?;
                 Ok(())
             }",
         ),
