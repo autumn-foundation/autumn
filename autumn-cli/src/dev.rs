@@ -346,11 +346,6 @@ fn strip_watch_root<'a>(path: &'a Path, roots: &[PathBuf]) -> &'a Path {
         .unwrap_or(path)
 }
 
-/// [`strip_watch_root`] for the roots of this run.
-fn relative_to_watch_root(path: &Path) -> &Path {
-    strip_watch_root(path, WATCH_ROOTS.get().map_or(&[], Vec::as_slice))
-}
-
 /// The member directory to watch for `.env` edits, if it is not the project
 /// root, which is already watched.
 fn member_dir_to_watch(member_dir: &Path, cwd: &Path) -> Option<PathBuf> {
@@ -1524,12 +1519,25 @@ fn classify_change(
     kind: DebouncedEventKind,
     custom_watch_dirs: &[CustomWatchDir],
 ) -> ChangeEffect {
+    let roots = WATCH_ROOTS.get().map_or(&[][..], Vec::as_slice);
+    classify_change_in(path, kind, custom_watch_dirs, roots)
+}
+
+/// [`classify_change`] for an explicit set of watch roots.
+fn classify_change_in(
+    path: &Path,
+    kind: DebouncedEventKind,
+    custom_watch_dirs: &[CustomWatchDir],
+    watch_roots: &[PathBuf],
+) -> ChangeEffect {
     if !matches!(kind, DebouncedEventKind::Any) {
         return ChangeEffect::Ignore;
     }
     // Judge the path inside the project, not the directories above it. A
-    // workspace under `~/.worktrees/` is not a hidden project.
-    let path = relative_to_watch_root(path);
+    // workspace under `~/.worktrees/` is not a hidden project. The original
+    // path stays for the custom watch directories, which match full paths.
+    let original = path;
+    let path = strip_watch_root(path, watch_roots);
 
     // A root-level dotenv file the config loader reads (`.env`, `.env.local`,
     // `.env.<profile>`, `.env.<profile>.local`) must restart the server so an
@@ -1596,7 +1604,7 @@ fn classify_change(
     // The relative form is also tried so events emitted as relative paths
     // (rare but possible on some platforms) still match.
     for dir in custom_watch_dirs {
-        if dir.matches(path) {
+        if dir.matches(original) {
             return ChangeEffect::RestartOnly;
         }
     }
@@ -3102,6 +3110,28 @@ mod tests {
             assert_eq!(inside, Path::new(".env"), "roots: {roots:?}");
             assert!(is_watched_dotenv_file(inside));
         }
+    }
+
+    #[test]
+    fn a_custom_watch_dir_still_matches_by_the_full_event_path() {
+        // The member is nested in the workspace, and the workspace config lists
+        // a directory inside it. Stripping the watch root for the hidden-file
+        // checks must not stop the full-path match.
+        let workspace = PathBuf::from("/work");
+        let member = workspace.join("crates").join("api");
+        let views = member.join("views");
+        let custom = vec![CustomWatchDir {
+            relative: PathBuf::from("crates/api/views"),
+            absolute: views.clone(),
+        }];
+        let roots = vec![workspace, member];
+        let effect = classify_change_in(
+            &views.join("page.html"),
+            DebouncedEventKind::Any,
+            &custom,
+            &roots,
+        );
+        assert_eq!(effect, ChangeEffect::RestartOnly);
     }
 
     #[test]
