@@ -1595,6 +1595,14 @@ impl Analyzer {
                     self.bind_pattern_callables(element_pat, element);
                 }
             }
+            // `let [run] = [tokio::spawn; 1];` repeats one element.
+            (Pat::Slice(p), Expr::Repeat(rep)) => {
+                for element_pat in &p.elems {
+                    if !matches!(element_pat, Pat::Rest(_)) {
+                        self.bind_pattern_callables(element_pat, &rep.expr);
+                    }
+                }
+            }
             // `let Holder { run } = Holder { run: tokio::spawn };`
             (Pat::Struct(p), Expr::Struct(s)) => {
                 for field in &p.fields {
@@ -7493,6 +7501,16 @@ mod tests {
             "run",
             r"async fn h() -> R {
                 let Wrap(run) = Wrap(tokio::spawn);
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a repeated array pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let [run] = [tokio::spawn; 1];
                 run(async {});
                 Ok(())
             }",
