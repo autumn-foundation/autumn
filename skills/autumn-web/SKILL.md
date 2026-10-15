@@ -420,10 +420,12 @@ for `String` (`text/plain; charset=utf-8`) and `Vec<u8>`
 a route whose own extension says otherwise (`/theme.css`, `/logo.png`) those two
 exact values are replaced by the extension type (recorded, so ISR still guards
 the route). That stops a `-> String` stylesheet from being served as plain text and dropped by `nosniff`.
-The two are indistinguishable in the response, so if you genuinely want one of
-them on such a route, declare it distinctly (bare `text/plain`, or
-`application/octet-stream` with a parameter) and it is recorded; to force a
-download prefer `Content-Disposition: attachment`. Extensions outside Autumn's
+The two are indistinguishable in the response. To keep one on such a route,
+declare it on the attribute:
+`#[static_get("/logo.png", content_type = "application/octet-stream")]`.
+That type is recorded and served as written, and it also covers routes whose
+type is hard to set through `IntoResponse`. It applies to the pre-rendered page
+only. To force a download prefer `Content-Disposition: attachment`. Extensions outside Autumn's
 asset table (`.pdf`, `.zip`) are unaffected.
 
 Return `Markup` (or `Html<String>`) for HTML pages: on an extensionless route a

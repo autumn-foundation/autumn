@@ -686,6 +686,27 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     html! { head { (seo.render()) } }
 /// }
 /// ```
+///
+/// # Declared Content-Type
+///
+/// `content_type = "..."` sets the media type of the pre-rendered page:
+///
+/// ```ignore
+/// #[static_get("/logo.png", content_type = "application/octet-stream")]
+/// async fn logo() -> Vec<u8> {
+///     logo_bytes()
+/// }
+/// ```
+///
+/// Build records the value as written. It replaces any header the handler
+/// sets. Autumn does not swap it for the route extension type. Without the
+/// argument, Autumn records the handler header, and replaces the axum
+/// return-type defaults (`text/plain; charset=utf-8`, `application/octet-stream`)
+/// with the extension type.
+///
+/// The value must be a non-empty media type in visible ASCII. The type only
+/// applies to the page served from `dist/`. A live request that reaches the
+/// handler gets the handler header. Compression follows the declared type.
 #[proc_macro_attribute]
 pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
     autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {

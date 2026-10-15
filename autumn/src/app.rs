@@ -19043,6 +19043,7 @@ mod tests {
             revalidate: None,
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         }
     }
 
@@ -19626,6 +19627,7 @@ mod tests {
                 revalidate: None,
                 params_fn: None,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
+                content_type: None,
             }],
             &dist,
         )
@@ -19736,6 +19738,7 @@ mod tests {
                     revalidate: None,
                     params_fn: None,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
+                    content_type: None,
                 }],
                 &dist,
             )
@@ -19864,6 +19867,7 @@ mod tests {
                 revalidate: None,
                 params_fn: None,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
+                content_type: None,
             }],
             &dist,
         )
@@ -20856,6 +20860,7 @@ mod tests {
                     revalidate: None,
                     params_fn: None,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
+                    content_type: None,
                 }],
                 &dist,
             )
@@ -21057,6 +21062,7 @@ mod tests {
             revalidate: None,
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         }];
         let builder = app().static_routes(metas);
         assert_eq!(builder.static_metas.len(), 1);

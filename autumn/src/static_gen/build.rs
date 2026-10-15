@@ -61,6 +61,8 @@ struct RenderJob {
     url: String,
     /// Optional ISR revalidation interval.
     revalidate: Option<u64>,
+    /// `Content-Type` declared on the route attribute (#2403).
+    content_type: Option<&'static str>,
 }
 
 /// Expand a `StaticRouteMeta` into one or more concrete `RenderJob`s.
@@ -78,6 +80,7 @@ async fn expand_route(
             Ok(vec![RenderJob {
                 url: meta.path.to_owned(),
                 revalidate: meta.revalidate,
+                content_type: meta.content_type,
             }])
         }
         Some(params_fn) => {
@@ -96,6 +99,7 @@ async fn expand_route(
                     RenderJob {
                         url,
                         revalidate: meta.revalidate,
+                        content_type: meta.content_type,
                     }
                 })
                 .collect();
@@ -139,7 +143,22 @@ fn substitute_params(pattern: &str, params: &StaticParams) -> String {
 /// `text/css; charset=utf-8`, not `text/plain` (which `nosniff` blocks).
 /// ISR applies the same function to fresh responses, so the type guard still
 /// holds on these routes (#2409).
-fn recorded_content_type(headers: &axum::http::HeaderMap, url: &str) -> Option<String> {
+///
+/// A type declared on the route (#2403) is recorded as is, if usable. It is
+/// intent, so the extension never replaces it, and the second value is `true`.
+fn recorded_content_type(
+    headers: &axum::http::HeaderMap,
+    url: &str,
+    declared: Option<&str>,
+) -> (Option<String>, bool) {
+    if let Some(value) = super::middleware::usable_recorded_content_type(declared) {
+        return (Some(value.to_owned()), true);
+    }
+    (inferred_content_type(headers, url), false)
+}
+
+/// The type the handler's response declared, normalized for `url`.
+fn inferred_content_type(headers: &axum::http::HeaderMap, url: &str) -> Option<String> {
     let raw = headers
         .get(axum::http::header::CONTENT_TYPE)?
         .to_str()
@@ -221,6 +240,7 @@ pub async fn render_static_routes(
             let staging = staging.clone();
             let url = job.url;
             let revalidate = job.revalidate;
+            let declared = job.content_type;
             async move {
                 eprintln!("  Rendering {url} ...");
 
@@ -249,7 +269,8 @@ pub async fn render_static_routes(
                 // the page's intended MIME type is actually known; recording it
                 // is what frees the serve path from re-deriving it from the
                 // route slug and the `<route>/index.html` file name.
-                let content_type = recorded_content_type(response.headers(), &url);
+                let (content_type, explicit) =
+                    recorded_content_type(response.headers(), &url, declared);
 
                 let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
@@ -267,7 +288,8 @@ pub async fn render_static_routes(
                     url,
                     ManifestEntry::new(file_path)
                         .with_revalidate(revalidate)
-                        .with_content_type(content_type),
+                        .with_content_type(content_type)
+                        .with_content_type_explicit(explicit),
                 ))
             }
         }))
@@ -317,6 +339,7 @@ mod tests {
             revalidate: None,
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         }
     }
 
@@ -331,6 +354,7 @@ mod tests {
             revalidate: Some(revalidate),
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         }
     }
 
@@ -515,6 +539,7 @@ mod tests {
             revalidate: None,
             params_fn: Some(slug_params_hello_world),
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
 
         let result = render_static_routes(echo_router(), &[meta], &dist).await;
@@ -545,6 +570,7 @@ mod tests {
             revalidate: None,
             params_fn: Some(multi_params),
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
 
         let result = render_static_routes(echo_router(), &[meta], &dist).await;
@@ -573,6 +599,7 @@ mod tests {
                 revalidate: None,
                 params_fn: Some(slug_params_alpha_beta),
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
+                content_type: None,
             },
         ];
 
@@ -599,6 +626,7 @@ mod tests {
             revalidate: Some(3600),
             params_fn: Some(slug_params_hello),
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
 
         let result = render_static_routes(echo_router(), &[meta], &dist).await;
@@ -681,6 +709,7 @@ mod tests {
             revalidate: None,
             params_fn: Some(slug_params_hello_world),
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
 
         render_static_routes(html_router(), &[meta], &dist)
@@ -1032,6 +1061,162 @@ mod tests {
             Some("application/octet-stream"),
             ".pdf is not in the asset table, so there is no extension to prefer"
         );
+    }
+
+    // ── #2403: a route-declared Content-Type beats the inferred default ─────
+
+    fn declared(path: &'static str, content_type: &'static str) -> StaticRouteMeta {
+        StaticRouteMeta {
+            content_type: Some(content_type),
+            ..test_meta(path, "declared")
+        }
+    }
+
+    /// The case the issue names: a deliberate `application/octet-stream`
+    /// on `/logo.png` is recorded as declared, not remapped to `image/png`.
+    #[tokio::test]
+    async fn declared_octet_stream_is_recorded_on_a_png_route() {
+        fn bytes_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                b"\x89PNG\r\n\x1a\n".to_vec()
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        let meta = declared("/logo.png", "application/octet-stream");
+        render_static_routes(bytes_router(), &[meta], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        let entry = &manifest.routes["/logo.png"];
+        assert_eq!(
+            entry.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert!(entry.content_type_explicit);
+    }
+
+    /// The route declaration wins over what the handler sent.
+    #[tokio::test]
+    async fn declared_type_wins_over_the_handler_header() {
+        fn json_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    "{}",
+                )
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(json_router(), &[declared("/data", "text/csv")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/data"].content_type.as_deref(),
+            Some("text/csv")
+        );
+    }
+
+    /// A declared type serves routes whose handler sets no header.
+    #[tokio::test]
+    async fn declared_type_is_recorded_when_the_handler_sets_none() {
+        fn bare_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                axum::response::Response::new(axum::body::Body::from("bare"))
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(
+            bare_router(),
+            &[declared("/feed", "application/rss+xml")],
+            &dist,
+        )
+        .await
+        .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/feed"].content_type.as_deref(),
+            Some("application/rss+xml")
+        );
+    }
+
+    /// A declared generic type is kept on a route with a disagreeing extension.
+    #[tokio::test]
+    async fn declared_text_plain_is_recorded_on_a_css_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        let meta = declared("/theme.css", "text/plain; charset=utf-8");
+        render_static_routes(echo_router(), &[meta], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/theme.css"].content_type.as_deref(),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    /// Every page of a parameterized route gets the declared type.
+    #[tokio::test]
+    async fn declared_type_applies_to_each_parameterized_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        let meta = StaticRouteMeta {
+            path: "/posts/{slug}",
+            params_fn: Some(slug_params_hello_world),
+            content_type: Some("text/markdown"),
+            ..test_meta("/posts/{slug}", "show_post")
+        };
+        render_static_routes(html_router(), &[meta], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        for route in ["/posts/hello", "/posts/world"] {
+            let entry = &manifest.routes[route];
+            assert_eq!(entry.content_type.as_deref(), Some("text/markdown"));
+            assert!(entry.content_type_explicit);
+        }
+    }
+
+    /// Padding around a declared value is trimmed when recorded.
+    #[tokio::test]
+    async fn declared_type_is_trimmed_when_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        let meta = declared("/data", "  text/csv  ");
+        render_static_routes(echo_router(), &[meta], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/data"].content_type.as_deref(),
+            Some("text/csv")
+        );
+    }
+
+    /// An inferred type is still not explicit.
+    #[tokio::test]
+    async fn inferred_type_is_not_marked_explicit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(echo_router(), &[test_meta("/theme.css", "theme")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert!(!manifest.routes["/theme.css"].content_type_explicit);
     }
 
     #[tokio::test]

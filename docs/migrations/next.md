@@ -1289,6 +1289,28 @@ that does not opt in behaves as before.
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### `StaticRouteMeta` has a `content_type` field
+
+**Why:** `#[static_get]` now takes `content_type = "..."` (#2403). The macro
+passes the value in this field.
+
+This affects only code that builds `StaticRouteMeta { .. }` by hand. Routes
+declared with `#[static_get]` do not change.
+
+**Before (`0.8`):**
+
+```rust
+let meta = StaticRouteMeta { path: "/a", name: "a", revalidate: None, params_fn: None, seo };
+```
+
+**After (next release):**
+
+```rust
+let meta = StaticRouteMeta { path: "/a", name: "a", revalidate: None, params_fn: None, seo, content_type: None };
+```
+
+**Automation:** `manual` — add `content_type: None` to each literal.
+
 ### Data flow: manifest rows have a crate version in `model_path`
 
 **Why:** Two incompatible versions of one crate can link into one binary. They
@@ -1412,6 +1434,7 @@ single most valuable section of the guide — keep it factual and short.
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 | `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`, `default_timeout_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
 | `error[E0063]: missing field \`timeout\`` | a `JobInfo` literal | add `timeout: None` |
+| `error[E0063]: missing field \`content_type\`` | a `StaticRouteMeta` literal | add `content_type: None` |
 | `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
 
 ## Configuration changes
