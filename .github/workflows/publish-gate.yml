@@ -65,9 +65,9 @@ jobs:
   # 0a. Security posture gate on autumn's own example apps — issue #1624
   #
   # The gate autumn scaffolds into every app, run against an autumn app: builds
-  # `examples/hello`, emits its posture manifest, and diffs it against the
-  # manifest committed next to the example. A change that widens the example's
-  # security surface — a route reachable by more callers, a guard removed —
+  # the examples listed in the script, emits each posture manifest, and diffs
+  # it against the manifest committed next to the example. A change that widens
+  # an example's security surface — a route reachable by more callers, a guard removed —
   # fails here, with the same acknowledgment escape hatch the product ships.
   # See scripts/check-posture-gate.sh and docs/guide/posture-gate.md.
   # ---------------------------------------------------------------------------

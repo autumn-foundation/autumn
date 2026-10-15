@@ -110,7 +110,8 @@ async fn main() {
         // (rather than a merged raw router) keeps these routes in the route
         // registry, so their `#[api_doc(mcp)]` tags project them as MCP tools
         // while `RequireApiToken` still guards every call — agent or HTTP.
-        .scoped(
+        // `scoped_guarded` tells the posture audit the layer is the guard.
+        .scoped_guarded(
             "/api",
             RequireApiToken::new(Arc::new(deferred.clone())),
             routes![

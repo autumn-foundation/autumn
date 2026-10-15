@@ -94,6 +94,10 @@ pub struct AuditRoute {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub policy: bool,
+    /// Gated by a layer the app declared (`scoped_guarded`), not by a proven
+    /// guard. Absent on older dumps.
+    #[serde(default)]
+    pub layer_guarded: bool,
     #[serde(default)]
     pub module: Option<String>,
     /// `file:line` source location of the handler, when known (serialized as
@@ -277,7 +281,8 @@ pub struct ManifestRoute {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     /// How the classification was established. `"provable"` means it was
-    /// derived from macro-expanded code (route + auth posture).
+    /// derived from macro-expanded code (route + auth posture). `"declared"`
+    /// means the app claimed a guarding layer (`scoped_guarded`).
     pub provenance: &'static str,
 }
 
@@ -425,7 +430,11 @@ fn build_routes_dimension(routes: &[AuditRoute]) -> RoutesDimension {
             policy: r.policy,
             source: r.source.clone(),
             location: r.location.clone(),
-            provenance: "provable",
+            provenance: if r.layer_guarded {
+                "declared"
+            } else {
+                "provable"
+            },
         })
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
@@ -1033,6 +1042,7 @@ mod tests {
             roles: vec![],
             scopes: vec![],
             policy: false,
+            layer_guarded: false,
             module: None,
             location: None,
             authorize_bindings: Vec::new(),
@@ -1167,6 +1177,21 @@ mod tests {
         ] {
             assert!(entry.get(key).is_some(), "manifest route missing `{key}`");
         }
+    }
+
+    /// A layer-guarded route is `gated`, and its entry says `declared`:
+    /// the layer is a claim by the app, not a fact the macros proved (#2468).
+    #[test]
+    fn layer_guarded_route_is_declared_not_provable() {
+        let mut guarded = route("GET", "/api/todos", "list", "gated");
+        guarded.layer_guarded = true;
+        let proven = route("GET", "/admin", "admin", "gated");
+        let manifest = build_manifest(&[guarded, proven], None);
+        let entries = &manifest.dimensions.routes.entries;
+        assert_eq!(entries[0].path, "/admin");
+        assert_eq!(entries[0].provenance, "provable");
+        assert_eq!(entries[1].path, "/api/todos");
+        assert_eq!(entries[1].provenance, "declared");
     }
 
     #[test]

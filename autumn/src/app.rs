@@ -655,6 +655,9 @@ pub struct ScopedGroup {
     pub routes: Vec<Route>,
     /// Registration origin: user application or a named plugin.
     pub source: crate::route_listing::RouteSource,
+    /// The app declared that the group's layer authenticates its routes
+    /// (`AppBuilder::scoped_guarded`). A claim, not a proof.
+    pub layer_guarded: bool,
     /// Closure that applies the layer to a sub-router.
     pub apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
@@ -1265,7 +1268,58 @@ impl AppBuilder {
     /// # }
     /// ```
     #[must_use]
-    pub fn scoped<L>(mut self, prefix: &str, layer: L, routes: Vec<Route>) -> Self
+pub fn scoped<L>(self, prefix: &str, layer: L, routes: Vec<Route>) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        self.push_scoped_group(prefix, layer, routes, false)
+    }
+
+    /// Like [`scoped`](Self::scoped), but declare that `layer` authenticates
+    /// every route in the group.
+    ///
+    /// Use it for a guard that is a layer, not an attribute, such as
+    /// `RequireApiToken`. `autumn routes audit` then lists a route with no
+    /// `#[secured]` or `#[public]` as `gated` with `provenance: "declared"`.
+    /// A handler's own `#[public]` or `#[secured]` still wins.
+    ///
+    /// The audit cannot check the claim. If the layer does not authenticate,
+    /// the manifest is wrong.
+    #[must_use]
+    pub fn scoped_guarded<L>(self, prefix: &str, layer: L, routes: Vec<Route>) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        self.push_scoped_group(prefix, layer, routes, true)
+    }
+
+    fn push_scoped_group<L>(
+        mut self,
+        prefix: &str,
+        layer: L,
+        routes: Vec<Route>,
+        layer_guarded: bool,
+    ) -> Self
     where
         L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
         L::Service: tower::Service<
@@ -1289,6 +1343,7 @@ impl AppBuilder {
             prefix: prefix.to_owned(),
             routes,
             source,
+            layer_guarded,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
@@ -15631,11 +15686,33 @@ mod validate_repository_api_policies_tests {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let offenders = collect_unguarded_repository_writes(&[], std::slice::from_ref(&group));
         assert_eq!(offenders.len(), 1);
         assert_eq!(offenders[0].0, "Post");
+    }
+
+    #[test]
+    fn scoped_guarded_marks_the_group_and_scoped_does_not() {
+        let app = app()
+            .scoped(
+                "/open",
+                tower::layer::util::Identity::new(),
+                vec![build_route(http::Method::GET, "/a", None)],
+            )
+            .scoped_guarded(
+                "/api",
+                tower::layer::util::Identity::new(),
+                vec![build_route(http::Method::GET, "/b", None)],
+            );
+        let flags: Vec<(&str, bool)> = app
+            .scoped_groups
+            .iter()
+            .map(|g| (g.prefix.as_str(), g.layer_guarded))
+            .collect();
+        assert_eq!(flags, vec![("/open", false), ("/api", true)]);
     }
 
     #[test]
@@ -15649,6 +15726,7 @@ mod validate_repository_api_policies_tests {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let registry = PolicyRegistry::default();

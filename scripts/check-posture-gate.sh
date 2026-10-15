@@ -40,7 +40,19 @@ cd "$root"
 
 # Examples carrying a committed posture baseline. Keep this list and the
 # `security-posture.json` files next to those examples in step.
-EXAMPLES=("hello")
+#
+# This is a representative subset, not the fleet (issue #2468). Each example is
+# one more build in `publish-gate`. The set covers each way a route gets its
+# classification:
+#   hello    - `#[public]` only
+#   flock    - `#[public]` page for a WASM island
+#   invoice  - `#[public]` page and PDF
+#   todo-app - `#[public]` routes, plus a bearer-token API guarded by a layer
+#              (`AppBuilder::scoped_guarded`)
+# The others stay out: most mount unauthenticated admin or write routes, and
+# `#[public]` on those would be false. Add one when its routes are classified
+# with care.
+EXAMPLES=("hello" "flock" "invoice" "todo-app")
 
 # The build to audit (issue #2472). A deployment ships a release build, and a
 # route behind `#[cfg(not(debug_assertions))]` is only in that build. The

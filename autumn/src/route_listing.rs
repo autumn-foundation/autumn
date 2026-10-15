@@ -364,6 +364,10 @@ pub struct RouteInfo {
     /// (`#[authorize]`), carried for `Gated` routes.
     #[serde(default, skip_serializing_if = "is_false")]
     pub policy: bool,
+    /// The route is `Gated` only because its group was mounted with
+    /// `AppBuilder::scoped_guarded`: a declared guard, not a proven one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub layer_guarded: bool,
     /// Module path of the handler (from `module_path!()`), used to name a
     /// route in audit diagnostics. `None` for routes without a known module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -681,8 +685,14 @@ pub fn collect_route_infos(
             let full_path = join_scope_path(&group.prefix, route.path);
             let (api_version, status, sunset_opt_out) =
                 resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
-            let (classification, roles, scopes, policy) =
+            let (mut classification, roles, scopes, policy) =
                 classify(&group.source, &route.api_doc, route.repository.as_ref());
+            // Only a route with no other answer takes the group's declared guard.
+            let layer_guarded =
+                group.layer_guarded && classification == RouteClassification::Unclassified;
+            if layer_guarded {
+                classification = RouteClassification::Gated;
+            }
             let pools = pools_of(&route.api_doc, route.repository.as_ref());
             infos.push(RouteInfo {
                 method: route.method.to_string(),
@@ -697,6 +707,7 @@ pub fn collect_route_infos(
                 roles,
                 scopes,
                 policy,
+                layer_guarded,
                 module: module_of(&route.api_doc),
                 location: source_location_of(&route.api_doc),
                 authorize_bindings: authorize_bindings_of(&group.source, &route.api_doc),
@@ -1100,6 +1111,7 @@ mod tests {
             prefix: "/api".to_owned(),
             routes: vec![make_route(Method::GET, "/posts", "api_list_posts")],
             source: RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
@@ -1114,6 +1126,7 @@ mod tests {
             prefix: "/api".to_owned(),
             routes: vec![make_route(Method::GET, "/", "api_root")],
             source: RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
@@ -1143,6 +1156,7 @@ mod tests {
             prefix: "/admin".to_owned(),
             routes: vec![make_route(Method::GET, "/users", "admin_users")],
             source: RouteSource::Plugin("admin".to_owned()),
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
@@ -1295,6 +1309,65 @@ mod tests {
         let route = make_route_with(Method::POST, "/widgets", "create_widget", public_doc);
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
         assert_eq!(infos[0].classification, RouteClassification::Public);
+    }
+
+    /// Group helper for the layer-guard tests (#2468).
+    fn group_of(layer_guarded: bool, routes: Vec<Route>) -> ScopedGroup {
+        ScopedGroup {
+            prefix: "/api".to_owned(),
+            routes,
+            source: RouteSource::User,
+            layer_guarded,
+            apply_layer: Box::new(|r| r),
+        }
+    }
+
+    /// An unclassified route in a layer-guarded group is `Gated`, but flagged
+    /// as declared (not proven): the layer is not visible to the macros.
+    #[test]
+    fn layer_guarded_group_gates_an_unclassified_route() {
+        let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
+        let infos = collect_route_infos(&[], &[], &[group_of(true, vec![route])], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Gated);
+        assert!(infos[0].layer_guarded);
+        assert!(infos[0].roles.is_empty() && !infos[0].policy);
+    }
+
+    /// Without the declaration, the same route still fails the audit.
+    #[test]
+    fn plain_scoped_group_stays_unclassified() {
+        let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
+        let infos = collect_route_infos(&[], &[], &[group_of(false, vec![route])], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Unclassified);
+        assert!(!infos[0].layer_guarded);
+    }
+
+    /// An explicit `#[public]` wins over the group: the manifest must not hide it.
+    #[test]
+    fn layer_guard_does_not_override_public() {
+        let doc = crate::openapi::ApiDoc {
+            public: true,
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::GET, "/todos", "list", doc);
+        let infos = collect_route_infos(&[], &[], &[group_of(true, vec![route])], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Public);
+        assert!(!infos[0].layer_guarded);
+    }
+
+    /// A handler guard is proven, so it keeps its own, stronger claim.
+    #[test]
+    fn layer_guard_does_not_weaken_a_handler_guard() {
+        let doc = crate::openapi::ApiDoc {
+            secured: true,
+            required_roles: &["admin"],
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::GET, "/todos", "list", doc);
+        let infos = collect_route_infos(&[], &[], &[group_of(true, vec![route])], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Gated);
+        assert_eq!(infos[0].roles, vec!["admin"]);
+        assert!(!infos[0].layer_guarded);
     }
 
     /// End-to-end through `collect_route_infos`: a policy-protected repository

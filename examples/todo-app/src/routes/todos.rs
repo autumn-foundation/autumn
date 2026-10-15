@@ -325,6 +325,7 @@ async fn list_page(
 
 /// Redirect the root path to `/todos`.
 #[get("/")]
+#[public]
 pub async fn index() -> Redirect {
     Redirect::to(&paths::list())
 }
@@ -334,6 +335,7 @@ pub async fn index() -> Redirect {
 /// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
 /// Defaults to 20 items per page ordered newest-first.
 #[get("/todos")]
+#[public]
 pub async fn list(page: PageRequest, db: Db) -> AutumnResult<Markup> {
     let blank = ChangesetForm::without_csrf(TodoForm {
         title: String::new(),
@@ -413,6 +415,7 @@ fn detail_view(todo: &Todo, csrf_token: Option<&str>) -> Markup {
 /// `#[delete("/todos/{id}")]` handler — Autumn's method-override middleware
 /// rewrites the transport `POST` to `DELETE` before route matching.
 #[get("/todos/{id}")]
+#[public]
 pub async fn detail(
     id: Path<i64>,
     headers: http::HeaderMap,
@@ -445,6 +448,7 @@ pub async fn detail(
 /// No-JavaScript fallback: when htmx is absent this endpoint is never called;
 /// the full `#[post("/todos")]` handler validates the whole form instead.
 #[post("/todos/validate/title")]
+#[public]
 pub async fn validate_title(form: ChangesetForm<TodoForm>) -> Markup {
     title_field_partial(&form)
 }
@@ -454,6 +458,7 @@ pub async fn validate_title(form: ChangesetForm<TodoForm>) -> Markup {
 /// On validation failure the list page is re-rendered with inline errors (422).
 /// On success a new row is inserted and the browser redirects to the list.
 #[post("/todos")]
+#[public]
 pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl IntoResponse> {
     match form.into_valid() {
         Ok(f) => {
@@ -479,6 +484,7 @@ pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl 
 /// eventual download link. The request itself returns immediately — the
 /// export runs as a background job instead of blocking this thread.
 #[post("/todos/export")]
+#[public]
 pub async fn start_export() -> AutumnResult<Markup> {
     let handle =
         crate::jobs::ExportTodosCsvJob::enqueue_tracked(crate::jobs::ExportTodosArgs {}).await?;
@@ -526,6 +532,7 @@ fn page_request_from_hx(hx: &HxRequest) -> PageRequest {
 /// Uses a single `UPDATE ... SET completed = NOT completed RETURNING *`
 /// query — one round-trip instead of three.
 #[post("/todos/{id}/toggle")]
+#[public]
 pub async fn toggle(id: Path<i64>, mut db: Db, hx: HxRequest) -> AutumnResult<impl IntoResponse> {
     let updated: Todo = diesel::update(todos::table.find(*id))
         .set(todos::completed.eq(diesel::dsl::not(todos::completed)))
@@ -558,6 +565,7 @@ pub async fn toggle(id: Path<i64>, mut db: Db, hx: HxRequest) -> AutumnResult<im
 ///   middleware before route matching. The handler redirects back to the
 ///   list, which is the no-JS-friendly response.
 #[delete("/todos/{id}")]
+#[public]
 pub async fn delete_todo(
     id: Path<i64>,
     mut db: Db,
