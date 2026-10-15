@@ -1595,6 +1595,20 @@ impl Analyzer {
                     self.bind_pattern_callables(element_pat, element);
                 }
             }
+            // `let Holder { run } = Holder { run: tokio::spawn };`
+            (Pat::Struct(p), Expr::Struct(s)) => {
+                for field in &p.fields {
+                    if let Some(value) = s.fields.iter().find(|f| f.member == field.member) {
+                        self.bind_pattern_callables(&field.pat, &value.expr);
+                    }
+                }
+            }
+            // `let Wrap(run) = Wrap(tokio::spawn);`
+            (Pat::TupleStruct(p), Expr::Call(c)) if p.elems.len() == c.args.len() => {
+                for (element_pat, element) in p.elems.iter().zip(c.args.iter()) {
+                    self.bind_pattern_callables(element_pat, element);
+                }
+            }
             _ => {}
         }
     }
@@ -1755,6 +1769,7 @@ impl Analyzer {
             }
             // `async { start() }.await` yields what the block's tail yields.
             Expr::Async(a) => self.block_tail_is_unread(&a.block),
+            Expr::Unsafe(u) => self.block_tail_is_unread(&u.block),
             head @ (Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_) | Expr::Path(_)) => {
                 !self.awaited_is_readable(head)
             }
@@ -7449,6 +7464,36 @@ mod tests {
             r"async fn h() -> R {
                 let fut = loop { break start_finance_job(); };
                 fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future yielded by an unsafe block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = unsafe { start_finance_job() };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a struct pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let Holder { run } = Holder { run: tokio::spawn };
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a tuple struct pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let Wrap(run) = Wrap(tokio::spawn);
+                run(async {});
                 Ok(())
             }",
         ),
