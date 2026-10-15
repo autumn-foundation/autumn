@@ -1752,9 +1752,23 @@ impl Analyzer {
                     self.assign_handles(target, value);
                 }
             }
+            // `Holder { fut } = Holder { fut: start() };`
+            (Expr::Struct(l), Expr::Struct(r)) => {
+                for field in &l.fields {
+                    if let Some(value) = r.fields.iter().find(|f| f.member == field.member) {
+                        self.assign_handles(&field.expr, &value.expr);
+                    }
+                }
+            }
+            // `Wrap(a) = Wrap(start());`
+            (Expr::Call(l), Expr::Call(r)) if l.args.len() == r.args.len() => {
+                for (target, value) in l.args.iter().zip(r.args.iter()) {
+                    self.assign_handles(target, value);
+                }
+            }
             // Autumn cannot read the right-hand side. If it is an unread call,
             // every target may hold its future.
-            (Expr::Tuple(_) | Expr::Array(_), _) => {
+            (Expr::Tuple(_) | Expr::Array(_) | Expr::Struct(_) | Expr::Call(_), _) => {
                 let handle = self.container_handle(right);
                 let unread = self.carries_unread(right);
                 self.assign_all(left, handle.as_ref(), unread);
@@ -1781,6 +1795,16 @@ impl Analyzer {
             Expr::Array(a) => {
                 for element in &a.elems {
                     self.assign_all(element, handle, unread);
+                }
+            }
+            Expr::Struct(s) => {
+                for field in &s.fields {
+                    self.assign_all(&field.expr, handle, unread);
+                }
+            }
+            Expr::Call(c) => {
+                for argument in &c.args {
+                    self.assign_all(argument, handle, unread);
                 }
             }
             Expr::Paren(p) => self.assign_all(&p.expr, handle, unread),
@@ -1900,6 +1924,7 @@ impl Analyzer {
         let handle = self.container_handle(&l.expr);
         let saved = self.enter_binding_scope(&l.pat, handle.as_ref());
         self.mark_pattern_unread(&l.pat, &l.expr);
+        self.bind_pattern_callables(&l.pat, &l.expr);
         saved
     }
 
@@ -2820,6 +2845,19 @@ impl Analyzer {
     fn awaited(&mut self, base: &Expr) {
         self.expr(base);
         let head = strip_transparent(base);
+        // `(async { start() }.await).await`: the inner await yields the
+        // block's tail, and the outer one polls it.
+        let mut inner = base;
+        while let Expr::Paren(p) = inner {
+            inner = &p.expr;
+        }
+        if let Expr::Await(inner_await) = inner
+            && let Expr::Async(block) = strip_transparent(&inner_await.base)
+            && self.block_tail_is_unread(&block.block)
+        {
+            self.refuse_awaited(head.span());
+            return;
+        }
         if self.awaited_is_readable(head) {
             // A combinator awaits the future it is handed, so that future is
             // judged here, where the `await` actually is.
@@ -7653,6 +7691,35 @@ mod tests {
             "run",
             r"async fn h() -> R {
                 for run in [tokio::spawn] { run(async {}); }
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias bound by an if let",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                if let Some(run) = Some(tokio::spawn) { run(async {}); }
+                Ok(())
+            }",
+        ),
+        (
+            "async block awaited twice",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                (async { start_finance_job() }.await).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future moved in by a struct destructuring assignment",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                let mut fut = tokio::time::sleep(d);
+                Holder { fut } = Holder { fut: start_finance_job() };
+                fut.await?;
                 Ok(())
             }",
         ),
