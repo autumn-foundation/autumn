@@ -878,6 +878,9 @@ struct Analyzer {
     effect_free_sites: Vec<(proc_macro2::Span, String)>,
     /// Diagnostics for sites that cannot be proven.
     errors: Vec<syn::Error>,
+    /// Messages already reported, by message and span, so walking a closure
+    /// again at a call site does not report its refusals twice.
+    error_keys: HashSet<String>,
     /// Depth of enclosing transaction callbacks: a plain `enqueue` in here
     /// fires even when the transaction rolls back.
     in_transaction: u32,
@@ -1037,6 +1040,7 @@ impl Analyzer {
             seen: HashSet::new(),
             effect_free_sites: Vec::new(),
             errors: Vec::new(),
+            error_keys: HashSet::new(),
             in_transaction: 0,
             tenant_declared: false,
             suppress: 0,
@@ -1285,7 +1289,9 @@ impl Analyzer {
         if self.suppress > 0 {
             return;
         }
-        self.errors.push(syn::Error::new(span, message));
+        if self.error_keys.insert(format!("{span:?}\n{message}")) {
+            self.errors.push(syn::Error::new(span, message));
+        }
     }
 
     /// Walk a site carrying an `#[agent_effect(...)]`, with the semantics the
@@ -1656,7 +1662,15 @@ impl Analyzer {
                     self.bind_pattern_callables(element_pat, element);
                 }
             }
-            _ => {}
+            // Nothing pairs the pattern with the initialiser, so every name in
+            // it takes what the source holds: `if let Some(run) = funcs`.
+            (pat, init) => {
+                let mut names = HashSet::new();
+                collect_pat_idents(pat, &mut names);
+                for name in names {
+                    self.bind_container_callables(&name, [init]);
+                }
+            }
         }
     }
 
@@ -1877,7 +1891,7 @@ impl Analyzer {
             (Expr::Tuple(_) | Expr::Array(_) | Expr::Struct(_) | Expr::Call(_), _) => {
                 let handle = self.container_handle(right);
                 let unread = self.carries_unread(right);
-                self.assign_all(left, handle.as_ref(), unread);
+                self.assign_all(left, handle.as_ref(), unread, Some(right));
             }
             (target, _) => {
                 let handle = self.expr_handle(right);
@@ -1891,33 +1905,40 @@ impl Analyzer {
 
     /// Give every name in a destructuring target the same handle and future
     /// state, descending through nested tuples and arrays.
-    fn assign_all(&mut self, target: &Expr, handle: Option<&Handle>, unread: bool) {
+    fn assign_all(
+        &mut self,
+        target: &Expr,
+        handle: Option<&Handle>,
+        unread: bool,
+        source: Option<&Expr>,
+    ) {
         match target {
             Expr::Tuple(t) => {
                 for element in &t.elems {
-                    self.assign_all(element, handle, unread);
+                    self.assign_all(element, handle, unread, source);
                 }
             }
             Expr::Array(a) => {
                 for element in &a.elems {
-                    self.assign_all(element, handle, unread);
+                    self.assign_all(element, handle, unread, source);
                 }
             }
             Expr::Struct(s) => {
                 for field in &s.fields {
-                    self.assign_all(&field.expr, handle, unread);
+                    self.assign_all(&field.expr, handle, unread, source);
                 }
             }
             Expr::Call(c) => {
                 for argument in &c.args {
-                    self.assign_all(argument, handle, unread);
+                    self.assign_all(argument, handle, unread, source);
                 }
             }
-            Expr::Paren(p) => self.assign_all(&p.expr, handle, unread),
+            Expr::Paren(p) => self.assign_all(&p.expr, handle, unread, source),
             _ => {
                 self.assign_handle_to(target, handle);
                 self.assign_future_to(target, unread);
-                self.assign_callable_to(target, None);
+                // The target holds what the source holds.
+                self.assign_callable_to(target, source);
             }
         }
     }
@@ -2943,6 +2964,31 @@ impl Analyzer {
         true
     }
 
+    /// `invoke(tokio::spawn)` where `invoke` is a closure bound earlier: walk
+    /// its body again with the parameters bound to what this call hands it,
+    /// as an immediately invoked closure is walked.
+    fn enter_stored_closure(&mut self, call: &ExprCall) {
+        let Expr::Path(path) = strip_transparent(&call.func) else {
+            return;
+        };
+        let Some(closure) = path
+            .path
+            .get_ident()
+            .and_then(|ident| self.closures.get(&ident.to_string()).cloned())
+        else {
+            return;
+        };
+        let mut saved = Vec::new();
+        for (param, arg) in closure.inputs.iter().zip(call.args.iter()) {
+            let handle = self.container_handle(arg);
+            saved.extend(self.enter_binding_scope(param, handle.as_ref()));
+            self.mark_pattern_unread(param, arg);
+            self.bind_pattern_callables(param, arg);
+        }
+        self.expr(&closure.body);
+        self.leave_binding_scope(saved);
+    }
+
     /// A call through a name an earlier binding made a `spawn`, an ambiguous
     /// effect verb, or one effect verb. Returns whether it handled the call.
     fn call_through_alias(&mut self, call: &ExprCall) -> bool {
@@ -3010,8 +3056,8 @@ impl Analyzer {
         // `opt.map(|r| r.delete_all())` — the closure parameter *is* the
         // handle `opt` carries. Binding it to nothing (the default for any
         // closure input) dropped the handle at the parameter list.
-        let carried = HANDLE_COMBINATORS
-            .contains(&name.as_str())
+        let combinator = HANDLE_COMBINATORS.contains(&name.as_str());
+        let carried = combinator
             .then(|| self.container_handle(&method.receiver))
             .flatten();
         for arg in &method.args {
@@ -3019,11 +3065,14 @@ impl Analyzer {
                 self.callback_arg(arg);
                 continue;
             }
-            if let (Some(handle), Expr::Closure(closure)) = (carried.as_ref(), arg) {
+            if combinator && let Expr::Closure(closure) = arg {
                 let mut saved = Vec::new();
                 let mut inputs = closure.inputs.iter();
                 if let Some(first) = inputs.next() {
-                    saved.extend(self.enter_binding_scope(first, Some(handle)));
+                    saved.extend(self.enter_binding_scope(first, carried.as_ref()));
+                    // The first parameter is what the receiver holds.
+                    self.mark_pattern_unread(first, &method.receiver);
+                    self.bind_pattern_callables(first, &method.receiver);
                 }
                 for input in inputs {
                     saved.extend(self.enter_binding_scope(input, None));
@@ -3340,6 +3389,7 @@ impl Analyzer {
             }
             return;
         }
+        self.enter_stored_closure(call);
         for arg in &call.args {
             self.expr(arg);
         }
@@ -5094,26 +5144,23 @@ fn macro_path_is_standard(path: &syn::Path, shadowed: &HashSet<String>) -> bool 
 
 /// Does a macro body name a `spawn`-family function?
 fn tokens_contain_spawn(tokens: &TokenStream) -> bool {
-    let mut iter = tokens.clone().into_iter().peekable();
-    while let Some(tt) = iter.next() {
-        match tt {
-            // Only a call counts: `spawn(..)` or `spawn::<T>(..)`. A bare
-            // `spawn` is data, as in `let spawn = 1;`.
-            TokenTree::Ident(ident) if SPAWN_FNS.contains(&ident.to_string().as_str()) => {
-                let called = match iter.peek() {
-                    Some(TokenTree::Group(group)) => group.delimiter() == Delimiter::Parenthesis,
-                    Some(TokenTree::Punct(punct)) => punct.as_char() == ':',
-                    _ => false,
-                };
-                if called {
-                    return true;
+    let trees: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    trees.iter().enumerate().any(|(at, tt)| match tt {
+        // Only a call counts: `spawn(..)` or `spawn::<T>(..)`. A bare `spawn`
+        // is data, as in `let spawn = 1;`, and a lone `:` is a field or a type.
+        TokenTree::Ident(ident) if SPAWN_FNS.contains(&ident.to_string().as_str()) => {
+            match trees.get(at + 1) {
+                Some(TokenTree::Group(group)) => group.delimiter() == Delimiter::Parenthesis,
+                Some(TokenTree::Punct(punct)) if punct.as_char() == ':' => {
+                    matches!(trees.get(at + 2), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+                        && matches!(trees.get(at + 3), Some(TokenTree::Punct(p)) if p.as_char() == '<')
                 }
+                _ => false,
             }
-            TokenTree::Group(group) if tokens_contain_spawn(&group.stream()) => return true,
-            _ => {}
         }
-    }
-    false
+        TokenTree::Group(group) => tokens_contain_spawn(&group.stream()),
+        _ => false,
+    })
 }
 
 fn tokens_look_like_fn(tokens: &TokenStream) -> bool {
@@ -8258,6 +8305,47 @@ mod tests {
             }",
         ),
         (
+            "spawn alias kept by a destructuring assignment from a container",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let funcs = (tokio::spawn,);
+                let mut run = tokio::spawn;
+                (run,) = funcs;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias passed into a combinator closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                Some(tokio::spawn).map(|run| run(async {}));
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias passed as an argument to a stored closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let invoke = |run| run(async {});
+                invoke(tokio::spawn);
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias read out of a named container by a pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let funcs = Some(tokio::spawn);
+                if let Some(run) = funcs { run(async {}); }
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -8625,6 +8713,13 @@ mod tests {
             r"async fn h() -> R {
                 let outer = async { start_finance_job() };
                 outer.await;
+                Ok(())
+            }",
+        ),
+        (
+            "a struct field named spawn inside an inert macro",
+            r"async fn h() -> R {
+                assert_eq!(Config { spawn: 1 }.spawn, 1);
                 Ok(())
             }",
         ),
