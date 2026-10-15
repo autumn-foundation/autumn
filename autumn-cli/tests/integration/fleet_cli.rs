@@ -386,6 +386,19 @@ mod sqlite {
     }
 
     #[test]
+    fn fleet_refuses_a_database_config_boot_refuses() {
+        let app =
+            App::new("[[database.shards]]\nname = \"s1\"\nprimary_url = \"sqlite://s1.db\"\n");
+        std::fs::create_dir_all(app.root()).unwrap();
+        let stderr = run_err(&app.dir, &["fleet", "list"]);
+        assert!(
+            stderr.contains("Invalid [database] configuration"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("database.shards"), "{stderr}");
+    }
+
+    #[test]
     fn fleet_refuses_a_control_database_inside_the_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("fleet");
@@ -449,6 +462,29 @@ mod sqlite {
             );
             assert!(stderr.contains("already exists"), "{stderr}");
             assert!(!target.exists(), "the link was not followed");
+        }
+        // Another user could swap the staging directory in a shared
+        // directory without the sticky bit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let shared = app.dir.join("shared");
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let into = shared.join("acme.db");
+            let stderr = run_err(
+                &app.dir,
+                &["fleet", "backup", "tenant:acme", into.to_str().unwrap()],
+            );
+            assert!(stderr.contains("writable by other users"), "{stderr}");
+            assert!(!into.exists());
+            // The sticky bit (as on /tmp) stops the swap.
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            run_ok(
+                &app.dir,
+                &["fleet", "backup", "tenant:acme", into.to_str().unwrap()],
+            );
+            assert_eq!(count_notes(&into), 3);
         }
         let leftovers: Vec<_> = std::fs::read_dir(&app.dir)
             .unwrap()

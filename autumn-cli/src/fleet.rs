@@ -151,12 +151,24 @@ mod imp {
 
     impl Target {
         fn load(profile: Option<&str>) -> Result<Self, String> {
-            let (profile, config) = replica::load_app_config(profile).map_err(|e| e.to_string())?;
+            let (profile, config) = replica::load_app_config(profile).map_err(|e| match e {
+                // The shared loader labels its errors for `[replication]`.
+                replica::ReplicaError::Config { detail } => {
+                    format!("Invalid configuration: {detail}")
+                }
+                other => other.to_string(),
+            })?;
             let fleet = config.database.fleet.clone().ok_or_else(|| {
                 "No [database.fleet] section is configured.\n  Add one to autumn.toml, or \
                  set AUTUMN_DATABASE__FLEET__MODE and AUTUMN_DATABASE__FLEET__ROOT."
                     .to_owned()
             })?;
+            // The checks boot makes: a file-backed SQLite control database,
+            // no `[[database.shards]]` beside the fleet, and the rest.
+            config
+                .database
+                .validate()
+                .map_err(|e| format!("Invalid [database] configuration: {e}"))?;
             Ok(Self {
                 profile,
                 config,
@@ -509,6 +521,8 @@ mod imp {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        #[cfg(unix)]
+        refuse_shared_parent(parent)?;
         let staging =
             replica::create_private_dir(parent, "fleet-backup").map_err(|e| e.to_string())?;
         let staged = staging.join("backup.db");
@@ -534,6 +548,27 @@ mod imp {
             dest.display(),
             bytes_on_disk(dest)
         );
+        Ok(())
+    }
+
+    /// Refuse a directory that other users can write to without the sticky
+    /// bit: such a user could rename the staging directory and put their own
+    /// file in its place before the copy is written.
+    #[cfg(unix)]
+    fn refuse_shared_parent(parent: &Path) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(parent)
+            .map_err(|e| format!("could not read {}: {e}", parent.display()))?
+            .permissions()
+            .mode();
+        let sticky = mode & 0o1000 != 0;
+        if mode & 0o022 != 0 && !sticky {
+            return Err(format!(
+                "{} is writable by other users.\n  Write the backup to a directory that only \
+                 you can write to.",
+                parent.display()
+            ));
+        }
         Ok(())
     }
 

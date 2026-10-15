@@ -169,8 +169,8 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   `database.fleet.root` does not exist, so a wrong directory does not give an
   empty fleet. For a new volume, create the root directory first.
 - Only `restore` creates a database file. The other commands do not.
-- Like boot, each command stops when the control database resolves inside
-  the fleet root.
+- Like boot, each command validates `[database]` first and stops when the
+  control database resolves inside the fleet root.
 - `list --open` reads each file and changes no data. It exits non-zero when
   it cannot read a file.
 - `migrate` reads the app's `migrations/` directory. It does not apply plugin
@@ -187,7 +187,8 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   can make the replicator start a new generation. `AUTUMN_MIGRATE=1` does the
   same.
 - `backup` never replaces or follows a file at `dest`. On Unix, only its
-  owner can read the copy. On Windows, the copy gets the ACL of the `dest`
+  owner can read the copy, and `backup` stops when other users can write to
+  the `dest` directory (unless it has the sticky bit, as `/tmp` has). On Windows, the copy gets the ACL of the `dest`
   directory: put backups in a directory that only you can read.
 - `delete` and `restore` destroy data, so they need `--force` on every
   profile. When another process has the file open (an app that serves the
