@@ -532,7 +532,7 @@ mod imp {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         #[cfg(unix)]
-        refuse_shared_parent(parent)?;
+        refuse_unsafe_path(parent)?;
         let staging =
             replica::create_private_dir(parent, "fleet-backup").map_err(|e| e.to_string())?;
         let staged = staging.join("backup.db");
@@ -561,23 +561,31 @@ mod imp {
         Ok(())
     }
 
-    /// Refuse a directory that other users can write to without the sticky
-    /// bit: such a user could rename the staging directory and put their own
-    /// file in its place before the copy is written.
+    /// Refuse a path another user could change on the way to `dir`. Every
+    /// directory from `/` down to `dir` must belong to root or to this user,
+    /// and must not be writable by others unless it has the sticky bit (as
+    /// `/tmp` has). Otherwise another user could rename a directory on the way
+    /// and put their own file where the copy is written. The rule is
+    /// OpenSSH's for its own files.
     #[cfg(unix)]
-    fn refuse_shared_parent(parent: &Path) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(parent)
-            .map_err(|e| format!("could not read {}: {e}", parent.display()))?
-            .permissions()
-            .mode();
-        let sticky = mode & 0o1000 != 0;
-        if mode & 0o022 != 0 && !sticky {
-            return Err(format!(
-                "{} is writable by other users.\n  Write the backup to a directory that only \
-                 you can write to.",
-                parent.display()
-            ));
+    fn refuse_unsafe_path(dir: &Path) -> Result<(), String> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let me = nix::unistd::geteuid().as_raw();
+        let canonical = std::fs::canonicalize(dir)
+            .map_err(|e| format!("could not read {}: {e}", dir.display()))?;
+        for ancestor in canonical.ancestors() {
+            let meta = std::fs::metadata(ancestor)
+                .map_err(|e| format!("could not read {}: {e}", ancestor.display()))?;
+            let mode = meta.permissions().mode();
+            let owned = meta.uid() == 0 || meta.uid() == me;
+            let shared = mode & 0o022 != 0 && mode & 0o1000 == 0;
+            if !owned || shared {
+                return Err(format!(
+                    "{} is writable by other users, or belongs to another user.\n  Write the \
+                     backup under directories that only you (or root) can change.",
+                    ancestor.display()
+                ));
+            }
         }
         Ok(())
     }

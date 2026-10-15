@@ -499,6 +499,17 @@ mod sqlite {
             );
             assert!(stderr.contains("writable by other users"), "{stderr}");
             assert!(!into.exists());
+            // A private directory under the shared one: the shared one can
+            // still rename it.
+            let private = shared.join("private");
+            std::fs::create_dir(&private).unwrap();
+            let nested = private.join("acme.db");
+            let stderr = run_err(
+                &app.dir,
+                &["fleet", "backup", "tenant:acme", nested.to_str().unwrap()],
+            );
+            assert!(stderr.contains("writable by other users"), "{stderr}");
+            assert!(!nested.exists());
             // The sticky bit (as on /tmp) stops the swap.
             std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
             run_ok(

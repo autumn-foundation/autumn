@@ -187,8 +187,10 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   can make the replicator start a new generation. `AUTUMN_MIGRATE=1` does the
   same.
 - `backup` never replaces or follows a file at `dest`. On Unix, only its
-  owner can read the copy, and `backup` stops when other users can write to
-  the `dest` directory (unless it has the sticky bit, as `/tmp` has). On Windows, the copy gets the ACL of the `dest`
+  owner can read the copy, and `backup` stops when another user could change
+  a directory on the way to `dest`: each one must belong to root or to you,
+  and must not be writable by others unless it has the sticky bit (as `/tmp`
+  has). On Windows, the copy gets the ACL of the `dest`
   directory: put backups in a directory that only you can read.
 - `delete` and `restore` destroy data, so they need `--force` on every
   profile. When another process has the file open (an app that serves the
