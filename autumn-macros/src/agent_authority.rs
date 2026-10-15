@@ -1675,6 +1675,10 @@ impl Analyzer {
                 self.bind_container_callables(name, s.fields.iter().map(|f| &f.expr));
             }
             Expr::Call(call) => self.bind_container_callables(name, call.args.iter()),
+            // A block, `if` or `match` is whatever its tails are.
+            Expr::Block(_) | Expr::If(_) | Expr::Match(_) | Expr::Unsafe(_) => {
+                self.bind_container_callables(name, value_tails(init));
+            }
             // `funcs.0` and `funcs[i]` are what `funcs` holds.
             Expr::Field(f) => self.bind_callable(name, &f.base),
             Expr::Index(i) => self.bind_callable(name, &i.expr),
@@ -1840,8 +1844,12 @@ impl Analyzer {
         match strip_transparent(expr) {
             // `(|| start())()` yields what the closure body yields.
             Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
-                immediately_invoked_closure(&call.func)
-                    .is_some_and(|closure| self.is_unread_call(&closure.body))
+                immediately_invoked_closure(&call.func).is_some_and(|closure| {
+                    self.is_unread_call(&closure.body)
+                        || return_values(&closure.body)
+                            .into_iter()
+                            .any(|value| self.value_unread(value))
+                })
             }
             // `async { start() }.await` yields what the block's tail yields.
             Expr::Async(a) => self.block_tail_is_unread(&a.block),
@@ -1865,6 +1873,22 @@ impl Analyzer {
             }),
             _ => false,
         }
+    }
+
+    /// Note whether a `break` or `return` value is an unread future, while the
+    /// names it uses are still bound.
+    fn record_value(&mut self, value: &Expr) {
+        let unread = self.carries_unread(value);
+        self.tail_unread
+            .insert(std::ptr::from_ref(value) as usize, unread);
+    }
+
+    /// A recorded `break` or `return` value, or a fresh reading of it.
+    fn value_unread(&self, value: &Expr) -> bool {
+        self.tail_unread
+            .get(&(std::ptr::from_ref(value) as usize))
+            .copied()
+            .unwrap_or_else(|| self.carries_unread(value))
     }
 
     fn block_tail_is_unread(&self, block: &Block) -> bool {
@@ -1972,11 +1996,11 @@ impl Analyzer {
             // `loop { break start(); }` and `'a: { break 'a start() }` yield
             // their `break` values.
             Expr::Loop(l) => break_values(&l.body)
-                .iter()
-                .any(|value| self.carries_unread(value)),
+                .into_iter()
+                .any(|value| self.value_unread(value)),
             Expr::Block(b) if b.label.is_some() => break_values(&b.block)
-                .iter()
-                .any(|value| self.carries_unread(value)),
+                .into_iter()
+                .any(|value| self.value_unread(value)),
             // `vec![start()]` builds a container of its elements.
             Expr::Macro(m) if m.mac.path.is_ident("vec") => vec_elements(&m.mac)
                 .iter()
@@ -2212,6 +2236,7 @@ impl Analyzer {
             Expr::Break(b) => {
                 if let Some(e) = b.expr.as_deref() {
                     self.expr(e);
+                    self.record_value(e);
                 }
             }
             Expr::Cast(c) => self.expr(&c.expr),
@@ -2238,6 +2263,7 @@ impl Analyzer {
             Expr::Return(r) => {
                 if let Some(e) = r.expr.as_deref() {
                     self.expr(e);
+                    self.record_value(e);
                 }
             }
             Expr::Struct(s) => {
@@ -4702,12 +4728,12 @@ fn iteration_elements(iterated: &Expr) -> Vec<Expr> {
 
 /// The values a `break` hands out of a block, at any depth. Deeper loops'
 /// breaks are included, which only makes the callers more careful.
-fn break_values(block: &Block) -> Vec<Expr> {
-    struct Breaks(Vec<Expr>);
-    impl<'ast> syn::visit::Visit<'ast> for Breaks {
+fn break_values(block: &Block) -> Vec<&Expr> {
+    struct Breaks<'ast>(Vec<&'ast Expr>);
+    impl<'ast> syn::visit::Visit<'ast> for Breaks<'ast> {
         fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
             if let Some(value) = &node.expr {
-                self.0.push((**value).clone());
+                self.0.push(value);
             }
             syn::visit::visit_expr_break(self, node);
         }
@@ -4715,6 +4741,49 @@ fn break_values(block: &Block) -> Vec<Expr> {
     let mut breaks = Breaks(Vec::new());
     syn::visit::Visit::visit_block(&mut breaks, block);
     breaks.0
+}
+
+/// The values `return` hands out of an expression, at any depth.
+fn return_values(body: &Expr) -> Vec<&Expr> {
+    struct Returns<'ast>(Vec<&'ast Expr>);
+    impl<'ast> syn::visit::Visit<'ast> for Returns<'ast> {
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if let Some(value) = &node.expr {
+                self.0.push(value);
+            }
+            syn::visit::visit_expr_return(self, node);
+        }
+    }
+    let mut returns = Returns(Vec::new());
+    syn::visit::Visit::visit_expr(&mut returns, body);
+    returns.0
+}
+
+/// The expressions a block, `if` or `match` can evaluate to.
+fn value_tails(expr: &Expr) -> Vec<&Expr> {
+    fn block_tail(block: &Block) -> Vec<&Expr> {
+        match block.stmts.last() {
+            Some(Stmt::Expr(tail, None)) => value_tails(tail),
+            _ => Vec::new(),
+        }
+    }
+    match strip_transparent(expr) {
+        Expr::Block(b) => block_tail(&b.block),
+        Expr::Unsafe(u) => block_tail(&u.block),
+        Expr::If(i) => {
+            let mut tails = block_tail(&i.then_branch);
+            if let Some((_, other)) = &i.else_branch {
+                tails.extend(value_tails(other));
+            }
+            tails
+        }
+        Expr::Match(m) => m
+            .arms
+            .iter()
+            .flat_map(|arm| value_tails(&arm.body))
+            .collect(),
+        other => vec![other],
+    }
 }
 
 /// The element expressions of a `vec![a, b]` or `vec![x; n]`. Empty when the
@@ -7719,6 +7788,36 @@ mod tests {
             r"async fn h(d: Duration) -> R {
                 let mut fut = tokio::time::sleep(d);
                 Holder { fut } = Holder { fut: start_finance_job() };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned by an explicit closure return",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = (|| { return start_finance_job(); })();
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias yielded by an if",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h(flag: bool) -> R {
+                let run = if flag { tokio::spawn } else { tokio::spawn };
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future broken out by name",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = loop { let inner = start_finance_job(); break inner; };
                 fut.await?;
                 Ok(())
             }",
