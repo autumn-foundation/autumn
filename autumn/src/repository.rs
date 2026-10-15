@@ -757,6 +757,12 @@ pub trait AutumnDependents {
     fn dependents() -> &'static [RuntimeDependentSpec] {
         &[]
     }
+
+    /// Every model a delete of this model also writes, through `dependent`
+    /// associations that are not `restrict`, children of `destroy` children
+    /// included. Defaults to none; `#[model]` shadows it with an inherent
+    /// const. Read by the agent-authority grant check.
+    const DEPENDENT_MODELS: &'static [&'static str] = &[];
 }
 
 // Blanket fallback — any type without an inherent `dependents()` (i.e. a model

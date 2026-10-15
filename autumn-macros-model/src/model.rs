@@ -2245,6 +2245,7 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
         });
     }
 
+    let dependent_models = emit_dependent_models(model_ident, &deps);
     quote! {
         impl #model_ident {
             /// Runtime dependent-cascade specs consulted by the parent
@@ -2260,7 +2261,43 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
                 ];
                 __AUTUMN_DEPENDENTS
             }
+            #dependent_models
         }
+    }
+}
+
+/// The inherent `DEPENDENT_MODELS` const: every model a delete of `model_ident`
+/// also writes. A `restrict` leg writes nothing. A `destroy` leg also runs the
+/// child's own cascade, so the child repository's list is joined in. A model
+/// that cascades into itself adds nothing new, and naming itself would make
+/// the const refer to itself.
+fn emit_dependent_models(model_ident: &syn::Ident, deps: &[&Association]) -> TokenStream {
+    let mut parts: Vec<TokenStream> = Vec::new();
+    for assoc in deps {
+        let action = assoc.dependent.expect("filtered to Some by the caller");
+        if action == DependentAction::Restrict || assoc.target == *model_ident {
+            continue;
+        }
+        let target = assoc.target.to_string();
+        parts.push(quote! { &[#target] });
+        if action == DependentAction::Destroy {
+            let child_repo = format_ident!("Pg{}Repository", assoc.target);
+            parts.push(quote! { #child_repo::__AUTUMN_CASCADE_MODELS });
+        }
+    }
+    if parts.is_empty() {
+        return quote! {};
+    }
+    quote! {
+        /// Every model a delete of this model also writes. Read by the
+        /// agent-authority grant check; framework plumbing.
+        #[doc(hidden)]
+        pub const DEPENDENT_MODELS: &'static [&'static str] = {
+            const PARTS: &[&[&str]] = &[#(#parts),*];
+            const N: usize = ::autumn_web::agent_authority::cascade_len(PARTS);
+            const JOINED: [&str; N] = ::autumn_web::agent_authority::cascade_union::<N>(PARTS);
+            &JOINED
+        };
     }
 }
 
@@ -13922,6 +13959,72 @@ mod tests {
         assert_eq!(assocs.len(), 1);
         assert_eq!(assocs[0].kind, AssocKind::HasOne);
         assert_eq!(assocs[0].dependent, Some(DependentAction::Nullify));
+    }
+
+    #[test]
+    fn a_model_publishes_every_model_its_delete_writes() {
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            #[has_many(Like, dependent = nullify)]
+            #[has_many(Audit, dependent = restrict)]
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        assert!(
+            generated.contains("const DEPENDENT_MODELS"),
+            "expected an inherent DEPENDENT_MODELS const: {generated}"
+        );
+        assert!(generated.contains("\"Comment\""), "{generated}");
+        assert!(
+            generated.contains("\"Like\""),
+            "nullify writes the child: {generated}"
+        );
+        assert!(
+            !generated.contains("\"Audit\""),
+            "restrict only probes and writes nothing: {generated}"
+        );
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_MODELS"),
+            "a destroy child cascades into its own dependents: {generated}"
+        );
+        assert!(
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE_MODELS"),
+            "nullify runs no cascade of its own: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_self_referencing_dependent_adds_no_cycle() {
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            struct Comment {
+                #[id]
+                id: i64,
+                body: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        assert!(
+            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_MODELS"),
+            "a model that cascades into itself must not reference itself: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_model_without_dependents_emits_no_dependent_models() {
+        let item: TokenStream = quote! {
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        assert!(!generated.contains("DEPENDENT_MODELS"), "{generated}");
     }
 
     #[test]

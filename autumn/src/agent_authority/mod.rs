@@ -286,6 +286,20 @@ impl Grant {
         list_contains(self.writes, model) || list_contains(self.unbounded_writes, model)
     }
 
+    /// Whether a write to every model in `models` is inside the envelope.
+    /// An empty list is allowed.
+    #[must_use]
+    pub const fn allows_writes_all(&self, models: &[&str]) -> bool {
+        let mut i = 0;
+        while i < models.len() {
+            if !self.allows_write(models[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
     /// Whether an unbounded write to `model` is inside the envelope.
     ///
     /// Checked against [`unbounded_writes`](Self::unbounded_writes) **only** —
@@ -452,6 +466,47 @@ const fn tail_eq(haystack: &[u8], start: usize, needle: &str) -> bool {
         i += 1;
     }
     true
+}
+
+// ── Models a delete cascades into ───────────────────────────────────
+
+/// The total length of `parts`, for sizing [`cascade_union`].
+#[doc(hidden)]
+#[must_use]
+pub const fn cascade_len(parts: &[&[&str]]) -> usize {
+    let mut total = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        total += parts[i].len();
+        i += 1;
+    }
+    total
+}
+
+/// All of `parts` in one array. `N` must be [`cascade_len`] of `parts`.
+///
+/// Generated repositories use it to join the dependent models of a delete in
+/// const context. A wrong `N` fails the build.
+#[doc(hidden)]
+#[must_use]
+pub const fn cascade_union<const N: usize>(parts: &[&[&'static str]]) -> [&'static str; N] {
+    assert!(
+        cascade_len(parts) == N,
+        "cascade_union: N must equal cascade_len"
+    );
+    let mut out = [""; N];
+    let mut at = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        let mut j = 0;
+        while j < parts[i].len() {
+            out[at] = parts[i][j];
+            at += 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    out
 }
 
 // ── Grammar of the declared-only dimensions ──────────────────────────
@@ -1163,6 +1218,34 @@ macro_rules! authority_grant {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_grant_allows_a_list_of_writes_only_when_it_allows_each() {
+        const GRANT: Grant = Grant {
+            name: "G",
+            writes: &["Post", "Comment"],
+            unbounded_writes: &["Tag"],
+            tenant_scope: TenantScope::Scoped,
+            outbound: &[],
+            webhooks: &[],
+            jobs: &[],
+            rate: None,
+            spend: None,
+            reversibility: Reversibility::Compensable,
+            location: "test",
+        };
+        assert!(GRANT.allows_writes_all(&[]));
+        assert!(GRANT.allows_writes_all(&["Post", "Tag"]));
+        assert!(!GRANT.allows_writes_all(&["Post", "Like"]));
+    }
+
+    #[test]
+    fn cascade_union_joins_slices_in_order() {
+        const PARTS: &[&[&str]] = &[&["A", "B"], &[], &["C"]];
+        const N: usize = cascade_len(PARTS);
+        const JOINED: [&str; N] = cascade_union::<N>(PARTS);
+        assert_eq!(JOINED, ["A", "B", "C"]);
+    }
+
     use super::*;
 
     /// The envelope every truth-table case starts from: nothing allowed,

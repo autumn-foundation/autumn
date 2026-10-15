@@ -462,6 +462,14 @@ authority under a manifest that says otherwise.
   `#[agent_effect(...)]`, or — when it is verified to do nothing an agent's
   grant governs — with `#[agent_effect(none, reason = "...")]`.
 
+- **A delete that cascades.** `repo.delete_by_id(id)` and
+  `repo.delete_many(&ids)` also write every model the `dependent(...)`
+  cascade names, except `restrict` legs. A `destroy` child adds its own
+  children. The grant must list each one in `writes`, or the build fails. A
+  model that cascades into itself adds nothing. The check reads a constant the
+  generated repository publishes, so a repository from a hand-written trait is
+  refused as an unresolvable handle.
+
 Each fails with a diagnostic naming the call site, both sides of the
 disagreement, and the annotation that resolves it.
 
@@ -558,6 +566,8 @@ malformed annotation, or a grant key it will not silently drop.
 | `agent_authority_edge_with_agent_operable` | `#[edge]` + `#[agent_operable]` | `macro` — the edge lane is read-only, with no session, auth state or audit sink |
 | `agent_authority_unknown_grant_key` | an invented grant key | `macro` — refused, never silently dropped |
 | `agent_authority_repository_unlisted_write` | the unlisted write against a real `#[repository]` | `E0080` — subject resolved through `__AUTUMN_MODEL_IDENT`, so it holds across crates |
+| `agent_authority_repository_grant_unlisted_model` | `#[repository(.., mcp, grant = X)]` where `X` does not list the model | `E0080` — the generated create, update and delete tools write the model |
+| `agent_authority_repository_cascade_unlisted_child` | `delete_by_id` where the grant omits a model the `dependent(...)` cascade writes | `E0080` — the delete also writes the cascaded models, grandchildren included |
 
 The macro also carries a seeded corpus of 26+ escape shapes as unit tests
 (handles laundered through tuples, context structs and conditionals; writes
@@ -699,8 +709,9 @@ object as the claim it qualifies. Six entries ship in this slice: `rate` and
 (`provable` with a caveat — the literal URL and the enqueue are proven; a
 runtime-resolved host and whatever the job itself goes on to do are not),
 `cascading_deletes` and `generated_repository_tools` (both `provable` with a
-caveat — a `dependent(...)` cascade is not folded into the write set, so
-deleting a parent may write child models the grant does not list; and
+caveat — a delete through a generated repository is checked against its
+`dependent(...)` cascade at compile time, but the manifest's write set does
+not list the cascaded models, and a database `ON DELETE CASCADE` is not seen; and
 `#[repository(api, mcp)]` tools are governed only with `grant = X`; without it,
 and for `expose_all_as_mcp` tools, they surface under `ungoverned_tools`
 rather than being gated).
@@ -962,7 +973,8 @@ generated MCP tools with grant `PostEditor`. `grant` needs `mcp`.
   the grant does not list it in `writes`.
 - With `mcp = "read"` only list and get exist. They have no effects, so the
   grant is not checked for writes.
-- The write set of a delete does not yet include `dependent(...)` children.
+- The delete tool is also checked against the repository's cascade (see
+  *A delete that cascades* above).
 
 ## Scope of the first slice
 
@@ -977,9 +989,10 @@ Deliberately out of scope for now:
   grant = X)]` governs the generated tools (see below). Without `grant`, and
   for `expose_all_as_mcp` tools, there is no annotation site, so they surface
   in `ungoverned_tools` rather than being gated.
-- **Cascading deletes.** A `dependent(...)` cascade is not folded into the
-  write set: `writes: [Post]` does not imply the comments the delete takes with
-  it. Named in `excluded`.
+- **Cascades in the manifest.** A delete is checked against its
+  `dependent(...)` cascade at compile time. The manifest's write set still does
+  not list the cascaded models, and a database `ON DELETE CASCADE` is not seen.
+  Named in `excluded`.
 - **Effects reached outside the handler body** — a `#[job]`'s own body, a
   `#[scheduled]` task, an interceptor, or plugin code. The envelope describes
   one action's body.

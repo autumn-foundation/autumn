@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: agent authority: `remove_post` deletes through the `AaCascadePost` repository, whose `dependent(...)` cascade also writes models grant `PostRemover` does not allow.
+
+              Add every dependent model to the grant's `writes: [...]`, make the association `restrict`, or move the delete out of the agent-operable handler. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_repository_cascade_unlisted_child.rs:76:11
+   |
+76 |     posts.delete_by_id(id).await?;
+   |           ^^^^^^^^^^^^ evaluation of `_` failed here

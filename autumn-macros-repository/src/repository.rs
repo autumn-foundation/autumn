@@ -555,6 +555,49 @@ fn dependent_child_repositories(config: &RepoConfig) -> Vec<(syn::Path, bool)> {
     children.into_iter().map(|(_, p, r)| (p, r)).collect()
 }
 
+/// The const expression behind `__AUTUMN_CASCADE_MODELS`.
+///
+/// A `dependent(..)` clause is authoritative when present, as it is at run
+/// time. A `restrict` leg writes nothing. A `destroy` leg runs the child's own
+/// cascade, so the child's list is joined in. A repository that cascades into
+/// itself adds nothing and must not name itself.
+fn cascade_models_expr(config: &RepoConfig, pg_name: &Ident) -> TokenStream {
+    if config.dependents.is_empty() {
+        let model = &config.model_name;
+        return quote! {{
+            use ::autumn_web::repository::AutumnDependents as _;
+            #model::DEPENDENT_MODELS
+        }};
+    }
+    let mut parts: Vec<TokenStream> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for dep in config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action != DependentAction::Restrict)
+    {
+        let child = &dep.child_repo;
+        if child.is_ident(pg_name) || seen.contains(&quote!(#child).to_string()) {
+            continue;
+        }
+        seen.push(quote!(#child).to_string());
+        parts.push(quote! { &[#child::__AUTUMN_MODEL_IDENT] });
+        if dep.action == DependentAction::Destroy {
+            parts.push(quote! { #child::__AUTUMN_CASCADE_MODELS });
+        }
+    }
+    if parts.is_empty() {
+        return quote! { &[] };
+    }
+    quote! {{
+        const PARTS: &[&[&::core::primitive::str]] = &[#(#parts),*];
+        const N: usize = ::autumn_web::agent_authority::cascade_len(PARTS);
+        const JOINED: [&::core::primitive::str; N] =
+            ::autumn_web::agent_authority::cascade_union::<N>(PARTS);
+        &JOINED
+    }}
+}
+
 /// Write methods that run the `dependent(...)` cascade.
 const CASCADING_WRITES: &[&str] = &["delete_by_id", "delete_many"];
 
@@ -810,6 +853,7 @@ fn generate_coherence_items(
     // type name. The guess is wrong for the supported escape hatch where they
     // differ — `#[repository(Comment)] trait ModerationRepository` — and a wrong
     // model means the cascade intersects nothing and the audit reports clean.
+    let cascade_models = cascade_models_expr(config, pg_name);
     let published_model = quote! {
         impl #pg_name {
             /// The model this repository writes, for the cache-coherence
@@ -830,6 +874,14 @@ fn generate_coherence_items(
             /// const context so the authority assertion works across crates.
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str = #model_ident;
+
+            /// Every other model a `delete_by_id` / `delete_many` on this
+            /// repository also writes through `dependent` cascades. The grant
+            /// check of an agent-operable delete reads it. A repository
+            /// `dependent(..)` clause wins over the model's own associations.
+            #[doc(hidden)]
+            pub const __AUTUMN_CASCADE_MODELS: &'static [&'static ::core::primitive::str] =
+                #cascade_models;
         }
     };
 
@@ -23267,6 +23319,70 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_publishes_the_models_its_delete_writes() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            generated.contains("const __AUTUMN_CASCADE_MODELS"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("Post :: DEPENDENT_MODELS"),
+            "with no `dependent(..)` clause the model's own list is used: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_dependent_clause_names_its_child_models() {
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgLikeRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgAuditRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_MODEL_IDENT"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_MODELS"),
+            "destroy runs the child's own cascade: {generated}"
+        );
+        assert!(
+            generated.contains("PgLikeRepository :: __AUTUMN_MODEL_IDENT"),
+            "nullify writes the child: {generated}"
+        );
+        assert!(
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE_MODELS"),
+            "{generated}"
+        );
+        assert!(
+            !generated.contains("PgAuditRepository :: __AUTUMN_MODEL_IDENT"),
+            "restrict writes nothing: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_repository_that_cascades_into_itself_does_not_name_itself() {
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                dependent(PgCommentRepository, fk = "parent_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_MODELS"),
+            "{generated}"
+        );
+    }
+
+    #[test]
     fn parse_repo_args_with_grant() {
         let tokens: proc_macro2::TokenStream =
             r#"Post, api = "/api/posts", mcp, grant = crate::grants::PostEditor"#
@@ -23330,6 +23446,15 @@ mod tests {
             generated
                 .contains("PostEditor . allows_write (PgPostRepository :: __AUTUMN_MODEL_IDENT)"),
             "the write subject is the model ident: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches(
+                    "PostEditor . allows_writes_all (PgPostRepository :: __AUTUMN_CASCADE_MODELS)"
+                )
+                .count(),
+            1,
+            "the delete tool is checked against its cascade"
         );
     }
 

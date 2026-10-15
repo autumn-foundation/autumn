@@ -1272,6 +1272,25 @@ fn governed_route(
     } else {
         quote! {}
     };
+    // A delete also writes the models its `dependent(...)` cascade names.
+    let cascade_assertion = if route == "delete" {
+        let message = format!(
+            "agent authority: the generated delete tool of this repository also writes the \
+             models its `dependent(...)` cascade names, and grant `{}` does not allow all of \
+             them.\n\nAdd every dependent model to the grant's `writes: [...]`, make the \
+             association `restrict`, or drop `grant = ...` from the repository. See \
+             docs/guide/agent-authority.md.",
+            path_text(grant),
+        );
+        quote! {
+            const _: () = ::core::assert!(
+                #grant.allows_writes_all(#pg_name::__AUTUMN_CASCADE_MODELS),
+                #message
+            );
+        }
+    } else {
+        quote! {}
+    };
     let items = quote! {
         #[doc(hidden)]
         #[allow(non_upper_case_globals, dead_code)]
@@ -1291,6 +1310,8 @@ fn governed_route(
         }
 
         #assertion
+
+        #cascade_assertion
     };
     (quote! { ::core::option::Option::Some(&#authority) }, items)
 }

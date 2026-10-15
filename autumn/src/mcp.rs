@@ -1725,6 +1725,22 @@ const MAX_ARGUMENT_NAMES_BYTES: usize = 512;
 /// audit row that cannot name who acted is still a row that must be greppable.
 const ANONYMOUS_AGENT: &str = "agent:anonymous";
 
+/// Decide whether a call may run: it must be inside its grant's `rate` cap, and
+/// its attempt record must be writable unless the action is provably reversible.
+/// Either refusal is the tool error text.
+async fn admit_call(server: &McpServer, tool: &McpTool, audit: &AgentAudit) -> Result<(), String> {
+    if let Err(refusal) = check_rate_cap(server, tool) {
+        audit.record_refusal(&server.state, &refusal).await;
+        return Err(refusal);
+    }
+    // The last thing before the action runs: if this record cannot be written
+    // and the action is not provably reversible, it does not run.
+    audit
+        .record_attempt(&server.state)
+        .await
+        .map_err(str::to_owned)
+}
+
 /// Refuse a call that is over its grant's declared `rate` cap. A cap that
 /// cannot be read refuses every call: it must never mean "no cap".
 fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
@@ -1742,7 +1758,7 @@ fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
     };
     server
         .rate_limiter
-        .check(grant.name, cap, server.state.clock().now())
+        .check(grant.name, grant.location, cap, server.state.clock().now())
         .map_err(|wait| {
             format!(
                 "rate cap {rate} for grant {} exceeded; retry in {wait}s",
@@ -1842,6 +1858,7 @@ impl AgentAudit {
             // the auth layer on the request scope, so a `secure_mcp` app names
             // its caller and an open one falls back rather than recording "".
             actor: crate::current::Current::scoped_actor()
+                .and_then(|actor| clean_actor(&actor))
                 .unwrap_or_else(|| ANONYMOUS_AGENT.to_owned()),
             ip: ctx.peer.map(|peer| peer.ip()),
             shared,
@@ -1870,11 +1887,11 @@ impl AgentAudit {
     /// Name the principal the route's own auth layer resolved. Only the rows
     /// written after dispatch carry it. The envelope's own actor, when it
     /// resolved one, wins.
-    fn adopt_actor(&mut self, actor: Option<String>) {
+    fn adopt_actor(&mut self, actor: Option<&str>) {
         if self.actor != ANONYMOUS_AGENT {
             return;
         }
-        if let Some(clean) = actor.as_deref().and_then(clean_actor) {
+        if let Some(clean) = actor.and_then(clean_actor) {
             self.actor = clean;
         }
     }
@@ -2585,16 +2602,8 @@ async fn serve_tools_call(
     // correlation id exists ahead of anything that can go wrong.
     let mut audit = AgentAudit::new(server, tool, &arguments, ctx);
 
-    // A grant's `rate` cap is enforced here, before anything is attempted.
-    if let Err(refusal) = check_rate_cap(server, tool) {
-        audit.record_refusal(&server.state, &refusal).await;
+    if let Err(refusal) = admit_call(server, tool, &audit).await {
         return reply(success(id, tool_error(&refusal)));
-    }
-
-    // The last thing before the action runs: if this record cannot be written
-    // and the action is not provably reversible, it does not run.
-    if let Err(refusal) = audit.record_attempt(&server.state).await {
-        return reply(success(id, tool_error(refusal)));
     }
 
     // MCP Tasks extension: give a task handle to a client that declared the
@@ -2634,7 +2643,7 @@ async fn serve_tools_call(
         replayed,
         actor,
     } = Dispatched::inspect(&response);
-    audit.adopt_actor(actor);
+    audit.adopt_actor(actor.as_deref());
     let client_accepts_sse = ctx
         .headers
         .get(header::ACCEPT)
@@ -2812,7 +2821,7 @@ async fn run_task(
         actor,
         ..
     } = Dispatched::inspect(&response);
-    outcome.audit.adopt_actor(actor);
+    outcome.audit.adopt_actor(actor.as_deref());
     // A task has no HTTP response to carry `Set-Cookie` or `Server-Timing`.
     outcome.status = Some(status);
     outcome.request_id = request_id;

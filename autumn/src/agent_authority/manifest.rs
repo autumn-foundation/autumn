@@ -990,9 +990,10 @@ pub fn excluded_dimensions() -> Vec<Excluded> {
         Excluded {
             dimension: "cascading_deletes".to_string(),
             eventual_provenance: "provable".to_string(),
-            runtime_caveat: "a `dependent(...)` cascade is not folded into the write set in this \
-                             slice, so deleting a parent may write child models the grant does \
-                             not list."
+            runtime_caveat: "a delete through a generated repository is checked at compile time \
+                             against every model its `dependent(...)` cascade writes. A \
+                             hand-written repository, a database `ON DELETE CASCADE`, and the \
+                             manifest's own write set do not include them."
                 .to_string(),
         },
         Excluded {

@@ -869,6 +869,10 @@ struct Analyzer {
     effects: Vec<Effect>,
     /// De-duplication keys for the above.
     seen: HashSet<(Kind, String)>,
+    /// Repositories whose cascading delete the handler calls: the repository
+    /// path, the model's human name, and the call's span. One entry per
+    /// repository.
+    cascades: Vec<(syn::Path, String, Span)>,
     /// Sites the author asserted effect-free with `#[agent_effect(none, ...)]`.
     ///
     /// The span carries the emitted `file!():line!()` (the same trick the
@@ -1038,6 +1042,7 @@ impl Analyzer {
             diesel_fns: HashMap::new(),
             effects: Vec::new(),
             seen: HashSet::new(),
+            cascades: Vec::new(),
             effect_free_sites: Vec::new(),
             errors: Vec::new(),
             error_keys: HashSet::new(),
@@ -2671,6 +2676,16 @@ impl Analyzer {
                 _ => Provenance::Syntactic,
             };
             self.record(kind, model.clone(), provenance, method.method.span());
+            if CASCADING_METHODS.contains(&name.as_str())
+                && let Subject::ModelIdent(path, human) = &model
+                && !self
+                    .cascades
+                    .iter()
+                    .any(|(seen, ..)| path_string(seen) == path_string(path))
+            {
+                self.cascades
+                    .push((path.clone(), human.clone(), method.method.span()));
+            }
         }
     }
 
@@ -4358,6 +4373,10 @@ const WEBHOOK_TOPIC_ARG: usize = 1;
 /// whose receiver syn keeps out of the argument list.
 const JOB_NAME_ARG: usize = 0;
 
+/// Repository methods that run the `dependent(...)` cascade: they also write
+/// every model a non-`restrict` dependent names.
+const CASCADING_METHODS: &[&str] = &["delete_by_id", "delete_many"];
+
 const SQL_READ_STATEMENTS: &[&str] = &["SELECT", "WITH"];
 
 /// Leading keywords that change rows or schema. Schema statements are folded
@@ -5675,8 +5694,27 @@ pub fn agent_operable_macro(attr: TokenStream, item: TokenStream) -> TokenStream
         effects,
         errors,
         effect_free_sites,
+        cascades,
         ..
     } = analyzer;
+
+    // A delete through a generated repository also writes the models its
+    // `dependent(...)` cascade names. Each must be in the grant. The list is a
+    // const the repository publishes, so the check holds across crates.
+    let cascade_assertions = cascades.iter().map(|(repo, human, span)| {
+        let message = format!(
+            "agent authority: `{action}` deletes through the `{human}` repository, whose \
+             `dependent(...)` cascade also writes models grant `{grant_name}` does not \
+             allow.\n\nAdd every dependent model to the grant's `writes: [...]`, make the \
+             association `restrict`, or move the delete out of the agent-operable handler. {GUIDE}"
+        );
+        quote_spanned! { *span=>
+            const _: () = ::core::assert!(
+                #grant.allows_writes_all(#repo::__AUTUMN_CASCADE_MODELS),
+                #message
+            );
+        }
+    });
 
     // One respanned const assertion per proved effect: const-eval sees the
     // linked `Grant`, so the check holds even when the grant is declared in
@@ -5869,6 +5907,8 @@ pub fn agent_operable_macro(attr: TokenStream, item: TokenStream) -> TokenStream
         #registration
 
         #(#assertions)*
+
+        #(#cascade_assertions)*
 
         #floor_assertion
 
@@ -9193,6 +9233,50 @@ mod tests {
                 && !expansion.contains("EffectProvenance :: Syntactic"),
             "a proof must not demote a declaration: {expansion}"
         );
+    }
+
+    fn cascade_assertions(handler: &str) -> usize {
+        expand(GRANT, handler).matches("allows_writes_all").count()
+    }
+
+    #[test]
+    fn a_repository_delete_is_checked_against_its_cascade() {
+        for call in ["repo.delete_by_id(1)", "repo.delete_many(&ids)"] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            let expansion = expand(GRANT, &handler);
+            assert!(
+                expansion.contains("PgRefundRepository :: __AUTUMN_CASCADE_MODELS"),
+                "{call}: {expansion}"
+            );
+            assert!(
+                expansion.contains("allows_writes_all"),
+                "{call}: {expansion}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cascade_is_checked_once_per_repository() {
+        assert_eq!(
+            cascade_assertions(
+                r"async fn h(repo: PgRefundRepository) -> R {
+                    repo.delete_by_id(1).await?;
+                    repo.delete_many(&ids).await?;
+                    Ok(())
+                }"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_write_that_cascades_nothing_adds_no_cascade_check() {
+        for call in ["repo.create(&b)", "repo.save(&b)", "repo.find_by_id(1)"] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            assert_eq!(cascade_assertions(&handler), 0, "{call}");
+        }
     }
 
     #[test]
