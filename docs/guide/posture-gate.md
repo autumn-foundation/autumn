@@ -167,8 +167,8 @@ required check as satisfied).
 
 ### If your app is a Cargo workspace member
 
-`autumn upgrade --apply` writes the workflow at the **git root** and sets it up
-for your crate:
+When the git root is also the workspace root, `autumn upgrade --apply` writes
+the workflow at the git root and names your member:
 
 ```yaml
 env:
@@ -180,19 +180,22 @@ It writes `ci.yml` at the git root too, and runs it in the crate directory.
 Everything else in the gate works unchanged, because it only reads the manifest
 path.
 
-One repository holds one `posture-gate.yml`. If another crate already wrote it,
-`autumn upgrade` reports a conflict for yours and does not overwrite it. A
-second crate needs its own workflow. Copy the file, give it a new name, and set
-`POSTURE_MANIFEST` and `POSTURE_AUDIT_FLAGS` for that crate.
+One repository holds one `posture-gate.yml`. If another member already wrote
+it, `autumn upgrade` reports a conflict and does not overwrite it. A second
+member needs its own workflow. Copy the file and give it a new name. Then set
+`POSTURE_MANIFEST` and `POSTURE_AUDIT_FLAGS` for that member.
+
+If the workspace root is below the git root, the gate cannot build the member
+from the git root. Adopt the gate by hand in that layout.
 
 A nested git repository or submodule is its own git root. Its workflow stays
-in the crate.
+in the member.
 
 The deploy workflows that `autumn release init` writes also read the manifest
-path from one variable, `POSTURE_MANIFEST`. When you move a deploy workflow to
-the git root, set it to the same path as above. If the file is missing, the
-deploy prints a `::warning::` and does not attest. The deploy does not fail, so
-apps that never adopted the gate still ship.
+path from one variable, `POSTURE_MANIFEST`. Move a deploy workflow to the git
+root. Then change the value of `POSTURE_MANIFEST` to the path above. If the file
+is missing, the deploy prints a `::warning::` and does not attest. The deploy
+does not fail, so apps that never adopted the gate still ship.
 
 ---
 

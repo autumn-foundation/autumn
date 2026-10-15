@@ -458,11 +458,12 @@ fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Op
          \n\
          defaults:\n  run:\n    working-directory: {rel_forward_slash}\n\
          \n\
-         `hashFiles` and `subject-path` ignore `working-directory`. Also set the\n\
-         path of the posture manifest from the repository root, or the posture\n\
-         attestation is skipped:\n\
+         `hashFiles` and `subject-path` ignore `working-directory`. Also change\n\
+         `POSTURE_MANIFEST` in the top-level `env:` block. Set it to the manifest\n\
+         path from the repository root. If you do not, the posture attestation\n\
+         is skipped:\n\
          \n\
-         env:\n  POSTURE_MANIFEST: {rel_forward_slash}/security-posture.json\n",
+         POSTURE_MANIFEST: {rel_forward_slash}/security-posture.json\n",
         git_root.display(),
         dir.display(),
         git_root.display(),
@@ -7964,7 +7965,8 @@ esac
              Dockerfile: {warning}"
         );
         assert!(
-            warning.contains("POSTURE_MANIFEST: examples/blog/security-posture.json"),
+            warning.contains("POSTURE_MANIFEST: examples/blog/security-posture.json")
+                && !warning.contains("env:\n  POSTURE_MANIFEST"),
             "the warning must give the manifest path from the git root, because \
              `hashFiles` and `subject-path` ignore working-directory: {warning}"
         );

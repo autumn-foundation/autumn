@@ -1,7 +1,7 @@
 # Plan — `autumn upgrade` for workspace members (#2469)
 
 Issue [#2469](https://github.com/autumn-foundation/autumn/issues/2469).
-Written before the code. It is the design record for this change.
+This is the design record. Write it before the code.
 
 ## Problem
 
@@ -25,18 +25,19 @@ the manifest is not at the repository root.
 | B8 | One workflow file per member. | Deferred. It changes check names and the PR comment marker. |
 | B9 | Share one file. The first member owns it. | **Chosen.** Other members see a conflict and can `--accept`. |
 
-## 2. Reverse brainstorming — how do we make it worse?
+## 2. Reverse brainstorming — how can this change fail?
 
 | Failure | Guard |
 |---|---|
-| Write a file outside the repository. | Target must be inside the member's git repository. No git repository: the workspace root only. |
+| Write a file outside the repository. | Target must be inside the member's git repository. No git repository: plan nothing. |
 | Overwrite the root file of another member. | A file with other content is a conflict. `apply` never writes a conflict. |
 | Follow a symlink out of the tree. | The existing `read_current` link check covers `..` paths. |
 | Claim a nested git repository's lint config. | The nested repository is its own git root. Cargo files stay out of scope. Its workflows stay local. |
+| Plant a wrong workflow. | A template anchor that is missing or not unique plans no file. |
 | Name the wrong member in the workflow. | Name comes from `[package] name`. The existing rule rejects bad names. |
 | Silent attestation skip. | A `::warning::` step when the manifest is missing. No hard failure. |
 
-## 3. Six hats
+## 3. Six thinking hats
 
 - **White (facts).** `current_files` removes root files. `classify` keys are
   project-relative. GitHub reads workflows from the git root only.
@@ -44,16 +45,18 @@ the manifest is not at the repository root.
 - **Red (feelings).** A silent no-op looks like a pass. The user must see what
   was skipped and why.
 - **Yellow (benefits).** One command adopts the gates. No new baseline format.
-- **Black (risks).** Writes leave the member directory. Mitigation: section 2.
+- **Black (risks).** Writes leave the member directory. Guards: section 2.
 - **Green (new ideas).** Per-member file names for several members (B8).
-  A matrix job. Both are follow-up work.
+  A matrix job. Both are future work.
 - **Blue (process).** Red test, green code, refactor. Then review.
 
 ## Design
 
-1. `root_target(root, path)` returns the directory that owns a root file.
+1. `root_owners(root)` returns the directory that owns each group of root files.
    Cargo files: the workspace root. Workflows: the git root.
-   Rule: a target must be inside the member's git repository.
+   Rule: a target must be inside the member's git repository. No git
+   repository: plan nothing. Workflows also need the git root to be the
+   workspace root, and a plain directory path.
 2. `current_files` returns `String` keys. A root file key is the relative path
    from the member, for example `../../clippy.toml`.
 3. `new::member_workflow` edits a rendered workflow for one member.

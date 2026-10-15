@@ -588,7 +588,7 @@ fn a_workspace_member_adopts_root_files_at_the_repository_root() {
     }
     assert!(!root.join(".github").exists());
     let ci = fs::read_to_string(repo.join(".github/workflows/ci.yml")).unwrap();
-    assert!(ci.contains("working-directory: member"), "{ci}");
+    assert!(ci.contains("working-directory: \"member\""), "{ci}");
     let gate = fs::read_to_string(repo.join(".github/workflows/posture-gate.yml")).unwrap();
     assert!(
         gate.contains("POSTURE_MANIFEST: member/security-posture.json"),
