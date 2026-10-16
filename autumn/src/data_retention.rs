@@ -41,6 +41,7 @@ use crate::config::{AutumnConfig, RetentionConfig};
 use crate::gdpr::{ErasureStrategy, GdprRegistry};
 use crate::state::AppState;
 use crate::task::{Schedule, TaskCoordination, TaskInfo};
+use std::fmt::Write as _;
 
 /// The scheduled-task name the framework sweep registers under.
 ///
@@ -628,6 +629,7 @@ async fn run_one_dataset(
                 dataset,
                 config,
                 effective.window.map_or(0, |window| window.as_secs()),
+                registry.as_deref(),
             ));
         }
         RetentionEnforcement::ArchiveRewrite => {
@@ -649,7 +651,12 @@ async fn run_one_dataset(
 /// in-memory session store records no expiry at all, so claiming plain
 /// "enforced by the backend" would present an unenforced policy as an
 /// enforced one. Each caveat is named rather than left to the guide.
-fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_secs: u64) -> String {
+fn backend_ttl_note(
+    dataset: RetentionDataset,
+    config: &AutumnConfig,
+    window_secs: u64,
+    registry: Option<&GdprRegistry>,
+) -> String {
     // `session.backend = "memory"` is the default, and `MemoryStore` is a
     // plain `HashMap` with no expiry: capping `session.max_age_secs` shortens
     // only the browser cookie while the server-side record lives as long as
@@ -671,6 +678,24 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
          the backend, not deleted by this sweep. Records written before this window was set \
          keep their original TTL until it elapses"
     );
+    // The database store skips its own cleanup while its table is held.
+    let held = (dataset == RetentionDataset::Idempotency
+        && config.idempotency.backend == crate::config::IdempotencyBackend::Database)
+        .then(|| table_legal_hold("autumn_idempotency_keys", registry))
+        .flatten();
+    if let Some(reason) = held {
+        let _ = write!(
+            note,
+            ". NOT removed: autumn_idempotency_keys is under legal hold: {reason}. The \
+             store keeps expired rows until the hold ends"
+        );
+    } else if evicts_lazily(dataset, config) {
+        note.push_str(
+            ". With the built-in store, expired records are not served. The store \
+             removes them only on later writes. A quiet process can keep them past the \
+             window. Use redis to remove them on time",
+        );
+    }
     if dataset == RetentionDataset::Sessions {
         note.push_str(
             ", and a custom SessionStore installed with AppBuilder::with_session_store must \
@@ -678,6 +703,27 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
         );
     }
     note
+}
+
+/// `true` when the dataset uses a built-in store that removes expired records
+/// only on later writes.
+fn evicts_lazily(dataset: RetentionDataset, config: &AutumnConfig) -> bool {
+    match dataset {
+        // The memory and database stores both sweep on every 128th write.
+        RetentionDataset::Idempotency => {
+            config.idempotency.backend != crate::config::IdempotencyBackend::Redis
+        }
+        RetentionDataset::WebhookReplay => {
+            config.security.webhooks.replay.backend == crate::webhook::WebhookReplayBackend::Memory
+        }
+        // An unknown backend falls back to the local runtime and its
+        // in-memory tracking store.
+        RetentionDataset::JobTracking => !matches!(
+            config.jobs.backend.as_str(),
+            "postgres" | "redis" | "sqlite"
+        ),
+        _ => false,
+    }
 }
 
 fn elapsed_ms(started: crate::time::MonotonicInstant) -> u64 {
@@ -871,6 +917,7 @@ async fn apply_sweep(
             if let Some(cutoff) = failure.cutoff {
                 report.cutoff = Some(cutoff.to_rfc3339());
             }
+            report.eligible_rows = failure.eligible;
             report.rows_removed = failure.removed;
             report.truncated = true;
             report.error = Some(failure.error.to_string());
@@ -956,7 +1003,7 @@ async fn sweep_postgres(
     })?;
 
     let cutoff = resolve_cutoff(&mut conn, table, window).await?;
-    let eligible = count_stale(&mut conn, table, predicate, cutoff, 0).await?;
+    let eligible = count_stale(&mut conn, table, predicate, cutoff, 0, None).await?;
 
     if dry_run || eligible == 0 {
         return Ok(SweptDataset {
@@ -992,6 +1039,7 @@ async fn sweep_postgres(
             sweep_failed_at(
                 cutoff,
                 removed,
+                Some(eligible),
                 format!("retention sweep of {table} failed: {e}"),
             )
         })?;
@@ -1014,7 +1062,8 @@ async fn sweep_postgres(
     // is actually done. `truncated` ends up in the audit record, so a wrong
     // answer here is a compliance trail claiming enforcement that did not
     // happen.
-    let remaining = count_stale(&mut conn, table, predicate, cutoff, removed).await?;
+    let remaining =
+        count_stale(&mut conn, table, predicate, cutoff, removed, Some(eligible)).await?;
 
     Ok(SweptDataset {
         cutoff,
@@ -1031,6 +1080,7 @@ fn sweep_failed(removed: u64, message: String) -> SweepFailure {
     SweepFailure {
         cutoff: None,
         removed,
+        eligible: None,
         error: Box::new(crate::AutumnError::internal_server_error_msg(message)),
     }
 }
@@ -1043,10 +1093,16 @@ fn sweep_failed(removed: u64, message: String) -> SweepFailure {
 /// seeded, which under clock skew names a different deletion boundary from
 /// the one actually applied.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
-fn sweep_failed_at(cutoff: DateTime<Utc>, removed: u64, message: String) -> SweepFailure {
+fn sweep_failed_at(
+    cutoff: DateTime<Utc>,
+    removed: u64,
+    eligible: Option<u64>,
+    message: String,
+) -> SweepFailure {
     SweepFailure {
         cutoff: Some(cutoff),
         removed,
+        eligible,
         error: Box::new(crate::AutumnError::internal_server_error_msg(message)),
     }
 }
@@ -1058,6 +1114,8 @@ fn sweep_failed_at(cutoff: DateTime<Utc>, removed: u64, message: String) -> Swee
 struct SweepFailure {
     cutoff: Option<DateTime<Utc>>,
     removed: u64,
+    /// Rows counted before the batches ran. `None` when the failure came first.
+    eligible: Option<u64>,
     /// Boxed to keep the `Err` variant of this module's sweep `Result`s small:
     /// `AutumnError` is wide enough that carrying it inline trips
     /// `clippy::result_large_err` on every function that returns one.
@@ -1113,8 +1171,8 @@ async fn resolve_cutoff(
 
 /// Count the rows `predicate` currently matches.
 ///
-/// `removed_so_far` rides along so a failure here still reports the rows an
-/// earlier batch loop already deleted.
+/// A failure here still reports `removed_so_far` and the earlier `eligible`
+/// count, if any.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 async fn count_stale(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -1122,6 +1180,7 @@ async fn count_stale(
     predicate: &str,
     cutoff: DateTime<Utc>,
     removed_so_far: u64,
+    eligible: Option<u64>,
 ) -> Result<u64, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
@@ -1142,6 +1201,7 @@ async fn count_stale(
         sweep_failed_at(
             cutoff,
             removed_so_far,
+            eligible,
             format!("retention count for {table} failed: {e}"),
         )
     })
@@ -1454,6 +1514,101 @@ mod tests {
         assert!(message.contains("job_history"), "{message}");
         assert!(message.contains("commit_hooks"), "{message}");
         assert!(message.contains("timeout"), "{message}");
+    }
+
+    #[test]
+    fn in_memory_stores_warn_about_late_eviction() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Memory;
+        config.jobs.backend = "local".to_owned();
+        for dataset in [
+            RetentionDataset::Idempotency,
+            RetentionDataset::WebhookReplay,
+            RetentionDataset::JobTracking,
+        ] {
+            let note = backend_ttl_note(dataset, &config, 60, None);
+            assert!(note.contains("built-in store"), "{dataset}: {note}");
+            assert!(note.contains("quiet process"), "{dataset}: {note}");
+        }
+    }
+
+    #[test]
+    fn shared_stores_do_not_warn_about_late_eviction() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
+        config.jobs.backend = "redis".to_owned();
+        for dataset in [
+            RetentionDataset::Idempotency,
+            RetentionDataset::WebhookReplay,
+            RetentionDataset::JobTracking,
+        ] {
+            let note = backend_ttl_note(dataset, &config, 60, None);
+            assert!(!note.contains("quiet process"), "{dataset}: {note}");
+        }
+    }
+
+    #[test]
+    fn only_the_dataset_with_an_in_memory_store_warns() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
+        config.jobs.backend = "redis".to_owned();
+        let warns =
+            |dataset| backend_ttl_note(dataset, &config, 60, None).contains("quiet process");
+        assert!(warns(RetentionDataset::Idempotency));
+        assert!(!warns(RetentionDataset::WebhookReplay));
+        assert!(!warns(RetentionDataset::JobTracking));
+    }
+
+    #[test]
+    fn the_database_idempotency_store_warns_and_sqlite_jobs_do_not() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Database;
+        assert!(evicts_lazily(RetentionDataset::Idempotency, &config));
+        config.jobs.backend = "sqlite".to_owned();
+        assert!(!evicts_lazily(RetentionDataset::JobTracking, &config));
+    }
+
+    #[test]
+    fn an_unknown_jobs_backend_warns_because_it_falls_back_to_memory() {
+        let mut config = AutumnConfig::default();
+        config.jobs.backend = "postgresql".to_owned();
+        assert!(evicts_lazily(RetentionDataset::JobTracking, &config));
+        config.jobs.backend = "redis".to_owned();
+        assert!(!evicts_lazily(RetentionDataset::JobTracking, &config));
+    }
+
+    #[test]
+    fn a_held_database_idempotency_table_is_not_described_as_swept() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Database;
+        let registry = GdprRegistry::new().register(crate::gdpr::ModelRegistration::retain(
+            "autumn_idempotency_keys",
+            "litigation",
+        ));
+        let note = backend_ttl_note(RetentionDataset::Idempotency, &config, 60, Some(&registry));
+        assert!(note.contains("legal hold: litigation"), "{note}");
+        assert!(!note.contains("quiet process"), "{note}");
+    }
+
+    #[test]
+    fn the_memory_session_note_keeps_its_own_verdict() {
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Memory;
+        let note = backend_ttl_note(RetentionDataset::Sessions, &config, 60, None);
+        assert!(note.starts_with("NOT enforced"), "{note}");
+        assert!(!note.contains("quiet process"), "{note}");
+    }
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[test]
+    fn a_failure_after_the_count_keeps_the_eligible_count() {
+        let failure = sweep_failed_at(Utc::now(), 500, Some(5_000_000), "timeout".to_owned());
+        assert_eq!(failure.eligible, Some(5_000_000));
+        assert_eq!(failure.removed, 500);
+        assert_eq!(sweep_failed(0, "no pool".to_owned()).eligible, None);
     }
 
     #[test]

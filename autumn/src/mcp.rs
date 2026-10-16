@@ -316,6 +316,8 @@ pub struct McpServer {
     has_task_tools: bool,
     server_name: String,
     server_version: String,
+    /// Enforces each grant's `rate` cap. Per process.
+    rate_limiter: crate::agent_authority::rate::RateLimiter,
 }
 
 impl McpServer {
@@ -944,6 +946,7 @@ impl McpServer {
             has_task_tools,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            rate_limiter: crate::agent_authority::rate::RateLimiter::default(),
         }
     }
 }
@@ -1722,6 +1725,71 @@ const MAX_ARGUMENT_NAMES_BYTES: usize = 512;
 /// audit row that cannot name who acted is still a row that must be greppable.
 const ANONYMOUS_AGENT: &str = "agent:anonymous";
 
+/// Admit a call. It must be inside the `rate` cap. Its attempt record must be
+/// writable, unless the action is provably reversible. A refusal becomes the
+/// tool error text.
+async fn admit_call(server: &McpServer, tool: &McpTool, audit: &AgentAudit) -> Result<(), String> {
+    if let Err(refusal) = check_rate_cap(server, tool) {
+        audit.record_refusal(&server.state, &refusal).await;
+        return Err(refusal);
+    }
+    // The last thing before the action runs: if this record cannot be written
+    // and the action is not provably reversible, it does not run.
+    audit
+        .record_attempt(&server.state)
+        .await
+        .map_err(str::to_owned)
+}
+
+/// Refuse a call that is over its grant's declared `rate` cap. A cap that
+/// cannot be read refuses every call: it must never mean "no cap".
+fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
+    let Some(grant) = tool.agent_authority.map(|a| a.grant) else {
+        return Ok(());
+    };
+    let Some(rate) = grant.rate else {
+        return Ok(());
+    };
+    let Some(cap) = crate::agent_authority::rate::parse_rate(rate) else {
+        return Err(format!(
+            "rate cap `{rate}` for grant {} cannot be read; the call is refused",
+            grant.name
+        ));
+    };
+    server
+        .rate_limiter
+        .check(grant.name, grant.location, cap, server.state.clock().now())
+        .map_err(|wait| {
+            format!(
+                "rate cap {rate} for grant {} exceeded; retry in {wait}s",
+                grant.name
+            )
+        })
+}
+
+/// Longest actor id an audit row keeps.
+const MAX_ACTOR_LEN: usize = 128;
+
+/// An actor id fit for an audit row: letters, digits and plain id punctuation
+/// only, capped in length.
+///
+/// An allowlist, because line separators, zero-width marks and bidirectional
+/// marks are not control characters, and a list of them is never complete.
+fn clean_actor(actor: &str) -> Option<String> {
+    let clean: String = actor
+        .chars()
+        .filter(|c| {
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '_' | '.' | ':' | '@' | '+' | '/' | '=' | '#' | '~' | ' '
+                )
+        })
+        .take(MAX_ACTOR_LEN)
+        .collect();
+    (!clean.trim().is_empty()).then_some(clean)
+}
+
 /// The tool error returned when a non-reversible action cannot be recorded.
 const UNAUDITABLE_REFUSAL: &str =
     "audit attempt record could not be written; refusing a non-reversible action";
@@ -1800,6 +1868,7 @@ impl AgentAudit {
             // the auth layer on the request scope, so a `secure_mcp` app names
             // its caller and an open one falls back rather than recording "".
             actor: crate::current::Current::scoped_actor()
+                .and_then(|actor| clean_actor(&actor))
                 .unwrap_or_else(|| ANONYMOUS_AGENT.to_owned()),
             ip: ctx.peer.map(|peer| peer.ip()),
             shared,
@@ -1823,6 +1892,18 @@ impl AgentAudit {
     /// unknown marker is that we do not get to assume.
     fn refuse_when_unauditable(&self) -> bool {
         self.reversibility != Some(crate::agent_authority::Reversibility::Reversible)
+    }
+
+    /// Name the principal the route's own auth layer resolved. Only the rows
+    /// written after dispatch carry it. The envelope's own actor, when it
+    /// resolved one, wins.
+    fn adopt_actor(&mut self, actor: Option<&str>) {
+        if self.actor != ANONYMOUS_AGENT {
+            return;
+        }
+        if let Some(clean) = actor.and_then(clean_actor) {
+            self.actor = clean;
+        }
     }
 
     /// Build one of this invocation's events.
@@ -2429,12 +2510,18 @@ struct Dispatched {
     /// replayed onto the outer HTTP response so a tool call sends what the
     /// equivalent direct call would have.
     replayed: Vec<(HeaderName, HeaderValue)>,
+    /// The principal the route's own auth layer resolved, if any.
+    actor: Option<String>,
 }
 
 impl Dispatched {
     fn inspect(response: &Response) -> Self {
         let headers = response.headers();
         Self {
+            actor: response
+                .extensions()
+                .get::<crate::agent_authority::AgentActor>()
+                .map(|actor| actor.0.clone()),
             status: response.status(),
             request_id: headers
                 .get("x-request-id")
@@ -2523,12 +2610,10 @@ async fn serve_tools_call(
 
     // Agent-authority envelope (#1691). Resolved before dispatch so the
     // correlation id exists ahead of anything that can go wrong.
-    let audit = AgentAudit::new(server, tool, &arguments, ctx);
+    let mut audit = AgentAudit::new(server, tool, &arguments, ctx);
 
-    // The last thing before the action runs: if this record cannot be written
-    // and the action is not provably reversible, it does not run.
-    if let Err(refusal) = audit.record_attempt(&server.state).await {
-        return reply(success(id, tool_error(refusal)));
+    if let Err(refusal) = admit_call(server, tool, &audit).await {
+        return reply(success(id, tool_error(&refusal)));
     }
 
     // MCP Tasks extension: give a task handle to a client that declared the
@@ -2566,7 +2651,9 @@ async fn serve_tools_call(
         request_id,
         is_event_stream,
         replayed,
+        actor,
     } = Dispatched::inspect(&response);
+    audit.adopt_actor(actor.as_deref());
     let client_accepts_sse = ctx
         .headers
         .get(header::ACCEPT)
@@ -2741,8 +2828,10 @@ async fn run_task(
         status,
         request_id,
         is_event_stream,
+        actor,
         ..
     } = Dispatched::inspect(&response);
+    outcome.audit.adopt_actor(actor.as_deref());
     // A task has no HTTP response to carry `Set-Cookie` or `Server-Timing`.
     outcome.status = Some(status);
     outcome.request_id = request_id;
@@ -4448,6 +4537,26 @@ mod tests {
             detect_schema_degradations(&schema, true, false).is_empty(),
             "structured query fields are honored, not degraded"
         );
+    }
+
+    #[test]
+    fn an_actor_id_keeps_only_id_characters_and_is_capped() {
+        assert_eq!(clean_actor("user-42").as_deref(), Some("user-42"));
+        assert_eq!(clean_actor("a\nb\r\u{0}c").as_deref(), Some("abc"));
+        assert_eq!(clean_actor("\n"), None);
+        assert_eq!(
+            clean_actor("ad\u{202E}min\u{200B}").as_deref(),
+            Some("admin")
+        );
+        // Line separators and soft or joining marks are not control characters.
+        assert_eq!(clean_actor("a\u{2028}b\u{2029}c").as_deref(), Some("abc"));
+        assert_eq!(clean_actor("a\u{2060}b\u{00AD}c").as_deref(), Some("abc"));
+        // Ordinary ids keep their punctuation.
+        assert_eq!(
+            clean_actor("agent:key_1.x@example.com").as_deref(),
+            Some("agent:key_1.x@example.com")
+        );
+        assert_eq!(clean_actor(&"x".repeat(500)).map(|a| a.len()), Some(128));
     }
 
     #[test]

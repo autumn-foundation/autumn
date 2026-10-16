@@ -37,7 +37,7 @@ Sigstore attestation via `actions/attest-build-provenance` +
 | B7 | A GitHub review approval from a CODEOWNER | Rejected on its own — approvals are dismissed (or not) by branch-protection settings the framework does not control, and an approval says "I approve the code", not "I approve *this* widening". |
 | B8 | A label (`posture-ack`) | Rejected — a label is a boolean. It survives *any* subsequent push, so re-widening after acknowledgment would sail through: the exact failure the AC calls out. |
 | B9 | A file committed to the repo (`posture-ack.toml`) | Rejected as the primary marker — the AC wants the acknowledgment *on the PR*, and a file in the diff is acknowledged by the same push that widens. |
-| B10 | **A PR comment carrying the widening-set digest: `/ack-posture <digest>`** | **Chosen.** Content-bound: the digest is computed over the *set of widening findings*, so pushing cosmetic or unrelated commits keeps the acknowledgment valid, and any new or changed widening produces a new digest that no existing comment matches — it re-blocks, by construction. It is human, explicit, timestamped, attributed, and visible exactly where the change happened. |
+| B10 | **A PR comment carrying the widening-set digest: `/ack-posture <digest>`** | **Chosen.** Content-bound: the digest is computed over the *set of widening findings*, so pushing cosmetic or unrelated commits keeps the acknowledgment valid, and any new or changed widening produces a new digest that no existing comment matches — it re-blocks, by construction. It is human, explicit, timestamped, attributed, and visible exactly where the change happened. Since #2497, a `ceiling=` token also lets narrowing pass; see `docs/guide/posture-gate.md`. |
 
 **Who is allowed to acknowledge?**
 

@@ -5,10 +5,9 @@
 //! `SIGUSR2`, and proves the properties the issue asks for:
 //!
 //! * no request is lost across the cutover. A refused connect is retried for
-//!   `REFUSED_RETRY_BUDGET`, up to `MAX_TOLERATED_REFUSALS` per run. An
-//!   isolated mid-flight reset (`ECONNRESET`/`ECONNABORTED`) is retried once,
-//!   up to `MAX_TOLERATED_RESETS` per run. Many resets or refusals fail the
-//!   run rather than being masked;
+//!   `REFUSED_RETRY_BUDGET`, up to `MAX_TOLERATED_REFUSALS` per run. A
+//!   mid-flight reset (`ECONNRESET`/`ECONNABORTED`) is never retried. One
+//!   reset fails the run (#2372);
 //! * a `503` from the successor's startup barrier is retried for up to
 //!   `STARTUP_BARRIER_BUDGET`. A successor that never becomes ready fails the run;
 //! * a value written before the upgrade is readable after it (from the *new*
@@ -157,28 +156,6 @@ async fn wait_until_ready(
     }
 }
 
-/// A connection reset (`ECONNRESET`) or abort (`ECONNABORTED`) mid-flight.
-///
-/// Autumn's in-place upgrade hands the successor the *same* listening socket
-/// by duplicating its fd across the `exec`
-/// (`HandoffSocket::from_listener`/`upgrade.rs`). No second `SO_REUSEPORT`
-/// socket exists, so no accept-queue race between two listeners can cause a
-/// reset. Issue #2398 fixed one known cause: hyper closed an accepted
-/// connection that had received no request. Issue #2462 (macOS only, did not
-/// reproduce) has no confirmed root cause. The test retries an isolated reset
-/// (`with_reset_retry`) and fails if the count passes `MAX_TOLERATED_RESETS`.
-/// Many resets fail the run.
-///
-/// This is distinct from `ECONNREFUSED`, which means nothing was listening.
-/// `with_refused_retry` handles it. A refusal that outlasts its budget is the
-/// zero-downtime violation.
-fn is_mid_flight_reset(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-    )
-}
-
 /// True once a write answered `200` from the `v2` build.
 fn v2_accepted_a_write(writes: &Mutex<Vec<Observation>>) -> bool {
     writes
@@ -190,174 +167,6 @@ fn v2_accepted_a_write(writes: &Mutex<Vec<Observation>>) -> bool {
 
 fn is_connection_refused(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionRefused
-}
-
-/// How many mid-flight resets a single run may retry past before the test
-/// fails anyway. One or two is the isolated anomaly issue #2462 observed;
-/// anywhere near double digits stops being noise and starts being evidence of
-/// a real defect in the handoff or drain path, which `with_reset_retry`
-/// retrying past a reset must not be allowed to hide.
-const MAX_TOLERATED_RESETS: u64 = 5;
-
-/// Runs `attempt` once; if it fails with a mid-flight reset, waits out a
-/// short backoff and runs it exactly one more time, returning that outcome.
-/// This helper does not retry a refused connect. `with_refused_retry` does.
-///
-/// The backoff (rather than retrying immediately) gives whatever caused the
-/// reset a moment to resolve, so the retry doesn't land in the same narrow
-/// window that reset the first attempt. The caller is responsible for
-/// bounding how many resets a run may retry past — see
-/// `MAX_TOLERATED_RESETS`.
-///
-/// A successful retry's `latency` is overwritten to cover the *whole* span
-/// from the first attempt's start through the retry's completion (failed
-/// attempt + backoff + retry), not just the retry's own timing — otherwise a
-/// first attempt that stalled for seconds before resetting would report only
-/// the few milliseconds the cheap retry took, hiding exactly the cutover
-/// latency spike this test exists to catch.
-async fn with_reset_retry<F, Fut>(
-    reset_retries: &AtomicU64,
-    mut attempt: F,
-) -> std::io::Result<Observation>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<Observation>>,
-{
-    let started = Instant::now();
-    match attempt().await {
-        Err(error) if is_mid_flight_reset(&error) => {
-            reset_retries.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let mut retried = attempt().await;
-            if let Ok(observation) = &mut retried {
-                observation.latency = started.elapsed();
-            }
-            retried
-        }
-        other => other,
-    }
-}
-
-#[cfg(test)]
-mod reset_retry_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn retries_exactly_once_after_a_mid_flight_reset() {
-        let attempts = AtomicU64::new(0);
-        let reset_retries = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || {
-            let attempts = &attempts;
-            async move {
-                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-                } else {
-                    Ok(Observation {
-                        status: 200,
-                        body: String::new(),
-                        latency: Duration::ZERO,
-                    })
-                }
-            }
-        })
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "the retried attempt should succeed: {result:?}"
-        );
-        assert_eq!(attempts.load(Ordering::Relaxed), 2, "exactly one retry");
-        assert_eq!(reset_retries.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn a_second_reset_after_retry_is_reported_as_a_failure() {
-        let reset_retries = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || async {
-            Err::<Observation, _>(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-        })
-        .await;
-
-        assert!(result.is_err(), "two resets in a row must not be swallowed");
-        assert!(is_mid_flight_reset(&result.unwrap_err()));
-        assert_eq!(
-            reset_retries.load(Ordering::Relaxed),
-            1,
-            "retried exactly once, not looped"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_retried_success_reports_latency_spanning_the_whole_attempt() {
-        let reset_retries = AtomicU64::new(0);
-        let attempts = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || {
-            let attempts = &attempts;
-            async move {
-                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-                } else {
-                    Ok(Observation {
-                        status: 200,
-                        body: String::new(),
-                        // Deliberately tiny: if this leaked through
-                        // unmodified, the assertion below would fail.
-                        latency: Duration::from_millis(1),
-                    })
-                }
-            }
-        })
-        .await
-        .expect("the retried attempt should succeed");
-
-        assert!(
-            result.latency >= Duration::from_millis(15),
-            "latency must cover the failed first attempt plus the backoff, \
-             not just the retry's own reported {:?}",
-            result.latency
-        );
-    }
-
-    #[tokio::test]
-    async fn a_refused_connection_is_not_retried_by_the_reset_retry() {
-        let attempts = AtomicU64::new(0);
-        let reset_retries = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || {
-            let attempts = &attempts;
-            async move {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
-            }
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert!(is_connection_refused(&result.unwrap_err()));
-        assert_eq!(
-            attempts.load(Ordering::Relaxed),
-            1,
-            "this helper does not retry a refusal"
-        );
-        assert_eq!(reset_retries.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn an_unrelated_error_is_never_retried() {
-        let attempts = AtomicU64::new(0);
-        let reset_retries = AtomicU64::new(0);
-        let result = with_reset_retry(&reset_retries, || {
-            let attempts = &attempts;
-            async move {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
-            }
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(attempts.load(Ordering::Relaxed), 1);
-        assert_eq!(reset_retries.load(Ordering::Relaxed), 0);
-    }
 }
 
 /// How long one request may keep hitting the successor's startup barrier
@@ -385,7 +194,7 @@ fn is_startup_barrier_response(observation: &Observation) -> bool {
 /// Returns any other result at once, including a connection error. See
 /// [`is_startup_barrier_response`].
 ///
-/// After a retry, `latency` covers the whole wait, as in `with_reset_retry`.
+/// After a retry, `latency` covers the whole wait, across all attempts.
 /// The spike check must see time spent behind the barrier.
 async fn with_startup_barrier_retry<F, Fut>(
     startup_barrier_hits: &AtomicU64,
@@ -548,7 +357,7 @@ const LOAD_CLIENTS: u64 = 8;
 /// `ECONNREFUSED`. Counts the request once, however many retries it needs. Stops when `budget` ends and returns the last error.
 /// Returns any other result at once.
 ///
-/// After a retry, `latency` covers the whole wait, as in `with_reset_retry`.
+/// After a retry, `latency` covers the whole wait.
 async fn with_refused_retry<F, Fut>(
     refusals: &AtomicU64,
     budget: Duration,
@@ -662,7 +471,10 @@ mod refused_retry_tests {
         })
         .await;
 
-        assert!(is_mid_flight_reset(&result.unwrap_err()));
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
         assert_eq!(refusals.load(Ordering::Relaxed), 0);
     }
@@ -714,35 +526,10 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         // Nothing here is behind a load balancer, so the deregistration window
         // only slows the test's own teardown down.
         .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
-        // Pin the production drain budget, for the same reason the prestop
-        // grace above is pinned: the `dev` profile shortens
-        // `shutdown_timeout_secs` from the 30s default to 1s so Ctrl-C is snappy
-        // while developing, and this test asserts a *production* guarantee, so
-        // it should not inherit a dev-convenience timing knob.
-        //
-        // Without this the test is asking for something it has made impossible:
-        // the predecessor starts draining at the cutover, but the load loop
-        // below keeps driving traffic for another 3.5 seconds. A 1-second drain
-        // budget therefore expires while requests are still arriving, and
-        // whatever is in flight at that moment is aborted — `exit_code: 1`,
-        // failing the "drained and exited 0" assertion below. Nothing about the
-        // upgrade path is wrong when that happens; the budget is just shorter
-        // than the load window.
-        //
-        // Measured, because the intuitive story (a slow cutover) is not the
-        // real one: reproduced locally under CPU oversubscription with the
-        // cutover completing in 135 ms and the drain still aborting two
-        // requests. Contention only changes the odds that a request is in
-        // flight at the one-second mark. See issue #2372.
-        //
-        // This weakens nothing. `wait_for_exit` still caps the wait at 30s, so
-        // a predecessor that genuinely fails to drain still fails the
-        // assertion, and the connection guarantees below — `refused == 0`,
-        // `hard == 0`, and the `MAX_TOLERATED_RESETS` bound (#2510) — are
-        // untouched by it. Verified rather than assumed: under CPU
-        // oversubscription with this pin in place, the refusal/reset assertions
-        // still fired on their own, so the budget is not what was holding them.
-        .env("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "30")
+        // Pin the production drain budget. The `dev` profile uses 1 s, which is
+        // shorter than the load window. The drain watchdog then exits 1 (#2372,
+        // #2492). `wait_for_exit` still bounds the wait.
+        .envs([drain_budget_env()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
@@ -784,11 +571,9 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     let writes = Arc::new(Mutex::new(Vec::<Observation>::new()));
     // A refused connection is retried for `REFUSED_RETRY_BUDGET`; one that
     // stays refused means nothing was listening. That is the violation.
-    // A mid-flight reset gets one free retry (see `with_reset_retry`); only a
-    // *second* failure in a row is a hard one.
+    // A mid-flight reset is never retried. Any reset is a hard failure (#2372).
     let refused_errors = Arc::new(AtomicU64::new(0));
     let hard_failures = Arc::new(AtomicU64::new(0));
-    let reset_retries = Arc::new(AtomicU64::new(0));
     let refused_retries = Arc::new(AtomicU64::new(0));
     let startup_barrier_hits = Arc::new(AtomicU64::new(0));
 
@@ -800,7 +585,6 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         let writes = Arc::clone(&writes);
         let refused_errors = Arc::clone(&refused_errors);
         let hard_failures = Arc::clone(&hard_failures);
-        let reset_retries = Arc::clone(&reset_retries);
         let refused_retries = Arc::clone(&refused_retries);
         let startup_barrier_hits = Arc::clone(&startup_barrier_hits);
         let successor_pid = Arc::clone(&successor_pid);
@@ -814,19 +598,12 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         let _ = writes;
         load.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
-                // `/bump` is not idempotent, so a reset that lands after the
-                // server already applied it — but before the client read the
-                // response — means the retry can double-apply the write. That
-                // is a real, at-least-once-delivery trade-off, not a bug: the
-                // guarantees this test checks (`hits` never goes backwards,
-                // 200/503-only outcomes) hold regardless, and it mirrors how
-                // any client that retries past a reset behaves in practice.
                 match with_startup_barrier_retry(
                     &startup_barrier_hits,
                     STARTUP_BARRIER_BUDGET,
                     || {
                         with_refused_retry(&refused_retries, REFUSED_RETRY_BUDGET, || {
-                            with_reset_retry(&reset_retries, || get(&addr, path))
+                            get(&addr, path)
                         })
                     },
                 )
@@ -895,7 +672,7 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     while !v2_accepted_a_write(&writes) && Instant::now() < cutover_seen_by {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    tokio::time::sleep(POST_CUTOVER_LOAD).await;
     stop.store(true, Ordering::Relaxed);
     for task in load {
         task.await.expect("load task");
@@ -904,10 +681,9 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     // The old process must have drained and exited cleanly on its own.
     let exit = wait_for_exit(&mut child, Duration::from_secs(30));
     let logged = log.lock().expect("log").join("\n");
-    assert!(
-        exit.map(|status| status.success()).unwrap_or(false),
-        "the predecessor should drain and exit 0 after handing over; logs:\n{logged}"
-    );
+    if let Some(reason) = exit_failure(exit) {
+        panic!("{reason}; it should drain and exit 0 after handing over; logs:\n{logged}");
+    }
 
     // ---- the guarantees --------------------------------------------------
     // Taken by value: the load tasks are joined, so nothing else holds these,
@@ -917,14 +693,12 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
 
     let refused = refused_errors.load(Ordering::Relaxed);
     let hard = hard_failures.load(Ordering::Relaxed);
-    let retried = reset_retries.load(Ordering::Relaxed);
     let refusals = refused_retries.load(Ordering::Relaxed);
     let startup_barrier = startup_barrier_hits.load(Ordering::Relaxed);
     println!(
-        "connection failures across cutover: refused={refused} hard_failures_after_retry={hard} mid_flight_resets_retried={retried} refusals_retried={refusals} startup_barrier_hits_retried={startup_barrier}"
+        "connection failures across cutover: refused={refused} hard_failures={hard} refusals_retried={refusals} startup_barrier_hits_retried={startup_barrier}"
     );
-    // Not bounded like `retried` below: unlike a mid-flight reset (which has
-    // no known-benign cause at all), a startup-barrier hit is *expected* to
+    // Not bounded: a startup-barrier hit is *expected* to
     // scale with how long the successor's own `on_startup` hooks take —
     // dozens of hits across 8 polling tasks during a slow (contended)
     // startup is normal, not evidence of a defect. `with_startup_barrier_retry`
@@ -937,30 +711,19 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         "a connection stayed refused for {REFUSED_RETRY_BUDGET:?} across the cutover; \
          logs:\n{logged}"
     );
-    // Bounded, as for resets: the listener is never closed, so a refusal is
+    // Bounded: the listener is never closed, so a refusal is
     // expected at most a few times. Many refusals show a gap in the handoff.
     assert!(
         refusals <= MAX_TOLERATED_REFUSALS,
         "{refusals} requests met a refused connection, too many to be an isolated anomaly \
          (bound: {MAX_TOLERATED_REFUSALS}); logs:\n{logged}"
     );
+    // The successor shares the same listening socket (a duplicated fd), so
+    // nothing may reset a connection. One reset is a real drain defect (#2372).
     assert_eq!(
         hard, 0,
-        "a request failed even after retrying once past a mid-flight reset \
-         (ECONNRESET/ECONNABORTED); logs:\n{logged}"
-    );
-    // Bounded, not unconditional: the successor is handed the *same*
-    // listening socket (a duplicated fd, not a second `SO_REUSEPORT`
-    // listener — see `is_mid_flight_reset`), so there is no known-benign
-    // mechanism that should reset a connection at all. Tolerating a lone
-    // reset keeps an unreproduced macOS anomaly (#2462) from failing the
-    // run; this bound keeps a *systemic* source of resets — real evidence of
-    // a defect in the handoff or drain path — from silently passing.
-    assert!(
-        retried <= MAX_TOLERATED_RESETS,
-        "{retried} mid-flight resets is too many to be an isolated anomaly \
-         (bound: {MAX_TOLERATED_RESETS}) — this looks like a real handoff/drain \
-         defect, not noise; logs:\n{logged}"
+        "a request failed with a connection error (ECONNRESET/ECONNABORTED); \
+         logs:\n{logged}"
     );
     // Six readers over five seconds put this in the thousands on any machine
     // that is not pathologically loaded; the floor is set well under that so a
@@ -1058,6 +821,78 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         "the handoff directory must be cleaned up, found {leftovers:?}"
     );
     let _ = std::fs::remove_dir_all(&handoff_dir);
+}
+
+/// Load window after the first `v2` write. The predecessor drains inside it.
+const POST_CUTOVER_LOAD: Duration = Duration::from_millis(3_500);
+
+/// Drain budget for the predecessor. It must be longer than
+/// `POST_CUTOVER_LOAD`. The `dev` profile uses 1 s, which makes the watchdog
+/// exit 1 while load continues (issue #2492).
+const PREDECESSOR_DRAIN_BUDGET_SECS: u64 = 30;
+
+/// The env var and value that set the predecessor's drain budget.
+fn drain_budget_env() -> (&'static str, String) {
+    (
+        "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
+        PREDECESSOR_DRAIN_BUDGET_SECS.to_string(),
+    )
+}
+
+/// Why the predecessor's exit is a failure, or `None` for a clean exit 0.
+/// `None` input means it did not exit in time.
+fn exit_failure(exit: Option<std::process::ExitStatus>) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let Some(status) = exit else {
+        return Some("the predecessor did not exit before the wait ended".to_owned());
+    };
+    if status.success() {
+        return None;
+    }
+    Some(match (status.code(), status.signal()) {
+        (Some(code), _) => format!("the predecessor exited with code {code}"),
+        (None, Some(signal)) => format!("the predecessor died from signal {signal}"),
+        (None, None) => "the predecessor ended with an unknown status".to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod predecessor_exit_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn the_spawn_env_sets_a_drain_budget_longer_than_the_post_cutover_load() {
+        // Issue #2492: a shorter budget makes the watchdog exit 1 mid-load.
+        let (key, value) = drain_budget_env();
+        assert_eq!(key, "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS");
+        let secs: u64 = value.parse().expect("whole seconds");
+        assert!(Duration::from_secs(secs) > POST_CUTOVER_LOAD);
+    }
+
+    #[test]
+    fn a_clean_exit_has_no_failure() {
+        assert_eq!(exit_failure(Some(ExitStatus::from_raw(0))), None);
+    }
+
+    #[test]
+    fn a_non_zero_exit_names_its_code() {
+        let report = exit_failure(Some(ExitStatus::from_raw(1 << 8))).expect("failure");
+        assert!(report.contains("code 1"), "{report}");
+    }
+
+    #[test]
+    fn a_signal_death_names_the_signal() {
+        let report = exit_failure(Some(ExitStatus::from_raw(9))).expect("failure");
+        assert!(report.contains("signal 9"), "{report}");
+    }
+
+    #[test]
+    fn no_exit_means_the_drain_timed_out() {
+        let report = exit_failure(None).expect("failure");
+        assert!(report.contains("did not exit"), "{report}");
+    }
 }
 
 /// Wait for `child` to exit, without blocking forever if it hangs.

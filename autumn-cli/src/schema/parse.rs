@@ -117,6 +117,19 @@ pub enum SchemaParseError {
         /// 1-based column of the error span.
         column: usize,
     },
+    /// Two models map one column to different `#[encrypted]` modes. Taking
+    /// either would re-encrypt the column in a mode the application may not
+    /// read.
+    #[error(
+        "{table}.{column} is #[encrypted] in both modes by different models; \
+         remove the model that is not production code"
+    )]
+    ConflictingEncryptedMode {
+        /// The table both models map to.
+        table: String,
+        /// The column both models encrypt.
+        column: String,
+    },
     /// A models file or directory could not be read.
     #[error("failed to read {path}: {source}")]
     Io {
@@ -347,33 +360,369 @@ pub fn parse_encrypted_columns(
     src: &str,
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
     let file = syn::parse_file(src).map_err(|e| SchemaParseError::from_syn(&e))?;
-    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
-    for item in &file.items {
-        let syn::Item::Struct(item_struct) = item else {
-            continue;
-        };
-        let Some(model_attr) = find_model_attr(&item_struct.attrs) else {
-            continue;
-        };
-        let syn::Fields::Named(named) = &item_struct.fields else {
-            continue;
-        };
-        let model_name = item_struct.ident.to_string();
-        let table = parse_model_args(model_attr)
-            .table
-            .unwrap_or_else(|| naming::pluralize(&naming::pascal_to_snake(&model_name)));
-        for field in &named.named {
-            let Some(ident) = field.ident.as_ref() else {
-                continue;
+    let mut scan = EncryptedScan::default();
+    if production_enabled(&file.attrs) {
+        syn::visit::Visit::visit_file(&mut scan, &file);
+    }
+    if let Some((table, column)) = scan.conflict {
+        return Err(SchemaParseError::ConflictingEncryptedMode { table, column });
+    }
+    Ok(scan.found)
+}
+
+/// The attributes of a `syn::Item`, or none for a kind without any.
+pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::ForeignItem`, or none for a kind without any.
+pub fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(i) => &i.attrs,
+        syn::ForeignItem::Static(i) => &i.attrs,
+        syn::ForeignItem::Type(i) => &i.attrs,
+        syn::ForeignItem::Macro(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::Pat`, or none for a kind without any.
+pub fn pat_attrs(pat: &syn::Pat) -> &[syn::Attribute] {
+    match pat {
+        syn::Pat::Const(p) => &p.attrs,
+        syn::Pat::Ident(p) => &p.attrs,
+        syn::Pat::Lit(p) => &p.attrs,
+        syn::Pat::Macro(p) => &p.attrs,
+        syn::Pat::Or(p) => &p.attrs,
+        syn::Pat::Paren(p) => &p.attrs,
+        syn::Pat::Path(p) => &p.attrs,
+        syn::Pat::Range(p) => &p.attrs,
+        syn::Pat::Reference(p) => &p.attrs,
+        syn::Pat::Rest(p) => &p.attrs,
+        syn::Pat::Slice(p) => &p.attrs,
+        syn::Pat::Struct(p) => &p.attrs,
+        syn::Pat::Tuple(p) => &p.attrs,
+        syn::Pat::TupleStruct(p) => &p.attrs,
+        syn::Pat::Type(p) => &p.attrs,
+        syn::Pat::Wild(p) => &p.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::GenericParam`.
+pub fn generic_param_attrs(param: &syn::GenericParam) -> &[syn::Attribute] {
+    match param {
+        syn::GenericParam::Lifetime(p) => &p.attrs,
+        syn::GenericParam::Type(p) => &p.attrs,
+        syn::GenericParam::Const(p) => &p.attrs,
+    }
+}
+
+/// The attributes of a `syn::FnArg`.
+pub fn fn_arg_attrs(arg: &syn::FnArg) -> &[syn::Attribute] {
+    match arg {
+        syn::FnArg::Receiver(r) => &r.attrs,
+        syn::FnArg::Typed(t) => &t.attrs,
+    }
+}
+
+/// The attributes of a `syn::TraitItem`, or none for a kind without any.
+pub fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Fn(i) => &i.attrs,
+        syn::TraitItem::Const(i) => &i.attrs,
+        syn::TraitItem::Type(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::ImplItem`, or none for a kind without any.
+pub fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Fn(i) => &i.attrs,
+        syn::ImplItem::Const(i) => &i.attrs,
+        syn::ImplItem::Type(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::Expr`, or none for a kind without any.
+pub fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Array(e) => &e.attrs,
+        syn::Expr::Assign(e) => &e.attrs,
+        syn::Expr::Async(e) => &e.attrs,
+        syn::Expr::Await(e) => &e.attrs,
+        syn::Expr::Binary(e) => &e.attrs,
+        syn::Expr::Block(e) => &e.attrs,
+        syn::Expr::Break(e) => &e.attrs,
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::Cast(e) => &e.attrs,
+        syn::Expr::Closure(e) => &e.attrs,
+        syn::Expr::Const(e) => &e.attrs,
+        syn::Expr::Continue(e) => &e.attrs,
+        syn::Expr::Field(e) => &e.attrs,
+        syn::Expr::ForLoop(e) => &e.attrs,
+        syn::Expr::Group(e) => &e.attrs,
+        syn::Expr::If(e) => &e.attrs,
+        syn::Expr::Index(e) => &e.attrs,
+        syn::Expr::Infer(e) => &e.attrs,
+        syn::Expr::Let(e) => &e.attrs,
+        syn::Expr::Lit(e) => &e.attrs,
+        syn::Expr::Loop(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Match(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Paren(e) => &e.attrs,
+        syn::Expr::Path(e) => &e.attrs,
+        syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::RawAddr(e) => &e.attrs,
+        syn::Expr::Reference(e) => &e.attrs,
+        syn::Expr::Repeat(e) => &e.attrs,
+        syn::Expr::Return(e) => &e.attrs,
+        syn::Expr::Struct(e) => &e.attrs,
+        syn::Expr::Try(e) => &e.attrs,
+        syn::Expr::TryBlock(e) => &e.attrs,
+        syn::Expr::Tuple(e) => &e.attrs,
+        syn::Expr::Unary(e) => &e.attrs,
+        syn::Expr::Unsafe(e) => &e.attrs,
+        syn::Expr::While(e) => &e.attrs,
+        syn::Expr::Yield(e) => &e.attrs,
+
+        _ => &[],
+    }
+}
+
+/// Whether the `#[cfg(...)]` attributes leave an item in a production build.
+///
+/// Only `test` is known to be off, and `not`, `all` and `any` combine it. Other
+/// predicates (a feature, a target) are unknown and count as on. This keeps a
+/// registration the app might have: scrubbing too much is the safe error.
+pub fn production_enabled(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().all(|a| {
+        if a.path().is_ident("cfg") {
+            a.parse_args::<syn::Meta>()
+                .map_or(true, |m| cfg_value(&m) != Some(false))
+        } else if a.path().is_ident("cfg_attr") {
+            cfg_attr_keeps_item(a)
+        } else {
+            true
+        }
+    })
+}
+
+/// `#[cfg_attr(pred, cfg(...))]` adds a `cfg` when `pred` holds. It disables the
+/// item only when `pred` is known true and an added `cfg` is known false.
+fn cfg_attr_keeps_item(attr: &syn::Attribute) -> bool {
+    use syn::punctuated::Punctuated;
+
+    let Ok(args) = attr.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+    else {
+        return true;
+    };
+    let mut args = args.into_iter();
+    let Some(predicate) = args.next() else {
+        return true;
+    };
+    if cfg_value(&predicate) != Some(true) {
+        return true;
+    }
+    args.all(|meta| match &meta {
+        syn::Meta::List(list) if list.path.is_ident("cfg") => list
+            .parse_args::<syn::Meta>()
+            .map_or(true, |m| cfg_value(&m) != Some(false)),
+        // `cfg_attr` can add another `cfg_attr`.
+        syn::Meta::List(list) if list.path.is_ident("cfg_attr") => {
+            let inner = syn::Attribute {
+                pound_token: attr.pound_token,
+                style: attr.style,
+                bracket_token: attr.bracket_token,
+                meta: syn::Meta::List(list.clone()),
             };
-            if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
-                out.entry(table.clone())
-                    .or_default()
-                    .insert(ident.to_string(), is_deterministic_encrypted(attr));
+            cfg_attr_keeps_item(&inner)
+        }
+        _ => true,
+    })
+}
+
+/// A `cfg` predicate's value when it is known without the build's settings.
+fn cfg_value(meta: &syn::Meta) -> Option<bool> {
+    use syn::punctuated::Punctuated;
+
+    match meta {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+        syn::Meta::List(list) => {
+            let inner: Vec<Option<bool>> = list
+                .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                .ok()?
+                .iter()
+                .map(cfg_value)
+                .collect();
+            if list.path.is_ident("not") {
+                inner.first().copied().flatten().map(|v| !v)
+            } else if list.path.is_ident("all") {
+                if inner.contains(&Some(false)) {
+                    Some(false)
+                } else if inner.iter().all(|v| *v == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("any") {
+                if inner.contains(&Some(true)) {
+                    Some(true)
+                } else if inner.iter().all(|v| *v == Some(false)) {
+                    // Includes the empty `any()`, which Rust defines as false.
+                    Some(false)
+                } else {
+                    None
+                }
+            } else {
+                None
             }
         }
+        _ => None,
     }
-    Ok(out)
+}
+
+/// Collects `#[encrypted]` fields from every production `#[model]` struct, however deeply
+/// its module is nested.
+#[derive(Default)]
+struct EncryptedScan {
+    found: BTreeMap<String, BTreeMap<String, bool>>,
+    /// The first column two models encrypt in different modes.
+    conflict: Option<(String, String)>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        if production_enabled(&module.attrs) {
+            syn::visit::visit_item_mod(self, module);
+        }
+    }
+
+    // A test-only item or expression can hold a fixture model. Skip it whole.
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if production_enabled(item_attrs(item)) {
+            syn::visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if production_enabled(trait_item_attrs(item)) {
+            syn::visit::visit_trait_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if production_enabled(impl_item_attrs(item)) {
+            syn::visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if production_enabled(expr_attrs(expr)) {
+            syn::visit::visit_expr(self, expr);
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if production_enabled(&local.attrs) {
+            syn::visit::visit_local(self, local);
+        }
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if production_enabled(&arm.attrs) {
+            syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if production_enabled(foreign_item_attrs(item)) {
+            syn::visit::visit_foreign_item(self, item);
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &'ast syn::Pat) {
+        if production_enabled(pat_attrs(pat)) {
+            syn::visit::visit_pat(self, pat);
+        }
+    }
+
+    fn visit_generic_param(&mut self, param: &'ast syn::GenericParam) {
+        if production_enabled(generic_param_attrs(param)) {
+            syn::visit::visit_generic_param(self, param);
+        }
+    }
+
+    fn visit_fn_arg(&mut self, arg: &'ast syn::FnArg) {
+        if production_enabled(fn_arg_attrs(arg)) {
+            syn::visit::visit_fn_arg(self, arg);
+        }
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if production_enabled(&field.attrs) {
+            syn::visit::visit_field(self, field);
+        }
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if production_enabled(&variant.attrs) {
+            syn::visit::visit_variant(self, variant);
+        }
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if production_enabled(&field.attrs) {
+            syn::visit::visit_field_value(self, field);
+        }
+    }
+
+    fn visit_item_struct(&mut self, item_struct: &'ast syn::ItemStruct) {
+        if !production_enabled(&item_struct.attrs) {
+            return;
+        }
+        if let Some(model_attr) = find_model_attr(&item_struct.attrs)
+            && let syn::Fields::Named(named) = &item_struct.fields
+        {
+            let model_name = item_struct.ident.to_string();
+            let table = parse_model_args(model_attr)
+                .table
+                .unwrap_or_else(|| naming::pluralize(&naming::pascal_to_snake(&model_name)));
+            for field in &named.named {
+                let Some(ident) = field.ident.as_ref() else {
+                    continue;
+                };
+                if !production_enabled(&field.attrs) {
+                    continue;
+                }
+                if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
+                    let column = field_column_name(field, ident);
+                    let deterministic = is_deterministic_encrypted(attr);
+                    let known = self.found.entry(table.clone()).or_default();
+                    if known.insert(column.clone(), deterministic) == Some(!deterministic) {
+                        self.conflict.get_or_insert_with(|| (table.clone(), column));
+                    }
+                }
+            }
+        }
+        syn::visit::visit_item_struct(self, item_struct);
+    }
 }
 
 /// Read the `#[encrypted]` column set from a models file or directory, using the
@@ -386,17 +735,179 @@ pub fn parse_encrypted_columns(
 pub fn parse_encrypted_columns_path(
     path: &Path,
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
-    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+    let mut sources = Vec::new();
     for file in model_source_files(path)? {
         let src = std::fs::read_to_string(&file).map_err(|source| SchemaParseError::Io {
             path: file.display().to_string(),
             source,
         })?;
-        for (table, columns) in parse_encrypted_columns(&src)? {
-            out.entry(table).or_default().extend(columns);
+        sources.push((file, src));
+    }
+    // A file reached only through `#[cfg(test)] mod x;` is test code.
+    let disabled = disabled_module_paths(&sources);
+    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+    for (file, src) in &sources {
+        if disabled.excludes(file) {
+            continue;
+        }
+        for (table, columns) in parse_encrypted_columns(src)? {
+            let known = out.entry(table.clone()).or_default();
+            for (column, deterministic) in columns {
+                if known.insert(column.clone(), deterministic) == Some(!deterministic) {
+                    return Err(SchemaParseError::ConflictingEncryptedMode { table, column });
+                }
+            }
         }
     }
     Ok(out)
+}
+
+/// The paths that `cfg`-disabled modules would load, across a set of source
+/// files `(path, source)`.
+///
+/// A `lib`, `main` or `mod` file owns its own directory; any other file owns a
+/// directory named for its stem. A module inside a disabled inline module is
+/// disabled too, and an inline module adds its name to the path. A path that any
+/// enabled declaration also loads, in any file (`lib.rs` and `main.rs` are two
+/// crate roots), is production code and is left out. A source that does not
+/// parse adds nothing: the caller reports that.
+#[must_use]
+pub fn disabled_module_paths(sources: &[(std::path::PathBuf, String)]) -> DisabledModules {
+    let mut active: Vec<&(std::path::PathBuf, String)> = sources.iter().collect();
+    // A declaration inside a test-only file does not enable anything, so repeat
+    // without the files the last round excluded. The set only shrinks.
+    loop {
+        let mut found = ModulePaths::default();
+        for (file, src) in &active {
+            let Ok(parsed) = syn::parse_file(src) else {
+                continue;
+            };
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let parent = file.parent().unwrap_or_else(|| Path::new(""));
+            let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            collect_module_paths(
+                &parsed.items,
+                (&module_dir, parent),
+                !production_enabled(&parsed.attrs),
+                &mut found,
+            );
+        }
+        let modules = DisabledModules {
+            disabled: found.disabled,
+            enabled: found.enabled,
+        };
+        let before = active.len();
+        active.retain(|(file, _)| !modules.excludes(file));
+        if active.len() == before {
+            return modules;
+        }
+    }
+}
+
+/// The paths `cfg`-disabled and enabled modules load, from
+/// [`disabled_module_paths`].
+pub struct DisabledModules {
+    disabled: Vec<std::path::PathBuf>,
+    enabled: Vec<std::path::PathBuf>,
+}
+
+impl DisabledModules {
+    /// Whether `file` is test code: under a disabled path, and not under a more
+    /// specific path that an enabled declaration loads (`#[cfg(test)] mod
+    /// fixtures;` beside `#[path = "fixtures/models.rs"] mod models;`).
+    #[must_use]
+    pub fn excludes(&self, file: &Path) -> bool {
+        self.disabled.iter().any(|d| {
+            file.starts_with(d)
+                && !self
+                    .enabled
+                    .iter()
+                    .any(|e| file.starts_with(e) && e.starts_with(d))
+        })
+    }
+}
+
+/// `path` with `.` and `..` folded away, without touching the file system. A
+/// `#[path = "a/../b.rs"]` then compares equal to the walked file `b.rs`.
+fn normalize_lexically(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[derive(Default)]
+struct ModulePaths {
+    disabled: Vec<std::path::PathBuf>,
+    enabled: Vec<std::path::PathBuf>,
+}
+
+/// `dirs` is the directory that holds module files, and the base a `#[path]`
+/// attribute resolves against.
+fn collect_module_paths(
+    items: &[syn::Item],
+    dirs: (&Path, &Path),
+    parent_disabled: bool,
+    out: &mut ModulePaths,
+) {
+    let (dir, path_base) = dirs;
+    // The paths a module loads: its `#[path]`, else the conventional pair.
+    let paths_of = |module: &syn::ItemMod| -> Vec<std::path::PathBuf> {
+        let custom = module
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("path"))
+            .find_map(|a| match &a.meta {
+                syn::Meta::NameValue(nv) => match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(path),
+                        ..
+                    }) => Some(path.value()),
+                    _ => None,
+                },
+                _ => None,
+            });
+        custom.map_or_else(
+            || {
+                vec![
+                    dir.join(format!("{}.rs", module.ident)),
+                    dir.join(module.ident.to_string()),
+                ]
+            },
+            |custom| vec![normalize_lexically(&path_base.join(custom))],
+        )
+    };
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let disabled = parent_disabled || !production_enabled(&module.attrs);
+        match &module.content {
+            None if disabled => out.disabled.extend(paths_of(module)),
+            None => out.enabled.extend(paths_of(module)),
+            Some((_, nested)) => {
+                let nested_dir = dir.join(module.ident.to_string());
+                collect_module_paths(nested, (&nested_dir, &nested_dir), disabled, out);
+            }
+        }
+    }
 }
 
 /// The `.rs` sources a models path expands to: the file itself, or every `*.rs`
@@ -421,6 +932,7 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
     }
     let mut paths = Vec::new();
     let mut stack = vec![path.to_path_buf()];
+    let root_depth = path.components().count();
     while let Some(dir) = stack.pop() {
         let read = std::fs::read_dir(&dir).map_err(|source| SchemaParseError::Io {
             path: dir.display().to_string(),
@@ -432,18 +944,29 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
                 source,
             })?;
             let candidate = entry.path();
-            let file_type = entry.file_type().map_err(|source| SchemaParseError::Io {
-                path: candidate.display().to_string(),
-                source,
-            })?;
-            if file_type.is_dir() {
-                stack.push(candidate);
-            } else if file_type.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
+            // `metadata` follows a symlink, as `Path::is_dir` does for the
+            // models path itself. A dangling link has no metadata and is skipped.
+            let Ok(meta) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if meta.is_dir() {
+                // A link to the directory being read, or to one above it, would
+                // loop the walk. Two links to one shared directory are distinct
+                // paths (`fixtures` and `models`), so each is walked.
+                let target =
+                    std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+                let here = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+                let too_deep = candidate.components().count() > root_depth + 64;
+                if !here.starts_with(&target) && !too_deep {
+                    stack.push(candidate);
+                }
+            } else if meta.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
                 paths.push(candidate);
             }
         }
     }
     paths.sort();
+    paths.dedup();
     Ok(paths)
 }
 
@@ -2043,7 +2566,7 @@ mod tests {
             SchemaParseError::Io { path, .. } => {
                 assert!(path.contains("does_not_exist.rs"), "path names the input");
             }
-            other @ SchemaParseError::Syntax { .. } => panic!("expected Io error, got {other:?}"),
+            other => panic!("expected Io error, got {other:?}"),
         }
     }
 
@@ -2165,6 +2688,436 @@ mod tests {
             .collect();
         assert!(names.contains(&"type"), "{names:?}");
         assert!(!names.iter().any(|n| n.starts_with("r#")), "{names:?}");
+    }
+
+    /// The encrypted-column map is keyed by the SQL column, so a raw identifier
+    /// and a `column_name` override both name the live column.
+    #[test]
+    fn encrypted_columns_use_the_sql_column_name() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct Item {
+                #[id] pub id: i64,
+                #[encrypted] pub r#type: String,
+                #[encrypted] #[diesel(column_name = "tok")] pub token: String,
+            }
+            "#,
+        )
+        .expect("parse");
+        let cols: Vec<&str> = found["items"].keys().map(String::as_str).collect();
+        assert_eq!(cols, vec!["tok", "type"]);
+    }
+
+    /// A test-only fixture model must not change a production column's mode.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_fixtures() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }
+            #[cfg(test)]
+            mod tests {
+                #[model]
+                pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A test-only item of any kind can hold a fixture model.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_items_of_every_kind() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[cfg(test)] fn a() { #[model] struct U { #[id] id: i64, #[encrypted] email: String } }
+            #[cfg(test)] impl X { fn b() { #[model] struct V { #[id] id: i64, #[encrypted] e: String } } }
+            struct X;
+            impl X {
+                #[cfg(test)] fn c() { #[model] struct W { #[id] id: i64, #[encrypted] f: String } }
+            }
+            trait T {
+                #[cfg(test)] fn d() { #[model] struct Y { #[id] id: i64, #[encrypted] g: String } }
+            }
+            #[cfg(test)] const K: () = { #[model] struct Z { #[id] id: i64, #[encrypted] h: String } };
+            #[cfg(test)] static S: () = { #[model] struct Q { #[id] id: i64, #[encrypted] i: String } };
+            #[cfg(test)] trait TT { fn e() { #[model] struct R { #[id] id: i64, #[encrypted] j: String } } }
+            "#,
+        )
+        .expect("parse");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// Blocks, locals and associated consts can be test-only too.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_expressions_and_consts() {
+        let found = parse_encrypted_columns(
+            r#"
+            fn f() {
+                #[cfg(test)] { #[model] struct U { #[id] id: i64, #[encrypted] a: String } }
+                match 1 { #[cfg(test)] _ => { #[model] struct A { #[id] id: i64, #[encrypted] k: String } } }
+                let _r = R { #[cfg(test)] f: { #[model] struct B { #[id] id: i64, #[encrypted] l: String } } };
+                #[cfg(test)] let _x = { #[model] struct V { #[id] id: i64, #[encrypted] b: String } };
+            }
+            enum EV { #[cfg(test)] V = { #[model] struct H { #[id] id: i64, #[encrypted] n: String } 0 } }
+            fn param(#[cfg(test)] x: [(); { #[model] struct M { #[id] id: i64, #[encrypted] q: String } 0 }]) {}
+            struct GP<#[cfg(test)] T = [(); { #[model] struct N { #[id] id: i64, #[encrypted] r: String } 0 }]>(T);
+            fn clo() { let _ = |#[cfg(test)] x: [(); { #[model] struct CL { #[id] id: i64, #[encrypted] s: String } 0 }]| {}; }
+            #[cfg(test)] extern "C" { static FX: [u8; { #[model] struct FM { #[id] id: i64, #[encrypted] t: String } 0 }]; }
+            struct TY;
+            impl TY { #[cfg(test)] type A = [(); { #[model] struct J { #[id] id: i64, #[encrypted] o: String } 0 }]; }
+            trait TT2 { #[cfg(test)] type B = [(); { #[model] struct K { #[id] id: i64, #[encrypted] p: String } 0 }]; }
+            #[cfg(test)] enum E { V = { #[model] struct G { #[id] id: i64, #[encrypted] m: String } 0 } }
+            struct X;
+            impl X {
+                #[cfg(test)] const C: () = { #[model] struct W { #[id] id: i64, #[encrypted] c: String } };
+            }
+            trait T {
+                #[cfg(test)] const D: () = { #[model] struct Y { #[id] id: i64, #[encrypted] d: String } };
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A file reached only through `#[cfg(test)] mod x;` is test code.
+    #[test]
+    fn encrypted_columns_skip_out_of_line_cfg_test_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "#[cfg(test)] mod tests;\n").unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A `#[path]` with `..` still names the walked file.
+    #[test]
+    fn encrypted_columns_skip_a_test_file_named_by_a_dotdot_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"nested/../fixtures.rs\"] mod fixtures;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+        assert_eq!(
+            normalize_lexically(Path::new("/a/./b/../c")),
+            Path::new("/a/c")
+        );
+    }
+
+    /// A module nested in a disabled inline module is disabled too.
+    #[test]
+    fn encrypted_columns_skip_files_under_a_disabled_inline_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod tests { mod fixtures; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests").join("fixtures.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A `#[cfg]` on a field turns that field off; the other alternative wins.
+    #[test]
+    fn encrypted_columns_ignore_cfg_disabled_fields() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct User {
+                #[id] pub id: i64,
+                #[cfg(not(test))] #[encrypted(deterministic)] pub email: String,
+                #[cfg(test)] #[encrypted] pub email: String,
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// `#[path]` moves a disabled module's file.
+    #[test]
+    fn encrypted_columns_skip_a_path_override_of_a_disabled_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"fixtures/special.rs\"] mod tests;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("special.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Exclusive declarations: the `#[path]` one is test code, the plain one is not.
+    #[test]
+    fn a_path_override_does_not_disable_the_conventional_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"fixtures/test_models.rs\"] mod models;\n#[cfg(not(test))] mod models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("test_models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A name declared for test and for production still loads in production.
+    #[test]
+    fn an_enabled_twin_keeps_the_conventional_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod models;\n#[cfg(not(test))] mod models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Two declarations of one custom path: the enabled one keeps it.
+    #[test]
+    fn an_enabled_twin_keeps_a_shared_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"models.rs\"] mod a;\n#[cfg(not(test))] #[path = \"models.rs\"] mod b;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A file no module reaches may still hold a stray model. Two modes for one
+    /// column is an error, not a last-wins merge.
+    #[test]
+    fn conflicting_encrypted_modes_are_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("z_fixture.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let err = parse_encrypted_columns_path(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, SchemaParseError::ConflictingEncryptedMode { ref column, .. } if column == "email"),
+            "{err:?}"
+        );
+    }
+
+    /// A symlinked model file or directory is followed, and a link back up the
+    /// tree does not loop.
+    #[cfg(unix)]
+    #[test]
+    fn encrypted_columns_follow_symlinked_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(
+            real.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(real.path().join("models.rs"), dir.path().join("models.rs"))
+            .unwrap();
+        std::os::unix::fs::symlink(real.path(), dir.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        std::os::unix::fs::symlink(real.path(), dir.path().join("alias")).unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Two models in one file that encrypt a column differently conflict too.
+    #[test]
+    fn conflicting_modes_in_one_file_are_an_error() {
+        let err = parse_encrypted_columns(
+            r#"
+            #[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }
+            #[cfg(feature = "fixtures")]
+            mod fixtures {
+                #[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SchemaParseError::ConflictingEncryptedMode { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// `lib.rs` disables a module that `main.rs` (another crate root) enables.
+    #[test]
+    fn another_crate_root_can_enable_a_disabled_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "#[cfg(test)] mod models;\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "mod models;\n").unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// An enabled file under a disabled module's directory stays production.
+    #[test]
+    fn an_enabled_path_under_a_disabled_directory_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod fixtures;\n#[path = \"fixtures/models.rs\"] mod production_models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Disabled and odd spellings the module and `cfg` helpers must survive.
+    #[test]
+    fn module_and_cfg_helpers_survive_odd_input() {
+        let attrs = |src: &str| syn::parse_str::<syn::ItemFn>(src).unwrap().attrs;
+        // A malformed `cfg_attr` or `cfg` keeps the item.
+        assert!(production_enabled(&attrs("#[cfg_attr] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg_attr(test)] fn f() {}")));
+        assert!(production_enabled(&attrs(
+            "#[cfg_attr(not(test), derive(Debug))] fn f() {}"
+        )));
+        assert!(production_enabled(&attrs(
+            "#[cfg_attr(not(test), cfg(feature = \"x\"))] fn f() {}"
+        )));
+        assert!(production_enabled(&attrs("#[cfg] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg(\"literal\")] fn f() {}")));
+        assert!(!production_enabled(&attrs("#[cfg(any())] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg(all())] fn f() {}")));
+        // A file-level `cfg(test)` empties the scan; an unparsable file adds nothing.
+        assert!(
+            parse_encrypted_columns(
+                "#![cfg(test)]\n#[model] pub struct U { #[encrypted] pub a: String }"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let dir = std::path::PathBuf::from("src");
+        let modules = disabled_module_paths(&[
+            (dir.join("bad.rs"), "fn {".to_owned()),
+            (
+                dir.join("lib.rs"),
+                "#![cfg(test)]\n#[path = 1] mod odd;\n#[cfg(test)] #[path] mod odd2;".to_owned(),
+            ),
+        ]);
+        assert!(modules.excludes(&dir.join("odd.rs")));
+        assert!(!modules.excludes(&dir.join("other.rs")));
+    }
+
+    /// A dangling symlink has no metadata and is skipped, not an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone.rs"), dir.path().join("dangling.rs"))
+            .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(!found["users"]["email"], "{found:?}");
+    }
+
+    /// A model in an inline module, at any depth, is still a model.
+    #[test]
+    fn encrypted_columns_are_found_in_inline_modules() {
+        let found = parse_encrypted_columns(
+            r#"
+            mod accounts {
+                pub mod inner {
+                    #[model]
+                    pub struct Account { #[id] pub id: i64, #[encrypted] pub token: String }
+                }
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found["accounts"].contains_key("token"), "{found:?}");
     }
 
     /// `#[diesel(column_name = ...)]` names the SQL column. Both spellings.

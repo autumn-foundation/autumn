@@ -15,10 +15,10 @@
 //!    for every POST *and* deletes those routes from the csrf dimension.
 //! 2. **Each finding carries a [`Finding::fingerprint`]**: the security-relevant
 //!    delta, escaped, and the only field besides kind/method/path that reaches
-//!    the acknowledgment digest. Human-facing `before`/`after` text stays out of
-//!    it, so a later *narrowing* on an already-acknowledged route does not
-//!    invalidate the acknowledgment, and no crafted route path can make one
-//!    finding hash like two.
+//!    the exact acknowledgment digest. Human-facing `before`/`after` text stays
+//!    out of it, and no crafted route path can make one finding hash like two.
+//!    A marker with a ceiling (see [`super::ceiling`]) drops the fingerprint of
+//!    route findings and orders the route posture instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -228,7 +228,7 @@ fn effective_posture(
 }
 
 /// The routes that demand a verified client certificate, by `(path, method)`.
-fn mtls_index(m: &PostureManifest) -> BTreeSet<RouteKey> {
+pub(super) fn mtls_index(m: &PostureManifest) -> BTreeSet<RouteKey> {
     m.dimensions
         .mtls
         .entries
@@ -262,7 +262,7 @@ fn postures_of(
 }
 
 /// The `#[authorize]` checks one route performs, sorted and deduplicated.
-fn checks_at(key: &RouteKey, bindings: &BTreeMap<AuthzKey, String>) -> Vec<String> {
+pub(super) fn checks_at(key: &RouteKey, bindings: &BTreeMap<AuthzKey, String>) -> Vec<String> {
     let mut checks: Vec<String> = bindings
         .keys()
         .filter(|(path, method, _, _)| (path, method) == (&key.0, &key.1))
@@ -310,7 +310,7 @@ fn diff_build(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Find
 }
 
 /// Index routes by `(path, method)`. Parsing refuses a duplicate key.
-fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, RouteEntry> {
+pub(super) fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, RouteEntry> {
     m.dimensions
         .routes
         .entries
@@ -1199,9 +1199,9 @@ const fn plural(n: usize) -> &'static str {
 /// does not put one untouched binding on both sides of the set difference —
 /// which read as a removal, and blocked a pull request that changed nothing.
 /// The path as the author wrote it is the value, for the finding's text.
-type AuthzKey = (String, String, String, String);
+pub(super) type AuthzKey = (String, String, String, String);
 
-fn authz_index(m: &PostureManifest) -> BTreeMap<AuthzKey, String> {
+pub(super) fn authz_index(m: &PostureManifest) -> BTreeMap<AuthzKey, String> {
     m.dimensions
         .authorization_policies
         .entries
@@ -1640,7 +1640,7 @@ fn report_displaced_bindings(
 /// outright: the head entry matched no base entry, and the disappearance check
 /// below could not catch it either, because `routes_after` holds normalized
 /// keys. The path as the author wrote it rides along for the finding's text.
-fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool, String)> {
+pub(super) fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool, String)> {
     let mut index: BTreeMap<RouteKey, (bool, bool, String)> = BTreeMap::new();
     for e in &m.dimensions.csrf.entries {
         let key = (normalize_captures(&e.path), e.method.clone());
@@ -4673,22 +4673,12 @@ mod tests {
         );
     }
 
-    /// **Any** later change to the route's posture re-asks for the
-    /// acknowledgment, including one that narrows it.
+    /// The exact digest asks again after **any** later change to the route,
+    /// narrowing included.
     ///
-    /// This asserted the opposite until the whole-posture binding landed, and
-    /// the reversal is deliberate rather than a broken test. The two properties
-    /// cannot both hold under a digest compared for equality: an acknowledgment
-    /// must not survive a constraint being *removed* after it was given, and
-    /// the digest is a function of the head posture alone, so it cannot tell a
-    /// constraint that appeared from one that vanished. Something has to give,
-    /// and re-asking after a narrowing costs a reviewer one comment on a diff
-    /// that shows exactly why, while the alternative loses a widening in
-    /// silence.
-    ///
-    /// Expressing "no wider than what I approved" needs the marker to carry the
-    /// approved posture ordinally rather than as a hash — a change to the
-    /// acknowledgment format, tracked in #2497.
+    /// A digest must be equal, so it cannot show if a constraint was added or
+    /// removed. It blocks to stay safe. A ceiling marker (#2497, see
+    /// `ceiling.rs`) allows narrowing.
     #[test]
     fn any_later_posture_change_re_asks_for_the_acknowledgment() {
         let base = routes_only(&route("/admin", "GET", "gated", &["admin"], &[], false));

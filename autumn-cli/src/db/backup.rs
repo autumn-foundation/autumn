@@ -1017,7 +1017,8 @@ fn verify_plain_dump(path: &Path, db: &str) -> Result<(), BackupError> {
 
 // ─── Restore ────────────────────────────────────────────────────────────────
 
-pub(super) fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
+/// Restore an artifact, returning the label of every target it wrote to.
+pub(super) fn restore(args: &RestoreArgs) -> Result<Vec<String>, BackupError> {
     // Production guard — identical to `autumn db drop` (AC #4). This guards the
     // RESTORE-TARGET profile (`--profile`), independent of any offsite source.
     let profile = migrate::effective_profile(args.profile.as_deref());
@@ -1045,7 +1046,7 @@ pub(super) fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
 /// Verify every selected artifact, then restore each into its resolved database.
 /// Shared by local and offsite restore so both go through the identical
 /// verify-all-before-mutate-any protocol (AC #4).
-fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<(), BackupError> {
+fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<Vec<String>, BackupError> {
     let format = plan.format;
     let entries = plan.select(args.shard.as_deref())?;
 
@@ -1105,7 +1106,7 @@ fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<(), Back
     }
 
     eprintln!("\n\u{2713} Restore complete ({} target(s)).", targets.len());
-    Ok(())
+    Ok(targets.into_iter().map(|(entry, _)| entry.label).collect())
 }
 
 /// Restore one artifact into one database.
@@ -1372,11 +1373,32 @@ pub(super) fn resolve_all_target_urls(
         .collect())
 }
 
+/// The target labels a local artifact restores, read before any restore runs.
+/// `None` for an offsite reference (resolved later) or an artifact that does
+/// not parse: the caller then assumes every target.
+pub(super) fn artifact_labels(artifact: &Path) -> Option<Vec<String>> {
+    if resolve_offsite_ref(false, &artifact.to_string_lossy()).is_some() {
+        return None;
+    }
+    let plan = RestorePlan::discover(artifact, None).ok()?;
+    Some(
+        plan.select(None)
+            .ok()?
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect(),
+    )
+}
+
 /// The profile a backup run directory was taken under, read from its
 /// `manifest.json`. `None` for a bare single-file artifact (which carries no
 /// manifest) or an unreadable/invalid manifest — callers treat absence as
 /// "unknown provenance", never as "safe".
 pub(super) fn artifact_source_profile(artifact: &Path) -> Option<String> {
+    // An offsite reference names its source profile.
+    if let Some(Ok(offsite)) = resolve_offsite_ref(false, &artifact.to_string_lossy()) {
+        return Some(offsite.profile);
+    }
     artifact
         .is_dir()
         .then(|| read_manifest(artifact).ok())
@@ -2791,7 +2813,7 @@ fn is_safe_leaf_name(name: &str) -> bool {
 /// Download the referenced offsite run to a fresh temp dir and restore from it
 /// via the identical [`RestorePlan::discover`] path (AC #4). The temp dir is
 /// removed when the guard drops (after the restore completes or fails).
-fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), BackupError> {
+fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<Vec<String>, BackupError> {
     // Canonicalize the profile so the REMOTE key prefix matches what upload wrote
     // (P2 #22): `offsite:production/latest` reads the same `prod/…` prefix that
     // `--profile production` uploaded under.
@@ -3808,6 +3830,37 @@ mod tests {
     }
 
     #[test]
+    fn artifact_labels_names_the_manifest_targets_before_a_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            &Manifest {
+                autumn_version: "0".to_owned(),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                profile: "prod".to_owned(),
+                format: "custom".to_owned(),
+                targets: vec![ManifestTarget {
+                    label: "shard:a".to_owned(),
+                    file: "shard-a.dump".to_owned(),
+                    database: "a".to_owned(),
+                    backend: "postgres".to_owned(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_labels(dir.path()),
+            Some(vec!["shard:a".to_owned()])
+        );
+        assert_eq!(
+            artifact_labels(Path::new("offsite:prod/latest")),
+            None,
+            "an offsite reference resolves later"
+        );
+        assert_eq!(artifact_labels(&dir.path().join("missing")), None);
+    }
+
+    #[test]
     fn restore_plan_select_filters_to_named_shard() {
         let plan = RestorePlan {
             dir: PathBuf::from("/x"),
@@ -4760,6 +4813,15 @@ mod tests {
                 selector: OffsiteSelector::Exact("20260710T040506Z".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn an_offsite_reference_names_its_source_profile() {
+        assert_eq!(
+            artifact_source_profile(Path::new("offsite:prod/latest")).as_deref(),
+            Some("prod")
+        );
+        assert_eq!(artifact_source_profile(Path::new("offsite:bad")), None);
     }
 
     #[test]

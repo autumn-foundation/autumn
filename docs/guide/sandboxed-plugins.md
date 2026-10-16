@@ -212,6 +212,7 @@ Every one of these is a hard error, not a warning:
 | a module that exports no linear memory named `memory`, or whose *initial* memory is already over the manifest's ceiling | every host function reads and writes through that export, so without it the plugin loads and then fails every request |
 | two routes that are one route to the router (`/{a}` and `/{b}`) | same |
 | a route path with a second spelling — `/a/./b`, `/a/%2e/b`, `/a%2Fb`, `/%74ransfer`, lower-case hex like `%c3%a9` | a client or proxy normalises it to another path, so the router's collision check would not see that it names an app route (#2463) |
+| a literal non-ASCII route path — `/café` | a client sends `/caf%C3%A9`, so the literal route is unreachable while the consent screen lists it. Write `/caf%C3%A9` (#2481). |
 | a version or route path carrying a control character | both are printed on the consent screen, where an escape sequence can rewrite what you read |
 | a digest that is not 64 lowercase hex characters | it is the only thing binding manifest to bytes |
 

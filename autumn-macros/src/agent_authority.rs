@@ -68,6 +68,7 @@
 //!
 //! See `docs/guide/agent-authority.md` for the user-facing guide.
 
+use autumn_macros_support::cascade::CASCADE_LEVELS;
 use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
@@ -869,6 +870,10 @@ struct Analyzer {
     effects: Vec<Effect>,
     /// De-duplication keys for the above.
     seen: HashSet<(Kind, String)>,
+    /// Repositories whose cascading delete the handler calls: the repository
+    /// path, the model's human name, and the call's span. One entry per
+    /// repository.
+    cascades: Vec<(syn::Path, String, Span)>,
     /// Sites the author asserted effect-free with `#[agent_effect(none, ...)]`.
     ///
     /// The span carries the emitted `file!():line!()` (the same trick the
@@ -1038,6 +1043,7 @@ impl Analyzer {
             diesel_fns: HashMap::new(),
             effects: Vec::new(),
             seen: HashSet::new(),
+            cascades: Vec::new(),
             effect_free_sites: Vec::new(),
             errors: Vec::new(),
             error_keys: HashSet::new(),
@@ -2671,6 +2677,7 @@ impl Analyzer {
                 _ => Provenance::Syntactic,
             };
             self.record(kind, model.clone(), provenance, method.method.span());
+            self.note_cascade(&name, model, method.method.span());
         }
     }
 
@@ -3576,8 +3583,23 @@ impl Analyzer {
             Subject::ModelIdent(..) => Provenance::TypeResolved,
             _ => Provenance::Syntactic,
         };
-        self.record(kind, model, provenance, span);
+        self.record(kind, model.clone(), provenance, span);
+        self.note_cascade(name, &model, span);
         true
+    }
+
+    /// A delete that runs the `dependent(...)` cascade also writes the models
+    /// the cascade names. Remember the repository once, for the grant check.
+    fn note_cascade(&mut self, method: &str, model: &Subject, span: Span) {
+        if CASCADING_METHODS.contains(&method)
+            && let Subject::ModelIdent(path, human) = model
+            && !self
+                .cascades
+                .iter()
+                .any(|(seen, ..)| path_string(seen) == path_string(path))
+        {
+            self.cascades.push((path.clone(), human.clone(), span));
+        }
     }
 
     /// Record a job effect, or refuse a job whose name is not compile-known.
@@ -4358,6 +4380,10 @@ const WEBHOOK_TOPIC_ARG: usize = 1;
 /// whose receiver syn keeps out of the argument list.
 const JOB_NAME_ARG: usize = 0;
 
+/// Repository methods that run the `dependent(...)` cascade: they also write
+/// every model a non-`restrict` dependent names.
+const CASCADING_METHODS: &[&str] = &["delete_by_id", "delete_many"];
+
 const SQL_READ_STATEMENTS: &[&str] = &["SELECT", "WITH"];
 
 /// Leading keywords that change rows or schema. Schema statements are folded
@@ -4387,7 +4413,8 @@ fn raw_sql_call(root: &Expr) -> Option<&ExprCall> {
 
 /// Read a raw SQL statement's kind and table. `None` when neither can be read.
 fn classify_sql(sql: &str) -> Option<SqlStatement> {
-    let words = sql_words(sql);
+    let tokens = sql_tokens(sql);
+    let words = words_of(&tokens);
     let first = words.first()?.to_ascii_uppercase();
     // `ON CONFLICT DO UPDATE` and `FOR [NO KEY] UPDATE` repeat a keyword
     // without naming a second table.
@@ -4413,9 +4440,10 @@ fn classify_sql(sql: &str) -> Option<SqlStatement> {
         if !writes.is_empty() {
             let mut tables = Vec::new();
             for at in writes {
-                let table = sql_table(&words, at)?;
-                if !tables.contains(&table) {
-                    tables.push(table);
+                for table in sql_write_tables(&tokens, &words, at)? {
+                    if !tables.contains(&table) {
+                        tables.push(table);
+                    }
                 }
             }
             return Some(SqlStatement::Write { tables });
@@ -4425,9 +4453,7 @@ fn classify_sql(sql: &str) -> Option<SqlStatement> {
         });
     }
     if SQL_WRITE_STATEMENTS.contains(&first.as_str()) {
-        return sql_table(&words, 0).map(|table| SqlStatement::Write {
-            tables: vec![table],
-        });
+        return sql_write_tables(&tokens, &words, 0).map(|tables| SqlStatement::Write { tables });
     }
     None
 }
@@ -4454,22 +4480,75 @@ fn is_lock_upsert_or_merge_action(words: &[String], at: usize) -> bool {
     }
 }
 
+/// Modifiers that sit between a keyword and the table name.
+const SQL_NAME_MODIFIERS: &[&str] = &[
+    "IF",
+    "EXISTS",
+    "NOT",
+    "ONLY",
+    "CONCURRENTLY",
+    "TEMP",
+    "TEMPORARY",
+    "UNLOGGED",
+    "TABLE",
+];
+
+/// Every table the write keyword at word `at` changes. `TRUNCATE a, b` and
+/// `DROP TABLE a, b` name a list; every other write names one table.
+fn sql_write_tables(tokens: &[String], words: &[String], at: usize) -> Option<Vec<String>> {
+    let first = sql_table(words, at)?;
+    let keyword = words[at].to_ascii_uppercase();
+    if !matches!(keyword.as_str(), "TRUNCATE" | "DROP") {
+        return Some(vec![first]);
+    }
+    // Map the word index back to its token, then walk `, name` pairs.
+    let mut seen = 0;
+    let start = tokens.iter().position(|token| {
+        let hit = token != "," && seen == at;
+        seen += usize::from(token != ",");
+        hit
+    })?;
+    let mut tables = vec![first];
+    let mut rest = tokens.iter().skip(start + 1).peekable();
+    while rest
+        .next_if(|t| SQL_NAME_MODIFIERS.contains(&t.to_ascii_uppercase().as_str()))
+        .is_some()
+    {}
+    rest.next();
+    rest.next_if(|t| t.as_str() == "*");
+    while rest.next_if(|t| t.as_str() == ",").is_some() {
+        while rest
+            .next_if(|t| SQL_NAME_MODIFIERS.contains(&t.to_ascii_uppercase().as_str()))
+            .is_some()
+        {}
+        // A list entry that is not a plain name cannot be read: fail closed.
+        tables.push(normalise_table(rest.next()?)?);
+        // `name *` includes the descendants; it names no further table.
+        rest.next_if(|t| t.as_str() == "*");
+    }
+    // Only option words may follow the list. Anything else is a name the
+    // reader did not understand, or a second statement: refuse. `TRUNCATE ..
+    // CASCADE` also empties every table that references the list, so it is
+    // refused too.
+    for token in rest {
+        let word = token.to_ascii_uppercase();
+        let cascade_ok = keyword == "DROP" && word == "CASCADE";
+        if !cascade_ok
+            && !matches!(
+                word.as_str(),
+                "RESTART" | "CONTINUE" | "IDENTITY" | "RESTRICT"
+            )
+        {
+            return None;
+        }
+    }
+    Some(tables)
+}
+
 /// The table a statement acts on, read forward from its governing keyword.
 fn sql_table(words: &[String], from: usize) -> Option<String> {
     /// The keywords a table name follows.
     const ANCHORS: &[&str] = &["INTO", "UPDATE", "FROM", "TABLE"];
-    /// Modifiers that sit between the anchor and the name.
-    const SKIP: &[&str] = &[
-        "IF",
-        "EXISTS",
-        "NOT",
-        "ONLY",
-        "CONCURRENTLY",
-        "TEMP",
-        "TEMPORARY",
-        "UNLOGGED",
-        "TABLE",
-    ];
     let mut index = words
         .iter()
         .enumerate()
@@ -4482,7 +4561,7 @@ fn sql_table(words: &[String], from: usize) -> Option<String> {
         .unwrap_or(from + 1);
     while words
         .get(index)
-        .is_some_and(|word| SKIP.contains(&word.to_ascii_uppercase().as_str()))
+        .is_some_and(|word| SQL_NAME_MODIFIERS.contains(&word.to_ascii_uppercase().as_str()))
     {
         index += 1;
     }
@@ -4502,14 +4581,19 @@ fn normalise_table(word: &str) -> Option<String> {
     .then(|| name.to_string())
 }
 
-/// Split a statement into words, with comments removed and punctuation that
-/// can abut a table name treated as a separator.
-fn sql_words(sql: &str) -> Vec<String> {
-    strip_sql_comments(sql)
-        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
-        .filter(|word| !word.is_empty())
+/// Split a statement into tokens, with comments removed. Punctuation that can
+/// abut a table name is a separator; a comma stays as its own `,` token.
+fn sql_tokens(sql: &str) -> Vec<String> {
+    let text = strip_sql_comments(sql).replace(',', " , ");
+    text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ';'))
+        .filter(|token| !token.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+/// The tokens without commas.
+fn words_of(tokens: &[String]) -> Vec<String> {
+    tokens.iter().filter(|t| *t != ",").cloned().collect()
 }
 
 /// Remove `--` line comments and `/* … */` blocks, so neither can hide the
@@ -5633,8 +5717,34 @@ pub fn agent_operable_macro(attr: TokenStream, item: TokenStream) -> TokenStream
         effects,
         errors,
         effect_free_sites,
+        cascades,
         ..
     } = analyzer;
+
+    // A delete through a generated repository also writes the models its
+    // `dependent(...)` cascade names. Each must be in the grant. The list is a
+    // const the repository publishes, so the check holds across crates.
+    let cascade_assertions = cascades.iter().map(|(repo, human, span)| {
+        let message = format!(
+            "agent authority: `{action}` deletes through the `{human}` repository, whose \
+             `dependent(...)` cascade also writes models grant `{grant_name}` does not \
+             allow.\n\nAdd every dependent model to the grant's `writes: [...]`, make the \
+             association `restrict`, or move the delete out of the agent-operable handler. {GUIDE}"
+        );
+        let too_deep = format!(
+            "agent authority: `{action}` deletes through the `{human}` repository, whose \
+             `dependent(...)` cascade is deeper than {CASCADE_LEVELS} levels, or loops.\n\n\
+             Grant `{grant_name}` cannot cover what Autumn cannot list. Make a leg \
+             `restrict`, or move the delete out of the agent-operable handler. {GUIDE}"
+        );
+        quote_spanned! { *span=>
+            const _: () = ::core::assert!(
+                #grant.allows_writes_all(#repo::__AUTUMN_CASCADE_3.models),
+                #message
+            );
+            const _: () = ::core::assert!(!#repo::__AUTUMN_CASCADE_3.more, #too_deep);
+        }
+    });
 
     // One respanned const assertion per proved effect: const-eval sees the
     // linked `Grant`, so the check holds even when the grant is declared in
@@ -5827,6 +5937,8 @@ pub fn agent_operable_macro(attr: TokenStream, item: TokenStream) -> TokenStream
         #registration
 
         #(#assertions)*
+
+        #(#cascade_assertions)*
 
         #floor_assertion
 
@@ -7262,6 +7374,158 @@ mod tests {
                 schedule!();
                 Ok(())
             }",
+        ),
+        (
+            "opaque macro bound by let with no handle",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let x = schedule!();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as the tail expression",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!()
+            }",
+        ),
+        (
+            "opaque macro under the try operator",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!()?;
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a call argument",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                keep(schedule!());
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a method receiver",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!().ok();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a return",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                return schedule!();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in an if condition",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                if schedule!() { noop(); }
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a match scrutinee",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                match schedule!() { _ => {} }
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a struct field",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = Wrapper { f: schedule!() };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a closure body",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let c = || schedule!(); c();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a block tail",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = { schedule!() };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a reference",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                keep(&schedule!());
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a let else",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let Some(v) = schedule!() else { return Ok(()) };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in an array",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = [schedule!()];
+                Ok(())
+            }",
+        ),
+        (
+            "raw truncate of two tables",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("TRUNCATE allowed, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "raw truncate with an inheritance marker",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("TRUNCATE allowed *, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "raw drop of two tables",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("DROP TABLE allowed, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
         ),
         (
             "unread future handed to timeout",
@@ -8999,6 +9263,92 @@ mod tests {
                 && !expansion.contains("EffectProvenance :: Syntactic"),
             "a proof must not demote a declaration: {expansion}"
         );
+    }
+
+    fn cascade_assertions(handler: &str) -> usize {
+        expand(GRANT, handler).matches("allows_writes_all").count()
+    }
+
+    #[test]
+    fn a_repository_delete_is_checked_against_its_cascade() {
+        for call in ["repo.delete_by_id(1)", "repo.delete_many(&ids)"] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            let expansion = expand(GRANT, &handler);
+            assert!(
+                expansion.contains("PgRefundRepository :: __AUTUMN_CASCADE_3 . models"),
+                "{call}: {expansion}"
+            );
+            assert!(
+                expansion.contains("allows_writes_all"),
+                "{call}: {expansion}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ufcs_delete_is_checked_against_its_cascade() {
+        for call in [
+            "PgRefundRepository::delete_by_id(&repo, 1)",
+            "PgRefundRepository::delete_many(&repo, &ids)",
+        ] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            let expansion = expand(GRANT, &handler);
+            assert!(
+                expansion.contains("PgRefundRepository :: __AUTUMN_CASCADE_3 . models"),
+                "{call}: {expansion}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cascade_is_checked_once_per_repository() {
+        assert_eq!(
+            cascade_assertions(
+                r"async fn h(repo: PgRefundRepository) -> R {
+                    repo.delete_by_id(1).await?;
+                    repo.delete_many(&ids).await?;
+                    Ok(())
+                }"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_write_that_cascades_nothing_adds_no_cascade_check() {
+        for call in ["repo.create(&b)", "repo.save(&b)", "repo.find_by_id(1)"] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            assert_eq!(cascade_assertions(&handler), 0, "{call}");
+        }
+    }
+
+    #[test]
+    fn a_table_list_records_every_table() {
+        let tables = |sql: &str| match classify_sql(sql) {
+            Some(SqlStatement::Write { tables }) => Some(tables),
+            _ => None,
+        };
+        let two = Some(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(tables("TRUNCATE TABLE ONLY a, b RESTART IDENTITY"), two);
+        assert_eq!(tables("DROP TABLE IF EXISTS a, \"b\" CASCADE"), two);
+        assert_eq!(
+            tables("TRUNCATE a RESTART IDENTITY"),
+            Some(vec!["a".into()])
+        );
+        assert_eq!(tables("TRUNCATE a *, b *"), two);
+        assert_eq!(tables("DROP TABLE a, b CASCADE"), two);
+        // `TRUNCATE .. CASCADE` reaches tables it does not name.
+        assert_eq!(tables("TRUNCATE a CASCADE"), None);
+        // A name the reader does not understand, or a second statement.
+        assert_eq!(tables("TRUNCATE public . a, secrets"), None);
+        assert_eq!(tables("TRUNCATE \"my table\", secrets"), None);
+        assert_eq!(tables("TRUNCATE temp, payouts"), None);
+        assert_eq!(tables("DROP TABLE a; DROP TABLE b"), None);
+        // An entry that is not a plain name cannot be read: refuse.
+        assert_eq!(tables("TRUNCATE a, $1"), None);
     }
 
     #[test]

@@ -133,18 +133,43 @@ pub trait DnsProvider: Send + Sync {
     /// Same contract as [`upsert_txt_batch`](Self::upsert_txt_batch) in reverse:
     /// a set-replacing provider must remove all values sharing a name in one
     /// change, or the second removal's stale read resurrects the first value.
+    ///
+    /// Best-effort: every record is attempted. The failures come back together
+    /// in one error (issue #2478).
     fn delete_txt_batch<'a>(
         &'a self,
         records: &'a [TxtRecord],
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            let mut errors = Vec::new();
             for record in records {
-                self.delete_txt(record).await?;
+                if let Err(e) = self.delete_txt(record).await {
+                    errors.push(format!("{}: {e}", record.fqdn));
+                }
             }
-            Ok(())
+            join_errors(&errors)
         })
     }
 }
+
+/// `Ok` when `errors` is empty, else one error that lists them all.
+///
+/// The list is cut to [`MAX_JOINED_ERROR_CHARS`], because the text reaches
+/// `/actuator/health` and the alert destination.
+pub(crate) fn join_errors(errors: &[String]) -> Result<(), String> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let joined = errors.join("; ");
+    if joined.chars().count() <= MAX_JOINED_ERROR_CHARS {
+        return Err(joined);
+    }
+    let cut: String = joined.chars().take(MAX_JOINED_ERROR_CHARS).collect();
+    Err(format!("{cut}…"))
+}
+
+/// The most text `join_errors` returns.
+const MAX_JOINED_ERROR_CHARS: usize = 4 * UPSTREAM_EXCERPT_CHARS;
 
 /// How much text copied from a DNS provider (an API error body, a hook's
 /// `stderr`) may reach an operator-facing message.
@@ -760,5 +785,62 @@ mod tests {
         let err = validate_credential(AcmeDnsProvider::Route53, "acme_dns", &credential)
             .expect_err("missing secret_access_key");
         assert!(!err.contains("AKIAEXAMPLE"), "leaked: {err}");
+    }
+
+    /// #2478: the default batch removal attempts every record.
+    #[tokio::test]
+    async fn default_batch_removal_attempts_every_record() {
+        use std::sync::Mutex;
+
+        struct Flaky(Mutex<Vec<String>>);
+        impl DnsProvider for Flaky {
+            fn name(&self) -> &'static str {
+                "flaky"
+            }
+            fn upsert_txt<'a>(&'a self, _: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn delete_txt<'a>(&'a self, r: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>> {
+                self.0.lock().unwrap().push(r.value.clone());
+                let fail = r.value.starts_with("bad");
+                Box::pin(async move {
+                    if fail {
+                        Err(format!("{} failed", r.value))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }
+
+        let provider = Flaky(Mutex::new(Vec::new()));
+        assert_eq!(provider.name(), "flaky");
+        provider
+            .upsert_txt(&TxtRecord::new("a.example", "v"))
+            .await
+            .unwrap();
+        let err = provider
+            .delete_txt_batch(&[
+                TxtRecord::new("a.example", "bad1"),
+                TxtRecord::new("b.example", "good"),
+                TxtRecord::new("c.example", "bad2"),
+            ])
+            .await
+            .expect_err("two removals fail");
+
+        assert_eq!(*provider.0.lock().unwrap(), ["bad1", "good", "bad2"]);
+        assert!(err.contains("a.example: bad1 failed"), "{err}");
+        assert!(
+            err.contains("bad1 failed") && err.contains("bad2 failed"),
+            "{err}"
+        );
+    }
+    #[test]
+    fn join_errors_joins_and_bounds_the_list() {
+        assert_eq!(join_errors(&[]), Ok(()));
+        assert_eq!(join_errors(&["a".into(), "b".into()]), Err("a; b".into()));
+        let long = "x".repeat(MAX_JOINED_ERROR_CHARS);
+        let err = join_errors(&[long.clone(), long]).unwrap_err();
+        assert_eq!(err.chars().count(), MAX_JOINED_ERROR_CHARS + 1);
     }
 }

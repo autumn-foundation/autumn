@@ -2508,6 +2508,59 @@ mod tests {
         }
     }
 
+    /// #2478: a nameserver one resolver cannot resolve is still found
+    /// through the next resolver.
+    #[tokio::test]
+    async fn a_nameserver_one_resolver_cannot_resolve_is_not_dropped() {
+        struct SplitView;
+        impl DnsLookup for SplitView {
+            fn query<'a>(
+                &'a self,
+                server: SocketAddr,
+                name: &'a str,
+                qtype: u16,
+                _recursion_desired: bool,
+            ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+                let owner = normalize_name(name);
+                let record = |rtype, rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                let records = match (qtype, owner.as_str(), server.port()) {
+                    (QTYPE_NS, "clientco.com", _) => vec![
+                        record(QTYPE_NS, Rdata::Name("ns1.test".to_owned())),
+                        record(QTYPE_NS, Rdata::Name("ns2.test".to_owned())),
+                    ],
+                    (QTYPE_A, "ns1.test", _) => {
+                        vec![record(QTYPE_A, Rdata::A([192, 0, 2, 1].into()))]
+                    }
+                    // Only the second resolver can resolve `ns2.test`.
+                    (QTYPE_A, "ns2.test", 2) => {
+                        vec![record(QTYPE_A, Rdata::A([192, 0, 2, 2].into()))]
+                    }
+                    _ => Vec::new(),
+                };
+                Box::pin(async move { Ok(DnsAnswer { rcode: 0, records }) })
+            }
+        }
+
+        let mut found = authoritative_resolvers(
+            "_acme-challenge.clientco.com",
+            &[resolver(1), resolver(2)],
+            &SplitView,
+        )
+        .await;
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                SocketAddr::from(([192, 0, 2, 1], 53)),
+                SocketAddr::from(([192, 0, 2, 2], 53)),
+            ]
+        );
+    }
+
     // Codex review on #2936: a zone whose nameservers have only IPv6
     // addresses is still found.
     #[tokio::test]
