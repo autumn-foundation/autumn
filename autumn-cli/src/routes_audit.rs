@@ -50,7 +50,12 @@ use crate::routes;
 /// audited binary was built with. Two builds can mount different routes, so
 /// the reader must know which build the manifest describes. A document
 /// without `build` came from a dev build with default features.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
+///
+/// v6 (#2468) adds `provenance` to each route entry: `declared` when a layer
+/// guard (`AppBuilder::scoped_guarded`) is the app's claim rather than a macro
+/// proof. A reader that predates it would read such a `gated` route as proven,
+/// so the bump makes an older CLI refuse the manifest instead.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 6;
 
 /// Options controlling `autumn routes audit`.
 pub struct AuditOptions<'a> {
@@ -143,7 +148,7 @@ pub enum Provenance {
     RuntimeOnly,
 }
 
-/// Top-level security manifest (schema v5).
+/// Top-level security manifest (schema v6).
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -1172,7 +1177,7 @@ mod tests {
         assert_eq!(manifest.dimensions.routes.entries[0].provenance, "provable");
 
         let json: serde_json::Value = serde_json::from_str(&manifest_json(&manifest)).unwrap();
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["schema_version"], 6);
         let entry = &json["dimensions"]["routes"]["entries"][0];
         for key in [
             "path",
@@ -1313,7 +1318,7 @@ mod tests {
         let sec = security_dump(true, &[]);
         let json = manifest_value(&build_manifest(&routes, Some(&sec)));
 
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["schema_version"], 6);
         assert_eq!(json["dimensions"]["routes"]["provenance"], "provable");
         assert_eq!(
             json["dimensions"]["routes"]["source"],
@@ -2189,7 +2194,7 @@ mod tests {
     fn manifest_records_the_default_build() {
         let m = build_manifest(&[route("GET", "/a", "a", "public")], None);
         let v = manifest_value(&m);
-        assert_eq!(v["schema_version"], 5);
+        assert_eq!(v["schema_version"], 6);
         assert_eq!(
             v["build"],
             serde_json::json!({

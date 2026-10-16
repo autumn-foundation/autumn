@@ -40,7 +40,13 @@ pub const MIN_SCHEMA_VERSION: u32 = 3;
 /// v5 (#2472) *adds* the top-level `build`. A v3 or v4 manifest has none, and
 /// reads as the dev build with default features, which is the only build
 /// those versions could come from.
-pub const MAX_SCHEMA_VERSION: u32 = 5;
+///
+/// v6 (#2468) *adds* `provenance` to each route entry, and that is the one
+/// addition that cannot be read tolerantly: a CLI without the field would
+/// read a `declared` layer guard as a proven one and miss the downgrade. So
+/// the bump exists to make an older CLI refuse the manifest. A v3 to v5
+/// manifest has no per-entry `provenance`, and every guard in it was proven.
+pub const MAX_SCHEMA_VERSION: u32 = 6;
 
 // Deliberately a literal, not `MANIFEST_SCHEMA_VERSION`. Tracking the emitter
 // would auto-widen what this differ accepts on the very bump whose doc comment

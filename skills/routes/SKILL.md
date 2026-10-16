@@ -132,7 +132,7 @@ The audit builds the dev profile with default features unless told otherwise.
 A route behind `#[cfg(not(debug_assertions))]` or a feature is only in the
 manifest when the audit builds it, so audit the build you deploy:
 `autumn routes audit --release` (issue #2472). The
-manifest (schema v5) records the build in a top-level `build` object, and
+manifest (schema v5 and later) records the build in a top-level `build` object, and
 `routes posture diff` reports `build_changed` as a widening when two manifests
 come from different builds.
 

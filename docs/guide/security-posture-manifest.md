@@ -11,7 +11,7 @@ runtime. Reading the manifest starts with reading these tags.
 
 ```json
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "build": { "profile": "release", "features": [], "all_features": false, "no_default_features": false },
   "dimensions": {
     "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]", "entries": [ … ] },
@@ -145,6 +145,11 @@ app mounted its group with `AppBuilder::scoped_guarded`. The macros did not prov
 that guard. Its entry says `"provenance": "declared"`. When any entry is
 declared, the `routes` dimension is `declared` too, and its `source` ends with
 `declared:scoped_guarded`. See [Route Auth Coverage](route-auth-coverage.md).
+
+The per-entry `provenance` is schema v6. An older `autumn` CLI would read a
+declared guard as a proven one, so it refuses a v6 manifest and asks you to
+upgrade. A v3 to v5 manifest has no per-entry `provenance`: every guard in it
+was proven.
 
 **Example — an `#[authorize]` binding in the `authorization_policies`
 dimension.** Where `routes` answers "is this endpoint guarded at all?", this
