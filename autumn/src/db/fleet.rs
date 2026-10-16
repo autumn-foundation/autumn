@@ -508,6 +508,9 @@ pub(crate) struct FleetMigrations {
     history: Vec<Vec<(String, String)>>,
     /// Whether opening an existing database applies its pending migrations.
     apply_on_open: bool,
+    /// Whether a database that records a version none of the sets has is
+    /// refused. See [`DatabaseFleetBuilder::refuse_unknown_migrations`].
+    refuse_unknown: bool,
 }
 
 impl FleetMigrations {
@@ -548,7 +551,26 @@ impl FleetMigrations {
             disambiguated,
             history,
             apply_on_open,
+            refuse_unknown: false,
         }
+    }
+
+    /// The versions the sets record, substitutes included. Sorted.
+    fn known_versions(&self) -> Vec<String> {
+        let mut versions: Vec<String> = self
+            .history
+            .iter()
+            .flatten()
+            .map(|(version, name)| {
+                self.disambiguated
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| version.clone())
+            })
+            .collect();
+        versions.sort();
+        versions.dedup();
+        versions
     }
 
     /// Migrations in the selected sets, which a new database receives.
@@ -573,7 +595,26 @@ impl FleetMigrations {
         // Every set in one run, under one `BEGIN IMMEDIATE`: a failure in a
         // later set rolls back the earlier ones too, so a database is never
         // left part-way through an upgrade.
-        let result = crate::migrate::run_pending_sqlite_quiet(url, self.chained()).map_err(fail)?;
+        let known = self.refuse_unknown.then(|| self.known_versions());
+        // The check reads the file the run migrates, under its write lock.
+        let guard = |recorded: &[String]| {
+            let unknown: Vec<&str> = known.as_ref().map_or_else(Vec::new, |known| {
+                recorded
+                    .iter()
+                    .filter(|v| known.binary_search(v).is_err())
+                    .map(String::as_str)
+                    .collect()
+            });
+            if unknown.is_empty() {
+                return Ok(());
+            }
+            Err(format!(
+                "records migrations that none of the sets has: {}",
+                unknown.join(", ")
+            ))
+        };
+        let result =
+            crate::migrate::run_pending_sqlite_guarded(url, self.chained(), guard).map_err(fail)?;
         for migration in &result.applied {
             tracing::info!(database = %name, migration = %migration, "fleet migration applied");
         }
@@ -780,6 +821,7 @@ pub struct DatabaseFleetBuilder {
     connect_timeout_secs: u64,
     migrations: Vec<FleetSet>,
     apply_on_open: bool,
+    refuse_unknown: bool,
 }
 
 impl DatabaseFleetBuilder {
@@ -824,6 +866,16 @@ impl DatabaseFleetBuilder {
         self
     }
 
+    /// Refuse to migrate a database that records a version none of the sets
+    /// has (a plugin's set, say). The check reads the migrated file under its
+    /// write lock. For a tool with only some of the app's sets (`autumn fleet
+    /// migrate`). Default: `false`.
+    #[must_use]
+    pub const fn refuse_unknown_migrations(mut self, refuse: bool) -> Self {
+        self.refuse_unknown = refuse;
+        self
+    }
+
     /// How long a database stays open after its last use before LRU may
     /// close it. Default: [`DEFAULT_MIN_RESIDENCY`].
     #[must_use]
@@ -846,7 +898,8 @@ impl DatabaseFleetBuilder {
     /// [`FleetError::InvalidKey`] for a bad template, [`FleetError::Io`] when
     /// the root cannot be created.
     pub fn build(self) -> Result<DatabaseFleet, FleetError> {
-        let migrations = FleetMigrations::from_sets(self.migrations, self.apply_on_open);
+        let mut migrations = FleetMigrations::from_sets(self.migrations, self.apply_on_open);
+        migrations.refuse_unknown = self.refuse_unknown;
         DatabaseFleet::from_parts(
             &self.config,
             self.connect_timeout_secs,
@@ -866,6 +919,7 @@ impl DatabaseFleet {
             connect_timeout_secs: 5,
             migrations: Vec::new(),
             apply_on_open: true,
+            refuse_unknown: false,
         }
     }
 
@@ -2319,22 +2373,7 @@ impl DatabaseFleet {
     /// fleet does not have (a plugin's, say).
     #[must_use]
     pub fn known_migration_versions(&self) -> Vec<String> {
-        let migrations = &self.inner.migrations;
-        let mut versions: Vec<String> = migrations
-            .history
-            .iter()
-            .flatten()
-            .map(|(version, name)| {
-                migrations
-                    .disambiguated
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| version.clone())
-            })
-            .collect();
-        versions.sort();
-        versions.dedup();
-        versions
+        self.inner.migrations.known_versions()
     }
 
     /// Apply the pending migrations of one database on disk, without opening
@@ -4201,6 +4240,45 @@ mod tests {
             pending.open(&FleetDbKey::Slot(2)).await,
             Err(FleetError::PendingMigrations { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn refuse_unknown_migrations_checks_the_migrated_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A set the next fleet does not have, as a plugin's.
+        let full = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .migrations(
+                "version-history",
+                crate::version_history::VERSION_HISTORY_MIGRATIONS,
+            )
+            .migrations("derivations", crate::derivation::DERIVATION_MIGRATIONS)
+            .build()
+            .unwrap();
+        full.open(&FleetDbKey::Slot(1)).await.unwrap();
+        full.close_all().await;
+
+        let partial = |refuse| {
+            DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+                .migrations(
+                    "version-history",
+                    crate::version_history::VERSION_HISTORY_MIGRATIONS,
+                )
+                .apply_migrations_on_open(false)
+                .refuse_unknown_migrations(refuse)
+                .build()
+                .unwrap()
+        };
+        let key = FleetDbKey::Slot(1);
+        match partial(true).migrate(&key).await {
+            Err(FleetError::Migration { detail, .. }) => {
+                assert!(detail.contains("none of the sets"), "{detail}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let report = partial(true).migrate_keys(vec![key.clone()], 1).await;
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        // The default does not check.
+        assert_eq!(partial(false).migrate(&key).await.unwrap(), 0);
     }
 
     #[test]

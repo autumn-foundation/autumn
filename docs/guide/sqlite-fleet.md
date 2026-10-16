@@ -178,7 +178,9 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   migration has the same version as a framework migration, `migrate` stops:
   only boot can record that pair correctly. `migrate` also stops when a
   database records a migration that is not in `migrations/` or the framework
-  sets (a plugin migration, for example). After you add a plugin, run the app once
+  sets (a plugin migration, for example). It checks each database again
+  inside the migration's write lock, so a file replaced after the first check
+  is not migrated. After you add a plugin, run the app once
   with `AUTUMN_MIGRATE=1` before you use `fleet migrate`: until then, no
   database records the plugin's migrations, so `migrate` cannot see them.
 - A failure on one database does not stop the others. `migrate` lists each

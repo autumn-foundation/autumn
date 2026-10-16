@@ -214,9 +214,12 @@ mod imp {
                 .connect_timeout_secs(self.config.database.connect_timeout_secs)
                 .apply_migrations_on_open(false);
             if let Some(migrations) = migrations {
+                // The check of `refuse_unknown_versions` again, on the file
+                // each run migrates: another process can replace it between.
                 builder = builder
                     .migration_source("app", migrations)
-                    .framework_migrations();
+                    .framework_migrations()
+                    .refuse_unknown_migrations(true);
             }
             let fleet = builder.build().map_err(|e| e.to_string())?;
             // The check boot makes: a key must not reach the control database.
@@ -557,6 +560,14 @@ mod imp {
             result
         });
         let published = copied.map_err(|e| e.to_string()).and_then(|()| {
+            // A default ACL on `dest`'s directory overrides the umask. `0600`
+            // also sets the ACL mask, which stops each inherited entry.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("could not protect the copy: {e}"))?;
+            }
             std::fs::hard_link(&staged, dest).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
                     taken()

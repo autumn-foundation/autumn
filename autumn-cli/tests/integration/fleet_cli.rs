@@ -437,6 +437,36 @@ mod sqlite {
         assert!(stderr.contains("control database"), "{stderr}");
     }
 
+    /// A default ACL on the directory overrides the umask. The copy must
+    /// still give no other user access.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fleet_backup_ignores_a_default_acl() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let app = App::new("");
+        app.provision(&app.fleet(), &["acme"], 1);
+        let out = app.dir.join("exports");
+        std::fs::create_dir(&out).unwrap();
+        let acl = std::process::Command::new("setfacl")
+            .args(["-d", "-m", "u:nobody:r"])
+            .arg(&out)
+            .status();
+        if !acl.is_ok_and(|s| s.success()) {
+            eprintln!("skipped: setfacl is not available here");
+            return;
+        }
+        let dest = out.join("acme.db");
+
+        run_ok(
+            &app.dir,
+            &["fleet", "backup", "tenant:acme", dest.to_str().unwrap()],
+        );
+        // On a file with an ACL the group bits are the ACL mask: `---`
+        // stops the inherited `user:nobody:r--` entry.
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "only the owner reads the copy");
+    }
+
     #[test]
     fn fleet_backup_writes_a_copy() {
         let app = App::new("");

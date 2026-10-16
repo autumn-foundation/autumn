@@ -825,10 +825,14 @@ pub fn run_pending_sqlite(
 /// A fleet (ADR 0019) migrates each database as it opens, which across
 /// thousands of tenant databases would print thousands of lines; the caller
 /// logs one summary through `tracing` instead. Same lock, same atomicity.
+///
+/// `guard` first gets the applied versions, under the same write lock. An
+/// error from `guard` stops the run before a migration is applied.
 #[cfg(feature = "sqlite")]
-pub(crate) fn run_pending_sqlite_quiet(
+pub(crate) fn run_pending_sqlite_guarded(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+    guard: impl FnOnce(&[String]) -> Result<(), String>,
 ) -> Result<MigrationResult, MigrationError> {
     if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
         return Err(err);
@@ -840,6 +844,13 @@ pub(crate) fn run_pending_sqlite_quiet(
         ))
     })?;
     let applied = with_sqlite_migration_lock(&mut conn, |conn| {
+        let recorded: Vec<String> = conn
+            .applied_migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        guard(&recorded).map_err(MigrationError::Migration)?;
         conn.run_pending_migrations(migrations)
             .map(|applied| applied.iter().map(|m| format!("{m}")).collect::<Vec<_>>())
             .map_err(|e| MigrationError::Migration(e.to_string()))
