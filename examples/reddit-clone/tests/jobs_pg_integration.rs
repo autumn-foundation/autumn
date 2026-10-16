@@ -105,8 +105,7 @@ async fn pg_job_enqueue_participates_in_transaction() {
     let (_container, pool) = start_postgres().await;
     let mut conn = pool.get().await.expect("get connection");
 
-    // Use `batch_execute`. `sql_query` rejects a migration with several
-    // statements.
+    // The migration holds several statements, so it needs the simple protocol.
     conn.batch_execute(CREATE_AUTUMN_JOBS)
         .await
         .expect("create autumn_jobs");
@@ -172,8 +171,7 @@ async fn user_onboarding_enqueue_run_ack_cycle() {
     let (_container, pool) = start_postgres().await;
     let mut conn = pool.get().await.expect("get connection");
 
-    // Use `batch_execute`. `sql_query` rejects a migration with several
-    // statements.
+    // The migration holds several statements, so it needs the simple protocol.
     conn.batch_execute(CREATE_AUTUMN_JOBS)
         .await
         .expect("create autumn_jobs");

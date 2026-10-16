@@ -52,7 +52,9 @@ fn posts_per_page() -> i64 {
         .unwrap_or(25)
 }
 
-use super::layout::{error_summary, layout, layout_with_seo, time_ago, vote_controls};
+use super::layout::{
+    field_errors, form_error_summary, layout, layout_with_seo, time_ago, vote_controls,
+};
 
 // ── Front page — hot posts across all subreddits ───────────────
 
@@ -500,12 +502,10 @@ fn submit_form_markup(
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { (heading) }
-            (error_summary(form, &[
-                ("subreddit_id", "Community"),
-                ("title", "Title"),
-                ("url", "Link URL"),
-                ("body", "Text"),
-            ]))
+            (form_error_summary(
+                form,
+                if fixed_sub.is_some() { &["title", "url", "body"] } else { &["subreddit_id", "title", "url", "body"] },
+            ))
             (form.form_tag(&paths::submit(), "post", html! {
                 @if let Some(sub) = fixed_sub {
                     input type="hidden" id="subreddit_id" name="subreddit_id" value=(sub.id);
@@ -597,53 +597,30 @@ fn submit_form_markup(
     }
 }
 
-/// Render one field's validation messages, in the element its control points
-/// at with `aria-describedby`.
-///
-/// `role="alert"` makes the message announced when it appears after an htmx
-/// swap; the stable `{field}-error` id is what makes it announced on focus for
-/// a full-page 422 too.
-fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
-    let errors = form.errors_for(field);
-    html! {
-        div id=(format!("{field}-error")) {
-            @for message in errors {
-                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
-            }
-        }
-    }
+/// A tag's name without a leading `#`. Older rows kept the `#` the author typed.
+fn tag_label(tag: &Tag) -> &str {
+    tag.name.trim_start_matches('#').trim_start()
 }
 
-/// Tag chips for a post. Shows the author's spelling (`Tag::name`).
-fn tag_chips_markup<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
-    let tags: Vec<&Tag> = tags.into_iter().collect();
+/// Render tag chips. Show `name`, the spelling the author typed.
+/// The `slug` is a URL key only. For a name with no Latin text, it is a hash.
+fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
     html! {
-        @if !tags.is_empty() {
-            div class="flex flex-wrap gap-2 mt-3" {
-                @for tag in tags {
-                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
-                        "#" (tag.name)
-                    }
+        div class="flex flex-wrap gap-2 mt-3" {
+            @for tag in tags {
+                span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
+                    "#" (tag_label(tag))
                 }
             }
         }
     }
 }
 
-/// Value of the manage-tags input. It uses names, so a save keeps the spelling.
-///
-/// `parse_tag_names` splits on `,` and newline and drops names that are too
-/// long or have no letter or number. A stored name that would not survive
-/// that falls back to its slug, so a save does not detach the tag.
-fn tags_field_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
+/// Build the manage-tags input value from names.
+/// A re-save then keeps the author's spelling.
+fn tag_input_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
     tags.into_iter()
-        .map(|tag| {
-            let name = tag.name.trim();
-            let survives = !name.contains([',', '\n'])
-                && contains_letter_or_number(name)
-                && name.chars().count() <= MAX_TAG_NAME_LEN;
-            if survives { name } else { tag.slug.as_str() }
-        })
+        .map(tag_label)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1176,7 +1153,9 @@ pub async fn show(
                         // Preloaded many-to-many tags (#1324): `post.tags()`
                         // reads the batched `post_tags` join loaded above, no
                         // per-tag query.
-                        (tag_chips_markup(post_tags.iter().map(|t| -> &Tag { t })))
+                        @if !post_tags.is_empty() {
+                            (tag_chips(post_tags.iter().map(|tag| &***tag)))
+                        }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
                                 a href=(paths::edit_form(&sub.slug, &post.slug))
@@ -1193,7 +1172,7 @@ pub async fn show(
                                 input type="hidden" name="_csrf" value=(csrf.token());
                                 input type="text" name="tags"
                                       aria-label="Post tags"
-                                      value=(tags_field_value(post_tags.iter().map(|t| -> &Tag { t })))
+                                      value=(tag_input_value(post_tags.iter().map(|tag| &***tag)))
                                       placeholder="tags, comma separated"
                                       class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
                                              focus:outline-none focus:ring-2 focus:ring-orange-400" {}
@@ -1311,7 +1290,7 @@ fn edit_form_markup(form: &ChangesetForm<EditPostForm>, sub_slug: &str, post_slu
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Edit Post" }
-            (error_summary(form, &[("title", "Title"), ("body", "Text")]))
+            (form_error_summary(form, &["title", "body"]))
             (form.form_tag(&paths::update(sub_slug, post_slug), "post", html! {
                 div {
                     (field_errors("title", form))
@@ -1496,7 +1475,8 @@ fn parse_tag_names(raw: &str) -> ParsedTags {
     let mut dropped_no_letter_or_number = 0_usize;
     let mut dropped_too_long = 0_usize;
     for piece in raw.split([',', '\n']) {
-        let name = piece.trim();
+        // The chip adds its own `#`, so a typed one is not part of the name.
+        let name = piece.trim().trim_start_matches('#').trim_start();
         if name.is_empty() {
             continue;
         }
@@ -1813,6 +1793,58 @@ autumn_web::paths![
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tag(name: &str, slug: &str) -> Tag {
+        Tag {
+            id: 1,
+            name: name.to_owned(),
+            slug: slug.to_owned(),
+        }
+    }
+
+    #[test]
+    fn tag_chips_show_the_name_not_the_slug() {
+        let out = tag_chips(&[tag("日本語", "n1a3b86"), tag("Web Dev", "web-dev")]).into_string();
+        assert!(out.contains("#日本語"), "{out}");
+        assert!(out.contains("#Web Dev"), "{out}");
+        assert!(!out.contains("n1a3b86"), "{out}");
+    }
+
+    #[test]
+    fn a_stored_name_with_a_hash_prefix_shows_one_hash() {
+        // Older rows kept the `#` the author typed.
+        let old = [tag("#rust", "rust")];
+        let out = tag_chips(&old).into_string();
+        assert!(out.contains("#rust") && !out.contains("##"), "{out}");
+        assert_eq!(tag_input_value(&old), "rust");
+    }
+
+    #[test]
+    fn a_typed_hash_prefix_is_not_stored_in_the_name() {
+        let parsed = parse_tag_names("#rust, ##Web Dev, #");
+        assert_eq!(parsed.slug_order, ["rust", "web-dev"]);
+        assert_eq!(parsed.name_by_slug["rust"], "rust");
+        assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+        assert_eq!(parsed.dropped_no_letter_or_number, 0);
+    }
+
+    #[test]
+    fn the_tag_input_keeps_the_authors_spelling() {
+        let tags = [tag("Web Dev", "web-dev"), tag("日本語", "n1a3b86")];
+        assert_eq!(tag_input_value(&tags), "Web Dev, 日本語");
+        // Saving the value again must not change a tag.
+        let parsed = parse_tag_names(&tag_input_value(&tags));
+        assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+        assert_eq!(parsed.name_by_slug[&slugify("日本語")], "日本語");
+    }
+
+    #[test]
+    fn a_rejected_submit_form_leads_with_a_focused_error_summary() {
+        let rendered = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        let blank = submit_form_markup(&blank_submit_form(), &[], None).into_string();
+        assert!(!blank.contains("error-summary"), "{blank}");
+    }
 
     #[tokio::test]
     async fn post_publication_enqueue_failure_is_returned_to_submit() {

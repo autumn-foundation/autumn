@@ -466,6 +466,61 @@ pub fn framework_owned_files(
     files
 }
 
+/// Rewrite a rendered workflow for one workspace member.
+///
+/// `dir` is the member path from the git root, with `/` separators. `ci.yml`
+/// runs in `dir`, so `cargo` selects the member. `posture-gate.yml` runs from
+/// the git root, so it gets the member path and `-p <package>`.
+///
+/// Returns `None` for any other file. Returns `None` too if a value is not
+/// plain, or if a template anchor is missing or not unique. The caller then
+/// plans no file. A wrong workflow is worse than none.
+#[must_use]
+pub fn member_workflow(path: &str, rendered: &str, package: &str, dir: &str) -> Option<String> {
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    };
+    if !plain(package) || !plain(dir) {
+        return None;
+    }
+    let swap = |text: &str, from: &str, to: &str| {
+        (text.matches(from).count() == 1).then(|| text.replace(from, to))
+    };
+    match path {
+        ".github/workflows/ci.yml" => {
+            let with_dir = swap(
+                rendered,
+                "\njobs:\n",
+                &format!(
+                    "\n# Set by `autumn upgrade`: this app is a workspace member.\n\
+                     defaults:\n  run:\n    # Quoted, so a name such as `null` stays a string.\n    working-directory: \"{dir}\"\n\njobs:\n"
+                ),
+            )?;
+            swap(
+                &with_dir,
+                "cargo fmt --all -- --check",
+                &format!("cargo fmt -p {package} -- --check"),
+            )
+        }
+        ".github/workflows/posture-gate.yml" => {
+            let with_manifest = swap(
+                rendered,
+                "POSTURE_MANIFEST: security-posture.json\n",
+                &format!("POSTURE_MANIFEST: {dir}/security-posture.json\n"),
+            )?;
+            swap(
+                &with_manifest,
+                "POSTURE_AUDIT_FLAGS: --release\n",
+                &format!("POSTURE_AUDIT_FLAGS: --release -p {package}\n"),
+            )
+        }
+        _ => None,
+    }
+}
+
 /// Anchors around the waiver that only a `--bundled-pg` app's tree can reach.
 const DENY_BUNDLED_PG_OPEN: &str = "    # >>> autumn:bundled-pg-waiver\n";
 const DENY_BUNDLED_PG_CLOSE: &str = "    # <<< autumn:bundled-pg-waiver\n";
@@ -2930,6 +2985,65 @@ mod tests {
             rust_version: "1.88.0",
         };
         framework_owned_files(&vars, opts)
+    }
+
+    /// A workflow rendered for the member `demo` at `apps/demo`.
+    fn member(path: &str) -> String {
+        let files = owned(GenerateOptions::default());
+        member_workflow(path, &files[path], "demo", "apps/demo").expect("a workflow")
+    }
+
+    #[test]
+    fn a_member_ci_workflow_runs_in_the_member_directory() {
+        let ci = member(".github/workflows/ci.yml");
+        assert!(
+            ci.contains("working-directory: \"apps/demo\"\n\njobs:"),
+            "{ci}"
+        );
+        assert!(ci.contains("cargo fmt -p demo -- --check"), "{ci}");
+        assert!(!ci.contains("cargo fmt --all"), "{ci}");
+    }
+
+    #[test]
+    fn a_member_posture_gate_names_its_manifest_and_package() {
+        let gate = member(".github/workflows/posture-gate.yml");
+        assert!(
+            gate.contains("POSTURE_MANIFEST: apps/demo/security-posture.json"),
+            "{gate}"
+        );
+        assert!(
+            gate.contains("POSTURE_AUDIT_FLAGS: --release -p demo"),
+            "{gate}"
+        );
+    }
+
+    #[test]
+    fn a_member_rewrite_refuses_values_yaml_could_misread() {
+        let files = owned(GenerateOptions::default());
+        let ci = &files[".github/workflows/ci.yml"];
+        assert_eq!(
+            member_workflow(".github/workflows/ci.yml", ci, "demo", "a b: c"),
+            None
+        );
+        assert_eq!(
+            member_workflow(".github/workflows/ci.yml", ci, "de mo", "apps"),
+            None
+        );
+        // An anchor that is not unique is a template bug, not a guess.
+        let doubled = format!("{ci}\njobs:\n");
+        assert_eq!(
+            member_workflow(".github/workflows/ci.yml", &doubled, "demo", "apps"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_member_rewrite_leaves_other_files_alone() {
+        let files = owned(GenerateOptions::default());
+        assert_eq!(
+            member_workflow("Dockerfile", &files["Dockerfile"], "demo", "apps/demo"),
+            None
+        );
     }
 
     #[test]
