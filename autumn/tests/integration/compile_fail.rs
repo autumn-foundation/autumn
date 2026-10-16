@@ -499,6 +499,17 @@ const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
     // The same unlisted write against the real generated repository surface,
     // where the model subject is resolved through the repository type.
     ("agent_authority_repository_unlisted_write", true),
+    // `#[repository(.., mcp, grant = X)]` checks the generated writes too.
+    ("agent_authority_repository_grant_unlisted_model", true),
+    // A delete also writes the models its `dependent(...)` cascade names.
+    ("agent_authority_repository_cascade_unlisted_child", true),
+    // The generated delete tool is checked against the cascade too.
+    (
+        "agent_authority_repository_grant_cascade_unlisted_child",
+        true,
+    ),
+    // A cascade that loops cannot be listed, so a governed delete is refused.
+    ("agent_authority_repository_cascade_cycle", true),
 ];
 
 /// The `#[agent_operable]` fixtures get their own `TestCases` for the same
@@ -534,6 +545,12 @@ fn agent_authority_compile_pass_tests() {
     // the attribute stacked in both orders and under `#[secured]`.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/agent_authority_route.rs");
+    // `#[repository(.., mcp, grant = X)]` governs the generated tools.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/agent_authority_repository_grant.rs");
+    // A delete is checked against its cascade; restrict and self-cascades pass.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/agent_authority_repository_cascade.rs");
 }
 
 /// Build-time cache coherence (#1716). Its own `TestCases` for the same
