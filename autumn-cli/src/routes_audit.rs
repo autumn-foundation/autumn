@@ -438,9 +438,19 @@ fn build_routes_dimension(routes: &[AuditRoute]) -> RoutesDimension {
         })
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
+    // The dimension reports its weakest claim: one declared guard makes it declared.
+    let declared = routes.iter().any(|r| r.layer_guarded);
     RoutesDimension {
-        provenance: Provenance::Provable,
-        source: "macro:#[secured]/#[authorize]/#[public]",
+        provenance: if declared {
+            Provenance::Declared
+        } else {
+            Provenance::Provable
+        },
+        source: if declared {
+            "macro:#[secured]/#[authorize]/#[public]; declared:scoped_guarded"
+        } else {
+            "macro:#[secured]/#[authorize]/#[public]"
+        },
         entries,
     }
 }
@@ -1192,6 +1202,19 @@ mod tests {
         assert_eq!(entries[0].provenance, "provable");
         assert_eq!(entries[1].path, "/api/todos");
         assert_eq!(entries[1].provenance, "declared");
+        // The dimension reports its weakest claim.
+        let dim = &manifest.dimensions.routes;
+        assert!(matches!(dim.provenance, Provenance::Declared));
+        assert!(dim.source.contains("scoped_guarded"), "{}", dim.source);
+    }
+
+    /// A manifest with no declared guard keeps its `provable` header.
+    #[test]
+    fn proven_routes_keep_a_provable_dimension() {
+        let manifest = build_manifest(&[route("GET", "/a", "a", "gated")], None);
+        let dim = &manifest.dimensions.routes;
+        assert!(matches!(dim.provenance, Provenance::Provable));
+        assert_eq!(dim.source, "macro:#[secured]/#[authorize]/#[public]");
     }
 
     /// The route dump from the app sets `layer_guarded`. The CLI must read it.

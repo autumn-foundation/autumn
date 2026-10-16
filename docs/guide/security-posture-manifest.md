@@ -14,7 +14,7 @@ runtime. Reading the manifest starts with reading these tags.
   "schema_version": 5,
   "build": { "profile": "release", "features": [], "all_features": false, "no_default_features": false },
   "dimensions": {
-    "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]; scoped_guarded", "entries": [ … ] },
+    "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]", "entries": [ … ] },
     "csrf":             { "provenance": "declared",  "source": "config:security.csrf",     "entries": [ … ] },
     "security_headers": { "provenance": "declared",  "source": "config:security.headers",  "entries": [ … ] },
     "authorization_policies": {
@@ -139,6 +139,12 @@ the route surfaces in the manifest as a proven `gated` classification:
 Nothing about this can drift: the classification *is* the expansion of the
 macro. An unannotated mutating handler classifies `unclassified`, and the audit
 gate fails and names it.
+
+**Exception — a declared layer guard.** A route can be `gated` only because the
+app mounted its group with `AppBuilder::scoped_guarded`. The macros did not prove
+that guard. Its entry says `"provenance": "declared"`. When any entry is
+declared, the `routes` dimension is `declared` too, and its `source` ends with
+`declared:scoped_guarded`. See [Route Auth Coverage](route-auth-coverage.md).
 
 **Example — an `#[authorize]` binding in the `authorization_policies`
 dimension.** Where `routes` answers "is this endpoint guarded at all?", this
