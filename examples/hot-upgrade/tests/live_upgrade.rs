@@ -526,34 +526,10 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         // Nothing here is behind a load balancer, so the deregistration window
         // only slows the test's own teardown down.
         .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
-        // Pin the production drain budget, for the same reason the prestop
-        // grace above is pinned: the `dev` profile shortens
-        // `shutdown_timeout_secs` from the 30s default to 1s so Ctrl-C is snappy
-        // while developing, and this test asserts a *production* guarantee, so
-        // it should not inherit a dev-convenience timing knob.
-        //
-        // Without this the test is asking for something it has made impossible:
-        // the predecessor starts draining at the cutover, but the load loop
-        // below keeps driving traffic for another 3.5 seconds. A 1-second drain
-        // budget therefore expires while requests are still arriving, and
-        // whatever is in flight at that moment is aborted — `exit_code: 1`,
-        // failing the "drained and exited 0" assertion below. Nothing about the
-        // upgrade path is wrong when that happens; the budget is just shorter
-        // than the load window.
-        //
-        // Measured, because the intuitive story (a slow cutover) is not the
-        // real one: reproduced locally under CPU oversubscription with the
-        // cutover completing in 135 ms and the drain still aborting two
-        // requests. Contention only changes the odds that a request is in
-        // flight at the one-second mark. See issue #2372.
-        //
-        // This weakens nothing. `wait_for_exit` still caps the wait at 30s, so
-        // a predecessor that genuinely fails to drain still fails the
-        // assertion, and the connection guarantees below — `refused == 0`
-        // and `hard == 0` — are untouched by it. Verified rather than assumed: under CPU
-        // oversubscription with this pin in place, the refusal/reset assertions
-        // still fired on their own, so the budget is not what was holding them.
-        .env("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "30")
+        // Pin the production drain budget. The `dev` profile uses 1 s, which is
+        // shorter than the load window. The drain watchdog then exits 1 (#2372,
+        // #2492). `wait_for_exit` still bounds the wait.
+        .envs([drain_budget_env()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
@@ -696,7 +672,7 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     while !v2_accepted_a_write(&writes) && Instant::now() < cutover_seen_by {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    tokio::time::sleep(POST_CUTOVER_LOAD).await;
     stop.store(true, Ordering::Relaxed);
     for task in load {
         task.await.expect("load task");
@@ -705,10 +681,9 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     // The old process must have drained and exited cleanly on its own.
     let exit = wait_for_exit(&mut child, Duration::from_secs(30));
     let logged = log.lock().expect("log").join("\n");
-    assert!(
-        exit.map(|status| status.success()).unwrap_or(false),
-        "the predecessor should drain and exit 0 after handing over; logs:\n{logged}"
-    );
+    if let Some(reason) = exit_failure(exit) {
+        panic!("{reason}; it should drain and exit 0 after handing over; logs:\n{logged}");
+    }
 
     // ---- the guarantees --------------------------------------------------
     // Taken by value: the load tasks are joined, so nothing else holds these,
@@ -846,6 +821,78 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
         "the handoff directory must be cleaned up, found {leftovers:?}"
     );
     let _ = std::fs::remove_dir_all(&handoff_dir);
+}
+
+/// Load window after the first `v2` write. The predecessor drains inside it.
+const POST_CUTOVER_LOAD: Duration = Duration::from_millis(3_500);
+
+/// Drain budget for the predecessor. It must be longer than
+/// `POST_CUTOVER_LOAD`. The `dev` profile uses 1 s, which makes the watchdog
+/// exit 1 while load continues (issue #2492).
+const PREDECESSOR_DRAIN_BUDGET_SECS: u64 = 30;
+
+/// The env var and value that set the predecessor's drain budget.
+fn drain_budget_env() -> (&'static str, String) {
+    (
+        "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
+        PREDECESSOR_DRAIN_BUDGET_SECS.to_string(),
+    )
+}
+
+/// Why the predecessor's exit is a failure, or `None` for a clean exit 0.
+/// `None` input means it did not exit in time.
+fn exit_failure(exit: Option<std::process::ExitStatus>) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let Some(status) = exit else {
+        return Some("the predecessor did not exit before the wait ended".to_owned());
+    };
+    if status.success() {
+        return None;
+    }
+    Some(match (status.code(), status.signal()) {
+        (Some(code), _) => format!("the predecessor exited with code {code}"),
+        (None, Some(signal)) => format!("the predecessor died from signal {signal}"),
+        (None, None) => "the predecessor ended with an unknown status".to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod predecessor_exit_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn the_spawn_env_sets_a_drain_budget_longer_than_the_post_cutover_load() {
+        // Issue #2492: a shorter budget makes the watchdog exit 1 mid-load.
+        let (key, value) = drain_budget_env();
+        assert_eq!(key, "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS");
+        let secs: u64 = value.parse().expect("whole seconds");
+        assert!(Duration::from_secs(secs) > POST_CUTOVER_LOAD);
+    }
+
+    #[test]
+    fn a_clean_exit_has_no_failure() {
+        assert_eq!(exit_failure(Some(ExitStatus::from_raw(0))), None);
+    }
+
+    #[test]
+    fn a_non_zero_exit_names_its_code() {
+        let report = exit_failure(Some(ExitStatus::from_raw(1 << 8))).expect("failure");
+        assert!(report.contains("code 1"), "{report}");
+    }
+
+    #[test]
+    fn a_signal_death_names_the_signal() {
+        let report = exit_failure(Some(ExitStatus::from_raw(9))).expect("failure");
+        assert!(report.contains("signal 9"), "{report}");
+    }
+
+    #[test]
+    fn no_exit_means_the_drain_timed_out() {
+        let report = exit_failure(None).expect("failure");
+        assert!(report.contains("did not exit"), "{report}");
+    }
 }
 
 /// Wait for `child` to exit, without blocking forever if it hangs.
