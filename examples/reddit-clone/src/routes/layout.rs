@@ -1,6 +1,5 @@
 //! Shared layout and UI components used across all routes.
 
-use autumn_web::form::ChangesetForm;
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
 use autumn_web::seo::SeoMeta;
@@ -104,47 +103,6 @@ pub fn layout(
         csrf_token,
         content,
     )
-}
-
-/// Error summary for the top of a rejected form.
-///
-/// A 422 page does not move focus. Screen readers often skip a `role="alert"`
-/// region that exists at page load. So the summary takes focus itself.
-/// `tabindex="-1"` makes the `div` focusable. `autofocus` focuses it on load.
-/// Each entry links to its field by id.
-/// `fields` lists (field name, label) pairs in form order.
-/// It renders nothing if no listed field has an error.
-pub fn error_summary<T>(form: &ChangesetForm<T>, fields: &[(&str, &str)]) -> Markup {
-    let entries: Vec<(&str, &str, &str)> = fields
-        .iter()
-        .flat_map(|&(field, label)| {
-            form.errors_for(field)
-                .iter()
-                .map(move |message| (field, label, message.as_str()))
-        })
-        .collect();
-    let count = entries.len();
-    html! {
-        @if count > 0 {
-            div id="error-summary" role="group" tabindex="-1" autofocus
-                aria-labelledby="error-summary-title"
-                class="mb-4 rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700" {
-                h2 id="error-summary-title" class="font-semibold mb-1" {
-                    @if count == 1 { "1 problem needs fixing" }
-                    @else { (count) " problems need fixing" }
-                }
-                ul class="list-disc pl-5" {
-                    @for (field, label, message) in entries {
-                        li {
-                            a href=(format!("#{field}")) class="underline" {
-                                (label) ": " (message)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Base HTML layout that takes an explicit [`SeoMeta`] builder.
@@ -379,7 +337,7 @@ pub fn form_error_summary<T>(form: &autumn_web::form::ChangesetForm<T>, fields: 
         .any(|field| !form.errors_for(field).is_empty());
     html! {
         @if has_errors {
-            div id="error-summary" tabindex="-1" autofocus
+            div id="error-summary" role="group" tabindex="-1" autofocus
                 aria-labelledby="error-summary-title"
                 class="mb-4 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-700" {
                 h2 id="error-summary-title" class="font-semibold mb-1" {
@@ -419,7 +377,6 @@ pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use autumn_web::form::ChangesetForm;
     use autumn_web::html;
     use autumn_web::seo::SeoMeta;
 
@@ -477,6 +434,7 @@ mod tests {
         assert!(out.contains(r#"id="error-summary""#), "{out}");
         assert!(out.contains(r#"tabindex="-1""#), "{out}");
         assert!(out.contains("autofocus"), "{out}");
+        assert!(out.contains(r#"role="group""#), "{out}");
         assert!(out.contains(r##"href="#title""##), "{out}");
         assert!(out.contains("Title is required"), "{out}");
     }

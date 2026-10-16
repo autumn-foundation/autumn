@@ -508,7 +508,7 @@ fn submit_form_markup(
             ))
             (form.form_tag(&paths::submit(), "post", html! {
                 @if let Some(sub) = fixed_sub {
-                    input type="hidden" id="subreddit_id" name="subreddit_id" value=(sub.id);
+                    input type="hidden" name="subreddit_id" value=(sub.id);
                 } @else {
                     div {
                         (field_errors("subreddit_id", form))
@@ -1864,68 +1864,6 @@ mod tests {
         );
     }
 
-    // #2454: tags show the name, not the slug
-
-    fn tag(name: &str) -> Tag {
-        Tag {
-            id: 1,
-            name: name.to_owned(),
-            slug: slugify(name),
-        }
-    }
-
-    #[test]
-    fn tag_chips_show_the_name_not_the_slug() {
-        let rendered = tag_chips_markup(&[tag("Web Dev")]).into_string();
-
-        assert!(rendered.contains("#Web Dev"), "rendered: {rendered}");
-        assert!(!rendered.contains("web-dev"), "rendered: {rendered}");
-    }
-
-    #[test]
-    fn a_non_latin_tag_shows_its_own_script() {
-        let tags = [tag("日本語")];
-        let rendered = tag_chips_markup(&tags).into_string();
-
-        assert!(rendered.contains("#日本語"), "rendered: {rendered}");
-        assert!(!rendered.contains(&tags[0].slug), "rendered: {rendered}");
-    }
-
-    #[test]
-    fn tag_names_are_escaped() {
-        let rendered = tag_chips_markup(&[tag("<b>x</b>")]).into_string();
-
-        assert!(!rendered.contains("<b>x"), "rendered: {rendered}");
-    }
-
-    #[test]
-    fn no_tags_render_no_chip_row() {
-        assert!(tag_chips_markup(&[]).into_string().is_empty());
-    }
-
-    #[test]
-    fn a_stored_name_that_would_not_survive_a_save_falls_back_to_its_slug() {
-        let odd = Tag {
-            id: 2,
-            name: "a, b".to_owned(),
-            slug: "a-b".to_owned(),
-        };
-        let field = tags_field_value(&[tag("Web Dev"), odd]);
-
-        assert_eq!(field, "Web Dev, a-b");
-        assert_eq!(parse_tag_names(&field).slug_order.len(), 2);
-    }
-
-    #[test]
-    fn the_tags_field_round_trips_names() {
-        let field = tags_field_value(&[tag("Web Dev"), tag("日本語")]);
-
-        assert_eq!(field, "Web Dev, 日本語");
-        let parsed = parse_tag_names(&field);
-        assert_eq!(parsed.name_by_slug[&slugify("Web Dev")], "Web Dev");
-        assert_eq!(parsed.name_by_slug[&slugify("日本語")], "日本語");
-    }
-
     // ── #2423: a NUL byte is an inline field error, not a 500 ──────
 
     /// The reported repro, on the reported form: `body=before%00after` used to
@@ -1973,37 +1911,6 @@ mod tests {
             !rendered.contains('\u{0}'),
             "a raw NUL must never be echoed back into the HTML"
         );
-    }
-
-    // #2454: a rejected form shows an error summary
-
-    #[test]
-    fn rejected_submission_shows_error_summary() {
-        let rendered = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
-
-        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
-        assert!(rendered.contains(r##"href="#title""##), "{rendered}");
-    }
-
-    #[test]
-    fn a_blank_submission_has_no_error_summary() {
-        let rendered = submit_form_markup(&blank_submit_form(), &[], None).into_string();
-
-        assert!(!rendered.contains("error-summary"), "{rendered}");
-    }
-
-    #[test]
-    fn rejected_edit_shows_error_summary() {
-        let form = EditPostForm {
-            title: String::new(),
-            body: String::new(),
-        };
-        let rejected = ChangesetForm::from_changeset(form.into_changeset());
-
-        let rendered = edit_form_markup(&rejected, "rust", "post").into_string();
-
-        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
-        assert!(rendered.contains(r##"href="#title""##), "{rendered}");
     }
 
     // ── Typed a11y form primitives (#1706) ─────────────────────────

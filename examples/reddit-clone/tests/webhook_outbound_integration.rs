@@ -86,7 +86,6 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     let mut config = autumn_web::config::AutumnConfig::default();
     config.security.csrf.enabled = true;
     let mut app_builder = TestApp::new()
-        .config(config)
         .plugin(plugin)
         .config(config)
         .routes(routes![
@@ -125,12 +124,6 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
     });
     job::start_runtime(jobs, state, &shutdown, &config, true).unwrap();
 
-    // `register` reads `registration_open` from the global runtime-config
-    // service. The service loads once. With no database URL it connects to
-    // the dev port, fails, and reports "closed". Load it with the test URL.
-    temp_env::with_var("AUTUMN_DATABASE__URL", Some(db.url()), || {
-        reddit_clone::config_svc();
-    });
     // 5. Fire a POST request to /register to trigger the user.created webhook event
     // The client keeps cookies, so the token from the form matches its session.
     let page = app.get("/register").send().await.assert_ok().text();

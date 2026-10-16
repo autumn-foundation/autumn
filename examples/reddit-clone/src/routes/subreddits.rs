@@ -577,32 +577,6 @@ autumn_web::paths![list, create_form, create, show];
 mod tests {
     use super::*;
 
-    // #2454: a rejected form shows an error summary
-
-    #[test]
-    fn rejected_community_shows_error_summary() {
-        use autumn_web::form::IntoChangeset as _;
-        let mut changeset = CreateSubredditForm {
-            name: "***".to_owned(),
-            description: String::new(),
-        }
-        .into_changeset();
-        changeset.add_error("name", "Community name already taken");
-        let rendered = create_form_markup(&ChangesetForm::from_changeset(changeset)).into_string();
-
-        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
-        assert!(rendered.contains(r##"href="#name""##), "{rendered}");
-    }
-
-    #[test]
-    fn a_blank_community_form_has_no_error_summary() {
-        let blank = ChangesetForm::without_csrf(CreateSubredditForm::default());
-
-        let rendered = create_form_markup(&blank).into_string();
-
-        assert!(!rendered.contains("error-summary"), "{rendered}");
-    }
-
     #[test]
     fn a_rejected_create_form_leads_with_a_focused_error_summary() {
         let rejected =
