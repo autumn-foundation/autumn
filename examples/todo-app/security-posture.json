@@ -8,8 +8,8 @@
   },
   "dimensions": {
     "routes": {
-      "provenance": "provable",
-      "source": "macro:#[secured]/#[authorize]/#[public]",
+      "provenance": "declared",
+      "source": "macro:#[secured]/#[authorize]/#[public]; declared:scoped_guarded",
       "entries": [
         {
           "path": "/",
@@ -20,7 +20,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:327",
+          "location": "examples/todo-app/src/routes/todos.rs:329",
           "provenance": "provable"
         },
         {
@@ -333,7 +333,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:337",
+          "location": "examples/todo-app/src/routes/todos.rs:339",
           "provenance": "provable"
         },
         {
@@ -345,7 +345,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:460",
+          "location": "examples/todo-app/src/routes/todos.rs:462",
           "provenance": "provable"
         },
         {
@@ -357,7 +357,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:486",
+          "location": "examples/todo-app/src/routes/todos.rs:488",
           "provenance": "provable"
         },
         {
@@ -381,7 +381,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:450",
+          "location": "examples/todo-app/src/routes/todos.rs:452",
           "provenance": "provable"
         },
         {
@@ -393,7 +393,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:567",
+          "location": "examples/todo-app/src/routes/todos.rs:569",
           "provenance": "provable"
         },
         {
@@ -405,7 +405,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:417",
+          "location": "examples/todo-app/src/routes/todos.rs:419",
           "provenance": "provable"
         },
         {
@@ -417,7 +417,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:534",
+          "location": "examples/todo-app/src/routes/todos.rs:536",
           "provenance": "provable"
         }
       ]
