@@ -966,6 +966,7 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
         }
     }
 
+    compare_guard_strength(before, after, &label_before, &label_after, out);
     compare_roles(before, after, &label_before, &label_after, out);
     compare_scopes(before, after, &label_before, &label_after, out);
 
@@ -995,6 +996,46 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
             detail: "record-level policy check added".to_owned(),
         });
     }
+}
+
+/// A gated route can change how its guard is known. A macro proves a
+/// `#[secured]` guard. An app only declares a layer guard (`scoped_guarded`).
+/// Proven to declared is a weaker guard. Declared to proven is a stronger one.
+fn compare_guard_strength(
+    before: &RouteEntry,
+    after: &RouteEntry,
+    label_before: &str,
+    label_after: &str,
+    out: &mut Vec<Finding>,
+) {
+    if is_open(&after.classification) || before.is_declared() == after.is_declared() {
+        return;
+    }
+    let (kind, severity, fingerprint, detail) = if after.is_declared() {
+        (
+            "guard_declared",
+            Severity::Widening,
+            "guard:proven->declared",
+            "guard was proven, now only declared by a layer",
+        )
+    } else {
+        (
+            "guard_proven",
+            Severity::Narrowing,
+            "guard:declared->proven",
+            "guard was declared by a layer, now proven",
+        )
+    };
+    out.push(Finding {
+        kind,
+        severity,
+        method: after.method.clone(),
+        path: after.path.clone(),
+        before: label_before.to_owned(),
+        after: label_after.to_owned(),
+        fingerprint: fingerprint.to_owned(),
+        detail: detail.to_owned(),
+    });
 }
 
 /// Roles are OR-ed (`#[secured("a", "b")]` admits *either*), so **adding** one
@@ -2477,6 +2518,60 @@ mod tests {
     }
 
     // ── added / removed routes ──────────────────────────────────────────────
+
+    /// `route` with a chosen provenance.
+    fn route_prov(path: &str, classification: &str, provenance: &str) -> String {
+        route(path, "GET", classification, &[], &[], false).replace(
+            r#""provenance":"provable""#,
+            &format!(r#""provenance":"{provenance}""#),
+        )
+    }
+
+    /// A proven guard that becomes a layer claim is a weaker guard (#2468).
+    #[test]
+    fn a_proven_guard_that_becomes_declared_is_widening() {
+        let base = routes_only(&route_prov("/api/todos", "gated", "provable"));
+        let head = routes_only(&route_prov("/api/todos", "gated", "declared"));
+        let f = only(diff(&base, &head));
+        assert_eq!(f.kind, "guard_declared");
+        assert_eq!(f.severity, Severity::Widening);
+        assert_ne!(base.posture_digest(), head.posture_digest());
+    }
+
+    #[test]
+    fn a_declared_guard_that_becomes_proven_is_narrowing() {
+        let base = routes_only(&route_prov("/api/todos", "gated", "declared"));
+        let head = routes_only(&route_prov("/api/todos", "gated", "provable"));
+        let f = only(diff(&base, &head));
+        assert_eq!(f.kind, "guard_proven");
+        assert_eq!(f.severity, Severity::Narrowing);
+    }
+
+    #[test]
+    fn an_unchanged_declared_guard_is_not_a_finding() {
+        let m = routes_only(&route_prov("/api/todos", "gated", "declared"));
+        assert!(diff(&m, &m).is_empty());
+    }
+
+    /// Removing the claim and opening the route is widening, as for any guard.
+    #[test]
+    fn a_declared_guard_that_becomes_public_is_widening() {
+        let base = routes_only(&route_prov("/api/todos", "gated", "declared"));
+        let head = routes_only(&route_prov("/api/todos", "public", "provable"));
+        let f = only(diff(&base, &head));
+        assert_eq!(f.kind, "classification_downgraded");
+        assert_eq!(f.severity, Severity::Widening);
+    }
+
+    /// A manifest with no `declared` entry keeps its digest.
+    #[test]
+    fn a_provable_manifest_keeps_its_digest() {
+        let provable = routes_only(&route_prov("/a", "gated", "provable"));
+        let absent = routes_only(
+            &route_prov("/a", "gated", "provable").replace(r#","provenance":"provable""#, ""),
+        );
+        assert_eq!(provable.posture_digest(), absent.posture_digest());
+    }
 
     #[test]
     fn a_new_public_route_is_widening() {

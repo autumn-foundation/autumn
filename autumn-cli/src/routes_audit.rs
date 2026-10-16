@@ -50,7 +50,12 @@ use crate::routes;
 /// audited binary was built with. Two builds can mount different routes, so
 /// the reader must know which build the manifest describes. A document
 /// without `build` came from a dev build with default features.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
+///
+/// v6 (#2468) adds `provenance` to each route entry: `declared` when a layer
+/// guard (`AppBuilder::scoped_guarded`) is the app's claim rather than a macro
+/// proof. A reader that predates it would read such a `gated` route as proven,
+/// so the bump makes an older CLI refuse the manifest instead.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 6;
 
 /// Options controlling `autumn routes audit`.
 pub struct AuditOptions<'a> {
@@ -94,6 +99,10 @@ pub struct AuditRoute {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub policy: bool,
+    /// The route is gated by a layer that the app declared (`scoped_guarded`).
+    /// The macros did not prove the guard. Older dumps do not have this field.
+    #[serde(default)]
+    pub layer_guarded: bool,
     #[serde(default)]
     pub module: Option<String>,
     /// `file:line` source location of the handler, when known (serialized as
@@ -139,7 +148,7 @@ pub enum Provenance {
     RuntimeOnly,
 }
 
-/// Top-level security manifest (schema v5).
+/// Top-level security manifest (schema v6).
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -277,7 +286,8 @@ pub struct ManifestRoute {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     /// How the classification was established. `"provable"` means it was
-    /// derived from macro-expanded code (route + auth posture).
+    /// derived from macro-expanded code (route + auth posture). `"declared"`
+    /// means the app claims a guard layer (`scoped_guarded`).
     pub provenance: &'static str,
 }
 
@@ -425,13 +435,27 @@ fn build_routes_dimension(routes: &[AuditRoute]) -> RoutesDimension {
             policy: r.policy,
             source: r.source.clone(),
             location: r.location.clone(),
-            provenance: "provable",
+            provenance: if r.layer_guarded {
+                "declared"
+            } else {
+                "provable"
+            },
         })
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
+    // The dimension reports its weakest claim: one declared guard makes it declared.
+    let declared = routes.iter().any(|r| r.layer_guarded);
     RoutesDimension {
-        provenance: Provenance::Provable,
-        source: "macro:#[secured]/#[authorize]/#[public]",
+        provenance: if declared {
+            Provenance::Declared
+        } else {
+            Provenance::Provable
+        },
+        source: if declared {
+            "macro:#[secured]/#[authorize]/#[public]; declared:scoped_guarded"
+        } else {
+            "macro:#[secured]/#[authorize]/#[public]"
+        },
         entries,
     }
 }
@@ -1033,6 +1057,7 @@ mod tests {
             roles: vec![],
             scopes: vec![],
             policy: false,
+            layer_guarded: false,
             module: None,
             location: None,
             authorize_bindings: Vec::new(),
@@ -1152,7 +1177,7 @@ mod tests {
         assert_eq!(manifest.dimensions.routes.entries[0].provenance, "provable");
 
         let json: serde_json::Value = serde_json::from_str(&manifest_json(&manifest)).unwrap();
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["schema_version"], 6);
         let entry = &json["dimensions"]["routes"]["entries"][0];
         for key in [
             "path",
@@ -1167,6 +1192,47 @@ mod tests {
         ] {
             assert!(entry.get(key).is_some(), "manifest route missing `{key}`");
         }
+    }
+
+    /// A layer-guarded route is `gated` and its entry says `declared`. The
+    /// layer is a claim of the app. The macros did not prove it (#2468).
+    #[test]
+    fn layer_guarded_route_is_declared_not_provable() {
+        let mut guarded = route("GET", "/api/todos", "list", "gated");
+        guarded.layer_guarded = true;
+        let proven = route("GET", "/admin", "admin", "gated");
+        let manifest = build_manifest(&[guarded, proven], None);
+        let entries = &manifest.dimensions.routes.entries;
+        assert_eq!(entries[0].path, "/admin");
+        assert_eq!(entries[0].provenance, "provable");
+        assert_eq!(entries[1].path, "/api/todos");
+        assert_eq!(entries[1].provenance, "declared");
+        // The dimension reports its weakest claim.
+        let dim = &manifest.dimensions.routes;
+        assert!(matches!(dim.provenance, Provenance::Declared));
+        assert!(dim.source.contains("scoped_guarded"), "{}", dim.source);
+    }
+
+    /// A manifest with no declared guard keeps its `provable` header.
+    #[test]
+    fn proven_routes_keep_a_provable_dimension() {
+        let manifest = build_manifest(&[route("GET", "/a", "a", "gated")], None);
+        let dim = &manifest.dimensions.routes;
+        assert!(matches!(dim.provenance, Provenance::Provable));
+        assert_eq!(dim.source, "macro:#[secured]/#[authorize]/#[public]");
+    }
+
+    /// The route dump from the app sets `layer_guarded`. The CLI must read it.
+    #[test]
+    fn audit_route_reads_layer_guarded_from_the_dump() {
+        let with: AuditRoute = serde_json::from_str(
+            r#"{"method":"GET","path":"/a","handler":"h","classification":"gated","layer_guarded":true}"#,
+        )
+        .unwrap();
+        assert!(with.layer_guarded);
+        let without: AuditRoute =
+            serde_json::from_str(r#"{"method":"GET","path":"/a","handler":"h"}"#).unwrap();
+        assert!(!without.layer_guarded);
     }
 
     #[test]
@@ -1252,7 +1318,7 @@ mod tests {
         let sec = security_dump(true, &[]);
         let json = manifest_value(&build_manifest(&routes, Some(&sec)));
 
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["schema_version"], 6);
         assert_eq!(json["dimensions"]["routes"]["provenance"], "provable");
         assert_eq!(
             json["dimensions"]["routes"]["source"],
@@ -2128,7 +2194,7 @@ mod tests {
     fn manifest_records_the_default_build() {
         let m = build_manifest(&[route("GET", "/a", "a", "public")], None);
         let v = manifest_value(&m);
-        assert_eq!(v["schema_version"], 5);
+        assert_eq!(v["schema_version"], 6);
         assert_eq!(
             v["build"],
             serde_json::json!({

@@ -1342,6 +1342,7 @@ double-submits and replays.
 | `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)`, `mcp_tasks(config)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()/mcp_task()` toggle exposure per route (plugin fluent opt-in); `mcp_tasks` sets task-tool limits |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
+| `scoped_guarded(prefix, layer, routes)` | Scoped group whose `layer` is the auth guard, such as `RequireApiToken` (trunk-dev, #2468). `routes audit` lists its unclassified routes as `gated` with `provenance: "declared"`. The audit cannot check the claim. Do not use it with a layer that does not authenticate. A plugin cannot use it for its own routes |
 | `layer(...)`, `has_layer<T>()`, `get_layer_types()` | Tower middleware |
 | `merge(router)`, `nest(path, router)` | Raw Axum composition |
 | `declare_plugin_routes(...)` | Plugin route declarations |

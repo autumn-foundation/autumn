@@ -40,7 +40,13 @@ pub const MIN_SCHEMA_VERSION: u32 = 3;
 /// v5 (#2472) *adds* the top-level `build`. A v3 or v4 manifest has none, and
 /// reads as the dev build with default features, which is the only build
 /// those versions could come from.
-pub const MAX_SCHEMA_VERSION: u32 = 5;
+///
+/// v6 (#2468) *adds* `provenance` to each route entry, and that is the one
+/// addition that cannot be read tolerantly: a CLI without the field would
+/// read a `declared` layer guard as a proven one and miss the downgrade. So
+/// the bump exists to make an older CLI refuse the manifest. A v3 to v5
+/// manifest has no per-entry `provenance`, and every guard in it was proven.
+pub const MAX_SCHEMA_VERSION: u32 = 6;
 
 // Deliberately a literal, not `MANIFEST_SCHEMA_VERSION`. Tracking the emitter
 // would auto-widen what this differ accepts on the very bump whose doc comment
@@ -207,6 +213,10 @@ pub struct RouteEntry {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub policy: bool,
+    /// `declared` when a layer guard is the app's claim (`scoped_guarded`).
+    /// Absent or `provable` otherwise.
+    #[serde(default)]
+    pub provenance: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -387,6 +397,12 @@ impl MtlsEntry {
 }
 
 impl RouteEntry {
+    /// The guard is a declared layer, not a proven one.
+    #[must_use]
+    pub fn is_declared(&self) -> bool {
+        self.provenance == "declared"
+    }
+
     /// `(path, method)` — the identity of a mounted route. Handler name and
     /// source location are not part of it.
     #[must_use]
@@ -536,8 +552,14 @@ impl PostureManifest {
         {
             let roles: Vec<String> = r.role_set().into_iter().collect();
             let scopes: Vec<String> = r.scope_set().into_iter().collect();
+            // Only a declared guard, so a manifest without one keeps its digest.
+            let declared = if r.is_declared() {
+                "\tprov=declared"
+            } else {
+                ""
+            };
             lines.push(format!(
-                "route\t{}\t{}\t{}\troles={}\tscopes={}\tpolicy={}",
+                "route\t{}\t{}\t{}\troles={}\tscopes={}\tpolicy={}{declared}",
                 escape_field(&normalize_captures(&r.path)),
                 escape_field(&r.method),
                 escape_field(&r.classification),
