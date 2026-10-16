@@ -162,6 +162,9 @@ telemetry-otlp = [
 # `[[bin]]` (W6 PR3), which is a binary and therefore cannot use dev-deps, can
 # depend on it too. `proptest` itself stays out of default builds.
 sim-testing = ["dep:proptest"]
+# Ledger profiling harnesses (`docs/perf/`). Off by default and not part of any
+# CI feature set, so the harness module is only compiled when asked for.
+ledger-profile = ["db"]
 # `dep:rustls` is not optional flavouring: `redis`'s `tokio-rustls-comp`
 # feature makes `rediss://` URLs reachable, and those panic inside
 # `rustls::ClientConfig::builder()` unless a process-level
