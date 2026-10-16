@@ -31,6 +31,9 @@ pub struct RoutePosture {
     csrf: Csrf,
     checks: BTreeSet<String>,
     mtls: bool,
+    /// The guard is the app's claim (`scoped_guarded`), not a macro proof. A
+    /// proven ceiling does not admit it.
+    declared: bool,
 }
 
 /// CSRF state of a route. `Absent`: no row, as for a safe method.
@@ -65,6 +68,9 @@ impl RoutePosture {
             && implies(ceiling.csrf == Csrf::On, self.csrf == Csrf::On)
             && ceiling.checks.is_subset(&self.checks)
             && implies(ceiling.mtls, self.mtls)
+            // Guard strength only matters against a ceiling that has a guard.
+            // A route that stopped being open is narrower, declared or not.
+            && implies(!ceiling_open && !ceiling.declared, !self.declared)
     }
 
     /// An empty role list admits all signed-in callers. It is the widest.
@@ -92,9 +98,18 @@ impl RoutePosture {
             u8::from(self.mtls).to_string(),
         ];
         out.push_str(&fields.join("|"));
+        // Written only when set, so a marker for a proven route keeps the
+        // text and the seal it always had.
+        if self.declared {
+            out.push_str("|declared");
+        }
     }
 
     fn decode(fields: &[&str]) -> Option<Self> {
+        let (fields, declared) = match fields {
+            [rest @ .., "declared"] => (rest, true),
+            _ => (fields, false),
+        };
         let [class, roles, scopes, policy, csrf, checks, mtls] = fields else {
             return None;
         };
@@ -111,6 +126,7 @@ impl RoutePosture {
             },
             checks: dec_list(checks)?,
             mtls: dec_flag(mtls)?,
+            declared,
         })
     }
 }
@@ -271,6 +287,8 @@ pub fn cover(widening: &[&Finding], head: &PostureManifest) -> Cover {
                 }),
                 checks: checks_at(&key, &bindings).into_iter().collect(),
                 mtls: mtls.contains(&key),
+                // An open route has no guard to be weaker.
+                declared: entry.is_declared() && !is_open(&entry.classification),
             };
         // The ceiling alone bounds a route finding. Its kind can change when
         // the route narrows, and one route can leave the set, so neither is
@@ -343,6 +361,7 @@ mod tests {
         csrf: Option<bool>,
         checks: Vec<&'static str>,
         mtls: bool,
+        declared: bool,
     }
 
     impl Fixture {
@@ -355,6 +374,7 @@ mod tests {
                 csrf: None,
                 checks: vec![],
                 mtls: false,
+                declared: false,
             }
         }
         fn roles(mut self, r: &[&'static str]) -> Self {
@@ -379,6 +399,11 @@ mod tests {
         }
         fn mtls(mut self, m: bool) -> Self {
             self.mtls = m;
+            self
+        }
+        /// The guard is a layer the app declared, not a macro proof.
+        fn declared(mut self) -> Self {
+            self.declared = true;
             self
         }
 
@@ -409,7 +434,7 @@ mod tests {
                   "routes":{{"provenance":"provable","source":"m","entries":[
                     {{"path":"/a","method":"POST","name":"h","classification":"{}",
                       "roles":[{}],"scopes":[{}],"policy":{},"source":"user",
-                      "location":"x:1","provenance":"provable"}}]}},
+                      "location":"x:1","provenance":"{}"}}]}},
                   "csrf":{{"provenance":"declared","source":"c","exempt_paths":[],"entries":[{csrf}]}},
                   "security_headers":{{"provenance":"declared","source":"c","entries":[]}},
                   "authorization_policies":{{"provenance":"provable","source":"m","runtime_caveat":"x","entries":[{authz}]}},
@@ -420,6 +445,11 @@ mod tests {
                 list(&self.roles),
                 list(&self.scopes),
                 self.policy,
+                if self.declared {
+                    "declared"
+                } else {
+                    "provable"
+                },
                 self.mtls
             );
             PostureManifest::parse(&json, "t.json").expect("fixture parses")
@@ -575,6 +605,97 @@ mod tests {
         ] {
             assert_eq!(Ceiling::decode(bad), None, "{bad:?}");
         }
+    }
+
+    // ── guard provenance ────────────────────────────────────────────────────
+
+    /// A proven ceiling does not admit a route whose guard is only declared.
+    /// The reverse is a narrowing, and a declared ceiling admits both.
+    #[test]
+    fn a_declared_guard_is_wider_than_a_proven_one() {
+        let proven = Fixture::new("gated").roles(&["admin"]).posture();
+        let declared = Fixture::new("gated").roles(&["admin"]).declared().posture();
+        assert!(!declared.no_wider_than(&proven));
+        assert!(proven.no_wider_than(&declared));
+        assert!(declared.no_wider_than(&declared));
+    }
+
+    /// The ordering follows the differ, which reports the same change as
+    /// `guard_declared`.
+    #[test]
+    fn guard_provenance_follows_the_differ_too() {
+        let proven = Fixture::new("gated").roles(&["admin"]);
+        let declared = Fixture::new("gated").roles(&["admin"]).declared();
+        assert!(differ_widens(&proven, &declared));
+        assert!(!differ_widens(&declared, &proven));
+        assert!(!declared.posture().no_wider_than(&proven.posture()));
+        assert!(proven.posture().no_wider_than(&declared.posture()));
+    }
+
+    /// Closing an open route is a narrowing even when a layer only declares the
+    /// new guard. The differ agrees: it stops comparing at that point.
+    #[test]
+    fn a_declared_guard_is_within_an_open_ceiling() {
+        let open = Fixture::new("public");
+        let declared = Fixture::new("gated").declared();
+        assert!(!differ_widens(&open, &declared));
+        assert!(declared.posture().no_wider_than(&open.posture()));
+        assert!(
+            Fixture::new("gated")
+                .posture()
+                .no_wider_than(&open.posture())
+        );
+    }
+
+    /// An open route has no guard, so its provenance changes nothing.
+    #[test]
+    fn provenance_on_an_open_route_is_ignored() {
+        let plain = Fixture::new("public").posture();
+        let flagged = Fixture::new("public").declared().posture();
+        assert_eq!(plain, flagged);
+    }
+
+    /// A proven route keeps the text it always had, so a marker already in a
+    /// PR keeps its seal. A declared one adds a trailing field and round-trips.
+    #[test]
+    fn declared_is_written_only_when_set() {
+        let encode = |f: &Fixture| {
+            let mut out = String::new();
+            f.posture().encode(&mut out);
+            out
+        };
+        let proven = encode(&Fixture::new("gated").roles(&["admin"]));
+        let declared = encode(&Fixture::new("gated").roles(&["admin"]).declared());
+        assert!(!proven.contains("declared"), "{proven}");
+        assert_eq!(declared, format!("{proven}|declared"));
+
+        let route = |posture: &str| format!("POST|%2Fa|{posture}");
+        let old = Ceiling::decode(&route(&proven)).expect("a 7-field entry still parses");
+        let new = Ceiling::decode(&route(&declared)).expect("a declared entry parses");
+        assert!(!old.routes[&("/a".to_owned(), "POST".to_owned())].declared);
+        assert!(new.routes[&("/a".to_owned(), "POST".to_owned())].declared);
+        assert_eq!(Ceiling::decode(&new.encode()), Some(new));
+    }
+
+    /// The reported gap: a marker approved for a route whose guard was proven
+    /// must not approve the same route once a layer only declares the guard.
+    #[test]
+    fn a_proven_marker_does_not_approve_a_declared_guard() {
+        let widen = finding("/a", "x");
+        let proven_head = Fixture::new("gated").manifest();
+        let approved = cover(&[&widen], &proven_head);
+        let (payload, digest) = (approved.ceiling.encode(), approved.seal());
+        assert!(
+            approved.accepts(&payload, &digest),
+            "the marker approves its own head"
+        );
+
+        let declared_head = Fixture::new("gated").declared().manifest();
+        let after = cover(&[&widen], &declared_head);
+        assert!(
+            !after.accepts(&payload, &digest),
+            "a weaker guard needs its own acknowledgment"
+        );
     }
 
     // ── cover ───────────────────────────────────────────────────────────────

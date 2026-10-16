@@ -1774,6 +1774,20 @@ jobs:
           # not just the crate's own generic suite above. Testcontainer-
           # managed, so no `services:` block is needed.
           cargo test -p wiki --test search_plugin_integration -- --ignored
+          # reddit-clone (#2454): run all #[ignore]d tests (Postgres, MinIO, live event).
+          # The run is bare `--ignored`. A new test needs no workflow edit.
+          # `--lib --tests` excludes doc tests. Their `ignore` blocks are not Docker tests.
+          # Use one thread. The tests share one job runtime.
+          # Browser tests use the `system-tests` feature, so they do not compile here.
+          # Check the pass count. `cargo test` exits 0 when no test matches.
+          # This adds about 15 minutes to the 75-minute budget above.
+          (
+            set -o pipefail
+            cargo test -p reddit-clone --lib --tests -- --ignored --test-threads=1 \
+              | tee "${RUNNER_TEMP}/reddit-clone-docker-sweep.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/reddit-clone-docker-sweep.log" \
+            || { echo "::error::no reddit-clone Docker test ran. Fix the filter in ci.yml."; exit 1; }
           # autumn-billing (#1190): the Postgres `DbBillingStore` contract suite
           # is testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-billing --test mirror_db -- --ignored
@@ -1830,10 +1844,6 @@ jobs:
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
-          # `examples/reddit-clone` (#2454): sweep its ignored tests. All use
-          # testcontainers. The Chromium smoke needs `system-tests`, so it is
-          # not built here.
-          cargo test -p reddit-clone --lib --tests -- --ignored --test-threads=1
           # Consolidated `cli_tests` binary: discover-and-run every Docker/
           # testcontainer `#[ignore]`d test the same way the autumn-web sweep
           # below does (#1923, #1945). Needs Docker (testcontainers) + host
@@ -2435,8 +2445,9 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- plugin::remove:: \
             | tee "$RUNNER_TEMP/cli-plugin-remove-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-plugin-remove-cov.log"
-          # Issue #2497: same gap for `posture::`. Check the count.
-          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: \
+          # Issues #2468 and #2497: same gap for `posture::` and
+          # `routes_audit::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: routes_audit:: \
             | tee "$RUNNER_TEMP/cli-posture-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-posture-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info

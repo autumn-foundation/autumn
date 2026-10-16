@@ -159,6 +159,8 @@ None.
   the new escape entry immediately below for a coordination defect this
   fix's merge timing collided with (independent, not a defect in the fix
   itself).
+  Update 2026-10-15 (#2454): the `Test (Docker)` job now runs the
+  `reddit-clone` ignored tests, this one included.
 
 ### Escape: four independent fixes for the same MinIO/Docker-Hub outage collided at merge, needing two reconciliation commits — ~8.3h of spurious Lint failures (two disjoint intervals) on 5 branches
 

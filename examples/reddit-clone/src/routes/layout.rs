@@ -337,7 +337,7 @@ pub fn form_error_summary<T>(form: &autumn_web::form::ChangesetForm<T>, fields: 
         .any(|field| !form.errors_for(field).is_empty());
     html! {
         @if has_errors {
-            div id="error-summary" tabindex="-1" autofocus
+            div id="error-summary" role="group" tabindex="-1" autofocus
                 aria-labelledby="error-summary-title"
                 class="mb-4 p-3 rounded border border-red-300 bg-red-50 text-sm text-red-700" {
                 h2 id="error-summary-title" class="font-semibold mb-1" {
@@ -434,6 +434,7 @@ mod tests {
         assert!(out.contains(r#"id="error-summary""#), "{out}");
         assert!(out.contains(r#"tabindex="-1""#), "{out}");
         assert!(out.contains("autofocus"), "{out}");
+        assert!(out.contains(r#"role="group""#), "{out}");
         assert!(out.contains(r##"href="#title""##), "{out}");
         assert!(out.contains("Title is required"), "{out}");
     }

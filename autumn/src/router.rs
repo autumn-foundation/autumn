@@ -9695,6 +9695,7 @@ mod tests {
                 prefix: "/en".to_owned(),
                 routes: vec![scoped_route],
                 source: crate::route_listing::RouteSource::User,
+                layer_guarded: false,
                 apply_layer: Box::new(|r| r),
             };
             let mut ctx = duplicate_test_ctx();
@@ -10305,6 +10306,7 @@ mod tests {
                 prefix: "/".to_owned(),
                 routes: vec![simple_route("/", "scoped_home", false)],
                 source: crate::route_listing::RouteSource::User,
+                layer_guarded: false,
                 apply_layer: Box::new(|r| r),
             };
             let both = super::build_aeo_site::<(), ()>(
@@ -10333,6 +10335,7 @@ mod tests {
                 prefix: "/".to_owned(),
                 routes: vec![scoped_home],
                 source: crate::route_listing::RouteSource::User,
+                layer_guarded: false,
                 apply_layer: Box::new(|r| r),
             };
             let mixed = super::build_aeo_site::<(), ()>(
@@ -10362,6 +10365,7 @@ mod tests {
                 prefix: "/admin".to_owned(),
                 routes: vec![scoped_route],
                 source: crate::route_listing::RouteSource::User,
+                layer_guarded: false,
                 apply_layer: Box::new(|r| r),
             };
             let mut ctx = duplicate_test_ctx();
@@ -10674,6 +10678,7 @@ enabled = true
                 sunset_opt_out: false,
             }],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
 
@@ -10888,6 +10893,7 @@ enabled = true
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
 
@@ -12102,6 +12108,7 @@ enabled = true
             prefix: "/api".to_owned(),
             routes: vec![scoped_child],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let mut ctx = duplicate_test_ctx();
@@ -12134,6 +12141,7 @@ enabled = true
                 "user_posts",
             )],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let b = crate::app::ScopedGroup {
@@ -12144,6 +12152,7 @@ enabled = true
                 "plugin_posts",
             )],
             source: crate::route_listing::RouteSource::Plugin("blog".to_owned()),
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let mut ctx = duplicate_test_ctx();
@@ -12237,6 +12246,7 @@ enabled = true
             prefix: "/api".to_owned(),
             routes: vec![scoped_child],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let mut ctx = duplicate_test_ctx();
@@ -12370,6 +12380,7 @@ enabled = true
             prefix: "/api".to_owned(),
             routes: vec![scoped_child],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let mut ctx = duplicate_test_ctx();
@@ -12764,6 +12775,7 @@ enabled = true
             prefix: "/".to_owned(),
             routes: vec![home],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let site = super::build_aeo_site::<(), ()>(
@@ -15606,6 +15618,7 @@ mod trusted_host_tests {
             prefix: prefix.to_owned(),
             routes: vec![timeout_route(http::Method::GET, "/", override_5s)],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
 
@@ -15654,6 +15667,7 @@ mod trusted_host_tests {
                 r
             }],
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let table =

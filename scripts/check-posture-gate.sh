@@ -40,7 +40,26 @@ cd "$root"
 
 # Examples carrying a committed posture baseline. Keep this list and the
 # `security-posture.json` files next to those examples in step.
-EXAMPLES=("hello")
+#
+# This is a representative subset, not the whole fleet (issue #2468). Each
+# example adds one build to `publish-gate`. The set shows each way a route gets
+# its classification:
+#   hello    - `#[public]` routes only
+#   flock    - a `#[public]` page for a WASM island
+#   invoice  - a `#[public]` page and a `#[public]` PDF
+#   todo-app - `#[public]` routes, and a bearer-token API that a layer guards
+#              (`AppBuilder::scoped_guarded`)
+# The other examples stay out. Most mount admin or write routes with no guard.
+# `#[public]` on those routes would be false. Add an example only after you
+# classify each of its routes by hand.
+EXAMPLES=("hello" "flock" "invoice" "todo-app")
+
+# The binary to audit. Only an example with more than one binary needs this.
+example_bin() {
+  case "$1" in
+    todo-app) echo "--bin todo-app" ;;
+  esac
+}
 
 # The build to audit (issue #2472). A deployment ships a release build, and a
 # route behind `#[cfg(not(debug_assertions))]` is only in that build. The
@@ -118,9 +137,10 @@ for example in "${EXAMPLES[@]}"; do
   echo "── $example ────────────────────────────────────────────────"
 
   # Also the #1604 default-deny gate: an unclassified route fails right here.
-  "$CLI" routes audit -p "$example" "${AUDIT_FLAGS[@]}" --manifest "$fresh" >/dev/null \
+  # shellcheck disable=SC2046  # the flag is two words, or none
+  "$CLI" routes audit -p "$example" $(example_bin "$example") "${AUDIT_FLAGS[@]}" --manifest "$fresh" >/dev/null \
     || die "$example: \`autumn routes audit\` failed — see the output above"
-  ok "$example: every route carries a proven classification"
+  ok "$example: every route carries a classification"
 
   if [ "$UPDATE" = "1" ]; then
     cp "$fresh" "$baseline"
@@ -174,7 +194,7 @@ for example in "${EXAMPLES[@]}"; do
       # fresh to a later head build, which then uses base code.
       (cd "$work/base-tree" \
         && CARGO_TARGET_DIR="$work/base-target" \
-          "$CLI" routes audit -p "$example" "${AUDIT_FLAGS[@]}" --manifest "$accepted" >/dev/null) \
+          "$CLI" routes audit -p "$example" $(example_bin "$example") "${AUDIT_FLAGS[@]}" --manifest "$accepted" >/dev/null) \
         || die "$example: \`autumn routes audit\` failed on $POSTURE_BASE_REF"
     fi
   fi

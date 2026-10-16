@@ -69,6 +69,22 @@ A `#[repository(api = ..., policy = ...)]` or `scope = ...` auto-API route is
 also `gated` — its guard lives on the generated CRUD handler, not on a
 `#[secured]` attribute, but the classifier knows to look there too.
 
+### Guarded by a layer
+
+A guard can be a tower layer instead of an attribute. `RequireApiToken` is a
+layer. Mount such a group with `scoped_guarded`, not `scoped`:
+
+```rust
+app.scoped_guarded("/api", RequireApiToken::new(store), routes![list_todos])
+```
+
+A route in the group with no `#[secured]` or `#[public]` is then `gated`, and
+its manifest entry has `"provenance": "declared"`. The audit cannot see inside
+the layer. It records your claim and does not check it. A handler's own `#[public]` or `#[secured]`
+wins over the group.
+
+Do not use `#[public]` on these routes. They are not public.
+
 ### `public` — deliberately open routes
 
 Use `#[public]` when a route has no guard *on purpose*. It injects no runtime

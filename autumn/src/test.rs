@@ -1073,6 +1073,7 @@ impl TestApp {
             prefix: prefix.to_owned(),
             routes,
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
