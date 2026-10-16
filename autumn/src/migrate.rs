@@ -4501,6 +4501,35 @@ mod tests {
         );
     }
 
+    /// A history table the guarded path cannot read stops the run before
+    /// the guard sees anything, and nothing is applied.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_guarded_sqlite_run_stops_on_an_unreadable_history() {
+        use diesel::{Connection as _, RunQueryDsl as _};
+
+        let (migrations_dir, url) = sqlite_scratch("guarded-history");
+        let path = url.trim_start_matches("sqlite://");
+        let mut conn = diesel::SqliteConnection::establish(path).expect("scratch database");
+        diesel::sql_query("CREATE TABLE __diesel_schema_migrations (other INTEGER)")
+            .execute(&mut conn)
+            .expect("a history table without a version column");
+        drop(conn);
+
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("empty app set");
+        let result = run_pending_sqlite_guarded(
+            &url,
+            DisambiguatedMigrations::new(&app, &HashMap::new()),
+            |_| panic!("the guard runs only on a readable history"),
+        );
+        match result {
+            Err(MigrationError::Migration(detail)) => {
+                assert!(detail.contains("version"), "{detail}");
+            }
+            other => panic!("expected a migration error, got {other:?}"),
+        }
+    }
+
     /// Rollback plans and reverts under the identities the apply path
     /// recorded: the app migration tracked under a substitute is listed
     /// under it with its directory, the derivation migration under the plain
