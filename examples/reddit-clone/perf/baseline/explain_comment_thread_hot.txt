@@ -1,0 +1,43 @@
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=73712.22..73977.76 rows=106215 width=61) (actual time=390.290..403.327 rows=110720 loops=1)
+   Output: c.id, c.parent_id, c.author_id, c.body, c.created_at, u.username
+   Sort Key: c.created_at, c.id
+   Sort Method: external merge  Disk: 7632kB
+   Buffers: shared hit=611 read=37807 written=8109, temp read=954 written=957
+   I/O Timings: shared read=109.601 write=25.672, temp read=1.199 write=3.032
+   ->  Hash Left Join  (cost=8043.88..60851.56 rows=106215 width=61) (actual time=73.394..342.774 rows=110720 loops=1)
+         Output: c.id, c.parent_id, c.author_id, c.body, c.created_at, u.username
+         Inner Unique: true
+         Hash Cond: (c.author_id = u.id)
+         Buffers: shared hit=605 read=37807 written=8109
+         I/O Timings: shared read=109.601 write=25.672
+         ->  Bitmap Heap Scan on public.comments c  (cost=4858.88..57387.73 rows=106215 width=52) (actual time=35.813..248.588 rows=110720 loops=1)
+               Output: c.id, c.parent_id, c.author_id, c.body, c.created_at
+               Recheck Cond: ((c.commentable_type = 'Post'::text) AND (c.commentable_id = 1))
+               Filter: (c.deleted_at IS NULL)
+               Rows Removed by Filter: 2303
+               Heap Blocks: exact=36443
+               Buffers: shared hit=3 read=37474 written=8109
+               I/O Timings: shared read=107.475 write=25.672
+               ->  Bitmap Index Scan on idx_comments_thread  (cost=0.00..4832.33 rows=108390 width=0) (actual time=27.321..27.322 rows=113023 loops=1)
+                     Index Cond: ((c.commentable_type = 'Post'::text) AND (c.commentable_id = 1))
+                     Buffers: shared hit=3 read=1031
+                     I/O Timings: shared read=6.370
+         ->  Hash  (cost=1935.00..1935.00 rows=100000 width=17) (actual time=36.960..36.961 rows=100000 loops=1)
+               Output: u.username, u.id
+               Buckets: 131072  Batches: 1  Memory Usage: 6485kB
+               Buffers: shared hit=602 read=333
+               I/O Timings: shared read=2.126
+               ->  Seq Scan on public.users u  (cost=0.00..1935.00 rows=100000 width=17) (actual time=0.026..15.632 rows=100000 loops=1)
+                     Output: u.username, u.id
+                     Buffers: shared hit=602 read=333
+                     I/O Timings: shared read=2.126
+ Query Identifier: 6391835700288697977
+ Planning:
+   Buffers: shared hit=248 read=23
+   I/O Timings: shared read=0.170
+ Planning Time: 1.262 ms
+ Execution Time: 409.131 ms
+(39 rows)
+
