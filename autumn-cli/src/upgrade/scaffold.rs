@@ -146,10 +146,10 @@ pub struct Manifest {
 impl Manifest {
     /// The manifest describing `files` as just written.
     #[must_use]
-    pub fn for_files(
+    pub fn for_files<K: AsRef<str>>(
         version: &str,
         options: GenerateOptions,
-        files: &BTreeMap<&'static str, String>,
+        files: &BTreeMap<K, String>,
     ) -> Self {
         Self {
             version: Some(version.to_owned()),
@@ -157,7 +157,7 @@ impl Manifest {
             options,
             digests: files
                 .iter()
-                .map(|(path, contents)| ((*path).to_owned(), digest(contents)))
+                .map(|(path, contents)| (path.as_ref().to_owned(), digest(contents)))
                 .collect(),
             pinned: BTreeSet::new(),
         }
@@ -434,6 +434,9 @@ pub enum ConflictReason {
     /// Set from the codemods' *plan*, so a preview says the same thing the
     /// apply it is previewing will.
     MigratedThisRun,
+    /// A Cargo config file sits in the member while the workspace root owns
+    /// it. Cargo reads the nearest copy, so this one shadows the root copy.
+    Shadows,
 }
 
 impl ConflictReason {
@@ -448,6 +451,7 @@ impl ConflictReason {
             Self::MigratedThisRun => {
                 "this run's app-code migrations rewrote it; reconcile it by hand"
             }
+            Self::Shadows => "shadows the workspace root copy; delete it",
         }
     }
 }
@@ -614,29 +618,178 @@ pub fn resolve_options(root: &Path, manifest: Option<&Manifest>) -> GenerateOpti
     }
 }
 
-/// Config that Cargo resolves from the nearest ancestor.
-///
-/// A crate-local copy in a workspace member **shadows** the workspace's,
-/// silently dropping its lints and MSRV pin. Seeding one is a regression.
+/// Files that Cargo reads from the nearest ancestor. A member gets them at the
+/// workspace root. A copy in the member **shadows** the workspace's copy.
 const CARGO_ROOT_OWNED: &[&str] = &["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"];
 
-/// Workflows. GitHub runs them from the **git root**, not the Cargo root.
+/// Files that GitHub reads from the **git root** only. A member gets them there.
 const GIT_ROOT_OWNED: &[&str] = &[
     ".github/workflows/ci.yml",
     ".github/workflows/posture-gate.yml",
 ];
 
-/// Whether `root` is itself a git repository root.
-fn is_git_root(root: &Path) -> bool {
-    root.canonicalize().is_ok_and(|absolute| {
-        crate::git_root::find_git_root(&absolute).as_deref() == Some(&absolute)
-    })
+/// Who owns a group of root-level files for one project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Owner {
+    /// The project directory itself.
+    Here,
+    /// An ancestor directory. The files are planned there.
+    Above(PathBuf),
+    /// No safe place for them. They are not planned.
+    OutOfScope,
 }
 
-/// Whether the project's workflows are out of scope: a workspace member that
-/// is not its own git root. Its workflows never run.
-fn workflows_out_of_scope(root: &Path) -> bool {
-    workspace_root_above(root).is_some() && !is_git_root(root)
+/// The owners of the root-level files of the project at `root`.
+struct RootOwners {
+    /// `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`.
+    cargo: Owner,
+    /// The CI workflows.
+    workflows: Owner,
+}
+
+/// Find who owns the root files of `root`.
+///
+/// Rule: a file goes only where the member's own git repository reaches. With
+/// no git repository, nothing bounds a write, so nothing is planned. A nested
+/// repository or submodule never writes into the repository above it.
+///
+/// The posture gate runs from the git root with no working directory. It can
+/// only build the member when the git root is also the workspace root, so the
+/// workflows need that too.
+fn root_owners(root: &Path) -> RootOwners {
+    let Some(workspace) = workspace_root_above(root) else {
+        return RootOwners {
+            cargo: Owner::Here,
+            workflows: Owner::Here,
+        };
+    };
+    let out_of_scope = RootOwners {
+        cargo: Owner::OutOfScope,
+        workflows: Owner::OutOfScope,
+    };
+    let Ok(absolute) = root.canonicalize() else {
+        return out_of_scope;
+    };
+    let Some(git) = crate::git_root::find_git_root(&absolute) else {
+        return out_of_scope;
+    };
+    if git == absolute {
+        return RootOwners {
+            cargo: Owner::OutOfScope,
+            workflows: Owner::Here,
+        };
+    }
+    let cargo = if workspace.starts_with(&git) {
+        Owner::Above(workspace.clone())
+    } else {
+        Owner::OutOfScope
+    };
+    // The path from the git root is written into YAML. Refuse any character
+    // that YAML could read as syntax.
+    let workflows = if workspace == git
+        && relative_dir(&git, &absolute).is_some_and(|dir| safe_in_yaml(&dir))
+        && is_cargo_member(&workspace, &absolute)
+    {
+        Owner::Above(git)
+    } else {
+        Owner::OutOfScope
+    };
+    RootOwners { cargo, workflows }
+}
+
+/// Whether Cargo counts `member` as a member of the workspace at `workspace`.
+///
+/// Asked of Cargo, not read from `Cargo.toml`: `members` globs, `exclude` and
+/// path dependencies in the workspace directory all decide it. The posture
+/// gate selects the member with `-p`, and Cargo cannot select an excluded
+/// crate. `--no-deps` needs no network. If Cargo fails, the answer is no.
+fn is_cargo_member(workspace: &Path, member: &Path) -> bool {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let manifest = plain(member).join("Cargo.toml");
+    let Ok(output) = std::process::Command::new(cargo)
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return false;
+    };
+    let same = |value: Option<&str>, expected: &Path| {
+        value
+            .and_then(|path| Path::new(path).canonicalize().ok())
+            .is_some_and(|path| plain(&path) == plain(expected))
+    };
+    same(metadata["workspace_root"].as_str(), workspace)
+        && metadata["packages"].as_array().is_some_and(|packages| {
+            packages
+                .iter()
+                .any(|package| same(package["manifest_path"].as_str(), &manifest))
+        })
+}
+
+/// `path` without the `\\?\` prefix Windows adds to a canonical path.
+///
+/// Cargo can fail to match a member found through a path dependency when its
+/// manifest path has that prefix. On other systems this returns `path` as it is.
+fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The `/`-separated path from `ancestor` down to `descendant`.
+fn relative_dir(ancestor: &Path, descendant: &Path) -> Option<String> {
+    let parts: Option<Vec<&str>> = descendant
+        .strip_prefix(ancestor)
+        .ok()?
+        .components()
+        .map(|part| part.as_os_str().to_str())
+        .collect();
+    Some(parts?.join("/"))
+}
+
+/// Whether `text` is safe to write into a YAML scalar as it is.
+fn safe_in_yaml(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// Cargo config files that sit in the member while the workspace root owns
+/// them. Each is a conflict: the member copy shadows the root copy, and the
+/// command never deletes a file.
+fn shadowing_copies(root: &Path) -> Vec<Entry> {
+    if !matches!(root_owners(root).cargo, Owner::Above(_)) {
+        return Vec::new();
+    }
+    CARGO_ROOT_OWNED
+        .iter()
+        .filter_map(|path| {
+            let current = read_current(root, path);
+            (current != OnDisk::Absent).then(|| Entry {
+                path: (*path).to_owned(),
+                status: Status::Conflict(ConflictReason::Shadows),
+                template: String::new(),
+                current,
+                diff: String::new(),
+                absolute: root.join(path),
+            })
+        })
+        .collect()
 }
 
 /// Whether `root` is a crate inside an enclosing Cargo workspace.
@@ -673,11 +826,11 @@ fn declares_workspace(directory: &Path) -> bool {
 
 /// The current release's framework-owned files, rendered for the project at
 /// `root`, or `None` when the project's name cannot be established.
+///
+/// A key is a path from `root`. A workspace member also gets the root-level
+/// files at their owner, as `../` paths (issue #2469).
 #[must_use]
-pub fn current_files(
-    root: &Path,
-    options: GenerateOptions,
-) -> Option<BTreeMap<&'static str, String>> {
+pub fn current_files(root: &Path, options: GenerateOptions) -> Option<BTreeMap<String, String>> {
     let name = project_name(root)?;
     let crate_name = name.replace('-', "_");
     let vars = TemplateVars {
@@ -686,15 +839,53 @@ pub fn current_files(
         autumn_version: env!("CARGO_PKG_VERSION"),
         rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
     };
-    let mut files = framework_owned_files(&vars, options);
-    if workspace_root_above(root).is_some() {
-        for path in CARGO_ROOT_OWNED {
-            files.remove(path);
-        }
-    }
-    if workflows_out_of_scope(root) {
-        for path in GIT_ROOT_OWNED {
-            files.remove(path);
+    let mut files: BTreeMap<String, String> = framework_owned_files(&vars, options)
+        .into_iter()
+        .map(|(path, contents)| (path.to_owned(), contents))
+        .collect();
+    let owners = root_owners(root);
+    for (group, owner, is_workflow) in [
+        (CARGO_ROOT_OWNED, &owners.cargo, false),
+        (GIT_ROOT_OWNED, &owners.workflows, true),
+    ] {
+        match owner {
+            Owner::Here => {}
+            Owner::OutOfScope => {
+                for path in group {
+                    files.remove(*path);
+                }
+            }
+            Owner::Above(directory) => {
+                // `root_owners` proved both. If either fails now, plan nothing
+                // rather than a copy inside the member.
+                let placed = root.canonicalize().ok().and_then(|absolute| {
+                    let below = absolute.strip_prefix(directory).ok()?;
+                    let up = "../".repeat(below.components().count());
+                    Some((up, relative_dir(directory, &absolute)?))
+                });
+                let Some((up, member_dir)) = placed else {
+                    for path in group {
+                        files.remove(*path);
+                    }
+                    continue;
+                };
+                for path in group {
+                    let Some(contents) = files.remove(*path) else {
+                        continue;
+                    };
+                    let contents = if is_workflow {
+                        // A workflow that cannot be rewritten for the member
+                        // is not planned. It would name the wrong package.
+                        match crate::new::member_workflow(path, &contents, &name, &member_dir) {
+                            Some(rewritten) => rewritten,
+                            None => continue,
+                        }
+                    } else {
+                        contents
+                    };
+                    files.insert(format!("{up}{path}"), contents);
+                }
+            }
         }
     }
     Some(files)
@@ -810,7 +1001,7 @@ pub struct Planned {
 #[must_use]
 pub fn classify(
     root: &Path,
-    files: &BTreeMap<&'static str, String>,
+    files: &BTreeMap<String, String>,
     manifest: Option<&Manifest>,
     migrated: &BTreeMap<String, Planned>,
 ) -> Vec<Entry> {
@@ -825,7 +1016,7 @@ pub fn classify(
             // A migrated file is judged by its planned text. In a preview, the
             // old file is still on disk. In `--apply`, the new file is already
             // there. Any other text is a later edit, so the disk wins.
-            let planned = migrated.get(*path);
+            let planned = migrated.get(path);
             let seen = match (&current, planned) {
                 (OnDisk::Text(text), Some(plan))
                     if *text == normalize(&plan.original) || *text == normalize(&plan.updated) =>
@@ -873,7 +1064,7 @@ pub fn classify(
                 }
             };
             Entry {
-                path: (*path).to_owned(),
+                path: path.clone(),
                 status,
                 template: normalize(template),
                 current,
@@ -950,9 +1141,9 @@ pub struct ScaffoldReport {
     /// `Dockerfile`, the build script and the CI workflow. Downgrades are out
     /// of scope, so the run refuses instead and [`Self::entries`] is empty.
     pub scaffolded_by_newer: Option<String>,
-    /// Whether this project is a crate inside an enclosing Cargo workspace.
-    /// Its Cargo config files are then out of scope. Its workflows are out of
-    /// scope too, unless it is its own git root.
+    /// Whether this project is a member of an enclosing Cargo workspace. The
+    /// report then plans the root files at the workspace root or the git root,
+    /// as `../` paths, where it can.
     pub workspace_member: bool,
     /// Every framework-owned file, up-to-date ones included.
     pub entries: Vec<Entry>,
@@ -1147,7 +1338,12 @@ pub fn plan_after(
         scaffolded_by_newer,
         workspace_member: workspace_root_above(root).is_some(),
         entries: files
-            .map(|files| classify(root, &files, manifest.as_ref(), migrated))
+            .map(|files| {
+                let mut entries = classify(root, &files, manifest.as_ref(), migrated);
+                entries.extend(shadowing_copies(root));
+                entries.sort_by(|a, b| a.path.cmp(&b.path));
+                entries
+            })
             .unwrap_or_default(),
         guide: release_guide(&target),
         target,
@@ -1275,11 +1471,25 @@ pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
         let unknown: Vec<&str> = paths
             .iter()
             .map(String::as_str)
-            .filter(|path| !owned.contains_key(path))
+            .filter(|path| !owned.contains_key(*path))
             .collect();
         if !unknown.is_empty() {
+            let hints: Vec<String> = unknown
+                .iter()
+                .filter_map(|path| {
+                    owned
+                        .keys()
+                        .find(|key| key.starts_with("../") && key.ends_with(&format!("/{path}")))
+                        .map(|key| format!("`{path}` is `{key}` here"))
+                })
+                .collect();
+            let hint = if hints.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", hints.join("; "))
+            };
             refusal = Some(format!(
-                "not framework-owned in this project, so there is nothing to accept: {}",
+                "not framework-owned in this project, so there is nothing to accept: {}{hint}",
                 unknown.join(", ")
             ));
             return Err(String::new());
@@ -1819,19 +2029,7 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
         );
     }
     if report.workspace_member {
-        let _ = writeln!(
-            out,
-            "  This crate is in a Cargo workspace. clippy.toml, rustfmt.toml and\n  \
-             rust-toolchain.toml are out of scope: a crate-local copy would shadow\n  \
-             the workspace's copy. Reconcile them at the workspace root."
-        );
-        if workflows_out_of_scope(&report.root) {
-            let _ = writeln!(
-                out,
-                "  The CI workflows are out of scope too: this crate is not the git\n  \
-                 root, so GitHub never runs them. Reconcile them at the git root."
-            );
-        }
+        render_workspace_note(&mut out, &report.root);
     }
 
     let changed = report.changed();
@@ -1869,6 +2067,48 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
     render_outcome(&mut out, report, diffs);
     let _ = writeln!(out, "Upgrade guide: {}", report.guide);
     out
+}
+
+/// Say where a workspace member's root-level files are planned.
+fn render_workspace_note(out: &mut String, root: &Path) {
+    use std::fmt::Write as _;
+
+    let owners = root_owners(root);
+    let _ = match owners.cargo {
+        Owner::Above(_) => writeln!(
+            out,
+            "  This crate is in a Cargo workspace. clippy.toml, rustfmt.toml and\n  \
+             rust-toolchain.toml are planned at the workspace root (the ../ paths):\n  \
+             a copy in the crate would shadow the workspace's. A root file that\n  \
+             another member wrote is a conflict. The command does not write it.\n  \
+             Use --accept to leave it to that member."
+        ),
+        _ => writeln!(
+            out,
+            "  This crate is in a Cargo workspace. clippy.toml, rustfmt.toml and\n  \
+             rust-toolchain.toml are out of scope: a crate-local copy would shadow\n  \
+             the workspace's copy. Reconcile them at the workspace root."
+        ),
+    };
+    match owners.workflows {
+        Owner::Above(_) => {
+            let _ = writeln!(
+                out,
+                "  The CI workflows are planned at the git root (the ../ paths): GitHub\n  \
+                 runs them only from there. They name this crate, so one workflow\n  \
+                 serves one member."
+            );
+        }
+        Owner::OutOfScope => {
+            let _ = writeln!(
+                out,
+                "  The CI workflows are out of scope too. They need a git repository\n  \
+                 whose root is the workspace root, and a plain directory path. Reconcile\n  \
+                 them by hand at the git root."
+            );
+        }
+        Owner::Here => {}
+    }
 }
 
 /// The closing paragraph: what happened, or what would, and how to undo it.
@@ -1985,6 +2225,8 @@ pub fn json(report: &ScaffoldReport) -> serde_json::Value {
             .iter()
             .map(|entry| serde_json::json!({
                 "path": entry.path,
+                // A root file sits outside the project directory.
+                "outside_project": entry.path.starts_with("../"),
                 "status": entry.status.label(),
                 "reason": entry.status.describe(),
                 "applied": entry.status.is_applied(),
@@ -2839,52 +3081,8 @@ mod tests {
         assert!(Manifest::load(tmp.path()).unwrap().options.with_api);
     }
 
-    #[test]
-    fn a_workspace_member_is_not_given_the_files_a_workspace_root_owns() {
-        // `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` resolve from
-        // the nearest ancestor, so a crate-local copy SHADOWS the workspace's —
-        // silently dropping its lints and MSRV pin. Workflows only run from
-        // the git root. Seeding those into a member is not an upgrade.
-        let outer = TempDir::new().unwrap();
-        fs::write(
-            outer.path().join("Cargo.toml"),
-            "[workspace]\nmembers = [\"app\"]\nresolver = \"3\"\n",
-        )
-        .unwrap();
-        let root = outer.path().join("app");
-        fs::create_dir_all(&root).unwrap();
-        write(
-            &root,
-            "Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-        );
-        write(&root, "autumn.toml", "[server]\n");
-
-        let report = plan(&root, "0.7.0");
-        let offered: Vec<&str> = report.entries.iter().map(|e| e.path.as_str()).collect();
-        for root_owned in [
-            "clippy.toml",
-            "rustfmt.toml",
-            "rust-toolchain.toml",
-            ".github/workflows/ci.yml",
-        ] {
-            assert!(
-                !offered.contains(&root_owned),
-                "{root_owned} in {offered:?}"
-            );
-        }
-        // ...but the per-crate files are still reconciled.
-        assert!(offered.contains(&"Dockerfile"), "{offered:?}");
-        assert!(offered.contains(&"build.rs"), "{offered:?}");
-        assert!(
-            render_text(&report).contains("workspace"),
-            "{}",
-            render_text(&report)
-        );
-    }
-
-    /// A member crate at `app/` under a Cargo workspace; `git_marker` is
-    /// written as `app/.git` when given.
+    /// A member crate `app/` under a Cargo workspace at the outer directory.
+    /// `git_marker` is written as `app/.git` when given.
     fn member_with_git(git_marker: Option<&str>) -> (TempDir, PathBuf) {
         let outer = TempDir::new().unwrap();
         fs::write(
@@ -2900,6 +3098,7 @@ mod tests {
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
         );
         write(&root, "autumn.toml", "[server]\n");
+        write(&root, "src/lib.rs", "");
         match git_marker {
             Some("dir") => fs::create_dir(root.join(".git")).unwrap(),
             Some(file) => write(&root, ".git", file),
@@ -2918,26 +3117,218 @@ mod tests {
         ".github/workflows/posture-gate.yml",
     ];
 
-    fn assert_scope(report: &ScaffoldReport, workflows_offered: bool) {
+    /// Where each group is planned: `Some(prefix)` before the file name, or
+    /// `None` when the group is out of scope.
+    fn assert_scope(report: &ScaffoldReport, workflows: Option<&str>, cargo_files: Option<&str>) {
         let offered = offered_paths(report);
-        for path in WORKFLOWS {
-            assert_eq!(
-                offered.contains(&path),
-                workflows_offered,
-                "{path}: {offered:?}"
-            );
-        }
-        for path in CARGO_FILES {
-            assert!(!offered.contains(&path), "{path} in {offered:?}");
+        for (group, prefix) in [
+            (WORKFLOWS.as_slice(), workflows),
+            (&CARGO_FILES, cargo_files),
+        ] {
+            for path in group {
+                let planned: Vec<&&str> = offered.iter().filter(|o| o.ends_with(path)).collect();
+                match prefix {
+                    Some(prefix) => {
+                        assert_eq!(
+                            planned,
+                            [&format!("{prefix}{path}").as_str()],
+                            "{offered:?}"
+                        );
+                    }
+                    None => assert!(planned.is_empty(), "{path} in {offered:?}"),
+                }
+            }
         }
     }
 
     #[test]
+    fn a_member_with_no_git_repo_gets_no_root_files() {
+        // Nothing bounds a write without a git repository (issue #2469).
+        let (_outer, root) = member_with_git(None);
+        let report = plan(&root, "0.7.0");
+        assert_scope(&report, None, None);
+        let offered = offered_paths(&report);
+        assert!(offered.contains(&"Dockerfile"), "{offered:?}");
+        assert!(offered.contains(&"build.rs"), "{offered:?}");
+        assert!(render_text(&report).contains("CI workflows are out of scope"));
+    }
+
+    /// Layout `git_at` / `ws_at` / `member_at`, relative to one temp dir.
+    fn layout(git_at: &str, ws_at: &str, member_at: &str) -> (TempDir, PathBuf) {
+        let outer = TempDir::new().unwrap();
+        let dir = |rel: &str| outer.path().join(rel);
+        fs::create_dir_all(dir(git_at).join(".git")).unwrap();
+        fs::create_dir_all(dir(ws_at)).unwrap();
+        let listed = Path::new(member_at)
+            .strip_prefix(ws_at)
+            .unwrap_or_else(|_| Path::new(member_at))
+            .to_string_lossy()
+            .into_owned();
+        fs::write(
+            dir(ws_at).join("Cargo.toml"),
+            format!("[workspace]\nmembers = [\"{listed}\"]\n"),
+        )
+        .unwrap();
+        let root = dir(member_at);
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "autumn.toml", "[server]\n");
+        write(&root, "src/lib.rs", "");
+        (outer, root)
+    }
+
+    #[test]
+    fn a_member_two_levels_down_uses_two_levels_of_dots() {
+        let (_outer, root) = layout(".", ".", "apps/demo");
+        let report = plan(&root, "0.7.0");
+        assert_scope(&report, Some("../../"), Some("../../"));
+        let gate = report
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("posture-gate.yml"))
+            .unwrap();
+        assert!(
+            gate.template
+                .contains("POSTURE_MANIFEST: apps/demo/security-posture.json")
+        );
+    }
+
+    #[test]
+    fn an_excluded_crate_gets_cargo_files_but_no_workflows() {
+        // `-p demo` cannot select a crate the workspace excludes.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"app\"]\n",
+        )
+        .unwrap();
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_path_dependency_in_the_workspace_is_a_member() {
+        // Cargo makes it an implicit member, so `-p demo` works.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[package]\nname = \"top\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\ndemo = { path = \"app\" }\n\n[workspace]\nmembers = []\n",
+        )
+        .unwrap();
+        write(outer.path(), "src/lib.rs", "");
+        assert_scope(&plan(&root, "0.7.0"), Some("../"), Some("../"));
+    }
+
+    #[test]
+    fn a_member_glob_does_not_override_exclude() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\nexclude = [\"app\"]\n",
+        )
+        .unwrap();
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_workspace_root_below_the_git_root_gets_cargo_files_only() {
+        // The posture gate runs from the git root. It cannot build there.
+        let (_outer, root) = layout(".", "ws", "ws/app");
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_workspace_root_above_the_git_repo_gets_nothing() {
+        // The Cargo files would land in another repository.
+        let (_outer, root) = layout("ws/repo", "ws", "ws/repo/app");
+        assert_scope(&plan(&root, "0.7.0"), None, None);
+    }
+
+    #[test]
+    fn a_deleted_root_file_is_removed_not_re_added() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        apply(&mut plan(&root, "0.7.0")).expect("apply");
+        fs::remove_file(outer.path().join("clippy.toml")).unwrap();
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "../clippy.toml"),
+            &Status::Removed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_github_directory_at_the_root_is_a_conflict() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), outer.path().join(".github")).unwrap();
+        let mut report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "../.github/workflows/ci.yml"),
+            &Status::Conflict(ConflictReason::Symlink)
+        );
+        apply(&mut report).expect("apply");
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_member_copy_of_a_root_cargo_file_is_a_shadow_conflict() {
+        // `autumn new` writes these. Adopting the project into a workspace
+        // leaves them behind, and Cargo reads the nearest copy.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        write(&root, "clippy.toml", "# local\n");
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "clippy.toml"),
+            &Status::Conflict(ConflictReason::Shadows)
+        );
+        assert!(report.drifted());
+        let mut report = report;
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(root.join("clippy.toml")).unwrap(),
+            "# local\n"
+        );
+
+        fs::remove_file(root.join("clippy.toml")).unwrap();
+        let report = plan(&root, "0.7.0");
+        assert!(!offered_paths(&report).contains(&"clippy.toml"));
+    }
+
+    #[test]
+    fn accepting_a_bare_root_file_name_points_at_the_real_key() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        let error = accept(&root, &["clippy.toml".to_owned()]).unwrap_err();
+        assert!(error.contains("`../clippy.toml`"), "{error}");
+    }
+
+    #[test]
+    fn a_member_below_the_git_root_gets_its_workflows_at_the_git_root() {
+        // The common monorepo: `.git` at the workspace root, member below it.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        let report = plan(&root, "0.7.0");
+        assert_scope(&report, Some("../"), Some("../"));
+        assert!(!render_text(&report).contains("CI workflows are out of scope"));
+    }
+
+    #[test]
     fn a_nested_git_repo_in_a_workspace_owns_its_workflows_but_not_its_lint_config() {
-        // Cargo resolves lint config by ancestry. GitHub runs workflows from
-        // the git root. A nested repo has its own live workflows.
+        // Cargo resolves lint config by ancestry, but the workspace root is in
+        // another repository. GitHub runs this repo's own workflows.
         let (_outer, root) = member_with_git(Some("dir"));
-        assert_scope(&plan(&root, "0.7.0"), true);
+        assert_scope(&plan(&root, "0.7.0"), Some(""), None);
     }
 
     #[test]
@@ -2945,16 +3336,8 @@ mod tests {
         // A submodule's `.git` is a file, not a directory.
         let (_outer, root) = member_with_git(Some("gitdir: ../.git/modules/app\n"));
         let report = plan(&root, "0.7.0");
-        assert_scope(&report, true);
+        assert_scope(&report, Some(""), None);
         assert!(!render_text(&report).contains("CI workflows are out of scope"));
-    }
-
-    #[test]
-    fn a_member_below_the_git_root_does_not_own_workflows() {
-        // The common monorepo: `.git` at the workspace root, member below it.
-        let (outer, root) = member_with_git(None);
-        fs::create_dir(outer.path().join(".git")).unwrap();
-        assert_scope(&plan(&root, "0.7.0"), false);
     }
 
     #[test]
@@ -2965,20 +3348,104 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_member_is_told_its_workflows_are_out_of_scope() {
-        let (_outer, root) = member_with_git(None);
-        let report = plan(&root, "0.7.0");
-        assert_scope(&report, false);
-        let text = render_text(&report);
-        assert!(text.contains("CI workflows are out of scope"), "{text}");
-    }
-
-    #[test]
     fn the_workspace_note_names_only_what_is_out_of_scope() {
         let (_outer, root) = member_with_git(Some("dir"));
         let text = render_text(&plan(&root, "0.7.0"));
         assert!(text.contains("rustfmt.toml"), "{text}");
         assert!(!text.contains("CI workflows are out of scope"), "{text}");
+    }
+
+    #[test]
+    fn apply_writes_a_members_root_files_at_the_root_and_none_in_the_member() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        let mut report = plan(&root, "0.7.0");
+        apply(&mut report).expect("apply");
+
+        for path in CARGO_FILES {
+            assert!(outer.path().join(path).is_file(), "{path} at the root");
+            assert!(!root.join(path).exists(), "{path} in the member");
+        }
+        let ci = fs::read_to_string(outer.path().join(".github/workflows/ci.yml")).unwrap();
+        assert!(ci.contains("working-directory: \"app\""), "{ci}");
+        let gate =
+            fs::read_to_string(outer.path().join(".github/workflows/posture-gate.yml")).unwrap();
+        assert!(
+            gate.contains("POSTURE_MANIFEST: app/security-posture.json"),
+            "{gate}"
+        );
+        assert!(!root.join(".github").exists());
+
+        // The next run finds nothing to do, and the digests live in the member.
+        let again = plan(&root, "0.7.0");
+        // (`autumn.toml` stays a conflict: the fixture wrote its own.)
+        for entry in again.entries.iter().filter(|e| e.path.starts_with("../")) {
+            assert_eq!(entry.status, Status::UpToDate, "{}", entry.path);
+        }
+        let manifest = Manifest::load(&root).expect("manifest");
+        assert!(
+            manifest.digests.contains_key("../clippy.toml"),
+            "{manifest:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_file_another_member_wrote_is_a_conflict_not_an_overwrite() {
+        // Two members share one root workflow. The second sees the first's
+        // text (it names another package), so it is never written over.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        write(
+            outer.path(),
+            ".github/workflows/ci.yml",
+            "name: other member\n",
+        );
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "../.github/workflows/ci.yml"),
+            &Status::Conflict(ConflictReason::NoBaseline)
+        );
+        let mut report = report;
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(outer.path().join(".github/workflows/ci.yml")).unwrap(),
+            "name: other member\n"
+        );
+    }
+
+    #[test]
+    fn a_member_in_a_directory_yaml_could_misread_gets_no_workflows() {
+        // The directory is written into the workflow. A space, `:` or `#` would
+        // change what the YAML means.
+        let outer = TempDir::new().unwrap();
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\n",
+        )
+        .unwrap();
+        let root = outer.path().join("my app");
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "autumn.toml", "[server]\n");
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_root_file_can_be_accepted_by_its_relative_path() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        write(outer.path(), "clippy.toml", "# ours\n");
+        accept(&root, &["../clippy.toml".to_owned()]).expect("accept");
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "../clippy.toml"),
+            &Status::Pinned
+        );
     }
 
     #[test]
