@@ -2562,6 +2562,13 @@ fn migrate_existing_blocking(fleet: &DatabaseFleet, key: &FleetDbKey) -> Result<
     let path = fleet.path_of(key);
     let name = key.name();
     check_contained(fleet.root(), &path)?;
+    let Some(_pin) = pin_existing(&path).map_err(|e| FleetError::Unavailable {
+        name: name.clone(),
+        detail: e.to_string(),
+    })?
+    else {
+        return Ok(0);
+    };
     let url = existing_only_url(&path);
     match check_identity_blocking(&url, &name) {
         Ok(()) => fleet.inner.migrations.apply(&url, &name),
@@ -2584,6 +2591,11 @@ fn inspect_blocking(path: &Path, name: &str) -> Result<FleetDbInfo, FleetError> 
     let unavailable = |detail: String| FleetError::Unavailable {
         name: name.to_owned(),
         detail,
+    };
+    let Some(_pin) = pin_existing(path).map_err(|e| unavailable(e.to_string()))? else {
+        return Err(FleetError::NotFound {
+            name: name.to_owned(),
+        });
     };
     let mut conn = crate::db::establish_sqlite_migration_connection(&existing_only_url(path))
         .map_err(|e| unavailable(e.to_string()))?;
@@ -2626,8 +2638,7 @@ fn inspect_blocking(path: &Path, name: &str) -> Result<FleetDbInfo, FleetError> 
 /// `file:` URI with `mode=rw`, which `SQLite` refuses to create through
 /// (`%`, `?` and `#` are escaped, as the URI grammar needs). Elsewhere the
 /// plain path, whose canonical Windows spelling (`\\?\C:\…`) has no URI
-/// form; [`migrate_existing_blocking`]'s existence check then narrows the
-/// window instead.
+/// form; there [`pin_existing`] keeps the file in place while it is opened.
 fn existing_only_url(path: &Path) -> String {
     #[cfg(unix)]
     {
@@ -2642,6 +2653,34 @@ fn existing_only_url(path: &Path) -> String {
     {
         DatabaseFleet::url_of(path)
     }
+}
+
+/// Keep `path` from being removed or replaced while the caller opens it, on
+/// Windows, where [`existing_only_url`] cannot refuse to create the file.
+/// The handle shares read and write but not delete, so a removal or rename
+/// fails while it lives; `SQLite` also opens without `FILE_SHARE_DELETE`, so
+/// the file stays put for as long as the caller's connections hold it.
+/// `None` when the file does not exist.
+#[cfg(windows)]
+fn pin_existing(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Nothing to hold where [`existing_only_url`] refuses to create the file.
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
+const fn pin_existing(_path: &Path) -> std::io::Result<Option<()>> {
+    Ok(Some(()))
 }
 
 /// [`check_identity`] on a blocking connection, for paths that migrate a file
@@ -4279,6 +4318,22 @@ mod tests {
         assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
         // The default does not check.
         assert_eq!(partial(false).migrate(&key).await.unwrap(), 0);
+    }
+
+    /// While pinned, a database cannot be removed, so opening it cannot
+    /// create a new file in its place; a missing file is `None`.
+    #[cfg(windows)]
+    #[test]
+    fn a_pinned_database_cannot_be_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.db");
+        assert!(pin_existing(&path).unwrap().is_none());
+        std::fs::write(&path, b"").unwrap();
+        let pin = pin_existing(&path).unwrap().expect("the file exists");
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::rename(&path, tmp.path().join("moved.db")).is_err());
+        drop(pin);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
