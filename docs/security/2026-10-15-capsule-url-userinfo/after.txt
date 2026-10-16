@@ -1,0 +1,2 @@
+test integration::failure_capsule_url_userinfo::outbound_url_userinfo_credential_is_masked_in_the_capsule ... ok
+test result: ok. 44 passed; 0 failed; 12 ignored; 0 measured; 2545 filtered out; finished in 0.79s

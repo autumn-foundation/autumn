@@ -837,7 +837,7 @@ fn replayed_response(
         // `next_http` already logged the divergence; the call fails closed.
         return Err(ClientError::BlockedDuringReplay(
             request.method.to_owned(),
-            request.url.to_owned(),
+            crate::capsule::redact::hide_url_userinfo(request.url),
         ));
     };
     if let Some(error) = recorded.error {
@@ -2272,7 +2272,7 @@ impl RequestBuilder {
         if outbound_blocked_for_replay() {
             return Err(ClientError::BlockedDuringReplay(
                 self.method.to_string(),
-                self.url.clone(),
+                crate::capsule::redact::hide_url_userinfo(&self.url),
             ));
         }
 

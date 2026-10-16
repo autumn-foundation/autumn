@@ -1213,7 +1213,8 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
                 || (key.starts_with("http[")
                     && (key.contains("].response_body")
                         || key.contains("].response_header")
-                        || key.contains("].final_url")))
+                        || key.contains("].final_url")
+                        || key.contains("].url:<host-echo>")))
         })
         .map(String::as_str)
         .collect();
@@ -1827,6 +1828,7 @@ mod tests {
             "cache[0].user_id",
             "http[0].response_header:set-cookie",
             "http[0].final_url.access_token",
+            "http[0].url:<host-echo>",
             "tenant.id",
         ] {
             capsule.request.redacted_keys = vec![key.to_owned()];
