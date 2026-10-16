@@ -8,7 +8,10 @@ use std::path::Path;
 
 fn ci_yml() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml");
-    std::fs::read_to_string(path).expect("read ci.yml")
+    // A Windows checkout may use CRLF line endings.
+    std::fs::read_to_string(path)
+        .expect("read ci.yml")
+        .replace("\r\n", "\n")
 }
 
 /// The reddit-clone run in the step: its subshell, log check and error line.
