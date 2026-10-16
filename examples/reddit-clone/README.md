@@ -353,7 +353,7 @@ curl -s http://localhost:3000/ | grep 'autumn-consent-banner'
 
 | Part | File | Guide |
 |------|------|-------|
-| `ChangesetForm` round-trip, re-rendering a 422 with the author's input | `src/routes/posts.rs` | [`forms.md`](../../docs/guide/forms.md) |
+| `ChangesetForm` round-trip, re-rendering a 422 with the author's input and a focused error summary (`error_summary` in `layout.rs`) | `src/routes/posts.rs` | [`forms.md`](../../docs/guide/forms.md) |
 | Typed accessible controls and their error wiring | `src/routes/posts.rs` | [`accessibility.md`](../../docs/guide/accessibility.md) |
 | Sanitized user-submitted Markdown post bodies | `src/routes/posts.rs` (`show`) | [`rich-text.md`](../../docs/guide/rich-text.md) |
 | Consent routes, the banner layer, the `analytics` gate | `src/routes/consent.rs`, `src/main.rs` | [`cookie-consent.md`](../../docs/guide/cookie-consent.md) |
