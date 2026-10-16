@@ -467,6 +467,26 @@ mod sqlite {
         assert_eq!(mode & 0o777, 0o600, "only the owner reads the copy");
     }
 
+    /// A symlinked directory on the way is resolved once, at the check; the
+    /// copy goes to the directory that was checked.
+    #[cfg(unix)]
+    #[test]
+    fn fleet_backup_resolves_a_symlinked_directory() {
+        let app = App::new("");
+        app.provision(&app.fleet(), &["acme"], 2);
+        let real = app.dir.join("exports-real");
+        std::fs::create_dir(&real).unwrap();
+        let via = app.dir.join("exports-link");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+        let dest = via.join("acme.db");
+
+        run_ok(
+            &app.dir,
+            &["fleet", "backup", "tenant:acme", dest.to_str().unwrap()],
+        );
+        assert_eq!(count_notes(&real.join("acme.db")), 2);
+    }
+
     #[test]
     fn fleet_backup_writes_a_copy() {
         let app = App::new("");

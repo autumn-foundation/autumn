@@ -548,10 +548,19 @@ mod imp {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        // From here on the checked path is used, with no symlink in it: a
+        // symlink on the way could point somewhere else after the check.
         #[cfg(unix)]
-        refuse_unsafe_path(parent)?;
+        let (parent, dest) = {
+            let dir = refuse_unsafe_path(parent)?;
+            let name = dest
+                .file_name()
+                .ok_or_else(|| format!("{} does not name a file.", dest.display()))?;
+            let dest = dir.join(name);
+            (dir, dest)
+        };
         let staging =
-            replica::create_private_dir(parent, "fleet-backup").map_err(|e| e.to_string())?;
+            replica::create_private_dir(&parent, "fleet-backup").map_err(|e| e.to_string())?;
         let staged = staging.join("backup.db");
         let rt = runtime()?;
         let copied = rt.block_on(async {
@@ -568,7 +577,7 @@ mod imp {
                 std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
                     .map_err(|e| format!("could not protect the copy: {e}"))?;
             }
-            std::fs::hard_link(&staged, dest).map_err(|e| {
+            std::fs::hard_link(&staged, &dest).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
                     taken()
                 } else {
@@ -581,7 +590,7 @@ mod imp {
         eprintln!(
             "\u{2713} Copied {key} to {} ({} byte(s)).",
             dest.display(),
-            bytes_on_disk(dest)
+            bytes_on_disk(&dest)
         );
         Ok(())
     }
@@ -591,9 +600,10 @@ mod imp {
     /// and must not be writable by others unless it has the sticky bit (as
     /// `/tmp` has). Otherwise another user could rename a directory on the way
     /// and put their own file where the copy is written. The rule is
-    /// OpenSSH's for its own files.
+    /// OpenSSH's for its own files. Returns the checked path, symlinks
+    /// resolved.
     #[cfg(unix)]
-    fn refuse_unsafe_path(dir: &Path) -> Result<(), String> {
+    fn refuse_unsafe_path(dir: &Path) -> Result<PathBuf, String> {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let me = nix::unistd::geteuid().as_raw();
         let canonical = std::fs::canonicalize(dir)
@@ -612,7 +622,7 @@ mod imp {
                 ));
             }
         }
-        Ok(())
+        Ok(canonical)
     }
 
     fn delete(target: &Target, key: &str, force: bool) -> Result<(), String> {
