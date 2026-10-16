@@ -77,8 +77,10 @@ Two sources need **no declaration at all**:
   plaintext strategy is refused outright. `null` is accepted on a nullable
   encrypted column. The scrub needs the target's `active_record_encryption`
   credentials for this and refuses before writing anything if they are missing.
-  It also refuses if it cannot tell *which* columns are encrypted — a host with
-  the CLI and `scrub.toml` but no `src/models` must name them, with their mode,
+  The scan reads every file under `src/`, in any module. Two models that
+  encrypt one column in different modes are an error, not a last-wins merge. It also refuses if it
+  cannot tell *which* columns are encrypted — a host with
+  the CLI and `scrub.toml` but no `src/` tree must name them, with their mode,
   under `[tables.<t>.encrypted]`:
 
   ```toml
@@ -709,7 +711,11 @@ apply-time error.
   database that **any** non-dev/test profile's *config file* declares — every
   `autumn-<profile>.toml` in the project is checked, not just the one an
   artifact's manifest names, so a bare `.dump` with no manifest is not treated
-  as permission to continue. That guard has its own waiver,
+  as permission to continue. The control URL and every shard URL of those
+  profiles are compared, hostless libpq URLs (`postgres:///db?host=/run/pg`,
+  `PGHOST`) included. The destination profile is never its own source. With
+  `--artifact`, only the targets the artifact restored are scrubbed. That guard
+  has its own waiver,
   `--allow-source-overwrite`, rather than riding on `--force`: the staging drill
   always passes `--force`, so a guard `--force` waived would be inert in exactly
   the workflow it exists for. The guard compares the control URL and every
@@ -732,18 +738,50 @@ apply-time error.
   partitions or aborts), and on a `CHECK`-constrained column, where no
   fabricated value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
   column and on a `NULLS NOT DISTINCT` unique index; a constant replacement is
-  refused on any column covered by a unique index — composite, partial, and the
-  input columns of a unique *expression* index (`(lower(email))`), whose
-  uniqueness a per-row token cannot preserve through an arbitrary expression,
-  and the *predicate* columns of a partial unique index, where a rewrite changes
-  which rows the index covers; and a `varchar(n)` bound narrows the generated token or refuses,
-  rather than truncating into collisions.
+  refused on any column covered by a unique index, composite and partial
+  included. PII is refused outright on a column read by a unique index
+  *expression* (`(lower(email))`) or *predicate*, and on a column of an
+  *exclusion* constraint: a value unique on its own can still collide after the
+  expression, and a predicate column decides which rows the index covers. A
+  `varchar(n)` bound narrows the generated token or refuses, rather than
+  truncating into collisions. A constraint declared on one partition only is
+  read as a constraint of its parent.
 - **Writes cannot be redirected.** Every statement is `public`-qualified and the
   transaction pins `search_path`, so a role- or database-level tenant
   `search_path` cannot send an `UPDATE` to a table nothing classified. The
   planned tables — and the ones `[framework] purge` empties — are locked for the
   duration, so a row inserted between the classification snapshot and the
   rewrite cannot slip through.
+- **A schema change mid-run is refused.** After the locks are taken, the
+  transaction compares `public`'s tables, columns, RLS state, triggers and rules
+  with the snapshot the plan was built from, and compares again before commit. A migration that changed the
+  schema in that window rolls the run back. The locks cover only the tables the
+  run writes, so a change to any other table after the last comparison is not
+  caught. Re-run the command. The SQL that `--dry-run` prints has the target
+  guard and the locks, but no schema-drift check. The drift check covers names, hazard
+  sets (RLS, triggers, rules, views, generated columns) and nothing else: a
+  change to a key or other constraint after the probe is not detected.
+- **Encrypted columns get the same plan-time gates.** An `#[encrypted]` column
+  must be `text`, `citext` or `varchar(n)`, and a `varchar(n)` must be wide
+  enough for the replacement envelope (148 characters; 168 for an email-shaped
+  column). A structural one (a referenced key, say) is declared `safe` and keeps
+  its ciphertext.
+- **A libpq `service` source needs the waiver.** The guard cannot read a
+  service file. A protected profile that connects through `service=`, or a
+  nonempty `PGSERVICE` in the environment, makes the guard refuse until you pass
+  `--allow-source-overwrite`.
+- **Test-only registrations are ignored.** A `ModelRegistration::anonymize` call
+  under `#[cfg(test)]` (an inline module, a `#[cfg(test)] mod tests;` file, or
+  `#![cfg(test)]`) is not a production registration. Other `cfg` predicates are
+  unknown and count as on. Files that a `#[path]` module loads resolve their own
+  child modules from the physical file name, not from the declaring module.
+  A `mod x;` declared inside a function body is not followed, so a test-only
+  function that loads a file this way does not exclude that file.
+- **Source scans read every file in `src/`.** A `.rs` file that no `mod` declares
+  still counts as production code. An old `#[model]` with an `#[encrypted]`
+  column in such a file marks that column encrypted. Delete the file, or gate it
+  with `#[cfg(test)]`. The scan does not follow `mod` declarations from the
+  crate root, because `#[path]`, macro-made modules and `include!` hide models.
 - **`NULL`s stay `NULL`.** A scrub anonymizes values; it never invents them.
 - **It is atomic.** Every statement for one database runs in a single
   transaction, so a failure can never leave a half-scrubbed database behind —
@@ -766,14 +804,15 @@ apply-time error.
   column too — and refuses on any difference, so a privilege gap can never look
   like a clean bill of health. Foreign tables count as part of that universe: one
   left pointing at production would otherwise be classified by nothing.
-- **Row-level security is refused** on every table the run reads or writes: the
+- **Row-level security that binds the role is refused** on every table the run reads or writes: the
   ones it rewrites, the ones `[framework] purge` and `never_include` empty, the
   ones the sample reads to decide what to keep, and both endpoints of every
   foreign key the run re-counts. A role that does not bypass RLS sees only the
   rows its policies expose, and each phase then reports a success it cannot
   stand behind — a partial rewrite, a table reported emptied that is not, or a
-  re-count that misses the orphan it exists to find. Connect as the table owner
-  or a `BYPASSRLS` role.
+  re-count that misses the orphan it exists to find. A superuser, a `BYPASSRLS`
+  role and the table owner are not bound, so they pass — except that the owner
+  is bound again on a `FORCE ROW LEVEL SECURITY` table.
 
   The re-count's endpoints matter more than they look: a framework-owned table
   the run never writes still gets checked, because a constraint a migration left

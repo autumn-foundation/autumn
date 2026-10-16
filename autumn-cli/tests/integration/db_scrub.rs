@@ -694,6 +694,38 @@ async fn a_newly_added_column_breaks_a_previously_passing_scrub() {
     );
 }
 
+/// Row-level security binds only a role its policies apply to. The test
+/// container connects as a superuser, so enabling (even forcing) RLS must not
+/// refuse the run — the refusal's own remedy is "connect as a bypassing role".
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_bypassing_role_is_not_refused_for_row_level_security() {
+    let (_pg, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let client = connect(&url).await;
+    client.batch_execute(FIXTURE_SCHEMA).await.unwrap();
+    client
+        .batch_execute(FIXTURE_FRAMEWORK_TABLES)
+        .await
+        .unwrap();
+    client.batch_execute(FIXTURE_ROWS).await.unwrap();
+    client
+        .batch_execute(
+            "ALTER TABLE users ENABLE ROW LEVEL SECURITY; \
+             ALTER TABLE users FORCE ROW LEVEL SECURITY;",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_project_sources(dir);
+    std::fs::write(dir.join("scrub.toml"), SCRUB_TOML).unwrap();
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--check"], &envs);
+}
+
 /// AC #3's other rot mode: a renamed column leaves a stale declaration behind.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]

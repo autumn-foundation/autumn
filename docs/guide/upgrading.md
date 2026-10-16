@@ -383,25 +383,55 @@ hatch.
 ### Inside a Cargo workspace
 
 Your crate may sit inside an enclosing workspace. Then its own `Cargo.toml`
-has no `[workspace]` table. Some files are out of scope, and the report says
-so:
+has no `[workspace]` table. Some files belong to the workspace, not to the
+member. These are the root files. `autumn upgrade` plans them at their owner,
+as `../` paths:
 
-- `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are resolved from the
-  nearest ancestor of the crate. A crate-local copy does not add to the
-  workspace's copy. It **shadows** it, and drops its lints and MSRV pin with no
-  diagnostic.
-- GitHub runs workflows from the **git root**, not the Cargo root. If the crate
-  is not its own git root, GitHub does not run its `.github/workflows/ci.yml`
-  and `posture-gate.yml`. They are out of scope.
+- `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` go to the
+  **workspace root**. Cargo reads them from the nearest ancestor. A copy in the
+  member **shadows** the workspace's copy and drops its lints and MSRV pin with
+  no diagnostic.
+- `ci.yml` and `posture-gate.yml` go to the **git root**. GitHub runs
+  workflows from there only. The command writes them for this member. `ci.yml`
+  runs in the member directory. `posture-gate.yml` sets `POSTURE_MANIFEST` to
+  the member path, and `-p <member>` in `POSTURE_AUDIT_FLAGS`.
 
-A nested git repository or submodule is its own git root. GitHub runs its
-workflows, so `autumn upgrade` still reconciles them. The three Cargo files
-stay out of scope.
+The command plans a root file only inside the member's own git repository:
 
-Everything genuinely per-crate — `autumn.toml`, `Dockerfile`, `.dockerignore`,
-`build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled as
-usual. Reconcile the Cargo files at the workspace root and the workflows at
-the git root, if that root is itself an Autumn project.
+- With no git repository, it plans no root file.
+- If the workspace root is outside the repository, it plans no root file.
+- If the workspace root is below the git root, it plans the three Cargo files
+  only. The posture gate runs from the git root and cannot build the member
+  there.
+- If Cargo does not count the crate as a workspace member (an excluded
+  crate), it plans the three Cargo files only. `-p` cannot select the crate.
+  The command asks `cargo metadata --no-deps`, so it needs `cargo` on the path.
+- If the member path has a space or other special character, it plans no
+  workflow.
+- A nested git repository or submodule is its own git root. Its workflows stay
+  in the member, and the three Cargo files are out of scope.
+
+A member may still hold its own copy of a Cargo file, for example one that
+`autumn new` wrote. That copy shadows the root file. The report shows it as a
+conflict. The command does not delete it. Delete it yourself.
+
+The report says which files it plans. `--json` marks each root file with
+`"outside_project": true`.
+
+A repository holds one copy of each root file. If another member, or you,
+already wrote the file, it is a **conflict**. The command does not write it. A
+workspace that already has these files sees conflicts in every member on the
+first run. Run `autumn upgrade --accept ../clippy.toml` to leave a file as it
+is. The member then has no copy to keep current. A workflow names one member,
+so it serves one member only.
+
+The digests of root files are in the member's own `.autumn/scaffold.toml`. The
+keys are paths from the member. If you move the member, the digests no longer
+match, and the files show as conflicts.
+
+Everything per-member — `autumn.toml`, `Dockerfile`, `.dockerignore`,
+`build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled
+as before.
 
 `autumn new` writes a bare `[workspace]` table into every generated
 `Cargo.toml`, so a scaffolded project is its own workspace root wherever you

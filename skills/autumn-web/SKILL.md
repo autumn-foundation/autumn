@@ -3629,10 +3629,15 @@ For the scaffold half, five more things (issue #1593):
   team's — a `Dockerfile` with their own base image — `autumn upgrade --accept
   <path>` records it in the manifest's `pinned` list so `--check` can go green
   again. Removing a line from that list brings the file back.
-- **Inside a Cargo workspace, member crates are not offered `clippy.toml`,
-  `rustfmt.toml`, `rust-toolchain.toml` or a CI workflow.** Those resolve from
-  the nearest ancestor, so a crate-local copy *shadows* the workspace's rather
-  than adding to it, and GitHub never runs a workflow from a subdirectory.
+- **A workspace member gets its root files at the root (issue #2469).**
+  `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are planned at the
+  workspace root, and `ci.yml` and `posture-gate.yml` at the git root, as
+  `../` paths in the report and in `.autumn/scaffold.toml`. The workflows name
+  the member. A root file that exists already is a `conflict`: use
+  `--accept ../<file>` to leave it. A member copy of a Cargo file is a
+  `conflict` too, because it shadows the root copy: tell the user to delete
+  it. With no git repository, nothing is planned. If the workspace root is
+  below the git root, only the Cargo files are planned.
 
 `--to` selects which codemods run; the scaffold half always reconciles to the
 release the CLI itself ships templates for — downgrades and historical

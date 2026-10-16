@@ -798,6 +798,10 @@ pub trait PostRepository {}
 - **`mcp = "read"`** opts in only `list` and `get`.
 - `mcp` requires `api = "/path"` (there are no routes to derive tools from
   otherwise) — the macro rejects it at compile time.
+- **`grant = X`** governs the generated tools with an
+  [authority grant](agent-authority.md#generated-repository-tools). It
+  needs `mcp`. The build fails if the grant does not list the model in
+  `writes`.
 - Every tool call still dispatches through the real pipeline, so a
   `policy = ...` repository enforces the same record-level checks for an
   agent as for any HTTP client.

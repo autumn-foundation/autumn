@@ -821,24 +821,24 @@ RustSec advisory sits in the tree being published. Run it locally exactly as CI
 does:
 
 ```bash
-./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
+./scripts/check-advisories.sh              # workspace, sqlite, generated apps, fuzz, island-flock graphs
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
-It audits a third graph beyond the two above: `autumn-web` under the `deny.toml`
-that `autumn new` writes into a generated app (`autumn-cli/src/templates/deny.toml.tmpl`),
-so an advisory the scaffold's shipped waiver set does not cover fails here
-rather than in a user's first CI run. Its advisory-database fetch retries and
-**fails closed**; the audits then run `--offline`, so a failure always names an
-advisory rather than a network blip. `--self-test` audits a throwaway crate with
+The third graph is every `autumn new` flavor. The gate generates each one and
+audits it with its own shipped `deny.toml`
+(`autumn-cli/src/templates/deny.toml.tmpl`). An advisory that the waivers do
+not cover fails here, not in a user's first CI run. The gate retries the
+advisory-database fetch and **fails closed**. The audits then run `--offline`,
+so a failure always names an advisory, not a network error. `--self-test` audits a throwaway crate with
 a deliberately injected known-vulnerable dependency and requires the gate to
 reject it, then to accept it once — and only once — that id is waived.
 
 **Scope.** The gate covers the shipped root workspace — the default plus
 additive Postgres feature graph (`deny.toml`) and the mutually-exclusive sqlite
 backend graph (`deny-sqlite.toml`), including dev- and build-dependency
-licenses — plus, for advisories only, autumn-web's tree under the policy
-`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). It also covers
+licenses — plus, for advisories only, every `autumn new` flavor, generated
+and audited with its own shipped `deny.toml`. It also covers
 the repository's separate *excluded* sub-workspaces — `fuzz/` and
 `examples/island-flock`, which each declare their own `[workspace]` and are
 excluded from the root `Cargo.toml` for their own build reasons (a

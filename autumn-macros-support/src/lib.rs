@@ -10,6 +10,7 @@
 //! Users should not depend on this crate directly — use `autumn-web`
 //! instead, which re-exports everything.
 
+pub mod cascade;
 pub mod crate_path;
 pub mod naming;
 pub mod schema;

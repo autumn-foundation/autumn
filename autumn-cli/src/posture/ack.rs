@@ -7,11 +7,14 @@
 //! /ack-posture 3f2a91c0d47b5e6a  widening /admin/users on purpose, launch week
 //! ```
 //!
-//! The digest binds the acknowledgment to **the exact set of widening
-//! findings** it was written for. That is what makes the marker survive
-//! unrelated pushes (the set is unchanged, so the digest is unchanged) while
-//! re-blocking the moment a later commit widens something new (a new set is a
-//! new digest, and no comment carries it yet).
+//! The digest binds the acknowledgment to **the set of widening findings** it
+//! was written for. An unrelated push keeps it valid. A new widening needs a
+//! new digest, and no comment carries it yet.
+//!
+//! A widened route also gets a `ceiling=` token. It holds the approved posture
+//! of the route (see [`super::ceiling`]). The marker means "no wider than
+//! this". Narrowing keeps it valid. A removed constraint blocks again. A bare
+//! digest means "exactly this".
 //!
 //! Everything parsed here came from a pull-request comment, which is to say
 //! from anyone who can type. Two lines of defense: this parser is strict about
@@ -26,6 +29,7 @@
 //! scaffolded workflow writes one file per comment and uses `--ack-dir`, which
 //! parses each file with [`parse_comment`]. That parser trusts no line.
 
+use super::ceiling::Cover;
 use super::diff::Finding;
 use super::model::hex_digest;
 
@@ -41,6 +45,9 @@ pub const ACK_PHRASE: &str = "/ack-posture";
 /// live. Each body is parsed with its own fence state.
 pub const SOURCE_SEPARATOR: &str = "<!-- autumn:ack-source -->";
 
+/// The key of the optional token that carries a ceiling (see [`super::ceiling`]).
+pub const CEILING_KEY: &str = "ceiling=";
+
 /// How much of the digest the phrase carries. 64 bits is far more than enough
 /// to bind an acknowledgment to a finding set nobody is trying to collide, and
 /// short enough to read out loud.
@@ -53,6 +60,8 @@ pub struct Acknowledgment {
     pub digest: String,
     /// Whatever the author wrote after the digest, when they wrote anything.
     pub reason: Option<String>,
+    /// The `ceiling=` payload, when the marker carries one.
+    pub ceiling: Option<String>,
 }
 
 /// The digest of a set of widening findings.
@@ -464,17 +473,33 @@ fn parse_marker(line: &str) -> Option<Acknowledgment> {
         return None;
     }
     let rest = rest.trim_start();
-    let (token, reason) = rest
-        .find(char::is_whitespace)
-        .map_or((rest, ""), |i| (&rest[..i], rest[i..].trim()));
+    let (token, rest) = split_token(rest);
     let digest = token.to_ascii_lowercase();
     if !is_digest(&digest) {
         return None;
     }
+    // Optional `ceiling=` token. Reject the marker if the token is bad. A
+    // bare-digest reading would silently change "no wider than" to "exactly
+    // this".
+    let rest = rest.trim_start();
+    let (next, after) = split_token(rest);
+    let (ceiling, reason) = match next.strip_prefix(CEILING_KEY) {
+        Some(payload) if super::ceiling::is_payload(payload) => (Some(payload.to_owned()), after),
+        Some(_) => return None,
+        None => (None, rest),
+    };
+    let reason = reason.trim();
     Some(Acknowledgment {
         digest,
         reason: (!reason.is_empty()).then(|| reason.to_owned()),
+        ceiling,
     })
+}
+
+/// The first whitespace-delimited token and what follows it.
+fn split_token(text: &str) -> (&str, &str) {
+    text.find(char::is_whitespace)
+        .map_or((text, ""), |i| (&text[..i], &text[i..]))
 }
 
 /// Whether `candidate` is a plausible digest: hex, and long enough to be worth
@@ -484,20 +509,39 @@ fn is_digest(candidate: &str) -> bool {
     (8..=64).contains(&candidate.len()) && candidate.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Whether any harvested acknowledgment matches `digest`.
+/// Whether any harvested acknowledgment approves the current widening.
 ///
-/// A marker may carry the short form or the full digest; both are compared
-/// case-insensitively against the expected digest's corresponding prefix.
+/// A bare marker must match the `exact` digest (short or full). A ceiling
+/// marker must match the same findings, and no route may be wider than the
+/// ceiling.
 #[must_use]
-pub fn matching<'a>(acks: &'a [Acknowledgment], digest: &str) -> Option<&'a Acknowledgment> {
-    acks.iter()
-        .find(|ack| super::verify::marker_matches(digest, &ack.digest))
+pub fn matching<'a>(
+    acks: &'a [Acknowledgment],
+    exact: &str,
+    cover: &Cover,
+) -> Option<&'a Acknowledgment> {
+    acks.iter().find(|ack| {
+        ack.ceiling.as_ref().map_or_else(
+            || super::verify::marker_matches(exact, &ack.digest),
+            |payload| cover.accepts(payload, &ack.digest),
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::posture::diff::Severity;
+
+    /// `matching` for bare markers: no widened route, so an empty cover.
+    fn matching<'a>(acks: &'a [Acknowledgment], digest: &str) -> Option<&'a Acknowledgment> {
+        let head = crate::posture::model::PostureManifest::parse(
+            r#"{"schema_version":3,"dimensions":{"routes":{"provenance":"provable","source":"m","entries":[]}},"excluded":[]}"#,
+            "t.json",
+        )
+        .expect("fixture parses");
+        super::matching(acks, digest, &crate::posture::ceiling::cover(&[], &head))
+    }
 
     fn finding(kind: &'static str, path: &str) -> Finding {
         Finding {
@@ -535,6 +579,34 @@ mod tests {
         assert_eq!(short(&d).len(), SHORT_DIGEST_LEN);
         assert!(d.starts_with(&short(&d)));
         assert!(short(&d).chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── ceiling token ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parses_a_ceiling_token_and_keeps_the_reason() {
+        let acks = parse_acks("/ack-posture 0123456789abcdef ceiling=GET|%2Fa|x launch week");
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].digest, "0123456789abcdef");
+        assert_eq!(acks[0].ceiling.as_deref(), Some("GET|%2Fa|x"));
+        assert_eq!(acks[0].reason.as_deref(), Some("launch week"));
+    }
+
+    #[test]
+    fn a_bare_marker_has_no_ceiling() {
+        let acks = parse_acks("/ack-posture 0123456789abcdef ceiling-ish reason");
+        assert_eq!(acks[0].ceiling, None);
+        assert_eq!(acks[0].reason.as_deref(), Some("ceiling-ish reason"));
+    }
+
+    /// A marker that tried to carry a ceiling and failed is not a bare marker:
+    /// dropping the ceiling would turn "no wider than" into "exactly this".
+    #[test]
+    fn a_malformed_ceiling_token_voids_the_marker() {
+        for bad in ["ceiling=", "ceiling=a`b", "ceiling=<x>", "ceiling=a\u{e9}"] {
+            let line = format!("/ack-posture 0123456789abcdef {bad}");
+            assert!(parse_acks(&line).is_empty(), "{bad}");
+        }
     }
 
     // ── parsing ─────────────────────────────────────────────────────────────

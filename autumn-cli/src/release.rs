@@ -456,7 +456,14 @@ fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Op
          the following so its `docker build` step still finds this crate's\n\
          Dockerfile:\n\
          \n\
-         defaults:\n  run:\n    working-directory: {rel_forward_slash}\n",
+         defaults:\n  run:\n    working-directory: {rel_forward_slash}\n\
+         \n\
+         `hashFiles` and `subject-path` ignore `working-directory`. Also change\n\
+         `POSTURE_MANIFEST` in the top-level `env:` block. Set it to the manifest\n\
+         path from the repository root. If you do not, the posture attestation\n\
+         is skipped:\n\
+         \n\
+         POSTURE_MANIFEST: {rel_forward_slash}/security-posture.json\n",
         git_root.display(),
         dir.display(),
         git_root.display(),
@@ -1295,13 +1302,29 @@ mod tests {
                     "posture attestation missing for CLI {cli_version}:\n{rendered}"
                 );
                 assert!(
-                    rendered.contains("subject-path: security-posture.json"),
+                    rendered.contains("POSTURE_MANIFEST: security-posture.json"),
+                    "the manifest path must be one variable a member can change:\n{rendered}"
+                );
+                assert!(
+                    rendered.contains("subject-path: ${{ env.POSTURE_MANIFEST }}"),
                     "the attested subject must be the committed manifest:\n{rendered}"
                 );
                 assert!(
-                    rendered.contains("hashFiles('security-posture.json') != ''"),
+                    rendered.contains("if: hashFiles(env.POSTURE_MANIFEST) != ''"),
                     "an app with no committed manifest must not fail its deploy:\n{rendered}"
                 );
+                // A missing manifest is a visible warning, never a hard failure.
+                let warning = rendered
+                    .split("- name: Warn when the security posture manifest is missing")
+                    .nth(1)
+                    .unwrap_or_else(|| panic!("no warning step:\n{rendered}"));
+                let step = warning.split("\n      - ").next().unwrap();
+                assert!(
+                    step.contains("if: hashFiles(env.POSTURE_MANIFEST) == ''"),
+                    "{step}"
+                );
+                assert!(step.contains("::warning::"), "{step}");
+                assert!(!step.contains("exit 1"), "{step}");
             }
         }
     }
@@ -7940,6 +7963,12 @@ esac
             "the warning must give the exact working-directory override needed so \
              the relocated workflow's docker build step still finds this crate's \
              Dockerfile: {warning}"
+        );
+        assert!(
+            warning.contains("POSTURE_MANIFEST: examples/blog/security-posture.json")
+                && !warning.contains("env:\n  POSTURE_MANIFEST"),
+            "the warning must give the manifest path from the git root, because \
+             `hashFiles` and `subject-path` ignore working-directory: {warning}"
         );
     }
 
