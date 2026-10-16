@@ -39,12 +39,12 @@
 # this workflow provides: comment on the pull request with the line the report
 # prints,
 #
-#     /ack-posture <digest>  the reason this is intended
+#     /ack-posture <digest> ceiling=<posture>  the reason this is intended
 #
 # from an account with write access (the harvest step checks the repository
-# permission of each commenter, not just their org affiliation). The digest
-# names that exact set of widenings: pushing unrelated commits keeps the
-# acknowledgment valid, and a NEW widening needs a new one.
+# permission of each commenter, not just their org affiliation). The marker
+# means "no wider than this". Unrelated pushes and narrowing keep it valid. A
+# new widening, or a removed constraint, needs a new one.
 #
 # NOTE: commenting does not re-run this workflow — `pull_request` does not fire
 # on comments. After posting the marker, re-run the check (Checks → the

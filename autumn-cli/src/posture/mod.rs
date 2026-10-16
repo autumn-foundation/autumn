@@ -21,6 +21,7 @@
 //! See `docs/guide/posture-gate.md` and `docs/plans/2026-09-03-posture-gate.md`.
 
 pub mod ack;
+pub mod ceiling;
 pub mod diff;
 pub mod model;
 pub mod render;
@@ -63,8 +64,10 @@ pub struct DiffOptions<'a> {
 #[derive(Debug)]
 pub struct Evaluation {
     pub findings: Vec<Finding>,
-    /// Digest over the widening subset — what an acknowledgment must carry.
+    /// Digest of the widening findings. A bare marker must carry it.
     pub ack_digest: String,
+    /// The text after the phrase in the line to paste.
+    pub marker: String,
     /// Posture digest of the head manifest.
     pub head_posture_digest: String,
     /// The acknowledgment that matched, when one did.
@@ -90,6 +93,7 @@ impl Evaluation {
         Report {
             findings: &self.findings,
             ack_digest: self.ack_digest.clone(),
+            marker: self.marker.clone(),
             head_posture_digest: self.head_posture_digest.clone(),
             acknowledged: self.acknowledged.clone(),
             bootstrap: self.bootstrap,
@@ -111,17 +115,20 @@ pub fn evaluate(
     let findings = base.map(|b| diff::diff(b, head)).unwrap_or_default();
     let widening = diff::widening(&findings);
     let ack_digest = ack::ack_digest(&widening);
+    let cover = ceiling::cover(&widening, head);
     // Only a widening can be acknowledged. Resolving a marker against a clean
     // run would let a stale comment sit on the pull request claiming to have
     // approved something nobody proposed.
     let acknowledged = if widening.is_empty() {
         None
     } else {
-        ack::matching(acks, &ack_digest).cloned()
+        ack::matching(acks, &ack_digest, &cover).cloned()
     };
+    let marker = cover.marker(&ack_digest);
     Evaluation {
         findings,
         ack_digest,
+        marker,
         head_posture_digest: head.posture_digest(),
         acknowledged,
         bootstrap: base.is_none(),
@@ -246,9 +253,9 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
         eprintln!(
             "\n\u{2717} security posture widened and is not acknowledged.\n  \
              Acknowledge it with this line \u{2014} as a pull-request comment, or \
-             locally as `--ack <digest>`:\n\n      {} {}\n",
+             locally as `--ack '<text after the phrase>'`:\n\n      {} {}\n",
             ack::ACK_PHRASE,
-            ack::short(&evaluation.ack_digest)
+            evaluation.marker
         );
     }
     evaluation.exit_code()
@@ -722,5 +729,187 @@ mod tests {
 
         let comment = format!("{} {}", ack::ACK_PHRASE, ack::short(&blocked.ack_digest));
         assert!(!evaluate(Some(&base), &head, &ack::parse_acks(&comment)).blocked());
+    }
+
+    // ── ceiling markers (#2497) ─────────────────────────────────────────────
+
+    /// A route with scopes, for the "constraint removed" cases.
+    fn scoped(path: &str, classification: &str, scopes: &[&str], policy: bool) -> String {
+        let scopes = scopes
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"path":"{path}","method":"GET","name":"h","classification":"{classification}",
+                 "roles":[],"scopes":[{scopes}],"policy":{policy},"source":"user","provenance":"provable"}}"#
+        )
+    }
+
+    /// The line the gate asks a reviewer to paste, as a parsed marker.
+    fn pasted(e: &Evaluation) -> Vec<Acknowledgment> {
+        ack::parse_acks(&format!("{} {} for launch", ack::ACK_PHRASE, e.marker))
+    }
+
+    fn admin_base() -> PostureManifest {
+        manifest(&route("/admin", "gated", &["admin"]))
+    }
+
+    #[test]
+    fn the_printed_marker_carries_a_ceiling_and_acknowledges() {
+        let base = admin_base();
+        let head = manifest(&scoped("/admin", "public", &["mfa"], false));
+        let blocked = evaluate(Some(&base), &head, &[]);
+        assert!(blocked.marker.contains("ceiling="), "{}", blocked.marker);
+        let e = evaluate(Some(&base), &head, &pasted(&blocked));
+        assert!(!e.blocked());
+        assert!(e.acknowledged.is_some());
+    }
+
+    /// Scenario 2 of #2497: a follow-up narrows the route; nothing got wider.
+    #[test]
+    fn an_acknowledgment_survives_a_later_narrowing() {
+        let base = admin_base();
+        let first = manifest(&scoped("/admin", "public", &[], false));
+        let acks = pasted(&evaluate(Some(&base), &first, &[]));
+        let narrowed = manifest(&scoped("/admin", "public", &[], true));
+        let e = evaluate(Some(&base), &narrowed, &acks);
+        assert!(!e.blocked(), "a policy check only narrows");
+        assert!(e.acknowledged.is_some());
+    }
+
+    /// Scenario 1 of #2497: a constraint is dropped after it was acknowledged.
+    #[test]
+    fn an_acknowledgment_does_not_survive_a_constraint_being_removed() {
+        let base = admin_base();
+        let first = manifest(&scoped("/admin", "public", &["mfa"], false));
+        let acks = pasted(&evaluate(Some(&base), &first, &[]));
+        let dropped = manifest(&scoped("/admin", "public", &[], false));
+        assert!(evaluate(Some(&base), &dropped, &acks).blocked());
+    }
+
+    #[test]
+    fn a_policy_check_dropped_after_acknowledgment_re_blocks() {
+        let base = manifest(&scoped("/admin", "gated", &[], true));
+        let first = manifest(&scoped("/admin", "gated", &[], true));
+        assert!(evaluate(Some(&base), &first, &[]).findings.is_empty());
+        let wide = manifest(&scoped("/admin", "public", &[], true));
+        let acks = pasted(&evaluate(Some(&base), &wide, &[]));
+        let dropped = manifest(&scoped("/admin", "public", &[], false));
+        assert!(evaluate(Some(&base), &dropped, &acks).blocked());
+    }
+
+    #[test]
+    fn a_ceiling_marker_does_not_cover_a_new_widening() {
+        let base = admin_base();
+        let first = manifest(&route("/admin", "public", &[]));
+        let acks = pasted(&evaluate(Some(&base), &first, &[]));
+        let second = manifest(&format!(
+            "{},{}",
+            route("/admin", "public", &[]),
+            route("/internal", "public", &[])
+        ));
+        assert!(evaluate(Some(&base), &second, &acks).blocked());
+    }
+
+    /// The digest covers the payload. A hand-widened payload with the old digest must
+    /// fail. The digest catches mistakes. It is not a secret.
+    #[test]
+    fn a_hand_widened_ceiling_is_refused() {
+        let base = admin_base();
+        let head = manifest(&scoped("/admin", "public", &["mfa"], false));
+        let strict = evaluate(Some(&base), &head, &[]);
+        let loose_head = manifest(&scoped("/admin", "public", &[], false));
+        let loose = evaluate(Some(&base), &loose_head, &[]);
+        let digest = strict.marker.split_whitespace().next().unwrap().to_owned();
+        let loose_payload = loose.marker.split("ceiling=").nth(1).unwrap().to_owned();
+        let forged = ack::parse_acks(&format!(
+            "{} {digest} ceiling={loose_payload}",
+            ack::ACK_PHRASE
+        ));
+        assert!(evaluate(Some(&base), &loose_head, &forged).blocked());
+    }
+
+    /// A bare digest keeps meaning "exactly this": that is the strict option.
+    #[test]
+    fn a_bare_digest_still_re_asks_after_a_narrowing() {
+        let base = admin_base();
+        let first = manifest(&scoped("/admin", "public", &[], false));
+        let pasted_bare = format!(
+            "{} {}",
+            ack::ACK_PHRASE,
+            ack::short(&evaluate(Some(&base), &first, &[]).ack_digest)
+        );
+        assert!(!evaluate(Some(&base), &first, &ack::parse_acks(&pasted_bare)).blocked());
+        let narrowed = manifest(&scoped("/admin", "public", &[], true));
+        assert!(evaluate(Some(&base), &narrowed, &ack::parse_acks(&pasted_bare)).blocked());
+    }
+
+    /// A finding that names no route at head has no posture to order, so it
+    /// stays bound to the exact digest, ceiling or not.
+    #[test]
+    fn a_build_change_is_still_bound_exactly() {
+        let routes = route("/admin", "gated", &["admin"]);
+        let base = parse(&manifest_json(&routes, ""));
+        let head = parse(&manifest_json(
+            &routes,
+            r#""build":{"profile":"release","features":["x"],"default_features":true},"#,
+        ));
+        let blocked = evaluate(Some(&base), &head, &[]);
+        assert!(blocked.blocked(), "{:?}", blocked.findings);
+        assert!(
+            !blocked.marker.contains("ceiling="),
+            "nothing to order: {}",
+            blocked.marker
+        );
+        assert!(!evaluate(Some(&base), &head, &pasted(&blocked)).blocked());
+    }
+
+    /// One of two acknowledged routes goes back to its base posture. The set of
+    /// findings shrinks, and every route left is within its ceiling.
+    #[test]
+    fn an_acknowledgment_survives_the_widening_set_shrinking() {
+        let base = manifest(&format!(
+            "{},{}",
+            route("/a", "gated", &["admin"]),
+            route("/b", "gated", &["admin"])
+        ));
+        let both = manifest(&format!(
+            "{},{}",
+            route("/a", "public", &[]),
+            route("/b", "public", &[])
+        ));
+        let acks = pasted(&evaluate(Some(&base), &both, &[]));
+        let one_back = manifest(&format!(
+            "{},{}",
+            route("/a", "gated", &["admin"]),
+            route("/b", "public", &[])
+        ));
+        assert!(!evaluate(Some(&base), &one_back, &acks).blocked());
+    }
+
+    /// Narrowing can change the kind of finding: `roles_cleared` becomes
+    /// `roles_widened`. The route is still within its ceiling.
+    #[test]
+    fn an_acknowledgment_survives_a_narrowing_that_changes_the_finding_kind() {
+        let base = manifest(&route("/a", "gated", &["admin"]));
+        let cleared = manifest(&route("/a", "gated", &[]));
+        let acks = pasted(&evaluate(Some(&base), &cleared, &[]));
+        let some = manifest(&route("/a", "gated", &["admin", "editor"]));
+        let e = evaluate(Some(&base), &some, &acks);
+        assert!(!diff::widening(&e.findings).is_empty());
+        assert!(!e.blocked());
+    }
+
+    #[test]
+    fn the_report_names_the_strict_digest_beside_a_ceiling_marker() {
+        let base = admin_base();
+        let head = manifest(&route("/admin", "public", &[]));
+        let e = evaluate(Some(&base), &head, &[]);
+        let md = render(&e, "markdown").unwrap();
+        let strict = format!("{} {}", ack::ACK_PHRASE, ack::short(&e.ack_digest));
+        assert!(md.contains(&strict), "{md}");
+        let strict_acks = ack::parse_acks(&strict);
+        assert!(!evaluate(Some(&base), &head, &strict_acks).blocked());
     }
 }

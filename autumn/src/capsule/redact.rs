@@ -282,10 +282,24 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
     let mut masked = String::with_capacity(text.len());
     let mut cursor = 0_usize;
     while let Some(rest) = text.get(cursor..).filter(|rest| !rest.is_empty()) {
+        // A placeholder an earlier pass wrote is not a secret to hide: with
+        // `FILTER` in the set it would be rewritten to `[[FILTERED]ED]`, which
+        // no longer matches the live text on replay.
+        let at_placeholder = rest.starts_with(FILTERED_PLACEHOLDER);
+        // ...unless a retained value itself begins with it (a decoded
+        // `[FILTERED]hunter2`), which has to be masked whole.
         let matched = needles.iter().find(|(needle, whole_token_only)| {
             rest.starts_with(*needle)
+                && (!at_placeholder
+                    || (needle.len() > FILTERED_PLACEHOLDER.len()
+                        && needle.starts_with(FILTERED_PLACEHOLDER)))
                 && (!*whole_token_only || stands_alone(text, cursor, needle, rest))
         });
+        if at_placeholder && matched.is_none() {
+            masked.push_str(FILTERED_PLACEHOLDER);
+            cursor = cursor.saturating_add(FILTERED_PLACEHOLDER.len());
+            continue;
+        }
         if let Some((needle, _)) = matched {
             masked.push_str(FILTERED_PLACEHOLDER);
             cursor = cursor.saturating_add(needle.len());
@@ -629,7 +643,18 @@ pub fn redact_effects(
     // the filter pass does. Replay refuses a capsule with masked input
     // (#2351 item 8).
     for (index, exchange) in effects.http.iter_mut().enumerate() {
-        exchange.url = mask_echoes(&exchange.url, values);
+        let (masked_url, host_masked) = mask_url_echoes(&exchange.url, values);
+        if host_masked {
+            keys.insert(format!("http[{index}].url:<host-echo>"));
+        }
+        exchange.url = masked_url;
+        if let Some(final_url) = exchange.final_url.as_mut() {
+            let (masked, _) = mask_url_echoes(final_url, values);
+            if masked != *final_url {
+                keys.insert(format!("http[{index}].final_url:<echo>"));
+            }
+            *final_url = masked;
+        }
         mask_body_echoes(&mut exchange.request_body, values);
         if mask_body_echoes(&mut exchange.response_body, values) {
             keys.insert(format!("http[{index}].response_body:<echo>"));
@@ -779,6 +804,164 @@ pub fn redact_effects(
     }
 }
 
+/// Blank the `user:password@` of an absolute URL's authority.
+///
+/// The whole userinfo goes: a username is as often the credential (an API key
+/// sent as the user) as the password is. Both spellings (raw and
+/// percent-decoded) are retained so an echo elsewhere in the capsule is masked
+/// and so replay can match the placeholder against the live URL.
+fn mask_url_userinfo(
+    url: &str,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+    location: &str,
+) -> String {
+    let Some((head, userinfo, host)) = split_userinfo(url) else {
+        return url.to_owned();
+    };
+    keys.insert(format!("{location}:userinfo"));
+    record_userinfo_components(&userinfo, values);
+    format!("{head}{FILTERED_PLACEHOLDER}@{host}")
+}
+
+/// Byte range of an absolute URL's authority (`userinfo@host:port`) within `url`.
+///
+/// A special scheme (`http`, `https`, `ws`, `wss`, `ftp`) is read the way the
+/// HTTP client's URL parser reads it: leading control characters and spaces are
+/// skipped, and `https:user:secret@host`, `https:/user:…` and backslash
+/// spellings all reach the wire as credentialed URLs, so a literal `://` is
+/// only required of other schemes.
+fn authority_bounds(url: &str) -> Option<(usize, usize)> {
+    let lead = url
+        .len()
+        .checked_sub(url.trim_start_matches(|c: char| c <= ' ').len())?;
+    let from_scheme = url.get(lead..)?;
+    let colon = from_scheme.find(':')?;
+    let scheme = from_scheme.get(..colon)?;
+    let mut chars = scheme.chars();
+    if !chars.next()?.is_ascii_alphabetic()
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let special = ["http", "https", "ws", "wss", "ftp"]
+        .iter()
+        .any(|name| scheme.eq_ignore_ascii_case(name));
+    let after_scheme = from_scheme.get(colon.checked_add(1)?..)?;
+    let slashes = after_scheme
+        .find(|c: char| !(c == '/' || (special && c == '\\')))
+        .unwrap_or(after_scheme.len());
+    if !special && slashes < 2 {
+        return None;
+    }
+    let start = lead
+        .checked_add(colon)?
+        .checked_add(1)?
+        .checked_add(slashes)?;
+    let rest = url.get(start..)?;
+    let len = rest
+        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(rest.len());
+    Some((start, start.checked_add(len)?))
+}
+
+/// `url` as the URL parser reads it: ASCII tab and newline characters are
+/// removed wherever they appear, so `https:\t//user:secret@host` is the
+/// credentialed URL it looks like. Text this returns is what gets recorded.
+pub(crate) fn parser_view(url: &str) -> Cow<'_, str> {
+    if url.contains(['\t', '\n', '\r']) {
+        Cow::Owned(
+            url.chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(url)
+    }
+}
+
+/// Split an absolute URL into what precedes its userinfo, the userinfo, and
+/// the rest (`host…`), read through [`parser_view`].
+fn split_userinfo(url: &str) -> Option<(String, String, String)> {
+    let url = parser_view(url);
+    let (start, end) = authority_bounds(&url)?;
+    let authority = url.get(start..end)?;
+    let (userinfo, _) = authority.rsplit_once('@')?;
+    if userinfo.is_empty() {
+        return None;
+    }
+    let head = url.get(..start)?;
+    let host_and_tail = url.get(start.checked_add(userinfo.len())?.checked_add(1)?..)?;
+    Some((
+        head.to_owned(),
+        userinfo.to_owned(),
+        host_and_tail.to_owned(),
+    ))
+}
+
+/// [`mask_echoes`] over a whole URL, and whether it reached the host.
+///
+/// A secret seeded from elsewhere in the request can appear in a hostname
+/// (`https://tenant-secret.example/`); it is masked there like anywhere else.
+/// The host then stops being a literal destination, so the caller records a
+/// redaction key that makes the capsule non-replayable instead of letting the
+/// placeholder act as a wildcard that matches any host.
+fn mask_url_echoes(url: &str, redacted: &RedactedValues) -> (String, bool) {
+    let host_masked = authority_bounds(url).is_some_and(|(start, end)| {
+        let authority = url.get(start..end).unwrap_or_default();
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        mask_echoes(host, redacted) != host
+    });
+    (mask_echoes(url, redacted), host_masked)
+}
+
+/// The `user:password` of an absolute URL's authority, if it has one.
+pub(crate) fn url_userinfo(url: &str) -> Option<String> {
+    split_userinfo(url).map(|(_, userinfo, _)| userinfo)
+}
+
+/// `url` with its userinfo replaced by the placeholder, for text that reaches
+/// replay output (divergence reports, blocked-call errors).
+pub(crate) fn hide_url_userinfo(url: &str) -> String {
+    split_userinfo(url).map_or_else(
+        || url.to_owned(),
+        |(head, _, host)| format!("{head}{FILTERED_PLACEHOLDER}@{host}"),
+    )
+}
+
+/// Retain a URL's userinfo, its user and its password, in the raw spelling and
+/// the percent-decoded *bytes* (a decoded credential need not be UTF-8), plus
+/// the lossy text spelling free-form messages quote. Capture and replay both
+/// call this so they agree on what was masked.
+pub(crate) fn record_userinfo_components(userinfo: &str, values: &mut RedactedValues) {
+    let mut retain = |part: &str| {
+        if part.is_empty() {
+            return;
+        }
+        values.insert(part.as_bytes());
+        let decoded: Vec<u8> = percent_encoding::percent_decode_str(part).collect();
+        if decoded != part.as_bytes() {
+            values.insert(&decoded);
+            let lossy = String::from_utf8_lossy(&decoded);
+            if lossy.as_bytes() != decoded.as_slice() {
+                values.insert(lossy.as_bytes());
+            }
+        }
+    };
+    retain(userinfo);
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    retain(user);
+    retain(password);
+    // The spelling the URL parser serialises (`p w` -> `p%20w`), which is what
+    // an error message quoting the normalised URL carries.
+    if let Ok(parsed) = url::Url::parse(&format!("http://{userinfo}@host/")) {
+        retain(parsed.username());
+        retain(parsed.password().unwrap_or_default());
+    }
+}
+
 /// Mask the query string of a recorded outbound URL by parameter name.
 ///
 /// Splices the masked query back onto the original prefix rather than
@@ -792,6 +975,12 @@ fn redact_url_query(
     keys: &mut BTreeSet<String>,
     location: &str,
 ) -> String {
+    // Userinfo (`https://user:secret@host/..`) is the same downstream
+    // credential an `Authorization: Basic` header carries — the HTTP client
+    // turns it into one — so it is masked like that header, not left in the
+    // clear because it lives in the authority instead of a header or query.
+    let url = mask_url_userinfo(url, values, keys, location);
+    let url = url.as_str();
     let Some(split) = url.find('?') else {
         return url.to_owned();
     };
@@ -2106,6 +2295,127 @@ mod tests {
                     .any(|key| key.contains("http[0].request_header:x-api-key")),
                 "{keys:?}"
             );
+        }
+
+        #[test]
+        fn url_userinfo_is_masked_and_echoed_in_the_redirect_target() {
+            let mut hit = exchange("https://svc:hunter2pw@api.example/start");
+            hit.final_url = Some("https://api.example/error/hunter2pw".to_owned());
+            let mut effects = CapsuleEffects {
+                http: vec![hit],
+                ..CapsuleEffects::default()
+            };
+            let keys = redact(&mut effects);
+            let hit = effects.http.first().expect("one exchange");
+            assert_eq!(hit.url, "https://[FILTERED]@api.example/start");
+            let final_url = hit.final_url.as_deref().expect("final url");
+            assert!(!final_url.contains("hunter2pw"), "{final_url}");
+            assert!(keys.contains("http[0].url:userinfo"), "{keys:?}");
+            assert!(keys.contains("http[0].final_url:<echo>"), "{keys:?}");
+        }
+
+        #[test]
+        fn a_credential_inside_the_placeholder_does_not_corrupt_the_masked_url() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://svc:FILTER@api.example/start")],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            let url = &effects.http.first().expect("one exchange").url;
+            assert_eq!(url, "https://[FILTERED]@api.example/start");
+        }
+
+        #[test]
+        fn a_credential_that_begins_with_the_placeholder_is_masked_whole() {
+            let mut values = RedactedValues::default();
+            values.insert(b"[FILTERED]hunter2");
+            assert_eq!(
+                mask_echoes("rejected [FILTERED]hunter2 and [FILTERED]", &values),
+                "rejected [FILTERED] and [FILTERED]"
+            );
+        }
+
+        #[test]
+        fn url_userinfo_is_found_in_the_authority_only() {
+            assert_eq!(
+                hide_url_userinfo("https:\t//a:b@h/p"),
+                "https://[FILTERED]@h/p"
+            );
+            assert_eq!(url_userinfo("https://a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("https://h/p?x=a@b"), None);
+            assert_eq!(url_userinfo("https://@h/p"), None);
+            assert_eq!(url_userinfo("no-scheme"), None);
+            // Spellings the HTTP client's URL parser also accepts.
+            assert_eq!(url_userinfo("https:a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("HTTPS:/a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("https:\\\\a:b@h\\p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("mailto:a@b"), None);
+            assert_eq!(url_userinfo("postgres://a:b@h/db"), Some("a:b".to_owned()));
+            assert_eq!(
+                hide_url_userinfo("https:a:b@h/p?q=1"),
+                "https:[FILTERED]@h/p?q=1"
+            );
+        }
+
+        #[test]
+        fn url_userinfo_retains_user_password_and_decoded_forms() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc%40x:p%20w", &mut values);
+            for expected in [
+                &b"svc%40x:p%20w"[..],
+                b"svc%40x",
+                b"p%20w",
+                b"svc@x",
+                b"p w",
+            ] {
+                assert!(values.contains(expected), "{expected:?}");
+            }
+        }
+
+        #[test]
+        fn a_credential_equal_to_a_host_label_masks_the_host_and_blocks_replay() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://payments:secret@payments.example/x")],
+                ..CapsuleEffects::default()
+            };
+            let keys = redact(&mut effects);
+            let url = &effects.http.first().expect("one exchange").url;
+            assert_eq!(url, "https://[FILTERED]@[FILTERED].example/x");
+            assert!(keys.contains("http[0].url:<host-echo>"), "{keys:?}");
+        }
+
+        #[test]
+        fn userinfo_behind_leading_control_characters_is_still_found() {
+            assert_eq!(url_userinfo("\n https://a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(hide_url_userinfo("\nhttps:a:b@h/p"), "https:[FILTERED]@h/p");
+        }
+
+        #[test]
+        fn url_userinfo_retains_the_parser_serialised_spelling() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc:p w", &mut values);
+            assert!(values.contains(b"p w"));
+            assert!(values.contains(b"p%20w"));
+        }
+
+        #[test]
+        fn a_url_without_credentials_is_recorded_verbatim_even_with_control_characters() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://host/a\tb?x=1")],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            assert_eq!(
+                effects.http.first().expect("one exchange").url,
+                "https://host/a\tb?x=1"
+            );
+        }
+
+        #[test]
+        fn url_userinfo_retains_the_decoded_bytes_of_a_non_utf8_credential() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc:%FFsecret", &mut values);
+            assert!(values.contains(b"\xffsecret"));
         }
 
         #[test]

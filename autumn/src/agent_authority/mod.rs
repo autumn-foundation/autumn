@@ -42,14 +42,16 @@
 //! The threat model is **drift detection, not an adversarial author** — the
 //! posture `docs/guide/security-posture-manifest.md` states for the security
 //! manifest and `classify` states for data flow. Two dimensions of the grant
-//! are *declared, not enforced* in this slice: `rate` and `spend` are validated
-//! for grammar at compile time and recorded in the manifest, but nothing meters
-//! them at runtime. [`manifest::AgentAuthorityManifest::excluded`] carries that
-//! caveat in the document itself rather than leaving it to the guide.
+//! are not compile-time facts. `rate` is enforced by the MCP dispatcher, per
+//! process. `spend` is *declared, not enforced*: nothing meters it.
+//! [`manifest::AgentAuthorityManifest::excluded`] carries that caveat in the
+//! document itself rather than leaving it to the guide.
 //!
 //! See `docs/guide/agent-authority.md`.
 
 pub mod manifest;
+#[cfg(feature = "mcp")]
+pub(crate) mod rate;
 
 use serde::{Deserialize, Serialize};
 
@@ -262,8 +264,8 @@ pub struct Grant {
     pub webhooks: &'static [&'static str],
     /// Allowed job names or job type idents, matched exactly.
     pub jobs: &'static [&'static str],
-    /// Declared rate cap, e.g. `"10/min"`. Validated for grammar at compile
-    /// time; **not** enforced at runtime in this slice.
+    /// Rate cap, e.g. `"10/min"`. Validated for grammar at compile time. The
+    /// MCP dispatcher enforces it for the whole grant, per process.
     pub rate: Option<&'static str>,
     /// Declared spend cap, e.g. `"500.00 USD"`. Validated for grammar at
     /// compile time; **not** enforced at runtime in this slice.
@@ -283,6 +285,20 @@ impl Grant {
     #[must_use]
     pub const fn allows_write(&self, model: &str) -> bool {
         list_contains(self.writes, model) || list_contains(self.unbounded_writes, model)
+    }
+
+    /// Whether a write to every model in `models` is inside the envelope.
+    /// An empty list is allowed.
+    #[must_use]
+    pub const fn allows_writes_all(&self, models: &[&str]) -> bool {
+        let mut i = 0;
+        while i < models.len() {
+            if !self.allows_write(models[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Whether an unbounded write to `model` is inside the envelope.
@@ -453,6 +469,68 @@ const fn tail_eq(haystack: &[u8], start: usize, needle: &str) -> bool {
     true
 }
 
+// ── Models a delete cascades into ───────────────────────────────────
+
+/// What a type publishes about the models a delete also writes, at one depth.
+///
+/// Generated repositories and models fill it. The grant check of an
+/// agent-operable delete reads it.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct CascadeLevel {
+    /// Models reachable within this depth.
+    pub models: &'static [&'static str],
+    /// Whether the cascade goes deeper than this level covers, or loops.
+    pub more: bool,
+}
+
+impl CascadeLevel {
+    /// A type with no cascade.
+    pub const NONE: Self = Self {
+        models: &[],
+        more: false,
+    };
+}
+
+/// The total length of `parts`, for sizing [`cascade_union`].
+#[doc(hidden)]
+#[must_use]
+pub const fn cascade_len(parts: &[&[&str]]) -> usize {
+    let mut total = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        total += parts[i].len();
+        i += 1;
+    }
+    total
+}
+
+/// All of `parts` in one array. `N` must be [`cascade_len`] of `parts`.
+///
+/// Generated repositories use it to join the dependent models of a delete in
+/// const context. A wrong `N` fails the build.
+#[doc(hidden)]
+#[must_use]
+pub const fn cascade_union<const N: usize>(parts: &[&[&'static str]]) -> [&'static str; N] {
+    assert!(
+        cascade_len(parts) == N,
+        "cascade_union: N must equal cascade_len"
+    );
+    let mut out = [""; N];
+    let mut at = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        let mut j = 0;
+        while j < parts[i].len() {
+            out[at] = parts[i][j];
+            at += 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
 // ── Grammar of the declared-only dimensions ──────────────────────────
 
 /// Whether a declared rate cap is well formed: `<positive integer>/<unit>`
@@ -598,6 +676,14 @@ pub struct AgentAuthority {
     /// why, which is precisely the question the hatch raises.
     pub asserted_effect_free: &'static [AssertedEffectFree],
 }
+
+/// The principal a route's own auth layer resolved for an MCP tool call.
+///
+/// Set on the dispatched **response** for tool calls only. The dispatcher
+/// reads it to name the principal in the outcome audit row. The attempt row is
+/// written before dispatch, so it cannot carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentActor(pub String);
 
 /// The compile-known authority of the MCP tool currently being invoked.
 ///
@@ -1111,8 +1197,8 @@ macro_rules! __authority_grant_parse {
 /// be omitted — an omitted key denies its dimension. `writes`,
 /// `unbounded_writes` and `jobs` take idents (stringified) or string literals;
 /// `outbound` and `webhooks` take string literals only. `rate` and `spend` are
-/// checked for grammar at compile time and recorded in the manifest, but
-/// nothing meters them at runtime in this slice — see
+/// checked for grammar at compile time and recorded in the manifest. The MCP
+/// dispatcher enforces `rate`, per process. Nothing meters `spend` — see
 /// [`manifest::AgentAuthorityManifest::excluded`].
 ///
 /// An unknown key, a missing `reversibility`, a misspelled keyword and an
@@ -1154,6 +1240,34 @@ macro_rules! authority_grant {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_grant_allows_a_list_of_writes_only_when_it_allows_each() {
+        const GRANT: Grant = Grant {
+            name: "G",
+            writes: &["Post", "Comment"],
+            unbounded_writes: &["Tag"],
+            tenant_scope: TenantScope::Scoped,
+            outbound: &[],
+            webhooks: &[],
+            jobs: &[],
+            rate: None,
+            spend: None,
+            reversibility: Reversibility::Compensable,
+            location: "test",
+        };
+        assert!(GRANT.allows_writes_all(&[]));
+        assert!(GRANT.allows_writes_all(&["Post", "Tag"]));
+        assert!(!GRANT.allows_writes_all(&["Post", "Like"]));
+    }
+
+    #[test]
+    fn cascade_union_joins_slices_in_order() {
+        const PARTS: &[&[&str]] = &[&["A", "B"], &[], &["C"]];
+        const N: usize = cascade_len(PARTS);
+        const JOINED: [&str; N] = cascade_union::<N>(PARTS);
+        assert_eq!(JOINED, ["A", "B", "C"]);
+    }
+
     use super::*;
 
     /// The envelope every truth-table case starts from: nothing allowed,

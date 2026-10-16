@@ -571,7 +571,12 @@ impl ReplayEffects {
     /// logged and the caller must fail the call rather than dial the peer.
     #[must_use]
     pub(crate) fn next_http(&self, request: &OutboundRequest<'_>) -> Option<HttpEffect> {
-        let (method, url) = (request.method, request.url);
+        let (method, raw_url) = (request.method, request.url);
+        self.observe_live_userinfo(raw_url);
+        // The URL parser ignores ASCII tab/CR/LF, so two spellings that differ
+        // only by those are one URL: compare and report the parser's view.
+        let live = crate::capsule::redact::parser_view(raw_url);
+        let url = live.as_ref();
         let Ok(mut seam) = self.http.lock() else {
             return None;
         };
@@ -596,7 +601,9 @@ impl ReplayEffects {
             });
             return None;
         };
-        if !next.method.eq_ignore_ascii_case(method) || !matches_redacted(&next.url, url) {
+        if !next.method.eq_ignore_ascii_case(method)
+            || !matches_redacted(&crate::capsule::redact::parser_view(&next.url), url)
+        {
             let expected = describe_http(&next.method, &next.url);
             drop(seam);
             let actual = describe_http(method, url);
@@ -626,7 +633,7 @@ impl ReplayEffects {
             drop(seam);
             // The URL matched: learn what its masked values stood for before
             // the report prints the live URL.
-            self.observe_text(&recorded_url, url);
+            self.observe_url(&recorded_url, url);
             let actual = describe_http(method, url);
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Http,
@@ -645,7 +652,7 @@ impl ReplayEffects {
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
         if let Some(recorded) = served.as_ref() {
-            self.observe_text(&recorded.url, url);
+            self.observe_url(&recorded.url, url);
             self.observe_headers(&recorded.request_headers, request.headers);
             self.observe_body(&recorded.request_body, request.body);
         }
@@ -1314,6 +1321,28 @@ impl ReplayEffects {
         }
     }
 
+    /// [`Self::observe_text`] for a URL, which also decomposes a masked
+    /// userinfo the way capture retained it (user, password, decoded forms).
+    fn observe_url(&self, recorded: &str, actual: &str) {
+        let recorded = crate::capsule::redact::parser_view(recorded);
+        let actual = crate::capsule::redact::parser_view(actual);
+        let (recorded, actual) = (recorded.as_ref(), actual.as_ref());
+        self.observe_text(recorded, actual);
+        if crate::capsule::redact::url_userinfo(recorded).as_deref() == Some("[FILTERED]") {
+            self.observe_live_userinfo(actual);
+        }
+    }
+
+    /// Keep the live URL's userinfo, so an outcome that quotes it is scrubbed
+    /// even when the call diverges before the recorded URL is compared.
+    fn observe_live_userinfo(&self, url: &str) {
+        if let Some(userinfo) = crate::capsule::redact::url_userinfo(url)
+            && let Ok(mut observed) = self.observed.lock()
+        {
+            crate::capsule::redact::record_userinfo_components(&userinfo, &mut observed);
+        }
+    }
+
     fn observe_headers(&self, recorded: &[(String, String)], actual: &[(String, String)]) {
         for ((name, recorded), (_, actual)) in recorded.iter().zip(actual.iter()) {
             self.observe_text(recorded, actual);
@@ -1585,6 +1614,9 @@ pub fn body_bytes(body: &CapsuleBody) -> Vec<u8> {
 fn describe_http(method: &str, url: &str) -> String {
     let path = url.split_once('?').map_or(url, |(head, _)| head);
     let elided = if path.len() < url.len() { "?…" } else { "" };
+    // The live URL's userinfo is a credential, and this text reaches replay's
+    // JSON and terminal output, so it is dropped like the query string is.
+    let path = crate::capsule::redact::hide_url_userinfo(path);
     format!("{method} {path}{elided}")
 }
 
@@ -3540,5 +3572,11 @@ mod tests {
     fn base64_of(bytes: &[u8]) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn a_divergence_report_never_prints_url_userinfo() {
+        let described = super::describe_http("GET", "https://svc:hunter2pw@api.example/x?k=v");
+        assert_eq!(described, "GET https://[FILTERED]@api.example/x?…");
     }
 }

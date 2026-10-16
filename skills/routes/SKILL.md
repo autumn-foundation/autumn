@@ -160,10 +160,12 @@ security header no longer emitted. Narrowing and neutral changes annotate and
 never block, a security header's *value* changing is reported but never
 blocked, and a handler rename or a moved file produces no finding at all.
 
-A widening is acknowledged with one pull-request comment carrying the digest
-the report prints — `/ack-posture <digest> <reason>` — which stays valid across
-unrelated pushes and stops matching the moment something new widens. That is
-also the only escape hatch for a false positive: nothing disables the gate.
+A widening is acknowledged with one pull-request comment carrying the marker
+the report prints — `/ack-posture <digest> ceiling=<posture> <reason>`. It
+means "no wider than this": it stays valid across unrelated pushes and
+narrowing, and stops matching when something new widens or a constraint is
+removed. A bare digest means "exactly this". The marker is also the only
+escape hatch for a false positive. Nothing disables the gate.
 
 `autumn new` scaffolds `.github/workflows/posture-gate.yml`; existing apps
 adopt it with `autumn upgrade --apply`. See `docs/guide/posture-gate.md`.

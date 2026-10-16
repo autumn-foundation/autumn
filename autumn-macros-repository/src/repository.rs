@@ -58,6 +58,9 @@ fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> syn::Result<Vec<
     Ok(cols)
 }
 
+use autumn_macros_support::cascade::{
+    CASCADE_LEVELS, CascadeLeg, any_const, cascade_level, level_name,
+};
 use autumn_macros_support::naming::infer_table_name;
 
 pub(crate) fn to_snake_case(name: &str) -> String {
@@ -177,6 +180,9 @@ pub(crate) struct RepoConfig {
     /// Expose the generated CRUD routes as MCP tools (`mcp` / `mcp = "read"`).
     /// `None` = not opted in. Requires `api = "/path"`.
     pub(crate) mcp_expose: Option<McpExpose>,
+    /// The `authority_grant!` that governs the generated MCP tools
+    /// (`grant = Path`). Requires `mcp`.
+    pub(crate) grant: Option<syn::Path>,
     pub(crate) policy_type: Option<Ident>,
     pub(crate) scope_type: Option<Ident>,
     pub(crate) cursor_key: Option<String>,
@@ -552,6 +558,75 @@ fn dependent_child_repositories(config: &RepoConfig) -> Vec<(syn::Path, bool)> {
     children.into_iter().map(|(_, p, r)| (p, r)).collect()
 }
 
+/// The `__AUTUMN_CASCADE_{k}` consts: the models a delete also writes, at each
+/// depth.
+///
+/// A `dependent(..)` clause is authoritative when present, as it is at run
+/// time. A `restrict` leg writes nothing. A `destroy` leg runs the child's own
+/// cascade. A repository that cascades into itself adds nothing. Each level
+/// reads only the level below it, so a cascade that loops is no const cycle.
+fn cascade_levels(config: &RepoConfig, pg_name: &Ident) -> TokenStream {
+    let level_consts = |any: TokenStream, expr_of: &dyn Fn(usize) -> TokenStream| {
+        let levels = (0..CASCADE_LEVELS).map(|k| {
+            let name = level_name(k);
+            let expr = expr_of(k);
+            quote! {
+                #[doc(hidden)]
+                pub const #name: ::autumn_web::agent_authority::CascadeLevel = #expr;
+            }
+        });
+        quote! {
+            #[doc(hidden)]
+            pub const __AUTUMN_CASCADE_ANY: bool = #any;
+            #(#levels)*
+        }
+    };
+    if config.dependents.is_empty() {
+        let model = &config.model_name;
+        // The inherent consts of `#[model]` win over the trait defaults.
+        let any = quote! {{
+            use ::autumn_web::repository::AutumnDependents as _;
+            #model::DEPENDENT_CASCADE_ANY
+        }};
+        return level_consts(any, &|k| {
+            let name = format_ident!("DEPENDENT_CASCADE_{}", k);
+            quote! {{
+                use ::autumn_web::repository::AutumnDependents as _;
+                #model::#name
+            }}
+        });
+    }
+    let mut legs: Vec<CascadeLeg> = Vec::new();
+    for dep in config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action != DependentAction::Restrict)
+    {
+        let child = &dep.child_repo;
+        // Only the bare name is proven to be this repository. A qualified path
+        // can name another repository with the same type name, and a macro
+        // cannot resolve paths. Keeping that leg can only refuse a governed
+        // delete. Skipping it could hide a model.
+        if child.is_ident(pg_name) {
+            continue;
+        }
+        let rendered = quote!(#child).to_string();
+        let destroy = dep.action == DependentAction::Destroy;
+        // One child can appear in several clauses. The runtime runs each, so
+        // the child's own cascade counts if any clause destroys.
+        if let Some(seen) = legs.iter_mut().find(|l| l.child.to_string() == rendered) {
+            seen.destroy |= destroy;
+            continue;
+        }
+        legs.push(CascadeLeg {
+            model: quote! { #child::__AUTUMN_MODEL_IDENT },
+            child: quote! { #child },
+            destroy,
+        });
+    }
+    level_consts(any_const(&legs), &|k| cascade_level(&legs, k))
+}
+
 /// Write methods that run the `dependent(...)` cascade.
 const CASCADING_WRITES: &[&str] = &["delete_by_id", "delete_many"];
 
@@ -807,6 +882,7 @@ fn generate_coherence_items(
     // type name. The guess is wrong for the supported escape hatch where they
     // differ — `#[repository(Comment)] trait ModerationRepository` — and a wrong
     // model means the cascade intersects nothing and the audit reports clean.
+    let cascade_consts = cascade_levels(config, pg_name);
     let published_model = quote! {
         impl #pg_name {
             /// The model this repository writes, for the cache-coherence
@@ -827,6 +903,8 @@ fn generate_coherence_items(
             /// const context so the authority assertion works across crates.
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str = #model_ident;
+
+            #cascade_consts
         }
     };
 
@@ -855,6 +933,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut commit_hooks = false;
     let mut api_path: Option<String> = None;
     let mut mcp_expose: Option<McpExpose> = None;
+    let mut grant: Option<syn::Path> = None;
     let mut mcp_span: Option<proc_macro2::Span> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
@@ -990,6 +1069,12 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             } else {
                 mcp_expose = Some(McpExpose::All);
             }
+            Ok(())
+        } else if meta.path.is_ident("grant") {
+            if grant.is_some() {
+                return Err(meta.error("duplicate `grant` key: a repository has one grant"));
+            }
+            grant = Some(meta.value()?.parse()?);
             Ok(())
         } else if meta.path.is_ident("policy") {
             let value: Ident = meta.value()?.parse()?;
@@ -1301,6 +1386,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "commit_hooks = true requires hooks = Type",
         ));
     }
+    if let Some(path) = &grant
+        && mcp_expose.is_none()
+    {
+        return Err(syn::Error::new_spanned(
+            path,
+            "grant requires mcp: a grant governs the generated MCP tools, and no `mcp` key \
+             exposes any",
+        ));
+    }
     if mcp_expose.is_some() && api_path.is_none() {
         return Err(syn::Error::new(
             mcp_span.unwrap_or_else(proc_macro2::Span::call_site),
@@ -1552,6 +1646,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         commit_hooks,
         api_path,
         mcp_expose,
+        grant,
         policy_type,
         scope_type,
         cursor_key,
@@ -23247,6 +23342,211 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_publishes_the_models_its_delete_writes() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        for level in 0..4 {
+            assert!(
+                generated.contains(&format!("const __AUTUMN_CASCADE_{level}")),
+                "{generated}"
+            );
+            assert!(
+                generated.contains(&format!("Post :: DEPENDENT_CASCADE_{level}")),
+                "with no `dependent(..)` clause the model's own levels are used: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependent_clause_names_its_child_models() {
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgLikeRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgAuditRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_MODEL_IDENT"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "destroy runs the child's own cascade: {generated}"
+        );
+        assert!(
+            generated.contains("PgLikeRepository :: __AUTUMN_MODEL_IDENT"),
+            "nullify writes the child: {generated}"
+        );
+        assert!(
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE"),
+            "{generated}"
+        );
+        assert!(
+            !generated.contains("PgAuditRepository :: __AUTUMN_MODEL_IDENT"),
+            "restrict writes nothing: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_later_destroy_clause_keeps_the_childs_own_cascade() {
+        // `nullify` first, `destroy` second, one child. The runtime runs both,
+        // so the child's own cascade must be listed.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgCommentRepository, fk = "editor_id", on_delete = destroy)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_path_is_never_taken_for_the_repository_itself() {
+        // `plugin::PgCommentRepository` can be another repository with the same
+        // name. A macro cannot resolve paths, so it keeps the leg: a missed
+        // model would be a hole, a kept leg only refuses a governed delete.
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                dependent(plugin::PgCommentRepository, fk = "parent_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("plugin :: PgCommentRepository :: __AUTUMN_MODEL_IDENT"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("plugin :: PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn a_repository_that_cascades_into_itself_does_not_name_itself() {
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                dependent(PgCommentRepository, fk = "parent_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_grant() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp, grant = crate::grants::PostEditor"#
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let grant = config.grant.expect("grant is parsed");
+        assert_eq!(
+            quote! { #grant }.to_string(),
+            "crate :: grants :: PostEditor"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_grant_without_mcp() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", grant = PostEditor"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("a grant with no MCP tools governs nothing and must be rejected");
+        };
+        assert!(err.to_string().contains("mcp"), "{err}");
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_a_duplicate_grant() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp, grant = A, grant = B"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("two grants must be rejected");
+        };
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn a_granted_repository_governs_every_mcp_tool_it_generates() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp, grant = PostEditor },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated
+                .matches("agent_authority : :: core :: option :: Option :: Some (&")
+                .count(),
+            5,
+            "list/get/create/update/delete each carry the authority"
+        );
+        assert_eq!(
+            generated.matches("AgentAuthorityDescriptor").count(),
+            5,
+            "each authority is registered for the manifest"
+        );
+        assert_eq!(
+            generated.matches("PostEditor . allows_write (").count(),
+            1,
+            "the writes are const-checked against the grant, once"
+        );
+        assert!(
+            generated
+                .contains("PostEditor . allows_write (PgPostRepository :: __AUTUMN_MODEL_IDENT)"),
+            "the write subject is the model ident: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches(
+                    "PostEditor . allows_writes_all (PgPostRepository :: __AUTUMN_CASCADE_3 . models)"
+                )
+                .count(),
+            1,
+            "the delete tool is checked against its cascade"
+        );
+    }
+
+    #[test]
+    fn a_granted_read_only_repository_has_no_write_assertion() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp = "read", grant = PostEditor },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(generated.matches("AgentAuthorityDescriptor").count(), 2);
+        assert_eq!(generated.matches("allows_write").count(), 0);
+    }
+
+    #[test]
+    fn an_ungranted_repository_emits_no_authority() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(generated.matches("AgentAuthority").count(), 0);
+    }
+
+    #[test]
     fn repository_macro_mcp_flags_all_five_crud_api_docs() {
         let generated = repository_macro(
             quote! { Post, api = "/api/posts", mcp },
@@ -29325,7 +29625,9 @@ mod tests {
             ("plain", quote! { Post }, 81_000),
             ("soft_delete", quote! { Post, soft_delete }, 89_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
-            ("api", quote! { Post, api = "/posts" }, 95_000),
+            // Raised from 95_000 (#2451): each repository publishes its
+            // cascade consts. Understood and intended.
+            ("api", quote! { Post, api = "/posts" }, 96_000),
             ("searchable", quote! { Post, searchable }, 98_000),
             ("versioned", quote! { Post, versioned = true }, 128_000),
             // Raised from 201_000 (#2490): `ledger_as_of_at`/`ledger_diff_at`
