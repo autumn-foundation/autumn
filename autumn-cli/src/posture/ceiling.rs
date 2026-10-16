@@ -68,7 +68,9 @@ impl RoutePosture {
             && implies(ceiling.csrf == Csrf::On, self.csrf == Csrf::On)
             && ceiling.checks.is_subset(&self.checks)
             && implies(ceiling.mtls, self.mtls)
-            && implies(!ceiling.declared, !self.declared)
+            // Guard strength only matters against a ceiling that has a guard.
+            // A route that stopped being open is narrower, declared or not.
+            && implies(!ceiling_open && !ceiling.declared, !self.declared)
     }
 
     /// An empty role list admits all signed-in callers. It is the widest.
@@ -628,6 +630,21 @@ mod tests {
         assert!(!differ_widens(&declared, &proven));
         assert!(!declared.posture().no_wider_than(&proven.posture()));
         assert!(proven.posture().no_wider_than(&declared.posture()));
+    }
+
+    /// Closing an open route is a narrowing even when a layer only declares the
+    /// new guard. The differ agrees: it stops comparing at that point.
+    #[test]
+    fn a_declared_guard_is_within_an_open_ceiling() {
+        let open = Fixture::new("public");
+        let declared = Fixture::new("gated").declared();
+        assert!(!differ_widens(&open, &declared));
+        assert!(declared.posture().no_wider_than(&open.posture()));
+        assert!(
+            Fixture::new("gated")
+                .posture()
+                .no_wider_than(&open.posture())
+        );
     }
 
     /// An open route has no guard, so its provenance changes nothing.
