@@ -2450,6 +2450,13 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: routes_audit:: \
             | tee "$RUNNER_TEMP/cli-posture-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-posture-cov.log"
+          # Issue #3232: same gap for `autumn fleet` (its clap shape and the
+          # Postgres-build stub) and the `db::replica` config loader it shares.
+          # Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- fleet::imp::tests \
+            tests::fleet_subcommands db::replica:: \
+            | tee "$RUNNER_TEMP/cli-fleet-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2606,6 +2613,22 @@ jobs:
           for log in cli-schema-sqlite-unit cli-schema-sqlite-it; do
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
               || { echo "::error::no autumn-cli sqlite schema test ran (${log})"; exit 1; }
+          done
+      - name: Run the autumn fleet CLI suite under sqlite
+        # Issue #3232. This job runs the SQLite tests of `autumn fleet`. Each
+        # test makes a fleet in a temporary directory, so no Docker. Linux
+        # only: `sqlite-fleet-windows` covers the Windows delete and restore
+        # paths in autumn-web. A filter that matches nothing exits 0, so the
+        # step checks the pass count.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --bin autumn fleet::imp::tests | tee "${RUNNER_TEMP}/cli-fleet-unit.log"
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --test cli_tests fleet_cli | tee "${RUNNER_TEMP}/cli-fleet-it.log"
+          for log in cli-fleet-unit cli-fleet-it; do
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
+              || { echo "::error::no autumn fleet test ran (${log})"; exit 1; }
           done
       - name: Clippy autumn-search under the sqlite backend
         # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
