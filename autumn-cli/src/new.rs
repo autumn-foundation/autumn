@@ -141,6 +141,27 @@ pub struct GenerateOptions {
     pub with_api: bool,
 }
 
+/// Reject `--with` on the DB-free daemon starter.
+///
+/// Plugins depend on `autumn-web` with default features. Cargo unifies them,
+/// so the database stack returns to a daemon that must not have it.
+///
+/// # Errors
+///
+/// [`NewError::IncompatibleOptions`] when `plugins` is not zero and the
+/// starter is the DB-free daemon.
+pub fn check_with_plugins(opts: GenerateOptions, plugins: usize) -> Result<(), NewError> {
+    if plugins > 0 && opts.with_daemon && !opts.with_bundled_pg {
+        return Err(NewError::IncompatibleOptions(
+            "--daemon scaffolds a database-free app, so --with is not supported. \
+             Plugins enable the database features again. Use --bundled-pg for a \
+             daemon with a managed Postgres, or remove --with"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Generate a new Autumn project under `parent_dir/name` with default options.
 pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     generate_with(name, parent_dir, GenerateOptions::default())
@@ -2208,6 +2229,28 @@ mod tests {
         assert!(matches!(err, NewError::IncompatibleOptions(_)));
         // Nothing should be scaffolded on rejection.
         assert!(!tmp.path().join("daemon-seed-app").exists());
+    }
+
+    #[test]
+    fn daemon_with_plugins_is_rejected() {
+        let err = check_with_plugins(daemon_opts(), 1).unwrap_err();
+        assert!(matches!(err, NewError::IncompatibleOptions(_)));
+    }
+
+    #[test]
+    fn daemon_without_plugins_is_accepted() {
+        assert!(check_with_plugins(daemon_opts(), 0).is_ok());
+    }
+
+    #[test]
+    fn plugins_with_a_database_flavor_are_accepted() {
+        let bundled = GenerateOptions {
+            with_bundled_pg: true,
+            with_daemon: true,
+            ..GenerateOptions::default()
+        };
+        assert!(check_with_plugins(bundled, 2).is_ok());
+        assert!(check_with_plugins(GenerateOptions::default(), 2).is_ok());
     }
 
     #[test]
