@@ -3990,7 +3990,7 @@ fn sessions_list_fragment(
                             @if let Some(csrf) = csrf {{
                                 input type="hidden" name=(csrf_name) value=(csrf.token());
                             }}
-                            input type="text" name="label" placeholder="Device label"
+                            input type="text" name="label" aria-label="Device label" placeholder="Device label"
                                 value=[s.label.as_deref()];
                             button type="submit" {{ "Save label" }}
                         }}
@@ -4226,12 +4226,12 @@ fn render_signup_form(
         form action="/signup" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Email" }}
-                input type="email" name="email" required autocomplete="email";
+                label for="signup-email" {{ "Email" }}
+                input id="signup-email" type="email" name="email" required autocomplete="email";
             }}
             div {{
-                label {{ "Password (" (min_len) "+ characters)" }}
-                input type="password" name="password" required
+                label for="signup-password" {{ "Password (" (min_len) "+ characters)" }}
+                input id="signup-password" type="password" name="password" required
                       autocomplete="new-password" minlength=(min_len);
             }}
             button type="submit" {{ "Sign Up" }}
@@ -4394,12 +4394,12 @@ pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Optio
         form action="/login" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Email" }}
-                input type="email" name="email" required autocomplete="email";
+                label for="login-email" {{ "Email" }}
+                input id="login-email" type="email" name="email" required autocomplete="email";
             }}
             div {{
-                label {{ "Password" }}
-                input type="password" name="password" required
+                label for="login-password" {{ "Password" }}
+                input id="login-password" type="password" name="password" required
                       autocomplete="current-password";
             }}
             label {{
@@ -4937,16 +4937,16 @@ fn render_change_password_form(
         form action="/account/password" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Current password" }}
-                input type="password" name="current_password" autocomplete="current-password" required;
+                label for="password-current-password" {{ "Current password" }}
+                input id="password-current-password" type="password" name="current_password" autocomplete="current-password" required;
             }}
             div {{
-                label {{ "New password" }}
-                input type="password" name="new_password" autocomplete="new-password" required;
+                label for="password-new-password" {{ "New password" }}
+                input id="password-new-password" type="password" name="new_password" autocomplete="new-password" required;
             }}
             div {{
-                label {{ "Confirm new password" }}
-                input type="password" name="new_password_confirmation" autocomplete="new-password" required;
+                label for="password-new-password-confirmation" {{ "Confirm new password" }}
+                input id="password-new-password-confirmation" type="password" name="new_password_confirmation" autocomplete="new-password" required;
             }}
             button type="submit" {{ "Change Password" }}
         }}
@@ -5144,12 +5144,12 @@ fn render_change_email_form(
         form action="/account/email" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "New email address" }}
-                input type="email" name="new_email" autocomplete="email" required;
+                label for="email-new-email" {{ "New email address" }}
+                input id="email-new-email" type="email" name="new_email" autocomplete="email" required;
             }}
             div {{
-                label {{ "Current password" }}
-                input type="password" name="current_password" autocomplete="current-password" required;
+                label for="email-current-password" {{ "Current password" }}
+                input id="email-current-password" type="password" name="current_password" autocomplete="current-password" required;
             }}
             button type="submit" {{ "Send Confirmation Link" }}
         }}
@@ -5508,8 +5508,8 @@ pub async fn reauth_form(
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="return_to" value=(return_to);
             div {{
-                label {{ "Password" }}
-                input type="password" name="password" autocomplete="current-password" required;
+                label for="reauth-password" {{ "Password" }}
+                input id="reauth-password" type="password" name="password" autocomplete="current-password" required;
             }}
             {totp_reauth_field}
             button type="submit" {{ "Confirm" }}
@@ -5571,8 +5571,8 @@ pub async fn reauth(
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(ret);
                     div {{
-                        label {{ "Password" }}
-                        input type="password" name="password" autocomplete="current-password" required;
+                        label for="reauth-password" {{ "Password" }}
+                        input id="reauth-password" type="password" name="password" autocomplete="current-password" required;
                     }}
                     {totp_reauth_field}
                     button type="submit" {{ "Confirm" }}
@@ -5728,8 +5728,8 @@ pub async fn forgot_password_form(csrf: Option<CsrfToken>, csrf_field: Option<Cs
         form action="/forgot-password" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Email" }}
-                input type="email" name="email" required autocomplete="email";
+                label for="forgot-email" {{ "Email" }}
+                input id="forgot-email" type="email" name="email" required autocomplete="email";
             }}
             button type="submit" {{ "Send Reset Link" }}
         }}
@@ -5840,8 +5840,8 @@ fn render_reset_password_form(
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="token" value=(token);
             div {{
-                label {{ "New Password (" (min_len) "+ characters)" }}
-                input type="password" name="password" required
+                label for="reset-password" {{ "New Password (" (min_len) "+ characters)" }}
+                input id="reset-password" type="password" name="password" required
                       autocomplete="new-password" minlength=(min_len);
             }}
             button type="submit" {{ "Set New Password" }}
@@ -6180,8 +6180,8 @@ pub async fn resend_confirmation_form(
         form action="/auth/confirm/resend" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Email" }}
-                input type="email" name="email" required autocomplete="email";
+                label for="resend-email" {{ "Email" }}
+                input id="resend-email" type="email" name="email" required autocomplete="email";
             }}
             button type="submit" {{ "Resend Confirmation Email" }}
         }}
@@ -9023,8 +9023,8 @@ fn totp_confirm_branch_src(snake_name: &str) -> String {
 /// `totp_enabled = true` and ignores it for accounts that don't.
 fn totp_reauth_field_src() -> String {
     "            div {{\n\
-     \x20               label {{ \"Authenticator code\" }}\n\
-     \x20               input type=\"text\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
+     \x20               label for=\"reauth-totp-code\" {{ \"Authenticator code\" }}\n\
+     \x20               input id=\"reauth-totp-code\" type=\"text\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
      \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" placeholder=\"6-digit code or recovery code\";\n\
      \x20               small {{ \"Required if your account uses two-factor authentication.\" }}\n\
      \x20           }}\n"
@@ -9053,8 +9053,8 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(return_to);
                     div {{
-                        label {{ "Authenticator code" }}
-                        input type="text" name="totp_code" autocomplete="one-time-code"
+                        label for="reauth-totp-code" {{ "Authenticator code" }}
+                        input id="reauth-totp-code" type="text" name="totp_code" autocomplete="one-time-code"
                             inputmode="numeric" pattern="[0-9 ]*" required
                             placeholder="6-digit code or recovery code";
                         small {{ "Required if your account uses two-factor authentication." }}
@@ -9119,8 +9119,8 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(return_to);
                     div {{
-                        label {{ "Authenticator code" }}
-                        input type="text" name="totp_code" autocomplete="one-time-code"
+                        label for="reauth-totp-code" {{ "Authenticator code" }}
+                        input id="reauth-totp-code" type="text" name="totp_code" autocomplete="one-time-code"
                             inputmode="numeric" pattern="[0-9 ]*" required
                             placeholder="6-digit code or recovery code";
                         small {{ "Required if your account uses two-factor authentication." }}
@@ -9352,8 +9352,8 @@ pub async fn two_factor_status(
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
                 p {
                     label { "Confirm with your password or a current 6-digit code:" }
-                    input type="password" name="password" autocomplete="current-password";
-                    input type="text" name="code" inputmode="numeric" autocomplete="one-time-code";
+                    input type="password" name="password" aria-label="Password" autocomplete="current-password";
+                    input type="text" name="code" aria-label="6-digit code" inputmode="numeric" autocomplete="one-time-code";
                 }
                 button type="submit" { "Disable two-factor" }
             }
@@ -9362,8 +9362,8 @@ pub async fn two_factor_status(
             form action="/account/2fa/enable" method="post" {
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
                 p {
-                    label { "Confirm your password to begin enrollment:" }
-                    input type="password" name="password" autocomplete="current-password" required;
+                    label for="enable-2fa-password" { "Confirm your password to begin enrollment:" }
+                    input id="enable-2fa-password" type="password" name="password" autocomplete="current-password" required;
                 }
                 button type="submit" { "Enable two-factor" }
             }
@@ -9451,7 +9451,7 @@ pub async fn two_factor_enable(
         p { "Enter the 6-digit code shown in your app to finish enabling 2FA." }
         form action="/account/2fa/confirm" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
-            input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+            input type="text" name="code" aria-label="6-digit code" inputmode="numeric" autocomplete="one-time-code" required;
             button type="submit" { "Confirm and enable" }
         }
     }))
@@ -9704,8 +9704,8 @@ pub async fn login_verify_form(
         form action="/login/verify" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
             div {
-                label { "Authentication code or recovery code" }
-                input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+                label for="verify-code" { "Authentication code or recovery code" }
+                input id="verify-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required;
             }
             button type="submit" { "Verify" }
         }
@@ -10048,8 +10048,8 @@ pub async fn magic_link_request_form(
         form action="/login/magic" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
             div {
-                label { "Email" }
-                input type="email" name="email" required autocomplete="email";
+                label for="magic-email" { "Email" }
+                input id="magic-email" type="email" name="email" required autocomplete="email";
             }
             button type="submit" { "Email me a link" }
         }
