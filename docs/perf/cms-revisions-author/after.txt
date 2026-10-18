@@ -1,49 +1,49 @@
    Compiling cms v0.8.0 (/home/user/autumn/examples/cms)
 warning: cms@0.8.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 12s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 54s
      Running tests/revisions_author_batch_profile.rs (target/debug/deps/revisions_author_batch_profile-7fa5d076607a30fe)
 
 running 1 test
 test revisions_author_batch_profile ... 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): revisions for the 12-editor post ===
-Sort  (cost=321.35..321.58 rows=95 width=76) (actual time=0.046..0.049 rows=60 loops=1)
+Sort  (cost=229.37..229.54 rows=65 width=76) (actual time=0.041..0.044 rows=60 loops=1)
   Output: id, post_id, title, excerpt, body, status, author_id, summary, created_at
   Sort Key: revisions.created_at DESC, revisions.id DESC
   Sort Method: quicksort  Memory: 31kB
   Buffers: shared hit=5
-  ->  Bitmap Heap Scan on public.revisions  (cost=5.16..318.23 rows=95 width=76) (actual time=0.022..0.029 rows=60 loops=1)
+  ->  Bitmap Heap Scan on public.revisions  (cost=4.92..227.42 rows=65 width=76) (actual time=0.020..0.026 rows=60 loops=1)
         Output: id, post_id, title, excerpt, body, status, author_id, summary, created_at
         Recheck Cond: (revisions.post_id = 50003)
         Heap Blocks: exact=2
         Buffers: shared hit=5
-        ->  Bitmap Index Scan on idx_revisions_post  (cost=0.00..5.13 rows=95 width=0) (actual time=0.014..0.014 rows=60 loops=1)
+        ->  Bitmap Index Scan on idx_revisions_post  (cost=0.00..4.91 rows=65 width=0) (actual time=0.013..0.013 rows=60 loops=1)
               Index Cond: (revisions.post_id = 50003)
               Buffers: shared hit=3
-Query Identifier: 2632098924250376026
+Query Identifier: -3481095382030685949
 Planning:
   Buffers: shared hit=60
-Planning Time: 0.221 ms
-Execution Time: 0.073 ms
+Planning Time: 0.154 ms
+Execution Time: 0.070 ms
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): one users.id = $1 lookup (per-editor find_by_id shape) ===
-Index Scan using users_pkey on public.users  (cost=0.28..8.29 rows=1 width=83) (actual time=0.009..0.010 rows=1 loops=1)
+Index Scan using users_pkey on public.users  (cost=0.28..8.29 rows=1 width=83) (actual time=0.005..0.005 rows=1 loops=1)
   Output: id, username, email, password_hash, display_name, role, bio, website, created_at, updated_at
   Index Cond: (users.id = 52)
   Buffers: shared hit=3
-Query Identifier: -3890080210679080517
+Query Identifier: -4079144792218453321
 Planning:
   Buffers: shared hit=21
-Planning Time: 0.103 ms
-Execution Time: 0.021 ms
+Planning Time: 0.072 ms
+Execution Time: 0.013 ms
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): one users.id = ANY($1) lookup (12 ids) ===
-Index Scan using users_pkey on public.users  (cost=0.28..35.54 rows=12 width=83) (actual time=0.011..0.023 rows=12 loops=1)
+Index Scan using users_pkey on public.users  (cost=0.28..35.54 rows=12 width=83) (actual time=0.008..0.020 rows=12 loops=1)
   Output: id, username, email, password_hash, display_name, role, bio, website, created_at, updated_at
-  Index Cond: (users.id = ANY ('{61,64,67,70,73,76,79,82,85,88,91,94}'::integer[]))
+  Index Cond: (users.id = ANY ('{51,54,57,60,63,66,69,72,75,78,81,84}'::integer[]))
   Buffers: shared hit=26
-Query Identifier: 4360105340827830568
-Planning Time: 0.063 ms
-Execution Time: 0.032 ms
+Query Identifier: 61972824524117591
+Planning Time: 0.045 ms
+Execution Time: 0.027 ms
 
 #################### MEASURED: GET /admin/content/post/{id}/revisions ####################
 
@@ -55,7 +55,7 @@ calls=1    buffers=3     wal=0      SELECT "posts"."id", "posts"."post_type", "p
 calls=1    buffers=3     wal=0      [AUTHOR-RESOLVE] SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
 calls=1    buffers=3     wal=0      [AUTHOR-RESOLVE] SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = ANY($1))
 -- request total: statements=10 buffers=15 wal_bytes=0 temp_blks_written=0; author-resolve slice: statements=2 (20.0% of calls) buffers=6 (40.0% of buffers) --
--- body: 32869 bytes, hash 31e4ddedf2509f97 --
+-- body: 32533 bytes, hash f09c299535069efa --
 
 === pg_stat_statements: k=4 editors (post id 50002) (ranked by calls) ===
 calls=4    buffers=0     wal=0      SELECT $1
@@ -65,7 +65,7 @@ calls=1    buffers=5     wal=0      SELECT "revisions"."id", "revisions"."post_i
 calls=1    buffers=3     wal=0      SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
 calls=1    buffers=3     wal=0      [AUTHOR-RESOLVE] SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
 -- request total: statements=10 buffers=20 wal_bytes=0 temp_blks_written=0; author-resolve slice: statements=2 (20.0% of calls) buffers=12 (60.0% of buffers) --
--- body: 32869 bytes, hash 23537ce1c40d4371 --
+-- body: 32737 bytes, hash a43d172c187895ef --
 
 === pg_stat_statements: k=12 editors (post id 50003) (ranked by calls) ===
 calls=4    buffers=0     wal=0      SELECT $1
@@ -75,7 +75,7 @@ calls=1    buffers=5     wal=0      SELECT "revisions"."id", "revisions"."post_i
 calls=1    buffers=3     wal=0      SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
 calls=1    buffers=3     wal=0      [AUTHOR-RESOLVE] SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
 -- request total: statements=10 buffers=37 wal_bytes=0 temp_blks_written=0; author-resolve slice: statements=2 (20.0% of calls) buffers=29 (78.4% of buffers) --
--- body: 32931 bytes, hash 64ea7e6153285cf4 --
+-- body: 32865 bytes, hash 221c2bcbc8288a93 --
 
 === summary (per request) ===
 k     stmts total  buffers total   stmts author-res   buffers author-res
@@ -84,5 +84,5 @@ k     stmts total  buffers total   stmts author-res   buffers author-res
 12             10             37                  2                   29
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.11s
 

@@ -44,8 +44,8 @@ scan, one index probe per user id).
 ## Equivalence
 
 Rendered response body hash is identical before and after for all three posts
-(`31e4dded…`, `23537ce1…`, `64ea7e61…`), and the harness asserts every editor's
-public name appears, including editors with an empty `display_name` (falls back
+(`f09c2995…`, `a43d172c…`, `221c2bcb…`), and the harness asserts every editor's
+public name appears, including (in every tier, asserted) an editor with an empty `display_name` (falls back
 to username, via the unchanged `User::public_name`) and NULL-author revisions
 (no lookup, no name). A deleted editor's id is simply absent from the map, as
 `find_by_id` returning `None` was before.
