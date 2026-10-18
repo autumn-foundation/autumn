@@ -81,7 +81,8 @@ Selected: 1, 2, 3, 10, and the detail levels of 4 inside `search_tools`.
 | A client skips the confirmation prompt for `call_tool`. | `call_tool` has `readOnlyHint: false` and `destructiveHint: true`. |
 | `search_tools` shows a tool that `tools/list` would hide. | `search_tools` reads the same catalog. `secure_mcp` gates both. |
 | A user tool named `search_tools` hides a meta-tool. | In progressive mode the router drops the user tool with a warning, as for a duplicate name. The AEO documents see the same list. |
-| One huge `query` blocks a worker. | A query has at most 512 bytes and 16 distinct words. The server builds the word index once, at start. |
+| One huge `query` blocks a worker. | A query has at most 128 characters and 16 distinct words. The server builds the word index once, at start. |
+| An agent thinks that one page is the whole catalog. | The result gives `total`. `offset` gets the next page. |
 | A gateway rule on `Mcp-Name` misses the inner tool. | The guide says so. A gateway must read `params.arguments.name`, or refuse `call_tool`. |
 | A client rule that allows `call_tool` allows every tool. | The guide says so, and tells the author to mark a destructive tool `core`. |
 | An operator cannot tell a wrapped call from a direct call. | The audit record adds `via = "call_tool"`. |
@@ -98,7 +99,8 @@ Selected: 1, 2, 3, 10, and the detail levels of 4 inside `search_tools`.
 - **White:** see "Facts".
 - **Red:** an author wants a short catalog without new route code. One
   builder call (`mcp_catalog`) does it. An agent that cannot find a tool
-  feels stuck. An empty query lists every tool.
+  feels stuck. An empty query lists the tools in catalog order, page by
+  page.
 - **Black:** the meta path costs extra calls. Arguments sent through
   `call_tool` are not checked against a schema by the client. The server
   still checks them, and a bad argument gets the normal error.
@@ -163,6 +165,7 @@ Selected: 1, 2, 3, 10, and the detail levels of 4 inside `search_tools`.
 | AC16 | `search_tools` has `readOnlyHint: true`. `call_tool` has `readOnlyHint: false` and `destructiveHint: true`. |
 | AC17 | `TestApp` mirrors `mcp_instructions` and `mcp_catalog`. |
 | AC18 | The guide, a changelog fragment and a migration note describe the change in ASD-STE100 style. `fmt`, `clippy` and the docs and changelog gates pass. |
-| AC19 | `search_tools` refuses a `query` over 512 bytes or 16 distinct words with `-32602`. |
+| AC19 | `search_tools` refuses a `query` over 128 characters or 16 distinct words with `-32602`. |
+| AC22 | `search_tools` takes `offset`, so an agent can page through a catalog of any size. |
 | AC20 | The audit record of a `call_tool` call names the inner tool and has `via = "call_tool"`. The grant rate cap counts calls of both kinds. |
 | AC21 | `core` alone does not expose a route. `call_tool` streams a streaming tool, and forwards the caller session. |

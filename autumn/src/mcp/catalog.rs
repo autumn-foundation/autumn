@@ -24,9 +24,10 @@ const DEFAULT_LIMIT: u64 = 10;
 /// The largest `limit` that `search_tools` accepts.
 const MAX_LIMIT: u64 = 50;
 
-/// The longest `query` that `search_tools` accepts, in bytes. This cap and
-/// [`MAX_TERMS`] bound the work of one call.
-const MAX_QUERY_BYTES: usize = 512;
+/// The longest `query` that `search_tools` accepts, in characters. A UTF-8
+/// character has at most 4 bytes, so a query has at most 512 bytes. This
+/// cap and [`MAX_TERMS`] bound the work of one call.
+const MAX_QUERY_CHARS: usize = 128;
 
 /// The most distinct words that one `query` can hold.
 const MAX_TERMS: usize = 16;
@@ -107,9 +108,10 @@ pub fn instructions(author: Option<&str>, catalog: McpCatalog) -> Option<String>
 pub fn meta_descriptors(tools: &[McpTool]) -> Vec<Value> {
     let search = format!(
         "Search the tool catalog. {} It matches words against tool names, \
-         descriptions, tags and argument names. An empty query lists every \
-         tool. Use `detail = \"full\"` to get the input schema, then run the \
-         tool with `call_tool`.",
+         descriptions, tags and argument names. An empty query lists the \
+         tools in catalog order. The result gives `total`, so use `offset` to \
+         get the next page. Use `detail = \"full\"` to get the input schema, \
+         then run the tool with `call_tool`.",
         outline(tools)
     );
     vec![
@@ -121,8 +123,8 @@ pub fn meta_descriptors(tools: &[McpTool]) -> Vec<Value> {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "maxLength": MAX_QUERY_BYTES,
-                        "description": "Words to match. Empty lists every tool.",
+                        "maxLength": MAX_QUERY_CHARS,
+                        "description": "Words to match. Empty lists the tools in catalog order.",
                     },
                     "detail": {
                         "type": "string",
@@ -135,6 +137,12 @@ pub fn meta_descriptors(tools: &[McpTool]) -> Vec<Value> {
                         "minimum": 1,
                         "maximum": MAX_LIMIT,
                         "default": DEFAULT_LIMIT,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "The number of hits to skip, for the next page.",
                     },
                 },
             },
@@ -210,6 +218,7 @@ pub struct SearchArgs {
     terms: Vec<String>,
     detail: Detail,
     limit: usize,
+    offset: usize,
 }
 
 /// Check the arguments of a `search_tools` call.
@@ -219,8 +228,11 @@ pub fn parse_search(arguments: &Value) -> Result<SearchArgs, String> {
         Some(Value::String(query)) => query.as_str(),
         Some(_) => return Err("`query` must be a string".to_owned()),
     };
-    if query.len() > MAX_QUERY_BYTES {
-        return Err(format!("`query` must be at most {MAX_QUERY_BYTES} bytes"));
+    // The byte check rejects a huge query before the character count.
+    if query.len() > MAX_QUERY_CHARS * 4 || query.chars().count() > MAX_QUERY_CHARS {
+        return Err(format!(
+            "`query` must be at most {MAX_QUERY_CHARS} characters"
+        ));
     }
     let mut terms: Vec<String> = Vec::new();
     for word in words(query) {
@@ -249,11 +261,20 @@ pub fn parse_search(arguments: &Value) -> Result<SearchArgs, String> {
             _ => return Err(format!("`limit` must be an integer from 1 to {MAX_LIMIT}")),
         },
     };
+    let offset = match arguments.get("offset") {
+        None | Some(Value::Null) => 0,
+        Some(value) => match value.as_u64() {
+            Some(offset) => offset,
+            None => return Err("`offset` must be an integer of 0 or more".to_owned()),
+        },
+    };
     Ok(SearchArgs {
         terms,
         detail,
         // `limit` is at most `MAX_LIMIT`, so the conversion cannot fail.
         limit: usize::try_from(limit).unwrap_or(usize::MAX),
+        // An offset past the hits gives an empty page.
+        offset: usize::try_from(offset).unwrap_or(usize::MAX),
     })
 }
 
@@ -294,8 +315,8 @@ pub fn index(tools: &[McpTool]) -> Vec<ToolWords> {
 }
 
 /// Search `tools`. `index` holds the words of each tool, in the same order.
-/// The result holds `total`, the number of hits, and `tools`, the best hits
-/// up to the limit.
+/// The result holds `total`, the number of hits, and `tools`, one page of
+/// hits from the offset, up to the limit.
 ///
 /// A higher score comes first. Equal scores keep the catalog order, so the
 /// result is the same on each call.
@@ -310,6 +331,7 @@ pub fn search(tools: &[McpTool], index: &[ToolWords], args: &SearchArgs) -> Valu
     hits.sort_by_key(|hit| std::cmp::Reverse(hit.0));
     let entries: Vec<Value> = hits
         .iter()
+        .skip(args.offset)
         .take(args.limit)
         .map(|(_, tool)| entry(tool, args.detail))
         .collect();
@@ -565,6 +587,25 @@ mod tests {
     }
 
     #[test]
+    fn the_query_cap_counts_characters() {
+        // 128 three-byte characters: 384 bytes, within the schema limit.
+        let wide = "日".repeat(MAX_QUERY_CHARS);
+        assert!(parse_search(&json!({ "query": wide })).is_ok());
+        let over = "日".repeat(MAX_QUERY_CHARS + 1);
+        assert!(parse_search(&json!({ "query": over })).is_err());
+    }
+
+    #[test]
+    fn the_offset_pages_through_the_hits() {
+        let page = run(&json!({ "limit": 2, "offset": 2 }));
+        assert_eq!(page["total"], 3);
+        assert_eq!(names(&page), ["health"]);
+        let past = run(&json!({ "offset": 99 }));
+        assert_eq!(past["total"], 3);
+        assert!(names(&past).is_empty());
+    }
+
+    #[test]
     fn detail_levels_add_fields() {
         let named = run(&json!({ "query": "health", "detail": "name" }));
         assert_eq!(named["tools"][0], json!({ "name": "health" }));
@@ -583,16 +624,18 @@ mod tests {
             json!({ "limit": -1 }),
             json!({ "limit": 1.5 }),
             json!({ "limit": MAX_LIMIT + 1 }),
-            json!({ "query": "a".repeat(MAX_QUERY_BYTES + 1) }),
+            json!({ "query": "a".repeat(MAX_QUERY_CHARS + 1) }),
+            json!({ "offset": -1 }),
+            json!({ "offset": "2" }),
             json!({ "query": (0..=MAX_TERMS).map(|n| format!("w{n}")).collect::<Vec<_>>().join(" ") }),
         ] {
             assert!(parse_search(&arguments).is_err(), "{arguments}");
         }
         assert!(parse_search(&json!({ "query": null, "limit": MAX_LIMIT })).is_ok());
         // A repeated word counts once toward the cap.
-        let repeated = vec!["same"; MAX_TERMS * 4].join(" ");
+        let repeated = vec!["ab"; MAX_TERMS * 2].join(" ");
         let args = parse_search(&json!({ "query": repeated })).unwrap();
-        assert_eq!(args.terms, ["same"]);
+        assert_eq!(args.terms, ["ab"]);
     }
 
     #[test]

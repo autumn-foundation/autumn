@@ -541,6 +541,27 @@ async fn empty_query_lists_every_tool_up_to_the_limit() {
 }
 
 #[tokio::test]
+async fn offset_pages_through_the_whole_catalog() {
+    let client = progressive_app();
+    let mut seen = Vec::new();
+    for offset in [0, 2, 4] {
+        let out = search(&client, json!({"limit": 2, "offset": offset})).await;
+        assert_eq!(out["result"]["structuredContent"]["total"], 5, "{out}");
+        seen.extend(found(&out));
+    }
+    assert_eq!(
+        seen,
+        [
+            "list_invoices",
+            "refund_invoice",
+            "find_articles",
+            "secret_report",
+            "build_report"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn search_result_text_mirrors_the_structured_content() {
     let out = search(&progressive_app(), json!({"query": "refund"})).await;
     let text = out["result"]["content"][0]["text"].as_str().unwrap();
@@ -557,7 +578,8 @@ async fn bad_search_arguments_are_invalid_params() {
         json!({"limit": 0}),
         json!({"limit": 51}),
         json!({"limit": "ten"}),
-        json!({"query": "x".repeat(513)}),
+        json!({"query": "x".repeat(129)}),
+        json!({"offset": -1}),
         json!("not an object"),
         json!(null),
     ] {

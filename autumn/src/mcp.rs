@@ -47,7 +47,8 @@
 //! The client polls `tasks/get`. See the `tasks` submodule.
 //!
 //! A large app can send a short catalog. `#[api_doc(mcp, core)]` marks a core
-//! tool, and [`McpCatalog::Progressive`] lists only the core tools plus
+//! tool, and [`McpCatalog::Progressive`](crate::mcp::McpCatalog::Progressive)
+//! lists only the core tools plus
 //! `search_tools` and `call_tool`. See the `catalog` submodule.
 //!
 //! The endpoint is dual-era. A request with the protocol version in

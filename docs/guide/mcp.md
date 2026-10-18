@@ -345,13 +345,14 @@ Then `tools/list` holds two meta-tools and the core tools:
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `search_tools` | `query`, `detail` (`name`, `summary` or `full`), `limit` (1 to 50, default 10) | `total` hits, and `tools`, the best hits. `full` adds each `inputSchema`. |
+| `search_tools` | `query`, `detail` (`name`, `summary` or `full`), `limit` (1 to 50, default 10), `offset` (default 0) | `total` hits, and `tools`, one page of the best hits. `full` adds each `inputSchema`. |
 | `call_tool` | `name`, `arguments` | The result of the named tool. |
 
 - `search_tools` matches words against tool names, descriptions, tags and
   argument names. An exact name word counts most. Equal scores keep the
-  catalog order. An empty query lists every tool. A query has at most 512
-  bytes and 16 distinct words.
+  catalog order. An empty query lists the tools in catalog order. Use
+  `offset` to get the next page. A query has at most 128 characters and 16
+  distinct words.
 - The `search_tools` description gives the tool count and the route tags, so
   the model knows what it can find.
 - `call_tool` runs the tool through the same path as a direct `tools/call`.
