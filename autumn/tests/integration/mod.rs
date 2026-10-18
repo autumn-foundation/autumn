@@ -231,6 +231,8 @@ mod mcp_endpoint;
 mod mcp_modern;
 #[cfg(feature = "mcp")]
 mod mcp_plugin;
+#[cfg(feature = "mcp")]
+mod mcp_progressive;
 #[cfg(all(feature = "db", feature = "mcp"))]
 mod mcp_repository;
 #[cfg(feature = "mcp")]

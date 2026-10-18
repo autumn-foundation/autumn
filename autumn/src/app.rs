@@ -1124,6 +1124,47 @@ impl AppBuilder {
         self
     }
 
+    /// Set the MCP server instructions.
+    ///
+    /// `initialize` and `server/discover` return the text. A client can put
+    /// it in the model's system prompt. Say what the server does and when to
+    /// search for its tools. Do not repeat the tool descriptions.
+    ///
+    /// If no MCP endpoint is set, this call mounts it at `/mcp`. Call
+    /// [`mount_mcp`](Self::mount_mcp) to use a different path.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_instructions(mut self, text: impl Into<String>) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .instructions = Some(text.into());
+        self
+    }
+
+    /// Select how `tools/list` presents the MCP tool catalog.
+    ///
+    /// [`McpCatalog::Full`](crate::mcp::McpCatalog::Full), the default,
+    /// lists every tool.
+    /// [`McpCatalog::Progressive`](crate::mcp::McpCatalog::Progressive)
+    /// lists the core tools (`#[api_doc(mcp, core)]`) and two meta-tools:
+    /// `search_tools` finds a tool, and `call_tool` runs it. Use it when the
+    /// catalog is too large to send in full.
+    ///
+    /// If no MCP endpoint is set, this call mounts it at `/mcp`. Call
+    /// [`mount_mcp`](Self::mount_mcp) to use a different path.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_catalog(mut self, catalog: crate::mcp::McpCatalog) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .catalog = catalog;
+        self
+    }
+
     /// Gate the **entire** MCP endpoint — the catalog (`initialize`/
     /// `tools/list`) as well as tool dispatch — behind a tower `layer`.
     ///
@@ -16321,6 +16362,31 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// `mcp_catalog` and `mcp_instructions` set the MCP runtime. Each one
+    /// mounts the endpoint at `/mcp`, and a later `mount_mcp` keeps both.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_catalog_and_instructions_set_the_runtime() {
+        use crate::mcp::McpCatalog;
+
+        let builder = super::app()
+            .mcp_catalog(McpCatalog::Progressive)
+            .mcp_instructions("Todo tools.");
+        let rt = builder.mcp.as_ref().expect("an MCP runtime");
+        assert_eq!(rt.mount_path, "/mcp");
+        assert_eq!(rt.catalog, McpCatalog::Progressive);
+        assert_eq!(rt.instructions.as_deref(), Some("Todo tools."));
+
+        let builder = builder.mount_mcp("/agent");
+        let rt = builder.mcp.as_ref().expect("an MCP runtime");
+        assert_eq!(rt.mount_path, "/agent");
+        assert_eq!(rt.catalog, McpCatalog::Progressive);
+        assert_eq!(rt.instructions.as_deref(), Some("Todo tools."));
+
+        let rt = super::app().mcp_instructions("x").mcp.expect("a runtime");
+        assert_eq!(rt.catalog, McpCatalog::Full, "the default catalog is full");
+    }
+
     /// Issue #2347: `on_session_rotation` puts one hook on the shared registry
     /// when the state initializers run.
     #[test]

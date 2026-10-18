@@ -1357,6 +1357,42 @@ that does not opt in behaves as before.
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### MCP: `ApiDoc` gains a `mcp_core` field
+
+**Why:** a core MCP tool (`#[api_doc(mcp, core)]`) needs a flag on the route
+metadata. A new public field breaks a struct literal, as for `mcp_task`. The
+route macros set the field for you.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::openapi::ApiDoc;
+
+let doc = ApiDoc {
+    method: "GET",
+    path: "/api/todos",
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::openapi::ApiDoc;
+
+let doc = ApiDoc {
+    method: "GET",
+    path: "/api/todos",
+    ..ApiDoc::default()
+};
+```
+
+The new field is `pub mcp_core: bool`. It is `false` by default, so a route
+that does not set it behaves as before.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+means to leave at their defaults.
+
 ### `StaticRouteMeta` has a `content_type` field
 
 **Why:** `#[static_get]` now takes `content_type = "..."` (#2403). The macro
