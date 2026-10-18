@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Drives the read workload through the public HTTP entry points, then dumps
+# pg_stat_statements. Usage: perf/run.sh <outdir>   (app on :3000, PG on $PSQL)
+set -euo pipefail
+OUT=${1:?outdir}; mkdir -p "$OUT"
+PSQL=${PSQL:-"psql -h /tmp/pgl -p 54329 -U postgres ledger"}
+BASE=${BASE:-http://localhost:3000}
+q() { $PSQL -Atq -c "$1"; }
+# workload targets: 3 hot posts (most comments), 3 mid, 3 cold; 3 subs of varying size
+HOT=$(q "select s.slug||'/posts/'||p.slug from posts p join subreddits s on s.id=p.subreddit_id order by p.comment_count desc limit 3")
+MID=$(q "select s.slug||'/posts/'||p.slug from posts p join subreddits s on s.id=p.subreddit_id where p.comment_count between 20 and 40 order by p.id limit 3")
+COLD=$(q "select s.slug||'/posts/'||p.slug from posts p join subreddits s on s.id=p.subreddit_id where p.comment_count=0 order by p.id limit 3")
+SUBS="sub1 sub50 sub900"
+q "select pg_stat_statements_reset()" >/dev/null
+q "select pg_stat_reset()" >/dev/null
+for i in 1 2 3 4 5; do curl -sf -o /dev/null $BASE/; done
+for s in $SUBS; do for i in 1 2 3; do curl -sf -o /dev/null $BASE/r/$s; done; done
+for p in $HOT $MID $COLD; do for i in 1 2 3; do curl -sf -o /dev/null $BASE/r/$p; done; done
+
+$PSQL -c "\\x off" >/dev/null
+dump() { $PSQL -P pager=off -c "$2" > "$OUT/$1.txt"; }
+TOT="(select sum(shared_blks_hit+shared_blks_read) from pg_stat_statements)"
+dump top_buffers "select calls, shared_blks_hit+shared_blks_read as blks, round(100.0*(shared_blks_hit+shared_blks_read)/$TOT,1) as pct, rows, temp_blks_written as tmpw, wal_bytes, left(regexp_replace(query,'\\s+',' ','g'),150) q from pg_stat_statements order by 2 desc limit 10"
+dump top_calls "select calls, round(100.0*calls/(select sum(calls) from pg_stat_statements),1) as pct, shared_blks_hit+shared_blks_read as blks, left(regexp_replace(query,'\\s+',' ','g'),150) q from pg_stat_statements order by calls desc limit 10"
+dump spills "select calls,temp_blks_written,left(query,150) from pg_stat_statements where temp_blks_written>0"
+dump seqscans "select relname,seq_scan,seq_tup_read,idx_scan from pg_stat_user_tables order by seq_tup_read desc limit 10"
+dump statio "select relname,heap_blks_read,heap_blks_hit,idx_blks_read,idx_blks_hit,toast_blks_read,toast_blks_hit from pg_statio_user_tables order by heap_blks_hit+heap_blks_read desc limit 8"
