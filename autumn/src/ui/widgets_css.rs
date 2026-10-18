@@ -48,6 +48,7 @@ pub const WIDGETS_CSS_PATH: &str = "/static/css/autumn-widgets.css";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn widgets_css_bundles_tokens_and_components() {
@@ -149,7 +150,10 @@ mod tests {
                 ((c + 0.055) / 1.055).powf(2.4)
             }
         };
-        0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2)
+        0.0722_f64.mul_add(
+            channel(2),
+            0.7152_f64.mul_add(channel(1), 0.2126 * channel(0)),
+        )
     }
 
     fn contrast(a: &str, b: &str) -> f64 {
@@ -169,20 +173,16 @@ mod tests {
             // `<color> <pct>%, <color>`
             let (first, second) = args.split_once("%,").unwrap();
             let (a, pct) = first.trim().rsplit_once(' ').unwrap();
-            let weight = pct.parse::<f64>().unwrap() / 100.0;
+            let weight = pct.parse::<u32>().unwrap();
             let (a, b) = (resolve(a), resolve(second));
-            let mixed: String = (0..3)
-                .map(|i| {
-                    let c = |h: &str| {
-                        f64::from(u8::from_str_radix(&h[1 + i * 2..3 + i * 2], 16).unwrap())
-                    };
-                    format!(
-                        "{:02x}",
-                        (c(&a) * weight + c(&b) * (1.0 - weight)).round() as u8
-                    )
-                })
-                .collect();
-            return format!("#{mixed}");
+            let channel =
+                |h: &str, i: usize| u32::from_str_radix(&h[1 + i * 2..3 + i * 2], 16).unwrap();
+            let mixed = (0..3).fold(String::from("#"), |mut out, i| {
+                let c = (channel(&a, i) * weight + channel(&b, i) * (100 - weight) + 50) / 100;
+                write!(out, "{c:02x}").unwrap();
+                out
+            });
+            return mixed;
         }
         let Some(inner) = value.strip_prefix("var(").and_then(|v| v.strip_suffix(')')) else {
             return value.to_owned();
@@ -211,7 +211,7 @@ mod tests {
         let line = body
             .lines()
             .filter_map(|l| l.trim().strip_prefix(&format!("{prop}:")))
-            .last()
+            .next_back()
             .unwrap_or_else(|| panic!("`{selector}` has no `{prop}`"));
         resolve(line.trim_end_matches(';'))
     }
