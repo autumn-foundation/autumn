@@ -51,7 +51,14 @@ INSERT INTO tags (name, slug) SELECT 'tag'||g, 'tag'||g FROM generate_series(1, 
 INSERT INTO post_tags SELECT DISTINCT p, 1 + floor(300*power(random(),2))::int
 FROM (SELECT 1 + (random()*499999)::int p FROM generate_series(1, 400000)) s;
 
--- dead-tuple ratio: churn ~15% of posts, leave them for autovacuum
-ALTER TABLE posts SET (autovacuum_enabled = false);
+-- churn ~15% of posts (update bloat), then vacuum like autovacuum would in production.
+-- Vacuuming sets the visibility map, which index-only scans need (otherwise they
+-- fall back to heap fetches); the measured profile was taken in this state.
 UPDATE posts SET score = score + 1 WHERE id % 7 = 0;
-ANALYZE;
+VACUUM (ANALYZE) users;
+VACUUM (ANALYZE) subreddits;
+VACUUM (ANALYZE) posts;
+VACUUM (ANALYZE) comments;
+VACUUM (ANALYZE) votes;
+VACUUM (ANALYZE) tags;
+VACUUM (ANALYZE) post_tags;

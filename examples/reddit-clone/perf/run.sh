@@ -3,7 +3,10 @@
 # pg_stat_statements. Usage: perf/run.sh <outdir>   (app on :3000, PG on $PSQL)
 set -euo pipefail
 OUT=${1:?outdir}; mkdir -p "$OUT"
-PSQL=${PSQL:-"psql -h /tmp/pgl -p 54329 -U postgres ledger"}
+# Same database the app uses (autumn-dev.toml / docker-compose.yml). Override with
+# DATABASE_URL, and use the same value for seed.sql: psql "$DATABASE_URL" -f seed.sql
+DATABASE_URL=${DATABASE_URL:-postgres://autumn:autumn@127.0.0.1:5433/reddit}
+PSQL=${PSQL:-"psql $DATABASE_URL"}
 BASE=${BASE:-http://localhost:3000}
 q() { $PSQL -Atq -c "$1"; }
 # workload targets: 3 hot posts (most comments), 3 mid, 3 cold; 3 subs of varying size

@@ -5,8 +5,19 @@ Findings and decision context: #3325.
 ## Workload
 reddit-clone `/`, `/r/{sub}`, `/r/{sub}/posts/{slug}` over HTTP, 27 requests (5 front page, 9 sub pages, 9 post pages),
 Postgres 16 + `pg_stat_statements`. Fixture: `examples/reddit-clone/perf/seed.sql` (100k users, 1k subs, 500k posts,
-3M comments, ~3M votes, power-law skew). `posts`, `votes`, `comments` vacuumed before both runs. Reproduce:
-`psql -f perf/seed.sql; perf/run.sh <outdir>`.
+3M comments, ~3M votes, power-law skew). The seed ends with `VACUUM (ANALYZE)` on every table, so the visibility map is set
+(index-only scans need it) — both runs were taken in that state.
+
+Reproduce (one database for every command; the default matches `docker-compose.yml`/`autumn-dev.toml`):
+```
+export DATABASE_URL=postgres://autumn:autumn@127.0.0.1:5433/reddit
+# boot the app once so it applies migrations (the new index is built then), then:
+psql "$DATABASE_URL" -f examples/reddit-clone/perf/seed.sql       # ~4 min
+examples/reddit-clone/perf/compare.sh out/                         # drops the index -> out/before, rebuilds it -> out/after
+psql "$DATABASE_URL" -f docs/reports/2026-10-18-ledger-reddit-votes-covering-index/after/equivalence.sql
+```
+`compare.sh` runs `perf/run.sh` once per state; the app must be serving on `:3000`. Buffer totals vary ~3% run to run
+(re-run on the same fixture: before 124,725 vs 128,890; after 57,325 both times); temp blocks and plan shape do not.
 
 ## Profile (baseline/, same session, before the index)
 | statement | calls | buffers | % buffers | temp blks written |
