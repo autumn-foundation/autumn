@@ -146,9 +146,10 @@ fn seed(conn: &mut PgConnection) -> Vec<(i64, i64, Vec<String>)> {
         .get_result::<IdRow>(conn)
         .expect("insert measured post")
         .id;
-        // Editors are users 50*j + 2 .. so some tiers include display_name = ''
-        // accounts (user id = 51 -> username editor50, empty display name).
-        let editor_ids: Vec<i64> = (0..k).map(|j| 49 + j * 3 + k).collect();
+        // Every tier starts at user id 51 (username `editor50`), the first
+        // account with an empty `display_name`, so the username fallback in
+        // `User::public_name` is exercised at every k.
+        let editor_ids: Vec<i64> = (0..k).map(|j| 51 + j * 3).collect();
         let ids_sql = editor_ids
             .iter()
             .map(ToString::to_string)
@@ -361,6 +362,12 @@ async fn revisions_author_batch_profile() {
     assert_eq!(resp.status, 303, "registration: {}", resp.text());
 
     let measured = seed(&mut conn);
+    assert!(
+        measured
+            .iter()
+            .all(|(_, _, names)| names.iter().any(|n| n == "editor50")),
+        "every tier must include the empty-display-name editor (username fallback)"
+    );
 
     // Warm lazy statics / the settings memo so measured requests are steady state.
     client
@@ -385,7 +392,7 @@ async fn revisions_author_batch_profile() {
     explain(
         &mut conn,
         "one users.id = ANY($1) lookup (12 ids)",
-        "SELECT * FROM users WHERE users.id = ANY(ARRAY[61,64,67,70,73,76,79,82,85,88,91,94])",
+        "SELECT * FROM users WHERE users.id = ANY(ARRAY[51,54,57,60,63,66,69,72,75,78,81,84])",
     );
 
     println!(
