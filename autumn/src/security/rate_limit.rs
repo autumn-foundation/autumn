@@ -193,7 +193,12 @@ impl MemoryStore {
                 Err(poisoned) => poisoned.into_inner(),
             };
 
-            let mut bucket = buckets.get(key).copied().unwrap_or(Bucket {
+            // Probe by `&str` and update the bucket in place. A returning
+            // client's key is already cached, so copying it into a fresh
+            // `String` only for `put` to drop it again cost an allocation per
+            // request. Only a first-seen key is copied (and may evict the LRU
+            // tail, as `put` did); a hit moves to the MRU end, as `get` + `put` did.
+            let bucket = buckets.get_or_insert_mut_ref(key, || Bucket {
                 tokens: burst,
                 last_refill: now,
             });
@@ -207,15 +212,12 @@ impl MemoryStore {
             bucket.tokens = elapsed.mul_add(refill_per_sec, bucket.tokens).min(burst);
             bucket.last_refill = now;
 
-            let result = if bucket.tokens >= 1.0 {
+            if bucket.tokens >= 1.0 {
                 bucket.tokens -= 1.0;
                 Ok(bucket.tokens)
             } else {
                 Err(bucket.tokens)
-            };
-
-            buckets.put(key.to_owned(), bucket);
-            result
+            }
         };
 
         match tokens_after {
@@ -257,6 +259,15 @@ impl MemoryStore {
 
 #[cfg(feature = "redis")]
 const RATE_LIMIT_LUA: &str = include_str!("rate_limit.lua");
+
+/// The token-bucket script, built once. `Script::new` copies the source and
+/// SHA-1-hashes it, and both results are identical on every call. `Script` is
+/// immutable, so one shared instance serves every `RedisStore`: `invoke_async`
+/// still `EVALSHA`s it and re-`LOAD`s it on `NOSCRIPT`, exactly as a per-call
+/// instance did.
+#[cfg(feature = "redis")]
+static RATE_LIMIT_SCRIPT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(RATE_LIMIT_LUA));
 
 #[cfg(feature = "redis")]
 struct RedisStore {
@@ -317,13 +328,17 @@ impl RedisStore {
         // no change to `rate_limit.lua` is required.
         let now_unix = crate::time::clock_unix_secs(self.clock.as_ref());
 
-        let redis_key = format!("{}:{}", self.key_prefix, key);
+        // Sized exactly up front: `format!` would start this at capacity 0 and
+        // grow it. Same `{key_prefix}:{key}` bytes.
+        let mut redis_key = String::with_capacity(self.key_prefix.len() + 1 + key.len());
+        redis_key.push_str(&self.key_prefix);
+        redis_key.push(':');
+        redis_key.push_str(key);
         let now_ms = crate::time::clock_unix_duration(self.clock.as_ref()).as_millis();
 
-        let script = redis::Script::new(RATE_LIMIT_LUA);
         let result: redis::RedisResult<Vec<i64>> = {
             let mut conn = self.connection.clone();
-            script
+            RATE_LIMIT_SCRIPT
                 .key(&redis_key)
                 .arg(burst)
                 .arg(refill_per_sec)
@@ -655,19 +670,6 @@ impl Limiter {
 
         let raw_key = self.extract_key(req)?;
 
-        // Fold the ambient tenant into the *bucket* key only — `raw_key` stays
-        // unqualified below for the tier hook. See `tenant_qualify_bucket_key`.
-        let tenant_qualified_key = tenant_qualify_bucket_key(self.key_strategy, &raw_key);
-
-        // Namespace the bucket key by the active path prefix so that different
-        // path overrides get independent token buckets (avoids burst-value
-        // collision when /strict and /normal share the same client IP).
-        let key = if key_ns.is_empty() {
-            tenant_qualified_key
-        } else {
-            format!("{key_ns}\0{tenant_qualified_key}")
-        };
-
         let mut burst = opt_burst.unwrap_or(self.burst);
         let mut rps = opt_rps.unwrap_or(self.refill_per_sec);
 
@@ -688,6 +690,21 @@ impl Limiter {
             }
         }
 
+        // Fold the ambient tenant into the *bucket* key only. The tier hook
+        // above already saw the unqualified `raw_key`, which is consumed here:
+        // moved, not copied, when there is nothing to qualify. See
+        // `tenant_qualify_bucket_key`.
+        let tenant_qualified_key = tenant_qualify_owned_bucket_key(self.key_strategy, raw_key);
+
+        // Namespace the bucket key by the active path prefix so that different
+        // path overrides get independent token buckets (avoids burst-value
+        // collision when /strict and /normal share the same client IP).
+        let key = if key_ns.is_empty() {
+            tenant_qualified_key
+        } else {
+            format!("{key_ns}\0{tenant_qualified_key}")
+        };
+
         Some((key, burst, rps))
     }
 
@@ -698,7 +715,7 @@ impl Limiter {
             KeyStrategy::ApiToken => {
                 let token = extract_bearer_token(req);
                 if token.is_some() {
-                    token.map(|t| format!("token:{t}"))
+                    token.map(|t| ["token:", t].concat())
                 } else {
                     self.client_ip(req)
                 }
@@ -707,7 +724,7 @@ impl Limiter {
                 let principal = req
                     .extensions()
                     .get::<RateLimitPrincipal>()
-                    .map(|p| format!("principal:{}", p.0));
+                    .map(|p| ["principal:", p.0.as_str()].concat());
                 if principal.is_some() {
                     principal
                 } else {
@@ -805,8 +822,23 @@ fn tenant_qualify_bucket_key(key_strategy: KeyStrategy, raw_key: &str) -> String
     }
 }
 
-/// Extract the key string from the `Authorization: Bearer <token>` header.
-fn extract_bearer_token<B>(req: &Request<B>) -> Option<String> {
+/// [`tenant_qualify_bucket_key`] for a caller that owns `raw_key` and has no
+/// further use for it. It returns `raw_key` as-is (moved, not copied) on every
+/// path where the borrowed form would only `to_owned()` it: `Ip`/`ApiToken`
+/// keys and the unauthenticated-IP fallback. That is every request under the
+/// default `ip` strategy.
+fn tenant_qualify_owned_bucket_key(key_strategy: KeyStrategy, raw_key: String) -> String {
+    if key_strategy == KeyStrategy::AuthenticatedPrincipal && raw_key.starts_with("principal:") {
+        tenant_qualify_bucket_key(key_strategy, &raw_key)
+    } else {
+        raw_key
+    }
+}
+
+/// Extract the key string from the `Authorization: Bearer <token>` header,
+/// borrowed from the header value. The caller copies it once, into its
+/// prefixed bucket key.
+fn extract_bearer_token<B>(req: &Request<B>) -> Option<&str> {
     req.headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -816,7 +848,7 @@ fn extract_bearer_token<B>(req: &Request<B>) -> Option<String> {
             if !scheme.eq_ignore_ascii_case("bearer") {
                 return None;
             }
-            parts.next().map(|t| t.trim().to_owned())
+            parts.next().map(str::trim)
         })
         .filter(|t| !t.is_empty())
 }
@@ -845,6 +877,30 @@ fn rate_limit_problem_json(key_class: &str) -> String {
         None,
         true,
     )
+}
+
+/// Every label [`key_class_label`] can return, in
+/// [`RATE_LIMIT_PROBLEM_BODIES`] order.
+const KEY_CLASS_LABELS: [&str; 3] = ["ip", "api token", "authenticated principal"];
+
+/// The 429 body for each of [`KEY_CLASS_LABELS`], rendered once.
+///
+/// [`rate_limit_problem_json`] is a pure function of its label (no request id,
+/// no instance, no field errors), and a denial is the hot path exactly while a
+/// client is being throttled.
+static RATE_LIMIT_PROBLEM_BODIES: std::sync::LazyLock<[String; 3]> =
+    std::sync::LazyLock::new(|| KEY_CLASS_LABELS.map(rate_limit_problem_json));
+
+/// The 429 body for `key_class`: the pre-rendered copy for a known label,
+/// byte-identical to [`rate_limit_problem_json`], which renders anything else.
+fn rate_limit_problem_body(key_class: &str) -> std::borrow::Cow<'static, str> {
+    KEY_CLASS_LABELS
+        .iter()
+        .position(|label| *label == key_class)
+        .map_or_else(
+            || std::borrow::Cow::Owned(rate_limit_problem_json(key_class)),
+            |index| std::borrow::Cow::Borrowed(RATE_LIMIT_PROBLEM_BODIES[index].as_str()),
+        )
 }
 
 /// Classify the bucket key for user-facing error messages without leaking the value.
@@ -1147,7 +1203,9 @@ where
                     let key_class = resolved
                         .as_ref()
                         .map_or("ip", |(k, _, _)| key_class_label(k));
-                    let body_json = rate_limit_problem_json(key_class);
+                    // `ResBody` is only bounded `From<String>`, so this side
+                    // copies the cached body once rather than re-rendering it.
+                    let body_json = rate_limit_problem_body(key_class).into_owned();
 
                     let mut response = Response::new(ResBody::from(body_json));
                     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
@@ -1241,6 +1299,51 @@ static THROTTLE_REGISTRY: std::sync::OnceLock<
 
 fn throttle_registry() -> &'static Mutex<std::collections::HashMap<String, Arc<Limiter>>> {
     THROTTLE_REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+thread_local! {
+    /// Scratch buffer [`__check_throttle`] renders its registry cache key into
+    /// (`{app_id}:{registry_key}@{fingerprint:016x}`), so a warm lookup — every
+    /// request to a throttled route after its first — probes the registry
+    /// without allocating; an owned copy is made only on the miss that inserts.
+    /// Bounded: it holds one key at a time, and every component of that key is
+    /// compile-time (`route_id`, a named limiter's name), a route *template*
+    /// (`MatchedPath`, never the request's concrete path) or a number.
+    static THROTTLE_CACHE_KEY: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Bucket namespace a `#[throttle]` limiter is cached and Redis-prefixed under.
+///
+/// Renders (via `Display`) as `route:{route_id}`, `route:{route_id}@{matched_path}`
+/// or `named:{name}` — the exact strings this namespace has always used — but
+/// is only rendered where those bytes are needed, not per request just to probe
+/// the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThrottleRegistryKey<'a> {
+    /// Inline `#[throttle(...)]`: isolated per mounted route path.
+    Route {
+        route_id: &'static str,
+        matched_path: Option<&'a str>,
+    },
+    /// Named `#[throttle("name")]`: shared by name.
+    Named(&'static str),
+}
+
+impl std::fmt::Display for ThrottleRegistryKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Route {
+                route_id,
+                matched_path: None,
+            } => write!(f, "route:{route_id}"),
+            Self::Route {
+                route_id,
+                matched_path: Some(path),
+            } => write!(f, "route:{route_id}@{path}"),
+            Self::Named(name) => write!(f, "named:{name}"),
+        }
+    }
 }
 
 /// Clear the process-wide `#[throttle]` limiter registry.
@@ -1433,12 +1536,12 @@ fn warn_once(key: String) -> bool {
 ///
 /// Returns `Some((limit, per_secs, key, registry_key))` when a limiter should
 /// be applied, or `None` when the named entry is missing (fail-open with warn).
-fn resolve_throttle_params(
+fn resolve_throttle_params<'a>(
     route_id: &'static str,
-    matched_path: Option<&str>,
+    matched_path: Option<&'a str>,
     spec: &ThrottleSpec,
     config: &RateLimitConfig,
-) -> Option<(u32, u64, KeyStrategy, String)> {
+) -> Option<(u32, u64, KeyStrategy, ThrottleRegistryKey<'a>)> {
     match spec {
         ThrottleSpec::Inline {
             limit,
@@ -1458,10 +1561,10 @@ fn resolve_throttle_params(
             // Named throttles do the opposite (see the `Named` arm below): a named
             // limiter is a deliberately shared, centrally-named bucket, so it is keyed by
             // name only and several routes referencing it share it.
-            let registry_key = matched_path.map_or_else(
-                || format!("route:{route_id}"),
-                |path| format!("route:{route_id}@{path}"),
-            );
+            let registry_key = ThrottleRegistryKey::Route {
+                route_id,
+                matched_path,
+            };
             Some((*limit, *per_secs, key, registry_key))
         }
         ThrottleSpec::Named(name) => {
@@ -1515,7 +1618,7 @@ fn resolve_throttle_params(
             // `POST /login` and `POST /login/2fa` sharing one abuse budget). This
             // is the deliberate counterpart to the per-path isolation the inline
             // arm above applies.
-            Some((entry.limit, per_secs, key, format!("named:{name}")))
+            Some((entry.limit, per_secs, key, ThrottleRegistryKey::Named(name)))
         }
     }
 }
@@ -1548,7 +1651,7 @@ fn extract_throttle_key(
 ///
 /// This mirrors the response the global tower layer emits on a denial
 /// (same status, `Retry-After`, `x-ratelimit-*` headers, and
-/// `application/problem+json` body via [`rate_limit_problem_json`]). The
+/// `application/problem+json` body via [`rate_limit_problem_body`]). The
 /// tower layer builds its own copy inline rather than calling this helper
 /// because `RateLimitService` is generic over the inner response body type,
 /// whereas this guard always returns an `axum` `Body`; keep the two in sync
@@ -1561,8 +1664,8 @@ fn build_rate_limited_response(
 ) -> axum::response::Response {
     use axum::body::Body;
 
-    let body_json = rate_limit_problem_json(key_class);
-    let mut response = Response::new(Body::from(body_json));
+    // A known label borrows its pre-rendered `'static` body: no render, no copy.
+    let mut response = Response::new(Body::from(rate_limit_problem_body(key_class)));
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
     let hdrs = response.headers_mut();
     hdrs.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
@@ -1673,16 +1776,29 @@ pub async fn __check_throttle(
     // lookup carries the app id + fingerprint.
     let app_id = state.app_id();
     let fingerprint = throttle_config_fingerprint(rl_config, trusted_proxies, key_strategy);
-    let cache_key = format!("{app_id}:{registry_key}@{fingerprint:016x}");
-    let limiter = {
+    // Rendered into a reused per-thread buffer and probed by `&str`: after a
+    // route's first request every lookup is a hit, so an owned key is built
+    // only on the miss that inserts it. Same bytes as the `format!` this
+    // replaced. The closure is synchronous, so neither the buffer borrow nor
+    // the registry lock is ever held across an `.await`.
+    // Probe the registry under the key rendered into `cache_key`, building and
+    // registering the limiter on a miss.
+    let lookup = |cache_key: &mut String| {
+        use std::fmt::Write as _;
+        cache_key.clear();
+        // `fmt::Write for String` is infallible.
+        let _ = write!(cache_key, "{app_id}:{registry_key}@{fingerprint:016x}");
         let mut reg = throttle_registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(reg.entry(cache_key).or_insert_with(|| {
+        if let Some(limiter) = reg.get(cache_key.as_str()) {
+            return Arc::clone(limiter);
+        }
+        Arc::clone(reg.entry(cache_key.clone()).or_insert_with(|| {
             build_throttle_limiter(
                 rl_config,
                 trusted_proxies,
-                &registry_key,
+                &registry_key.to_string(),
                 limit,
                 per_secs,
                 key_strategy,
@@ -1690,6 +1806,15 @@ pub async fn __check_throttle(
             )
         }))
     };
+    // The scratch buffer is out of reach only while this thread's locals are
+    // being torn down (or, defensively, if it is somehow already borrowed). A
+    // fresh `String` then does the same job at the one allocation the key
+    // always used to cost, instead of panicking on the request path.
+    let limiter = THROTTLE_CACHE_KEY
+        .try_with(|cell| cell.try_borrow_mut().ok().map(|mut buf| lookup(&mut buf)))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| lookup(&mut String::new()));
 
     let Some(bucket_key) = extract_throttle_key(&limiter, headers, peer, principal) else {
         // In-process caller with no identifiable peer (SSG, tests without
@@ -1699,7 +1824,8 @@ pub async fn __check_throttle(
     // Same tenant fold-in the global tower layer applies (see
     // `tenant_qualify_bucket_key`) — `#[throttle(key = "principal")]` shares
     // the same `extract_key` derivation and the same cross-tenant collision.
-    let bucket_key = tenant_qualify_bucket_key(key_strategy, &bucket_key);
+    // `bucket_key` is moved in, not copied, when there is nothing to qualify.
+    let bucket_key = tenant_qualify_owned_bucket_key(key_strategy, bucket_key);
 
     let burst = f64::from(limit.max(1));
     let rps = throttle_rps(limit.max(1), per_secs);
@@ -1873,6 +1999,48 @@ mod tests {
         assert!(reset.is_some(), "x-ratelimit-reset must be present on 429");
     }
 
+    #[test]
+    fn cached_rate_limit_problem_bodies_match_a_fresh_render() {
+        for label in KEY_CLASS_LABELS {
+            assert_eq!(
+                rate_limit_problem_body(label),
+                rate_limit_problem_json(label),
+                "{label}"
+            );
+        }
+        // Every label key_class_label can produce is served from the cache.
+        for key in ["1.2.3.4", "token:abc", "principal:n:u"] {
+            let label = key_class_label(key);
+            assert!(
+                matches!(
+                    rate_limit_problem_body(label),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{label}"
+            );
+        }
+        // A label outside the cache still renders, byte-identically.
+        let unknown = rate_limit_problem_body("something else");
+        assert!(matches!(unknown, std::borrow::Cow::Owned(_)));
+        assert_eq!(unknown, rate_limit_problem_json("something else"));
+    }
+
+    #[tokio::test]
+    async fn request_429_body_is_byte_identical_to_a_fresh_render() {
+        // The global layer serves the cached body; the wire bytes must be
+        // exactly what rendering it per denial produced.
+        let app = app(&cfg(true, 1.0, 1));
+
+        let _ = app.clone().oneshot(req_with_ip("9.9.9.10")).await.unwrap();
+        let response = app.clone().oneshot(req_with_ip("9.9.9.10")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("429 body is buffered");
+        assert_eq!(body, rate_limit_problem_json("ip").as_bytes());
+    }
+
     #[tokio::test]
     async fn request_ok_has_ratelimit_reset_header() {
         let app = app(&cfg(true, 10.0, 5));
@@ -2004,6 +2172,51 @@ mod tests {
             } => assert_eq!(retry_after_secs, 1),
             Decision::Allowed { .. } => panic!("Expected Denied"),
         }
+    }
+
+    #[test]
+    fn memory_store_repeat_key_updates_its_bucket_and_refreshes_lru_position() {
+        let store = MemoryStore {
+            buckets: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(2).expect("2 is non-zero"),
+            ))),
+        };
+        let now = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        assert!(matches!(
+            store.decide("a", now, 2.0, 0.1),
+            Decision::Allowed { remaining: 1, .. }
+        ));
+        assert!(matches!(
+            store.decide("b", now, 2.0, 0.1),
+            Decision::Allowed { remaining: 1, .. }
+        ));
+        // A repeat key keeps drawing down its own bucket and moves to the MRU end...
+        assert!(matches!(
+            store.decide("a", now, 2.0, 0.1),
+            Decision::Allowed { remaining: 0, .. }
+        ));
+        // ...so the next new key evicts "b", not "a".
+        assert!(matches!(
+            store.decide("c", now, 2.0, 0.1),
+            Decision::Allowed { remaining: 1, .. }
+        ));
+        let buckets = store.buckets.lock().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert!(buckets.contains("a") && buckets.contains("c") && !buckets.contains("b"));
+        drop(buckets);
+        // "a" kept its drained bucket through the eviction: denied, with the
+        // same retry-after the copy-modify-put version computed.
+        match store.decide("a", now, 2.0, 0.1) {
+            Decision::Denied {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 10),
+            Decision::Allowed { .. } => panic!("Expected Denied"),
+        }
+        // An evicted key starts over with a full bucket.
+        assert!(matches!(
+            store.decide("b", now, 2.0, 0.1),
+            Decision::Allowed { remaining: 1, .. }
+        ));
     }
 
     #[test]
@@ -2416,10 +2629,7 @@ mod tests {
             .header("authorization", "Bearer my-secret-token")
             .body(())
             .unwrap();
-        assert_eq!(
-            extract_bearer_token(&req).as_deref(),
-            Some("my-secret-token")
-        );
+        assert_eq!(extract_bearer_token(&req), Some("my-secret-token"));
     }
 
     #[test]
@@ -2428,7 +2638,7 @@ mod tests {
             .header("authorization", "BEARER token123")
             .body(())
             .unwrap();
-        assert_eq!(extract_bearer_token(&req).as_deref(), Some("token123"));
+        assert_eq!(extract_bearer_token(&req), Some("token123"));
     }
 
     #[test]
@@ -2519,6 +2729,45 @@ mod tests {
                 tenant_qualify_bucket_key(KeyStrategy::ApiToken, "token:abc"),
                 "token:abc"
             );
+        });
+    }
+
+    #[test]
+    fn tenant_qualify_owned_bucket_key_matches_the_borrowed_form() {
+        let cases = [
+            (KeyStrategy::Ip, "1.2.3.4"),
+            (KeyStrategy::ApiToken, "token:abc"),
+            (KeyStrategy::AuthenticatedPrincipal, "1.2.3.4"),
+            (KeyStrategy::AuthenticatedPrincipal, "principal:user-42"),
+        ];
+        for tenant in [None, Some("tenant-a".to_owned())] {
+            crate::tenancy::CURRENT_TENANT.sync_scope(tenant, || {
+                for (strategy, raw) in cases {
+                    assert_eq!(
+                        tenant_qualify_owned_bucket_key(strategy, raw.to_owned()),
+                        tenant_qualify_bucket_key(strategy, raw),
+                        "{strategy:?} {raw:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn tenant_qualify_owned_bucket_key_moves_an_unqualified_key() {
+        // Nothing to qualify: the caller's `String` comes back as-is, the
+        // same allocation, rather than a copy of it.
+        crate::tenancy::CURRENT_TENANT.sync_scope(Some("tenant-a".to_owned()), || {
+            for (strategy, raw) in [
+                (KeyStrategy::Ip, "1.2.3.4"),
+                (KeyStrategy::AuthenticatedPrincipal, "1.2.3.4"),
+            ] {
+                let raw = raw.to_owned();
+                let ptr = raw.as_ptr();
+                let key = tenant_qualify_owned_bucket_key(strategy, raw);
+                assert_eq!(key, "1.2.3.4");
+                assert_eq!(key.as_ptr(), ptr, "{strategy:?} must move, not copy");
+            }
         });
     }
 
@@ -2672,6 +2921,18 @@ mod tests {
         assert!(dbg.contains("test_prefix"));
         assert!(dbg.contains("failure_mode"));
         assert!(dbg.contains("FailOpen"));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_script_is_the_lua_source_built_once() {
+        // Same SHA as a per-call `Script::new`, so the `EVALSHA` every
+        // decision sends still matches scripts already cached on running
+        // Redis servers.
+        assert_eq!(
+            RATE_LIMIT_SCRIPT.get_hash(),
+            redis::Script::new(RATE_LIMIT_LUA).get_hash()
+        );
     }
 
     #[cfg(feature = "redis")]
@@ -3345,7 +3606,7 @@ mod tests {
         assert_eq!(limit, 5);
         assert_eq!(per, 60);
         assert_eq!(key, KeyStrategy::AuthenticatedPrincipal);
-        assert_eq!(reg_key, "route:m::h");
+        assert_eq!(reg_key.to_string(), "route:m::h");
     }
 
     #[test]
@@ -3363,11 +3624,37 @@ mod tests {
             resolve_throttle_params("m::h", Some("/a/thing"), &spec, &global).expect("params");
         let (_, _, _, reg_key_b) =
             resolve_throttle_params("m::h", Some("/b/thing"), &spec, &global).expect("params");
-        assert_eq!(reg_key_a, "route:m::h@/a/thing");
-        assert_eq!(reg_key_b, "route:m::h@/b/thing");
+        assert_eq!(reg_key_a.to_string(), "route:m::h@/a/thing");
+        assert_eq!(reg_key_b.to_string(), "route:m::h@/b/thing");
         assert_ne!(
             reg_key_a, reg_key_b,
             "same handler at two mounted paths must get distinct registry namespaces"
+        );
+    }
+
+    #[test]
+    fn throttle_registry_key_renders_the_historical_namespace() {
+        // These bytes are the in-memory cache key's middle and the Redis
+        // keyspace suffix, so they must stay exactly what `format!` produced.
+        assert_eq!(
+            ThrottleRegistryKey::Route {
+                route_id: "m::h",
+                matched_path: None,
+            }
+            .to_string(),
+            "route:m::h"
+        );
+        assert_eq!(
+            ThrottleRegistryKey::Route {
+                route_id: "m::h",
+                matched_path: Some("/a/{id}"),
+            }
+            .to_string(),
+            "route:m::h@/a/{id}"
+        );
+        assert_eq!(
+            ThrottleRegistryKey::Named("login").to_string(),
+            "named:login"
         );
     }
 
@@ -3395,7 +3682,7 @@ mod tests {
             resolve_throttle_params("m::a", Some("/a/login"), &spec, &global).expect("params");
         let (_, _, _, reg_key_b) =
             resolve_throttle_params("m::b", Some("/b/login"), &spec, &global).expect("params");
-        assert_eq!(reg_key_a, "named:login");
+        assert_eq!(reg_key_a.to_string(), "named:login");
         assert_eq!(
             reg_key_a, reg_key_b,
             "named limiters stay shared by name regardless of mounted path"
@@ -3445,7 +3732,7 @@ mod tests {
         assert_eq!(limit, 3);
         assert_eq!(per, 30);
         assert_eq!(key, KeyStrategy::ApiToken);
-        assert_eq!(reg_key, "named:login");
+        assert_eq!(reg_key.to_string(), "named:login");
     }
 
     #[test]
@@ -3687,6 +3974,151 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/problem+json"),
         );
+    }
+
+    /// The registry is probed with a key rendered into a reused buffer; the
+    /// first call must insert under the exact bytes the old `format!` built,
+    /// and every later call must hit that entry rather than build a limiter of
+    /// its own (which would hand it a fresh, full bucket).
+    #[tokio::test]
+    async fn check_throttle_warm_call_hits_the_entry_its_first_call_inserted() {
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let route = "test::check_throttle_warm_call_hits_the_entry_its_first_call_inserted";
+        let spec = ThrottleSpec::Inline {
+            limit: 2,
+            per_secs: 60,
+            key: Some(KeyStrategy::Ip),
+        };
+        let check = || {
+            __check_throttle(
+                &state,
+                route,
+                Some("/warm/{id}"),
+                spec.clone(),
+                &headers,
+                Some(peer),
+                None,
+                None,
+                false,
+            )
+        };
+
+        assert!(check().await.is_ok(), "first call inserts and is allowed");
+        assert!(check().await.is_ok(), "warm call is allowed");
+        // Only one limiter ever served this route: its bucket of 2 is spent.
+        let denied = check().await.expect_err("third call must be denied");
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let config = state.config_arc();
+        let fingerprint = throttle_config_fingerprint(
+            &config.security.rate_limit,
+            &config.security.trusted_proxies,
+            KeyStrategy::Ip,
+        );
+        let expected = format!(
+            "{}:route:{route}@/warm/{{id}}@{fingerprint:016x}",
+            state.app_id()
+        );
+        let reg = throttle_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries: Vec<String> = reg
+            .keys()
+            .filter(|key| key.contains(route))
+            .cloned()
+            .collect();
+        drop(reg);
+        assert_eq!(
+            entries,
+            [expected],
+            "same key bytes as before, and the warm calls hit instead of inserting again"
+        );
+    }
+
+    /// Swapping the config on the SAME app (same `app_id`) must still move the
+    /// fingerprint and so build a fresh limiter, exactly as before the
+    /// registry key was rendered into a reused buffer.
+    #[tokio::test]
+    async fn check_throttle_config_change_on_one_app_builds_a_fresh_limiter() {
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let route = "test::check_throttle_config_change_on_one_app_builds_a_fresh_limiter";
+        let spec = ThrottleSpec::Inline {
+            limit: 1,
+            per_secs: 60,
+            key: Some(KeyStrategy::Ip),
+        };
+        let check = || {
+            __check_throttle(
+                &state,
+                route,
+                None,
+                spec.clone(),
+                &headers,
+                Some(peer),
+                None,
+                None,
+                false,
+            )
+        };
+
+        assert!(check().await.is_ok(), "first call spends the only token");
+        assert!(check().await.is_err(), "same config: same, spent bucket");
+
+        // `insert_extension` swaps the config in place; `app_id` is unchanged.
+        let mut config = (*state.config_arc()).clone();
+        config.security.rate_limit.trust_forwarded_headers =
+            !config.security.rate_limit.trust_forwarded_headers;
+        state.insert_extension(config);
+        assert!(
+            check().await.is_ok(),
+            "a changed config must get a fresh limiter with a full bucket"
+        );
+
+        let reg = throttle_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries = reg.keys().filter(|key| key.contains(route)).count();
+        drop(reg);
+        assert_eq!(entries, 2, "one limiter per config fingerprint");
+    }
+
+    #[tokio::test]
+    async fn check_throttle_429_body_is_byte_identical_to_a_fresh_render() {
+        // The `#[throttle]` guard borrows the cached `'static` body; the wire
+        // bytes must be exactly what rendering it per denial produced.
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let route = "test::check_throttle_429_body_is_byte_identical_to_a_fresh_render";
+        let spec = ThrottleSpec::Inline {
+            limit: 1,
+            per_secs: 60,
+            key: Some(KeyStrategy::Ip),
+        };
+        let check = || {
+            __check_throttle(
+                &state,
+                route,
+                None,
+                spec.clone(),
+                &headers,
+                Some(peer),
+                None,
+                None,
+                false,
+            )
+        };
+
+        assert!(check().await.is_ok(), "first call spends the only token");
+        let denied = check().await.expect_err("second call must be denied");
+        let body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .expect("429 body is buffered");
+        assert_eq!(body, rate_limit_problem_json("ip").as_bytes());
     }
 
     #[tokio::test]

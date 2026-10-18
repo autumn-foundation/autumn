@@ -858,6 +858,14 @@ path = "tests/request_meta_alloc_gate.rs"
 name = "db_metrics_alloc_gate"
 path = "tests/db_metrics_alloc_gate.rs"
 
+# Allocation gate for the `#[throttle]` per-route check on a warm route: the
+# limiter registry and the per-client bucket map are probed by borrowed key, so
+# a request to a route that already has its limiter, from a client that already
+# has its bucket, copies neither key. Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "throttle_alloc_gate"
+path = "tests/throttle_alloc_gate.rs"
 
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
