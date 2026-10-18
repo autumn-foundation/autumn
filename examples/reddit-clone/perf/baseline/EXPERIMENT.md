@@ -1,3 +1,4 @@
+SUPERSEDED: produced from an earlier, non-deterministic seed version. See docs/reports/2026-10-18-ledger-reddit-votes-covering-index/ for the reproducible baseline/after.
 # Ledger experiment: covering index for the front-page leaderboard (NOT shipped)
 
 `CREATE INDEX idx_votes_post_cover ON votes (post_id) INCLUDE (value)` + `VACUUM (ANALYZE) votes`.

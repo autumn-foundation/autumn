@@ -36,3 +36,6 @@ dump top_calls "select calls, round(100.0*calls/(select sum(calls) from pg_stat_
 dump spills "select calls,temp_blks_written,left(query,150) from pg_stat_statements where temp_blks_written>0"
 dump seqscans "select relname,seq_scan,seq_tup_read,idx_scan from pg_stat_user_tables order by seq_tup_read desc limit 10"
 dump statio "select relname,heap_blks_read,heap_blks_hit,idx_blks_read,idx_blks_hit,toast_blks_read,toast_blks_hit from pg_statio_user_tables order by heap_blks_hit+heap_blks_read desc limit 8"
+# Index evidence. Dumped BEFORE the EXPLAIN below, because EXPLAIN ANALYZE itself scans.
+dump index_usage "select indexrelname, idx_scan, idx_tup_read, pg_size_pretty(pg_relation_size(indexrelid)) as size from pg_stat_user_indexes where relname='votes' order by indexrelname"
+$PSQL -P pager=off -c "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) SELECT post_id AS agg_key, CAST(SUM(value) AS bigint) AS agg_val FROM votes WHERE post_id IS NOT NULL GROUP BY post_id ORDER BY agg_val DESC NULLS LAST, agg_key ASC LIMIT 5" > "$OUT/explain_leaderboard.txt"

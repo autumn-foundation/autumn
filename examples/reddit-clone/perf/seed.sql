@@ -41,11 +41,17 @@ UPDATE posts p SET comment_count = x.n FROM
 UPDATE subreddits s SET comment_count = x.n FROM
  (SELECT p.subreddit_id, sum(p.comment_count) n FROM posts p GROUP BY 1) x WHERE x.subreddit_id = s.id;
 
--- 3M votes (unique per user/post), mostly on popular posts
+-- ~3M votes (unique per user/post), mostly on popular posts. Dedupe the (user, post)
+-- pairs FIRST, then derive each vote's direction (80% up) from a hash of the pair, so the
+-- fixture is identical regardless of plan, work_mem or parallelism.
 INSERT INTO votes (user_id, post_id, value, created_at)
-SELECT DISTINCT ON (u, p) u, p, CASE WHEN random() < 0.8 THEN 1 ELSE -1 END, now()
-FROM (SELECT 1 + (random()*99999)::int u, 1 + floor(500000 * power(random(), 3))::int p
-      FROM generate_series(1, 3000000)) s;
+SELECT u, p,
+       CASE WHEN get_byte(decode(md5(u || ':' || p), 'hex'), 0) % 10 < 8 THEN 1 ELSE -1 END,
+       timestamp '2026-01-01'
+FROM (SELECT DISTINCT 1 + (random()*99999)::int AS u,
+                      1 + floor(500000 * power(random(), 3))::int AS p
+      FROM generate_series(1, 3000000)) d
+ORDER BY u, p;
 
 INSERT INTO tags (name, slug) SELECT 'tag'||g, 'tag'||g FROM generate_series(1, 300) g;
 INSERT INTO post_tags SELECT DISTINCT p, 1 + floor(300*power(random(),2))::int

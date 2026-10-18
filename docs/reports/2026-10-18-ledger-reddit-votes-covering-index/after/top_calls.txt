@@ -1,14 +1,14 @@
  calls | pct  |  blks  |                                                                           q                                                                            
 -------+------+--------+--------------------------------------------------------------------------------------------------------------------------------------------------------
-   123 | 24.5 |      0 | SET statement_timeout = 0
-    91 | 18.1 |      0 | UPDATE autumn_jobs SET status = $4, started_at = NOW(), claimed_by = $1, claimed_at = NOW(), pending_unique_key = CASE WHEN unique_window = $5 THEN un
+   123 | 24.6 |      0 | SET statement_timeout = 0
+    87 | 17.4 |      0 | UPDATE autumn_jobs SET status = $4, started_at = NOW(), claimed_by = $1, claimed_at = NOW(), pending_unique_key = CASE WHEN unique_window = $5 THEN un
     37 |  7.4 |      0 | SELECT "live_feed_events"."id", "live_feed_events"."subreddit_slug", "live_feed_events"."event", "live_feed_events"."created_at" FROM "live_feed_event
-    32 |  6.4 |    462 | SELECT "users"."id", "users"."username", "users"."password_hash", "users"."karma", "users"."role", "users"."created_at", "users"."avatar" FROM "users"
-    27 |  5.4 |     96 | SELECT "subreddits"."id", "subreddits"."name", "subreddits"."slug", "subreddits"."description", "subreddits"."creator_id", "subreddits"."subscriber_co
+    32 |  6.4 |    456 | SELECT "users"."id", "users"."username", "users"."password_hash", "users"."karma", "users"."role", "users"."created_at", "users"."avatar" FROM "users"
+    27 |  5.4 |     81 | SELECT "subreddits"."id", "subreddits"."name", "subreddits"."slug", "subreddits"."description", "subreddits"."creator_id", "subreddits"."subscriber_co
     27 |  5.4 |    108 | SELECT "id" AS id FROM "posts" WHERE "posts"."id" = $1
     27 |  5.4 |    108 | SELECT "posts"."id", "posts"."title", "posts"."slug", "posts"."body", "posts"."url", "posts"."author_id", "posts"."subreddit_id", "posts"."score", "po
-    27 |  5.4 |    126 | SELECT "post_tags"."post_id", "tags"."id", "tags"."name", "tags"."slug" FROM ("post_tags" INNER JOIN "tags" ON ("tags"."id" = "post_tags"."tag_id")) W
-    27 |  5.4 | 230949 | SELECT c."id" AS id, c."parent_id" AS parent_id, c."author_id" AS author_id, c."body" AS body, c."created_at" AS created_at, __autumn_cmt_author."user
-     9 |  1.8 |  39894 | SELECT "posts"."id", "posts"."title", "posts"."slug", "posts"."score", "posts"."comment_count", "users"."username", "posts"."created_at" FROM ("posts"
+    27 |  5.4 |    114 | SELECT "post_tags"."post_id", "tags"."id", "tags"."name", "tags"."slug" FROM ("post_tags" INNER JOIN "tags" ON ("tags"."id" = "post_tags"."tag_id")) W
+    27 |  5.4 | 230877 | SELECT c."id" AS id, c."parent_id" AS parent_id, c."author_id" AS author_id, c."body" AS body, c."created_at" AS created_at, __autumn_cmt_author."user
+     9 |  1.8 |  39885 | SELECT "posts"."id", "posts"."title", "posts"."slug", "posts"."score", "posts"."comment_count", "users"."username", "posts"."created_at" FROM ("posts"
 (10 rows)
 
