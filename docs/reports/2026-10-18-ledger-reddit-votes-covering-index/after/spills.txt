@@ -1,0 +1,5 @@
+ calls | temp_blks_written |                                                                          left                                                                          
+-------+-------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+    27 |              2871 | SELECT c."id" AS id, c."parent_id" AS parent_id, c."author_id" AS author_id, c."body" AS body, c."created_at" AS created_at, __autumn_cmt_author."user
+(1 row)
+
