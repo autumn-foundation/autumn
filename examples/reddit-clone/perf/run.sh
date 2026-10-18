@@ -11,7 +11,8 @@ BASE=${BASE:-http://localhost:3000}
 q() { $PSQL -Atq -c "$1"; }
 # Preflight: the profile is read from pg_stat_statements, which must be preloaded by the
 # server (postgres -c shared_preload_libraries=pg_stat_statements -c track_io_timing=on).
-case "$(q 'show shared_preload_libraries')" in
+libs=$(q 'show shared_preload_libraries') || { echo "run.sh: cannot connect to the database (check DATABASE_URL)" >&2; exit 1; }
+case "$libs" in
   *pg_stat_statements*) ;;
   *) echo "run.sh: server must start with -c shared_preload_libraries=pg_stat_statements" >&2; exit 1;;
 esac
