@@ -90,7 +90,7 @@
    test in tests/integration/widget_css_coverage.rs. */
 .wizard-step--upcoming .wizard-step__number {
     background-color: var(--border);
-    color: var(--text-muted);
+    color: var(--text);
 }
 
 .wizard-step--upcoming .wizard-step__label {
@@ -978,7 +978,7 @@
 
 .autumn-job-status__success {
     font-size: 0.875rem;
-    color: var(--success);
+    color: var(--success-text, #065f46);
 }
 
 .autumn-job-status__error {
@@ -1015,19 +1015,19 @@
 
 .badge--success {
     background: var(--success-light, #ecfdf5);
-    color: var(--success);
+    color: var(--success-text, #065f46);
     border-color: var(--success);
 }
 
 .badge--warning {
     background: var(--warning-light, #fffbeb);
-    color: var(--warning, #92400e);
+    color: var(--warning-text, #92400e);
     border-color: var(--warning, #fcd34d);
 }
 
 .badge--danger {
     background: var(--danger-light, #fef2f2);
-    color: var(--danger);
+    color: var(--danger-hover);
     border-color: var(--danger);
 }
 
@@ -1177,19 +1177,19 @@
 
 .alert-success {
     background: var(--success-light, #ecfdf5);
-    color: var(--success);
+    color: var(--success-text, #065f46);
     border-color: var(--success);
 }
 
 .alert-warning {
     background: var(--warning-light, #fffbeb);
-    color: var(--warning, #92400e);
+    color: var(--warning-text, #92400e);
     border-color: var(--warning, #fcd34d);
 }
 
 .alert-error {
     background: var(--danger-light, #fef2f2);
-    color: var(--danger);
+    color: var(--danger-hover);
     border-color: var(--danger);
 }
 
