@@ -832,6 +832,13 @@ path = "tests/version_history_alloc_gate.rs"
 name = "metrics_alloc_gate"
 path = "tests/metrics_alloc_gate.rs"
 
+# Allocation gate for trusted-proxy resolution: a request behind a proxy must
+# not copy its one-line `X-Forwarded-For` chain to read it (the addr, host and
+# scheme resolvers each re-read it in hop-count mode). Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "trusted_proxies_alloc_gate"
+path = "tests/trusted_proxies_alloc_gate.rs"
 
 # Allocation gate for the layers that carry a request's matched route and
 # request id (the access log, primary and fallback, and the log context): they
