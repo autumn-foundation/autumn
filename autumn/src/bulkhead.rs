@@ -40,7 +40,9 @@ use crate::sync_shim::Mutex;
 /// the number of permits out.
 pub struct TenantBulkhead {
     max_per_tenant: usize,
-    in_flight: Mutex<HashMap<String, usize>>,
+    /// Each key is shared with the permits out for that tenant, so an acquire
+    /// for a tenant already in flight copies nothing.
+    in_flight: Mutex<HashMap<Arc<str>, usize>>,
 }
 
 impl std::fmt::Debug for TenantBulkhead {
@@ -56,7 +58,8 @@ impl std::fmt::Debug for TenantBulkhead {
 #[must_use = "the permit goes back when it drops"]
 pub struct TenantPermit {
     bulkhead: Arc<TenantBulkhead>,
-    tenant: String,
+    /// The same allocation as this tenant's key in the bulkhead's map.
+    tenant: Arc<str>,
 }
 
 impl std::fmt::Debug for TenantPermit {
@@ -91,15 +94,28 @@ impl TenantBulkhead {
             .in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let held = map.get(tenant).copied().unwrap_or(0);
-        if self.max_per_tenant != 0 && held >= self.max_per_tenant {
-            return None;
-        }
-        map.insert(tenant.to_owned(), held.saturating_add(1));
+        // Probe by borrow, and share one `Arc<str>` between the map key and the
+        // permit: a tenant already in flight costs no copy, a new one costs one.
+        let shared = if let Some((key, &held)) = map.get_key_value(tenant) {
+            if self.max_per_tenant != 0 && held >= self.max_per_tenant {
+                return None;
+            }
+            let key = Arc::clone(key);
+            if let Some(count) = map.get_mut(tenant) {
+                *count = held.saturating_add(1);
+            }
+            key
+        } else {
+            // Nothing held, so under any cap: `max_per_tenant` is 0 (no cap)
+            // or at least 1.
+            let key: Arc<str> = Arc::from(tenant);
+            map.insert(Arc::clone(&key), 1);
+            key
+        };
         drop(map);
         Some(TenantPermit {
             bulkhead: Arc::clone(self),
-            tenant: tenant.to_owned(),
+            tenant: shared,
         })
     }
 
@@ -168,19 +184,21 @@ pub(crate) fn acquire_db_permit() -> Result<Option<TenantPermit>, crate::AutumnE
     let Ok(bulkhead) = TENANT_DB_BULKHEAD.try_with(Arc::clone) else {
         return Ok(None);
     };
-    let Some(tenant) = crate::tenancy::CURRENT_TENANT
-        .try_with(Clone::clone)
-        .ok()
-        .flatten()
-    else {
+    // Acquire on a borrow of the task-local tenant rather than copying it
+    // per checkout.
+    let Ok(Some(acquired)) = crate::tenancy::CURRENT_TENANT.try_with(|tenant| {
+        tenant.as_deref().map(|tenant| {
+            bulkhead.try_acquire(tenant).ok_or_else(|| {
+                tracing::debug!(tenant = %tenant, "tenant database-connection cap reached");
+                crate::AutumnError::service_unavailable_msg(
+                    "Too many database connections for this tenant; try again shortly.",
+                )
+            })
+        })
+    }) else {
         return Ok(None);
     };
-    bulkhead.try_acquire(&tenant).map(Some).ok_or_else(|| {
-        tracing::debug!(tenant = %tenant, "tenant database-connection cap reached");
-        crate::AutumnError::service_unavailable_msg(
-            "Too many database connections for this tenant; try again shortly.",
-        )
-    })
+    acquired.map(Some)
 }
 
 /// FNV-1a, 64 bit.
@@ -200,6 +218,24 @@ const fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// [`shuffle_shard`]'s round cap.
+const SHARD_MAX_ROUNDS: u32 = 1 << 20;
+
+/// The lane that round `round` of [`shuffle_shard`] proposes for `key`.
+///
+/// [`shuffle_shard`] and [`shuffle_shard_contains`] both call this, so the two
+/// cannot drift apart.
+fn shard_round_lane(key: &str, round: u32, lanes: u16) -> u16 {
+    let hash = mix64(fnv1a_64(
+        key.bytes()
+            .chain(std::iter::once(0xff))
+            .chain(round.to_le_bytes()),
+    ));
+    // Callers have `want > 0`, so `lanes > 0`. The remainder is below
+    // `lanes`, so it fits in `u16`.
+    u16::try_from(hash.checked_rem(u64::from(lanes)).unwrap_or(0)).unwrap_or(0)
+}
+
 /// The lanes of `key`: `min(size, lanes)` distinct lanes in `0..lanes`,
 /// sorted.
 ///
@@ -211,23 +247,15 @@ const fn mix64(mut z: u64) -> u64 {
 /// 2. Mix the hash with the splitmix64 finalizer.
 /// 3. Take the hash modulo `lanes`. Ignore a lane that the result has.
 ///
-/// After `MAX_ROUNDS` rounds, the lowest free lanes fill the result. Thus the
-/// loop always ends.
+/// After `SHARD_MAX_ROUNDS` (2^20) rounds, the lowest free lanes fill the
+/// result. Thus the loop always ends.
 #[must_use]
 pub fn shuffle_shard(key: &str, lanes: u16, size: u16) -> Vec<u16> {
-    const MAX_ROUNDS: u32 = 1 << 20;
     let want = usize::from(size.min(lanes));
     let mut picked: Vec<u16> = Vec::with_capacity(want);
     let mut round: u32 = 0;
-    while picked.len() < want && round < MAX_ROUNDS {
-        let hash = mix64(fnv1a_64(
-            key.bytes()
-                .chain(std::iter::once(0xff))
-                .chain(round.to_le_bytes()),
-        ));
-        // `want > 0` here, so `lanes > 0`. The remainder is below `lanes`,
-        // so it fits in `u16`.
-        let lane = u16::try_from(hash.checked_rem(u64::from(lanes)).unwrap_or(0)).unwrap_or(0);
+    while picked.len() < want && round < SHARD_MAX_ROUNDS {
+        let lane = shard_round_lane(key, round, lanes);
         if !picked.contains(&lane) {
             picked.push(lane);
         }
@@ -241,6 +269,43 @@ pub fn shuffle_shard(key: &str, lanes: u16, size: u16) -> Vec<u16> {
     picked.extend(free);
     picked.sort_unstable();
     picked
+}
+
+/// Whether `lane` is one of `shuffle_shard(key, lanes, size)`.
+///
+/// The same picks as [`shuffle_shard`], kept on the stack for the usual small
+/// shard, so the job runtime's per-pop lane check builds no lane list. A
+/// shard wider than the inline buffer falls back to [`shuffle_shard`].
+#[must_use]
+pub(crate) fn shuffle_shard_contains(key: &str, lanes: u16, size: u16, lane: u16) -> bool {
+    const INLINE: usize = 16;
+    let want = usize::from(size.min(lanes));
+    if want > INLINE {
+        return shuffle_shard(key, lanes, size).contains(&lane);
+    }
+    let mut buf = [0_u16; INLINE];
+    let mut len = 0_usize;
+    let mut round: u32 = 0;
+    while len < want && round < SHARD_MAX_ROUNDS {
+        let candidate = shard_round_lane(key, round, lanes);
+        if !buf.get(..len).unwrap_or_default().contains(&candidate) {
+            // Every lane a round picks is in the shard.
+            if candidate == lane {
+                return true;
+            }
+            if let Some(slot) = buf.get_mut(len) {
+                *slot = candidate;
+            }
+            len = len.saturating_add(1);
+        }
+        round = round.saturating_add(1);
+    }
+    // The rest of the shard is the lowest lanes no round picked.
+    let picked = buf.get(..len).unwrap_or_default();
+    (0..lanes)
+        .filter(|free| !picked.contains(free))
+        .take(want.saturating_sub(len))
+        .any(|free| free == lane)
 }
 
 #[cfg(test)]
@@ -258,6 +323,56 @@ mod tests {
         drop(a1);
         assert_eq!(bulkhead.in_flight("a"), 1);
         assert!(bulkhead.try_acquire("a").is_some(), "a released one permit");
+    }
+
+    #[test]
+    fn permits_of_one_tenant_share_its_key() {
+        let bulkhead = TenantBulkhead::new(0);
+        let first = bulkhead.try_acquire("acme").expect("no cap");
+        let second = bulkhead.try_acquire("acme").expect("no cap");
+        assert!(
+            std::ptr::eq(first.tenant(), second.tenant()),
+            "one shared key"
+        );
+        let other = bulkhead.try_acquire("globex").expect("no cap");
+        assert!(!std::ptr::eq(first.tenant(), other.tenant()));
+        assert_eq!(bulkhead.in_flight("acme"), 2);
+        assert_eq!(bulkhead.in_flight("globex"), 1);
+        drop((first, second, other));
+        assert_eq!(bulkhead.tracked_tenants(), 0);
+    }
+
+    #[test]
+    fn a_tenant_that_returns_to_zero_starts_counting_again() {
+        // The shared key leaves the map with the last permit: the map stays
+        // bounded by the permits out, and the next acquire starts at one.
+        let bulkhead = TenantBulkhead::new(2);
+        let first = bulkhead.try_acquire("acme").expect("first permit");
+        let second = bulkhead.try_acquire("acme").expect("second permit");
+        assert!(bulkhead.try_acquire("acme").is_none(), "at the cap");
+        drop((first, second));
+        assert_eq!(bulkhead.tracked_tenants(), 0);
+        let again = bulkhead.try_acquire("acme").expect("a fresh permit");
+        assert_eq!(again.tenant(), "acme");
+        assert_eq!(bulkhead.in_flight("acme"), 1);
+        let _second = bulkhead.try_acquire("acme").expect("second permit");
+        assert!(
+            bulkhead.try_acquire("acme").is_none(),
+            "the cap still holds"
+        );
+        assert_eq!(bulkhead.in_flight("acme"), 2);
+    }
+
+    #[test]
+    fn a_rejected_acquire_leaves_the_count_alone() {
+        let bulkhead = TenantBulkhead::new(1);
+        let held = bulkhead.try_acquire("acme").expect("the one permit");
+        for _ in 0..3 {
+            assert!(bulkhead.try_acquire("acme").is_none());
+        }
+        assert_eq!(bulkhead.in_flight("acme"), 1);
+        drop(held);
+        assert_eq!(bulkhead.tracked_tenants(), 0, "nothing leaked");
     }
 
     #[test]
@@ -339,6 +454,44 @@ mod tests {
         assert_eq!(shuffle_shard("acme", 8, 2), vec![0, 6]);
         assert_eq!(shuffle_shard("globex", 8, 2), vec![0, 3]);
         assert_eq!(shuffle_shard("initech", 16, 3), vec![0, 10, 14]);
+    }
+
+    #[test]
+    fn shuffle_shard_contains_agrees_with_shuffle_shard() {
+        // A size of 17 or 64 on 17 or 40 lanes is wider than the inline
+        // buffer, so it takes the fallback.
+        for key in ["acme", "globex", "initech", "", "tenant-7", "ünï"] {
+            for lanes in [0_u16, 1, 2, 3, 8, 16, 17, 40] {
+                for size in [0_u16, 1, 2, 3, 15, 16, 17, 64] {
+                    let shard = shuffle_shard(key, lanes, size);
+                    for lane in 0..lanes.saturating_add(2) {
+                        assert_eq!(
+                            shuffle_shard_contains(key, lanes, size, lane),
+                            shard.contains(&lane),
+                            "{key:?} lanes={lanes} size={size} lane={lane}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shuffle_shard_contains_matches_the_pinned_shards() {
+        // The golden shards of `shuffle_shard_is_stable`, by membership.
+        for (key, lanes, size, shard) in [
+            ("acme", 8, 2, vec![0, 6]),
+            ("globex", 8, 2, vec![0, 3]),
+            ("initech", 16, 3, vec![0, 10, 14]),
+        ] {
+            for lane in 0..lanes {
+                assert_eq!(
+                    shuffle_shard_contains(key, lanes, size, lane),
+                    shard.contains(&lane),
+                    "{key} lane {lane}"
+                );
+            }
+        }
     }
 
     #[test]

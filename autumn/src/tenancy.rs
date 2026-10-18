@@ -767,9 +767,11 @@ pub async fn tenancy_middleware(
                 .then(|| std::time::Duration::from_secs(config.tenancy.idle_ttl_secs)),
         )
     });
-    let handle = crate::tenant_cell::TenantCellHandle::new(
+    // The id goes in as an `Arc<str>`, so the clone for the body below, and
+    // the body's clone on every frame, copy no id.
+    let handle = crate::tenant_cell::TenantCellHandle::from_shared(
         (*registry).clone(),
-        tenant_id.clone(),
+        std::sync::Arc::from(tenant_id.as_str()),
         config.tenancy.quota_bytes,
     );
     let handle_for_body = Some(handle.clone());
@@ -1019,6 +1021,36 @@ mod tests {
             Some(true),
             "the body's checkout counts against the tenant's cap"
         );
+    }
+
+    /// The middleware clones the tenant-cell handle for the body, and the body
+    /// clones it on every frame: the clones share one tenant id.
+    #[test]
+    fn tenant_cell_handle_clones_share_one_tenant_id() {
+        let reg = crate::tenant_cell::TenantCellRegistry::new();
+        let handle =
+            crate::tenant_cell::TenantCellHandle::new(reg.clone(), "acme".to_owned(), 1_000);
+        let clone = handle.clone();
+        assert_eq!(clone.tenant_id(), "acme");
+        assert!(
+            std::ptr::eq(handle.tenant_id(), clone.tenant_id()),
+            "clones share the id"
+        );
+        let debug = format!("{clone:?}");
+        assert!(debug.contains("tenant_id: \"acme\""), "{debug}");
+
+        // The middleware's constructor keeps the caller's allocation.
+        let shared: std::sync::Arc<str> = std::sync::Arc::from("globex");
+        let from_shared = crate::tenant_cell::TenantCellHandle::from_shared(
+            reg,
+            std::sync::Arc::clone(&shared),
+            1_000,
+        );
+        assert!(std::ptr::eq(
+            from_shared.tenant_id().as_ptr(),
+            shared.as_ptr()
+        ));
+        assert_eq!(from_shared.cell().tenant_id(), "globex");
     }
 
     /// A handler runs inside the tenant's database bulkhead (#3072).
