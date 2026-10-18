@@ -143,7 +143,7 @@ rust_decimal = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 # HTML allowlist sanitizer for user-submitted rich text (issue #1255). Pulled in
 # by autumn-web's `markdown` feature; see `autumn/src/markdown/user_content.rs`.
-ammonia = "4.1"
+ammonia = "4.2.4"
 # Interactive console prompt (issue #2148). Pulled in only by autumn-web's
 # `repl` feature; see `autumn/src/repl.rs`.
 rhai = { version = "1", default-features = false, features = ["std", "serde"] }
