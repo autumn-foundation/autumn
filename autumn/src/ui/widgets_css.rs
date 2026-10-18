@@ -139,4 +139,94 @@ mod tests {
             "the transparent outline belongs on the four :focus rules only"
         );
     }
+    /// `#rrggbb` -> WCAG relative luminance.
+    fn luminance(hex: &str) -> f64 {
+        let channel = |i: usize| {
+            let c = f64::from(u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap()) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Resolve `#hex` / `var(--x)` / `var(--x, #hex)` against the shipped
+    /// tokens, the way a browser does: the token wins, the fallback only
+    /// applies when the token is undefined.
+    fn resolve(value: &str) -> String {
+        let value = value.trim();
+        let Some(inner) = value.strip_prefix("var(").and_then(|v| v.strip_suffix(')')) else {
+            return value.to_owned();
+        };
+        let (name, fallback) = inner
+            .split_once(',')
+            .map_or((inner, None), |(n, f)| (n, Some(f)));
+        let tokens = crate::ui::tokens::TOKENS_CSS;
+        let def = format!("{}:", name.trim());
+        tokens
+            .find(&def)
+            .map(|at| {
+                let rest = &tokens[at + def.len()..];
+                rest[..rest.find(';').unwrap()].trim().to_owned()
+            })
+            .or_else(|| fallback.map(|f| f.trim().to_owned()))
+            .unwrap_or_else(|| panic!("`{name}` is neither a token nor has a fallback"))
+    }
+
+    fn declared(selector: &str, prop: &str) -> String {
+        let at = WIDGETS_COMPONENT_CSS
+            .find(&format!("{selector} {{"))
+            .unwrap_or_else(|| panic!("missing `{selector}` rule"));
+        let body = &WIDGETS_COMPONENT_CSS[at..];
+        let body = &body[..body.find('}').unwrap()];
+        let line = body
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(&format!("{prop}:")))
+            .unwrap_or_else(|| panic!("`{selector}` has no `{prop}`"));
+        resolve(line.trim_end_matches(';'))
+    }
+
+    /// Wayfinder audit (contrast, tier 1): computed text/background pairs of
+    /// the status chips and the wizard step number against the shipped
+    /// tokens. WCAG 1.4.3 needs 4.5:1 for normal-size text. Baseline before
+    /// the fix: badge/alert-success 3.58, badge/alert-warning 3.07,
+    /// badge/alert-error 3.95, job-status__success 3.77, upcoming wizard
+    /// step number 3.90 (8 failing pairs).
+    #[test]
+    fn widget_text_meets_aa_contrast_against_its_own_background() {
+        let surface = "var(--surface)";
+        let mut failures = Vec::new();
+        for (selector, bg) in [
+            (".badge--success", "background"),
+            (".badge--warning", "background"),
+            (".badge--danger", "background"),
+            (".alert-success", "background"),
+            (".alert-warning", "background"),
+            (".alert-error", "background"),
+            (".autumn-job-status__success", ""),
+            (".autumn-job-status__error", ""),
+            (
+                ".wizard-step--upcoming .wizard-step__number",
+                "background-color",
+            ),
+        ] {
+            let bg = if bg.is_empty() {
+                resolve(surface)
+            } else {
+                declared(selector, bg)
+            };
+            let ratio = contrast(&declared(selector, "color"), &bg);
+            if ratio < 4.5 {
+                failures.push(format!("{selector}: {ratio:.2}:1"));
+            }
+        }
+        assert!(failures.is_empty(), "below 4.5:1 — {failures:?}");
+    }
 }
