@@ -1653,9 +1653,9 @@ impl Counter {
     /// deduplicated first-wins); an invalid or reserved key drops that label,
     /// never the sample. Values are stripped of control characters and
     /// truncated to [`MAX_LABEL_VALUE_LEN`] characters here, so an over-long
-    /// value is never carried around whole. A handle that is kept and reused
-    /// therefore records without allocating: its labels already are the
-    /// series key.
+    /// value is never carried around whole. Once its series exists (the first
+    /// sample for a label set registers it), a handle that is kept and reused
+    /// records without allocating: its labels already are the series key.
     ///
     /// An inert handle (one whose name was rejected) skips the work entirely.
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {

@@ -244,9 +244,10 @@ metrics::counter("checkout_completed_total")
 ```
 
 Canonicalizing happens as each label is attached, so a handle you keep is
-already in its final shape. Recording through a held handle finds its series
-without allocating. On a hot loop with a fixed label set, build the handle
-once and reuse it. The per-call form above also works, but pays to build the
+already in its final shape. The first sample for a label set registers its
+series, which allocates once. After that, recording through a held handle
+finds the series without allocating. On a hot loop with a fixed label set,
+build the handle once and reuse it. The per-call form above also works, but pays to build the
 label strings on every call.
 
 > **Label values must come from a small, closed set the code controls.** Never

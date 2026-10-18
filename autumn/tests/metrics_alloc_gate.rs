@@ -14,8 +14,11 @@
 //! that already holds an equal key. That is what this gate pins:
 //!
 //! - **A held handle** (`let c = counter(..).with_label(..); c.increment(1)`)
-//!   allocates nothing per sample: its labels are already canonical, so the
-//!   series map is probed with them directly.
+//!   allocates nothing per sample once its series exists: its labels are
+//!   already canonical, so the series map is probed with them directly. The
+//!   first sample for a label set still registers the series (one `Arc` and
+//!   one owned key); the warm-up in [`per_sample`] pays that before the
+//!   measured window, because the steady state is what this gate pins.
 //! - **The per-call idiom** (`counter(..).with_label(..).increment(1)`) pays
 //!   only for building the handle — the label `Vec` plus one owned key and one
 //!   owned value per label, which `with_label`'s `&str` / `impl Into<String>`
