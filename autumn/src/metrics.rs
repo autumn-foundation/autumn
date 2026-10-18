@@ -2288,6 +2288,46 @@ mod tests {
     }
 
     #[test]
+    fn gauge_and_histogram_labels_canonicalize_like_counter_labels() {
+        // `Gauge::with_label` and `Histogram::with_label` share the counter's
+        // canonicalization: order-independent, first-wins, invalid names
+        // dropped. Two handles built in different orders land in one series.
+        let gauge_name = unique_name("facade_gauge_labels");
+        gauge(&gauge_name)
+            .with_label("pool", "primary")
+            .with_label("region", "eu")
+            .with_label("pool", "replica")
+            .set(3_u32);
+        gauge(&gauge_name)
+            .with_label("region", "eu")
+            .with_label("not-a-valid-name", "x")
+            .with_label("pool", "primary")
+            .increment(2_u32);
+        let instrument = expect_instrument(&gauge_name);
+        let series = only_series(&instrument);
+        assert!((gauge_value(series) - 5.0).abs() < f64::EPSILON);
+        assert_eq!(
+            series.labels.get("pool").map(String::as_str),
+            Some("primary")
+        );
+        assert_eq!(series.labels.len(), 2);
+
+        let histogram_name = unique_name("facade_histogram_labels");
+        histogram(&histogram_name)
+            .with_label("route", "/upload")
+            .with_label("method", "POST")
+            .record(1_u32);
+        timer(&histogram_name)
+            .with_label("method", "POST")
+            .with_label("route", "/upload")
+            .record(Duration::from_secs(2));
+        let instrument = expect_instrument(&histogram_name);
+        let (count, sum, _) = histogram_parts(only_series(&instrument));
+        assert_eq!(count, 2, "both handles record into one series");
+        assert!((sum - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn a_held_handle_applies_the_label_cap_in_force_when_it_records() {
         // The cap is a property of the configuration at record time, not of
         // the moment the handle was built: a handle built under one cap and
