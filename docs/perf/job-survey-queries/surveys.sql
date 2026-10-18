@@ -1,0 +1,3 @@
+-- Verbatim from autumn/src/job.rs (pg_update_concurrency_blocked_gauges / pg_update_queue_depth_gauges)
+\set blocked 'SELECT blocked.name AS name, COUNT(*) AS count FROM autumn_jobs blocked WHERE blocked.status = ''enqueued'' AND blocked.run_at <= NOW() AND blocked.concurrency_limit IS NOT NULL AND ( SELECT COUNT(*) FROM autumn_jobs running WHERE running.status = ''running'' AND running.name = blocked.name AND running.concurrency_key IS NOT DISTINCT FROM blocked.concurrency_key ) >= blocked.concurrency_limit GROUP BY blocked.name'
+\set depth 'SELECT queue, name, COUNT(*) AS count, CAST(EXTRACT(EPOCH FROM (NOW() - MIN(run_at))) * 1000 AS BIGINT) AS oldest_wait_ms FROM autumn_jobs WHERE status = ''enqueued'' AND run_at <= NOW() GROUP BY queue, name'

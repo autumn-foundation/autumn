@@ -1,0 +1,82 @@
+psql:fixture.sql:9: NOTICE:  table "autumn_jobs" does not exist, skipping
+##### ready=50000
+rows=500000 enqueued=51000 ready=50000 running=250 limited_ready=15124
+n_live_tup=500000 n_dead_tup=49959
+table=69 MB indexes=56 MB
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) blocked ===
+                                                                                    QUERY PLAN                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=6553812.89..6553849.81 rows=10 width=14) (actual time=511.150..511.153 rows=1 loops=1)
+   Output: blocked.name, count(*)
+   Group Key: blocked.name
+   Buffers: shared hit=164937 read=3 dirtied=1
+   ->  Sort  (cost=6553812.89..6553825.16 rows=4909 width=6) (actual time=511.045..511.053 rows=160 loops=1)
+         Output: blocked.name
+         Sort Key: blocked.name
+         Sort Method: quicksort  Memory: 27kB
+         Buffers: shared hit=164937 read=3 dirtied=1
+         ->  Index Scan using idx_autumn_jobs_queue_ready on public.autumn_jobs blocked  (cost=0.29..6553511.94 rows=4909 width=6) (actual time=366.867..510.915 rows=160 loops=1)
+               Output: blocked.name
+               Index Cond: (blocked.run_at <= now())
+               Filter: ((blocked.concurrency_limit IS NOT NULL) AND ((SubPlan 1) >= blocked.concurrency_limit))
+               Rows Removed by Filter: 49840
+               Buffers: shared hit=164934 read=3 dirtied=1
+               SubPlan 1
+                 ->  Aggregate  (cost=130.91..130.92 rows=1 width=8) (actual time=0.008..0.008 rows=1 loops=15124)
+                       Output: count(*)
+                       Buffers: shared hit=109513
+                       ->  Bitmap Heap Scan on public.autumn_jobs running  (cost=4.40..130.91 rows=1 width=0) (actual time=0.007..0.007 rows=0 loops=15124)
+                             Recheck Cond: ((running.name = blocked.name) AND (running.status = 'running'::text))
+                             Filter: (NOT (running.concurrency_key IS DISTINCT FROM blocked.concurrency_key))
+                             Rows Removed by Filter: 47
+                             Heap Blocks: exact=94389
+                             Buffers: shared hit=109513
+                             ->  Bitmap Index Scan on idx_autumn_jobs_concurrency_running  (cost=0.00..4.39 rows=33 width=0) (actual time=0.002..0.002 rows=52 loops=15124)
+                                   Index Cond: (running.name = blocked.name)
+                                   Buffers: shared hit=15124
+ Query Identifier: -4893531502133561295
+ Planning:
+   Buffers: shared hit=220
+ Planning Time: 0.601 ms
+ JIT:
+   Functions: 23
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+   Timing: Generation 1.687 ms, Inlining 91.365 ms, Optimization 172.778 ms, Emission 102.037 ms, Total 367.867 ms
+ Execution Time: 525.349 ms
+(37 rows)
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) depth ===
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=11333.74..11334.64 rows=40 width=29) (actual time=18.205..18.218 rows=40 loops=1)
+   Output: queue, name, count(*), ((EXTRACT(epoch FROM (now() - min(run_at))) * '1000'::numeric))::bigint
+   Group Key: autumn_jobs.queue, autumn_jobs.name
+   Batches: 1  Memory Usage: 24kB
+   Buffers: shared hit=1022 read=2
+   ->  Bitmap Heap Scan on public.autumn_jobs  (cost=1166.24..10835.74 rows=49800 width=21) (actual time=3.199..10.551 rows=50000 loops=1)
+         Output: queue, name, run_at
+         Recheck Cond: ((autumn_jobs.run_at <= now()) AND (autumn_jobs.status = 'enqueued'::text))
+         Heap Blocks: exact=833
+         Buffers: shared hit=1022 read=2
+         ->  Bitmap Index Scan on idx_autumn_jobs_ready  (cost=0.00..1153.79 rows=49800 width=0) (actual time=3.079..3.079 rows=54959 loops=1)
+               Index Cond: (autumn_jobs.run_at <= now())
+               Buffers: shared hit=189 read=2
+ Query Identifier: -4112742595566416696
+ Planning:
+   Buffers: shared hit=240 read=1 dirtied=1
+ Planning Time: 0.679 ms
+ Execution Time: 18.288 ms
+(18 rows)
+
+=== pg_stat_statements (10 ticks), ranked by buffers ===
+ calls | buffers | shared_blks_hit | shared_blks_read | temp_blks_read | temp_blks_written | rows | pct_buffers | pct_calls |                                 query                                  
+-------+---------+-----------------+------------------+----------------+-------------------+------+-------------+-----------+------------------------------------------------------------------------
+    10 | 1601420 |         1601420 |                0 |              0 |                 0 |   10 |       99.36 |     50.00 | SELECT blocked.name AS name, COUNT(*) AS count FROM autumn_jobs blocke
+    10 |   10240 |           10240 |                0 |              0 |                 0 |  400 |        0.64 |     50.00 | SELECT queue, name, COUNT(*) AS count, CAST(EXTRACT($1 FROM (NOW() - M
+(2 rows)
+
+ seq_scan | seq_tup_read | idx_scan 
+----------+--------------+----------
+       12 |      1000000 |   166386
+(1 row)
+

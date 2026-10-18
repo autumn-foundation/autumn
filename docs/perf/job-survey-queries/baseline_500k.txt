@@ -1,0 +1,121 @@
+psql:fixture.sql:9: NOTICE:  table "autumn_jobs" does not exist, skipping
+##### ready=500000
+rows=5000000 enqueued=510000 ready=500014 running=2500 limited_ready=150159
+n_live_tup=4999923 n_dead_tup=499478
+table=711 MB indexes=561 MB
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) blocked ===
+                                                                                        QUERY PLAN                                                                                        
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=493417909.99..493418291.77 rows=10 width=14) (actual time=11992.265..11993.223 rows=8 loops=1)
+   Output: blocked.name, count(*)
+   Group Key: blocked.name
+   Buffers: shared hit=8457271 read=10998 dirtied=2113 written=7535
+   ->  Sort  (cost=493417909.99..493418037.22 rows=50891 width=6) (actual time=11990.453..11991.575 rows=26599 loops=1)
+         Output: blocked.name
+         Sort Key: blocked.name
+         Sort Method: quicksort  Memory: 1184kB
+         Buffers: shared hit=8457271 read=10998 dirtied=2113 written=7535
+         ->  Index Scan using idx_autumn_jobs_queue_ready on public.autumn_jobs blocked  (cost=0.42..493413931.56 rows=50891 width=6) (actual time=268.474..11978.892 rows=26599 loops=1)
+               Output: blocked.name
+               Index Cond: (blocked.run_at <= now())
+               Filter: ((blocked.concurrency_limit IS NOT NULL) AND ((SubPlan 1) >= blocked.concurrency_limit))
+               Rows Removed by Filter: 473415
+               Buffers: shared hit=8457268 read=10998 dirtied=2113 written=7535
+               SubPlan 1
+                 ->  Aggregate  (cost=975.22..975.23 rows=1 width=8) (actual time=0.072..0.072 rows=1 loops=150159)
+                       Output: count(*)
+                       Buffers: shared hit=7914061 read=61 written=1
+                       ->  Bitmap Heap Scan on public.autumn_jobs running  (cost=10.16..975.22 rows=1 width=0) (actual time=0.038..0.071 rows=3 loops=150159)
+                             Recheck Cond: ((running.name = blocked.name) AND (running.status = 'running'::text))
+                             Filter: (NOT (running.concurrency_key IS DISTINCT FROM blocked.concurrency_key))
+                             Rows Removed by Filter: 479
+                             Heap Blocks: exact=7434515
+                             Buffers: shared hit=7914061 read=61 written=1
+                             ->  Bitmap Index Scan on idx_autumn_jobs_concurrency_running  (cost=0.00..10.15 rows=250 width=0) (actual time=0.014..0.014 rows=529 loops=150159)
+                                   Index Cond: (running.name = blocked.name)
+                                   Buffers: shared hit=479597 read=10 written=1
+ Query Identifier: -7851230056161549620
+ Planning:
+   Buffers: shared hit=207 read=13 dirtied=2 written=13
+ Planning Time: 0.753 ms
+ JIT:
+   Functions: 23
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+   Timing: Generation 1.089 ms, Inlining 59.489 ms, Optimization 125.666 ms, Emission 82.650 ms, Total 268.894 ms
+ Execution Time: 12008.324 ms
+(37 rows)
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) depth ===
+                                                                           QUERY PLAN                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate  (cost=130567.89..130578.92 rows=40 width=29) (actual time=253.978..260.029 rows=40 loops=1)
+   Output: queue, name, count(*), ((EXTRACT(epoch FROM (now() - min(run_at))) * '1000'::numeric))::bigint
+   Group Key: autumn_jobs.queue, autumn_jobs.name
+   Buffers: shared hit=13430 read=77588
+   ->  Gather Merge  (cost=130567.89..130577.22 rows=80 width=29) (actual time=253.917..259.918 rows=120 loops=1)
+         Output: queue, name, (PARTIAL count(*)), (PARTIAL min(run_at))
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=13430 read=77588
+         ->  Sort  (cost=129567.87..129567.97 rows=40 width=29) (actual time=242.166..242.170 rows=40 loops=3)
+               Output: queue, name, (PARTIAL count(*)), (PARTIAL min(run_at))
+               Sort Key: autumn_jobs.queue, autumn_jobs.name
+               Sort Method: quicksort  Memory: 27kB
+               Buffers: shared hit=13430 read=77588
+               Worker 0:  actual time=236.189..236.193 rows=40 loops=1
+                 Sort Method: quicksort  Memory: 27kB
+                 JIT:
+                   Functions: 8
+                   Options: Inlining false, Optimization false, Expressions true, Deforming true
+                   Timing: Generation 0.657 ms, Inlining 0.000 ms, Optimization 0.412 ms, Emission 17.941 ms, Total 19.011 ms
+                 Buffers: shared hit=4066 read=25797
+               Worker 1:  actual time=237.016..237.020 rows=40 loops=1
+                 Sort Method: quicksort  Memory: 27kB
+                 JIT:
+                   Functions: 8
+                   Options: Inlining false, Optimization false, Expressions true, Deforming true
+                   Timing: Generation 0.675 ms, Inlining 0.000 ms, Optimization 0.469 ms, Emission 6.641 ms, Total 7.785 ms
+                 Buffers: shared hit=4654 read=25743
+               ->  Partial HashAggregate  (cost=129566.40..129566.80 rows=40 width=29) (actual time=242.101..242.109 rows=40 loops=3)
+                     Output: queue, name, PARTIAL count(*), PARTIAL min(run_at)
+                     Group Key: autumn_jobs.queue, autumn_jobs.name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=13414 read=77588
+                     Worker 0:  actual time=236.114..236.122 rows=40 loops=1
+                       Batches: 1  Memory Usage: 24kB
+                       Buffers: shared hit=4058 read=25797
+                     Worker 1:  actual time=236.950..236.957 rows=40 loops=1
+                       Batches: 1  Memory Usage: 24kB
+                       Buffers: shared hit=4646 read=25743
+                     ->  Parallel Seq Scan on public.autumn_jobs  (cost=0.00..127459.77 rows=210663 width=21) (actual time=13.504..216.477 rows=166672 loops=3)
+                           Output: queue, name, run_at
+                           Filter: ((autumn_jobs.status = 'enqueued'::text) AND (autumn_jobs.run_at <= now()))
+                           Rows Removed by Filter: 1499995
+                           Buffers: shared hit=13414 read=77588
+                           Worker 0:  actual time=18.342..215.086 rows=140376 loops=1
+                             Buffers: shared hit=4058 read=25797
+                           Worker 1:  actual time=7.093..210.398 rows=188883 loops=1
+                             Buffers: shared hit=4646 read=25743
+ Query Identifier: -8789752318557149558
+ Planning:
+   Buffers: shared hit=240 read=1 dirtied=1
+ Planning Time: 0.715 ms
+ JIT:
+   Functions: 27
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+   Timing: Generation 2.444 ms, Inlining 0.000 ms, Optimization 1.836 ms, Emission 38.710 ms, Total 42.990 ms
+ Execution Time: 279.411 ms
+(57 rows)
+
+=== pg_stat_statements (10 ticks), ranked by buffers ===
+ calls | buffers  | shared_blks_hit | shared_blks_read | temp_blks_read | temp_blks_written | rows | pct_buffers | pct_calls |                                 query                                  
+-------+----------+-----------------+------------------+----------------+-------------------+------+-------------+-----------+------------------------------------------------------------------------
+    10 | 99197962 |        99194712 |             3250 |              0 |                 0 |   80 |       99.09 |     50.00 | SELECT blocked.name AS name, COUNT(*) AS count FROM autumn_jobs blocke
+    10 |   910180 |          131823 |           778357 |              0 |                 0 |  400 |        0.91 |     50.00 | SELECT queue, name, COUNT(*) AS count, CAST(EXTRACT($1 FROM (NOW() - M
+(2 rows)
+
+ seq_scan | seq_tup_read | idx_scan 
+----------+--------------+----------
+       45 |     65000000 |  1651797
+(1 row)
+
