@@ -67,10 +67,16 @@ fn per_sample(label: &str, mut f: impl FnMut()) -> u64 {
             f();
         }
     });
-    let per = info.count_total / SAMPLES;
-    println!(
-        "{label}: {} allocations over {SAMPLES} samples ({per}/sample)",
-        info.count_total
+    let total = info.count_total;
+    let per = total / SAMPLES;
+    println!("{label}: {total} allocations over {SAMPLES} samples ({per}/sample)");
+    // Every sample takes the same path, so the total is an exact multiple. A
+    // remainder means some samples allocate and others do not, which a
+    // per-sample quotient alone would round away.
+    assert_eq!(
+        total % SAMPLES,
+        0,
+        "{label}: {total} allocations over {SAMPLES} samples is not a whole number per sample"
     );
     per
 }
