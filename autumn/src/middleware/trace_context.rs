@@ -169,12 +169,20 @@ impl Extractor for HeaderMapExtractor<'_> {
 
 struct HeaderMapInjector<'a>(&'a mut HeaderMap);
 
+// The two keys the W3C trace-context propagator injects on every response.
+// Neither is a standard `http` header, so `HeaderName::from_bytes` would copy
+// the name into a fresh allocation each time; these are built at compile time.
+const TRACEPARENT_HEADER: http::HeaderName = http::HeaderName::from_static("traceparent");
+const TRACESTATE_HEADER: http::HeaderName = http::HeaderName::from_static("tracestate");
+
 impl Injector for HeaderMapInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
-        if let (Ok(name), Ok(value)) = (
-            http::HeaderName::from_bytes(key.as_bytes()),
-            http::HeaderValue::from_str(&value),
-        ) {
+        let name = match key {
+            "traceparent" => Ok(TRACEPARENT_HEADER),
+            "tracestate" => Ok(TRACESTATE_HEADER),
+            other => http::HeaderName::from_bytes(other.as_bytes()),
+        };
+        if let (Ok(name), Ok(value)) = (name, http::HeaderValue::from_str(&value)) {
             self.0.insert(name, value);
         }
     }
@@ -226,6 +234,38 @@ mod tests {
             headers.get("tracestate").unwrap().to_str().unwrap(),
             "vendor=opaque"
         );
+    }
+
+    #[test]
+    fn header_map_injector_handles_other_keys_and_rejects_invalid_names() {
+        // The two W3C keys take the precomputed names; any other key still
+        // goes through `HeaderName::from_bytes`, which rejects an invalid name.
+        let mut headers = HeaderMap::new();
+        {
+            let mut injector = HeaderMapInjector(&mut headers);
+            injector.set("baggage", "k=v".to_owned());
+            injector.set("not a header", "x".to_owned());
+            injector.set("tracestate", String::new());
+        }
+        assert_eq!(headers.get("baggage").unwrap().to_str().unwrap(), "k=v");
+        assert_eq!(headers.get("tracestate").unwrap().to_str().unwrap(), "");
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
+    fn precomputed_trace_header_names_match_parsed_names() {
+        // Regression guard: the compile-time names are the same names
+        // `from_bytes` produced for these keys before.
+        assert_eq!(
+            TRACEPARENT_HEADER,
+            http::HeaderName::from_bytes(b"traceparent").unwrap()
+        );
+        assert_eq!(
+            TRACESTATE_HEADER,
+            http::HeaderName::from_bytes(b"tracestate").unwrap()
+        );
+        assert_eq!(TRACEPARENT_HEADER.as_str(), "traceparent");
+        assert_eq!(TRACESTATE_HEADER.as_str(), "tracestate");
     }
 
     #[test]

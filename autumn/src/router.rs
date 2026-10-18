@@ -6152,8 +6152,12 @@ fn apply_middleware(
     // uncompressed bytes labeled as gzip. User layers (EtagLayer etc.) stay inner
     // to Compression, so ETags are computed on the uncompressed body.
     //
-    // The error page context layer must be inner to the exception filter, so
-    // `WantsHtml` is set on the response before the filter inspects it.
+    // The error page context layer must sit directly inner to the exception
+    // filter (adjacent in the tuple below), so `WantsHtml` is set on the
+    // response before the filter inspects it. It attaches its context only to
+    // responses that already carry `AutumnErrorInfo`, which is correct only
+    // while no layer between the two could turn a plain response into an
+    // error one.
     //
     // Full ingress layer order (outermost → innermost). The framework's outermost
     // `SecurityHeadersLayer` and the `static_gate` layers are applied by
