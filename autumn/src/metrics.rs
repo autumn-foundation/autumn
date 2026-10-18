@@ -813,10 +813,7 @@ impl Instrument {
             series
                 .iter()
                 .map(|(key, value)| {
-                    let labels = key
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    let labels = key.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     (labels, Arc::clone(value))
                 })
                 .collect()
