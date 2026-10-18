@@ -133,6 +133,80 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
 
+## Operating the fleet
+
+`autumn fleet` runs these operations from the command line. Use it when the
+app is stopped and when it runs. It reads `[database.fleet]` the same way the
+app does. `restore` also reads `[replication]`. The sources are
+`autumn.toml`, the `[profile.<p>]` overlay, `.env.<profile>` and `AUTUMN_*`
+overrides. Run it from the app directory. `--profile <p>` selects a profile.
+
+The fleet API is in the SQLite build only. Install that build of the CLI:
+
+```shell
+cargo install autumn-cli --no-default-features --features sqlite
+```
+
+| Command | Does |
+| --- | --- |
+| `autumn fleet list [--open] [--json]` | name, size and path of each database; `--open` adds the identity row, the latest applied app migration and the number of pending app migrations |
+| `autumn fleet migrate [--concurrency N] [--key K]` | apply `migrations/` and the framework tables to every database, or to one |
+| `autumn fleet backup <key> <dest>` | copy one database with `VACUUM INTO`; `dest` must not exist |
+| `autumn fleet delete <key> --force` | remove one database and its sidecars |
+| `autumn fleet restore <key> [--timestamp T] --force` | rebuild one database from its replica; `--timestamp` sets a point in time |
+
+```shell
+autumn fleet list --open
+autumn fleet migrate --concurrency 4
+autumn fleet backup tenant:acme /backups/acme.db
+autumn fleet delete tenant:acme --force
+autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+```
+
+- A key is a name as `autumn fleet list` prints it: `tenant:<id>` or
+  `slot:<nnnnn>`. `tenant/<id>` and `slot/<n>` are also accepted.
+- No command creates the fleet root. Each command stops when
+  `database.fleet.root` does not exist, so a wrong directory does not give an
+  empty fleet. For a new volume, create the root directory first.
+- Only `restore` creates a database file. The other commands do not.
+- Like boot, each command validates `[database]` first and stops when the
+  control database resolves inside the fleet root.
+- `list --open` reads each file and changes no data. It exits non-zero when
+  it cannot read a file.
+- `migrate` reads the app's `migrations/` directory. It does not apply plugin
+  migrations. For those, run the app once with `AUTUMN_MIGRATE=1`. If an app
+  migration has the same version as a framework migration, `migrate` stops:
+  only boot can record that pair correctly. `migrate` also stops when a
+  database records a migration that is not in `migrations/` or the framework
+  sets (a plugin migration, for example). It checks each database again
+  inside the migration's write lock, so a file replaced after the first check
+  is not migrated. After you add a plugin, run the app once
+  with `AUTUMN_MIGRATE=1` before you use `fleet migrate`: until then, no
+  database records the plugin's migrations, so `migrate` cannot see them.
+- A failure on one database does not stop the others. `migrate` lists each
+  failure and exits non-zero.
+- With `[replication]` on, a migration of a database that the app has open
+  can make the replicator start a new generation. `AUTUMN_MIGRATE=1` does the
+  same.
+- `backup` never replaces or follows a file at `dest`. On Unix, only its
+  owner can read the copy, and `backup` stops when another user could change
+  a directory on the way to `dest`: each one must belong to root or to you,
+  and must not be writable by others unless it has the sticky bit (as `/tmp`
+  has). On Windows, the copy gets the ACL of the `dest`
+  directory: put backups in a directory that only you can read.
+- `delete` and `restore` destroy data, so they need `--force` on every
+  profile. When another process has the file open (an app that serves the
+  tenant), they stop with "open in another process" and change nothing. Wait
+  until the app closes the database (`idle_close_secs`), or stop the app.
+- `restore` verifies the replica chain before it replaces the file, as
+  `autumn db replica restore` does.
+- `delete` does not remove the replica. With `restore_missing = true`, the app
+  restores a deleted database on the next request for it.
+- On Windows, another process can open the database while `delete` or
+  `restore` removes files (see [Limits](#limits)). The command then
+  stops with "open in another process" or "created ... during the restore".
+  The replica keeps the data. Stop the app, then run the command again.
+
 ## Migrations
 
 Every fleet database gets the app's migrations and the shard framework tables
@@ -144,7 +218,8 @@ Every fleet database gets the app's migrations and the shard framework tables
   migrations (`database.auto_migrate`, `auto_migrate_in_production`).
 - Otherwise opening one with pending migrations answers `503` until you run
   the app once with `AUTUMN_MIGRATE=1`, which migrates the control database
-  and then every fleet database.
+  and then every fleet database. `autumn fleet migrate` migrates the fleet
+  databases only (see [Operating the fleet](#operating-the-fleet)).
 
 Each database's run is one `BEGIN IMMEDIATE` transaction: atomic, and safe
 when two processes race. During a rollout the fleet is mixed, so write

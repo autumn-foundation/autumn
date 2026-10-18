@@ -2989,8 +2989,14 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - The control database lives outside `root` (validation refuses it inside).
 - Outbox rows and derivation backfill stay on the control database.
 - Tests: `TestApp::new().with_db(control).with_fleet(fleet)`.
+- Out of band (stopped or live app), with the `sqlite` CLI build:
+  `autumn fleet list --open`, `migrate [--key K]`, `backup <key> <dest>`,
+  `delete <key> --force`, `restore <key> [--timestamp T] --force`. Keys are
+  `tenant:<id>` / `slot:<nnnnn>`. A file another process has open is refused
+  ("open in another process"). `migrate` reads `migrations/` only: plugin
+  sets need `AUTUMN_MIGRATE=1`. Run it from the app directory.
 
-See `docs/guide/sqlite-fleet.md`.
+See `docs/guide/sqlite-fleet.md` ("Operating the fleet").
 
 ## Cell and shuffle-shard isolation (issue #3072)
 
@@ -3488,6 +3494,7 @@ autumn db backup --keep 7        # dump control DB + shards to ./backups/<profil
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
 autumn db replica restore --force        # SQLite tier: rebuild from the continuous replica; --timestamp <RFC3339> for PITR, --overwrite to replace an existing file  # (0.7.0)
 autumn db replica status --json          # replica generation, segments, and current replication lag; db replica verify proves it restorable  # (0.7.0)
+autumn fleet list --open                 # SQLite fleet (sqlite CLI build): every tenant/slot database; migrate | backup <key> <dest> | delete <key> --force | restore <key> [--timestamp T] --force
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
 autumn db scrub --sample users=1% --seed 42            # scrub AND subset in one pass: 1% of users plus every row they relate to, reproducibly
 autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
