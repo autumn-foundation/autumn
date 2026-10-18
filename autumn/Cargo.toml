@@ -849,6 +849,14 @@ path = "tests/trusted_proxies_alloc_gate.rs"
 name = "request_meta_alloc_gate"
 path = "tests/request_meta_alloc_gate.rs"
 
+# Allocation gate for recording a DB query sample: a query key the collector
+# already holds is found with a borrowed lookup, and `run_instrumented` composes
+# its `"{route} {verb}"` key on the stack instead of a `String` per query. Own
+# binary for the same `allocation-counter` global-allocator reason as
+# `config_alloc_gate` above.
+[[test]]
+name = "db_metrics_alloc_gate"
+path = "tests/db_metrics_alloc_gate.rs"
 
 
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under

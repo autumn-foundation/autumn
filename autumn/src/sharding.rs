@@ -1843,13 +1843,13 @@ fn cross_shard_seed(
             FLEET_METRIC_LABEL,
             crate::repository::ReadRoute::Primary,
         );
-        seed.route.clone_from(&ctx.route_key);
+        seed.route = ctx.route_key.as_ref().map(ToString::to_string);
         return Ok(seed);
     }
     let shard = set.iter().next().ok_or_else(no_shards_configured)?;
     let mut seed =
         ShardRepositorySeed::from_ctx(shard.primary_pool(), ctx, shard.name(), shard.read_route());
-    seed.route.clone_from(&ctx.route_key);
+    seed.route = ctx.route_key.as_ref().map(ToString::to_string);
     Ok(seed)
 }
 
@@ -2158,9 +2158,9 @@ impl Shards {
             idle_in_transaction_timeout: ctx.idle_in_transaction_timeout,
             // Tag the route metric with the shard so per-shard latency
             // separates in /actuator/metrics.
-            route_key: ctx
-                .route_key
-                .map(|key| format!("{key} shard={}", shard.metric_label())),
+            route_key: ctx.route_key.map(|key| {
+                crate::db::RouteKey::Composed(format!("{key} shard={}", shard.metric_label()))
+            }),
             metrics: ctx.metrics,
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
@@ -3213,7 +3213,7 @@ mod tests {
         let ctx = crate::db::RequestDbContext {
             idle_in_transaction_timeout: None,
             statement_timeout: None,
-            route_key: Some("GET /notes".to_owned()),
+            route_key: Some(crate::db::RouteKey::Composed("GET /notes".to_owned())),
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
@@ -3244,7 +3244,7 @@ mod tests {
             ctx: crate::db::RequestDbContext {
                 idle_in_transaction_timeout: None,
                 statement_timeout: None,
-                route_key: Some("GET /test".to_owned()),
+                route_key: Some(crate::db::RouteKey::Composed("GET /test".to_owned())),
                 metrics: None,
                 slow_query_threshold: std::time::Duration::from_millis(500),
                 interceptors: Vec::new(),
@@ -3548,7 +3548,7 @@ mod tests {
         let ctx = crate::db::RequestDbContext {
             idle_in_transaction_timeout: None,
             statement_timeout: Some(std::time::Duration::from_secs(3)),
-            route_key: Some("GET /test".to_owned()),
+            route_key: Some(crate::db::RouteKey::Composed("GET /test".to_owned())),
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(200),
             interceptors: Vec::new(),
@@ -3602,7 +3602,7 @@ mod tests {
         let ctx = crate::db::RequestDbContext {
             idle_in_transaction_timeout: None,
             statement_timeout: Some(std::time::Duration::from_millis(1500)),
-            route_key: Some("GET /admin".to_owned()),
+            route_key: Some(crate::db::RouteKey::Composed("GET /admin".to_owned())),
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(250),
             interceptors: Vec::new(),

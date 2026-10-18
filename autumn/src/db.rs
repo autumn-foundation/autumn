@@ -1326,8 +1326,10 @@ where
 
     // Record metrics regardless of success/failure
     let verb = sql.split_whitespace().next().unwrap_or("?");
-    let metric_key = format!("{route_key} {verb}");
-    metrics.record_db_query(&metric_key, elapsed_ms);
+    // Composed on the stack rather than into a `String` per query. Kept to
+    // this one statement: `fmt::Arguments` is `!Send` and must not live across
+    // an `.await` of this future.
+    metrics.record_db_query_fmt(format_args!("{route_key} {verb}"), elapsed_ms);
     // NOTE: deliberately *not* recorded into the per-request Server-Timing
     // accumulator. The connection-level `RequestQueryTimer` instrumentation
     // (installed at `Db::checkout`) already brackets every executed statement
@@ -3192,7 +3194,7 @@ pub struct Db {
     span: tracing::Span,
     tx_depth: usize,
     tx_poisoned: bool,
-    route_key: Option<String>,
+    route_key: Option<RouteKey>,
     metrics: Option<crate::middleware::MetricsCollector>,
     slow_query_threshold: std::time::Duration,
     /// Checkout instant on the injected clock's monotonic timeline; `Drop`
@@ -3787,6 +3789,33 @@ impl std::ops::DerefMut for Db {
     }
 }
 
+/// The per-route DB metrics key, `"METHOD /matched/path"`.
+///
+/// A matched route keeps the request's method and axum's shared
+/// [`MatchedPath`](axum::extract::MatchedPath) (an `Arc<str>`) and is composed
+/// only when written — at record time, into a stack buffer — instead of a fresh
+/// `String` per `Db` extraction. Anything already composed (an unmatched
+/// request's raw path, a shard-tagged label) is kept as-is.
+#[derive(Clone)]
+pub(crate) enum RouteKey {
+    /// A route axum matched: the method plus its shared matched-path template.
+    Matched {
+        method: axum::http::Method,
+        path: axum::extract::MatchedPath,
+    },
+    /// A key composed up front, written verbatim.
+    Composed(String),
+}
+
+impl std::fmt::Display for RouteKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Matched { method, path } => write!(f, "{method} {}", path.as_str()),
+            Self::Composed(key) => f.pad(key),
+        }
+    }
+}
+
 /// Everything required to check out and instrument a pooled connection.
 ///
 /// Shared by the plain [`Db`] extractor and shard-routed checkouts so that
@@ -3807,7 +3836,7 @@ pub(crate) struct DbCheckoutParams<'a> {
     /// transactions. `None` disables it.
     pub idle_in_transaction_timeout: Option<std::time::Duration>,
     /// `"METHOD /matched/path"` key used for per-route DB metrics.
-    pub route_key: Option<String>,
+    pub route_key: Option<RouteKey>,
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
@@ -4120,7 +4149,7 @@ impl Db {
 pub(crate) struct RequestDbContext {
     pub statement_timeout: Option<std::time::Duration>,
     pub idle_in_transaction_timeout: Option<std::time::Duration>,
-    pub route_key: Option<String>,
+    pub route_key: Option<RouteKey>,
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
@@ -4133,16 +4162,25 @@ impl RequestDbContext {
     pub(crate) fn from_parts<S: DbState>(parts: &axum::http::request::Parts, state: &S) -> Self {
         note_route_statement_timeout(parts);
         let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
-        let matched_path = parts
+        // A matched route keeps the method and axum's shared `MatchedPath`: no
+        // `String` per extraction. Only a request no route matched (a fallback)
+        // composes its raw path, exactly as before.
+        let route_key = parts
             .extensions
             .get::<axum::extract::MatchedPath>()
-            .map_or_else(|| parts.uri.path(), axum::extract::MatchedPath::as_str);
+            .map_or_else(
+                || RouteKey::Composed(format!("{} {}", parts.method, parts.uri.path())),
+                |path| RouteKey::Matched {
+                    method: parts.method.clone(),
+                    path: path.clone(),
+                },
+            );
         Self {
             statement_timeout: timeout_override
                 .map(|t| t.0)
                 .or_else(|| state.statement_timeout()),
             idle_in_transaction_timeout: state.idle_in_transaction_timeout(),
-            route_key: Some(format!("{} {}", parts.method, matched_path)),
+            route_key: Some(route_key),
             metrics: state.metrics().cloned(),
             slow_query_threshold: state.slow_query_threshold(),
             interceptors: state.db_interceptors(),
@@ -4314,9 +4352,9 @@ impl Drop for Db {
                 .saturating_duration_since(self.start_time);
             let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
-            // Record DB query metric
-            let metric_key = format!("{route_key} SELECT");
-            metrics.record_db_query(&metric_key, elapsed_ms);
+            // Record DB query metric. Composed on the stack: this runs once
+            // per request that extracts `Db`.
+            metrics.record_db_query_fmt(format_args!("{route_key} SELECT"), elapsed_ms);
             // Deliberately not recorded into the Server-Timing per-request
             // accumulator. `elapsed` here is the whole connection
             // checkout-to-release window (see `start_time` and the `span` doc
@@ -6542,6 +6580,102 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The per-route DB metrics key is `"METHOD /matched/path"` byte for byte,
+    /// and a matched route keeps axum's shared `MatchedPath` instead of a
+    /// `String` composed per extraction. An unmatched request keys by raw path.
+    #[tokio::test]
+    async fn request_db_context_keys_by_method_and_matched_path() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::{any, get};
+        use tower::ServiceExt;
+
+        /// Answers with the context's route key, then the metric key `Db`'s
+        /// drop records under it (composed on the stack, as `Drop` does).
+        async fn handler(parts: axum::http::request::Parts) -> String {
+            let ctx = RequestDbContext::from_parts(&parts, &TestDbState);
+            assert!(
+                matches!(ctx.route_key, Some(RouteKey::Matched { .. })),
+                "a matched route must not compose a String per extraction"
+            );
+            let route_key = ctx
+                .route_key
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let metrics = crate::middleware::MetricsCollector::new();
+            if let Some(key) = &ctx.route_key {
+                metrics.record_db_query_fmt(format_args!("{key} SELECT"), 1);
+            }
+            let metric_key = metrics
+                .snapshot()
+                .db_queries
+                .into_keys()
+                .next()
+                .unwrap_or_default();
+            format!("{route_key}\n{metric_key}")
+        }
+
+        async fn body_of(app: Router, request: Request<Body>) -> String {
+            let response = app.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+
+        let app = Router::new()
+            .route("/users/{id}", get(handler))
+            .route("/dav/{*rest}", any(handler));
+
+        let request = Request::builder()
+            .uri("/users/7")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            body_of(app.clone(), request).await,
+            "GET /users/{id}\nGET /users/{id} SELECT"
+        );
+
+        // An extension method too long for `Method`'s inline storage writes
+        // exactly as the old `format!("{} {}", method, path)` did.
+        let request = Request::builder()
+            .method("X-LONG-EXTENSION-VERB")
+            .uri("/dav/a/b")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            body_of(app, request).await,
+            "X-LONG-EXTENSION-VERB /dav/{*rest}\nX-LONG-EXTENSION-VERB /dav/{*rest} SELECT"
+        );
+
+        let (parts, ()) = Request::builder()
+            .method("POST")
+            .uri("/no/route?q=1")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let ctx = RequestDbContext::from_parts(&parts, &TestDbState);
+        assert!(
+            matches!(ctx.route_key, Some(RouteKey::Composed(_))),
+            "a request no route matched composes its raw path"
+        );
+        assert_eq!(
+            ctx.route_key.as_ref().map(ToString::to_string).as_deref(),
+            Some("POST /no/route")
+        );
+    }
+
+    /// A composed key (a shard-tagged label, an unmatched path) is written
+    /// verbatim into both the metric key and the slow-query `route` field.
+    #[test]
+    fn route_key_composed_writes_verbatim() {
+        let key = RouteKey::Composed("GET /notes shard=shard0".to_owned());
+        assert_eq!(key.to_string(), "GET /notes shard=shard0");
+        assert_eq!(format!("{key} SELECT"), "GET /notes shard=shard0 SELECT");
     }
 
     /// #2264: `Db` is a `FromRequestParts` extractor. Axum runs it before a
