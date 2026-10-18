@@ -198,7 +198,7 @@ mod tests {
                 let rest = &tokens[at + def.len()..];
                 rest[..rest.find(';').unwrap()].trim().to_owned()
             })
-            .or_else(|| fallback.map(|f| f.trim().to_owned()))
+            .or_else(|| fallback.map(resolve))
             .unwrap_or_else(|| panic!("`{name}` is neither a token nor has a fallback"))
     }
 
@@ -214,6 +214,27 @@ mod tests {
             .next_back()
             .unwrap_or_else(|| panic!("`{selector}` has no `{prop}`"));
         resolve(line.trim_end_matches(';'))
+    }
+
+    /// Status chips keep their light tint under dark themes (the Midnight
+    /// story re-themes `--text` but not `--*-light`), so their foreground must
+    /// not be derived from `--text`: mixing toward a light `--text` would
+    /// lighten it against a light chip (2.3:1 on Midnight).
+    #[test]
+    fn status_chip_text_is_independent_of_the_theme_foreground() {
+        for selector in [
+            ".badge--success",
+            ".badge--warning",
+            ".alert-success",
+            ".alert-warning",
+        ] {
+            let at = WIDGETS_COMPONENT_CSS
+                .find(&format!("{selector} {{"))
+                .unwrap();
+            let body = &WIDGETS_COMPONENT_CSS[at..];
+            let body = &body[..body.find('}').unwrap()];
+            assert!(!body.contains("var(--text"), "{selector} reads --text");
+        }
     }
 
     /// Wayfinder audit (contrast, tier 1): computed text/background pairs of
