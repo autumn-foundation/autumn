@@ -9,6 +9,10 @@ the leaderboard's 5 `calls` are the front pages. Postgres 16 + `pg_stat_statemen
 3M comments, ~3M votes, power-law skew). The seed ends with `VACUUM (ANALYZE)` on every table, so the visibility map is set
 (index-only scans need it) — both runs were taken in that state.
 
+Prerequisite: Postgres must preload `pg_stat_statements`; the stock compose service does not. e.g.
+`docker compose -f examples/reddit-clone/docker-compose.yml run -d -p 5433:5432 db -c shared_preload_libraries=pg_stat_statements -c track_io_timing=on`
+(or add that `command:` to your local compose file; the compose invocation is untested here — my sandbox has no Docker, I used a local Postgres 16 with the same settings). `run.sh` checks this and runs `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`.
+
 Reproduce (one database for every command; the default matches `docker-compose.yml`/`autumn-dev.toml`):
 ```
 export DATABASE_URL=postgres://autumn:autumn@127.0.0.1:5433/reddit

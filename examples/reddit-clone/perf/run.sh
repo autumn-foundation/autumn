@@ -9,6 +9,13 @@ DATABASE_URL=${DATABASE_URL:-postgres://autumn:autumn@127.0.0.1:5433/reddit}
 PSQL=${PSQL:-"psql $DATABASE_URL"}
 BASE=${BASE:-http://localhost:3000}
 q() { $PSQL -Atq -c "$1"; }
+# Preflight: the profile is read from pg_stat_statements, which must be preloaded by the
+# server (postgres -c shared_preload_libraries=pg_stat_statements -c track_io_timing=on).
+case "$(q 'show shared_preload_libraries')" in
+  *pg_stat_statements*) ;;
+  *) echo "run.sh: server must start with -c shared_preload_libraries=pg_stat_statements" >&2; exit 1;;
+esac
+q "create extension if not exists pg_stat_statements" >/dev/null
 # workload targets: 3 hot posts (most comments), 3 mid, 3 cold; 3 subs of varying size
 HOT=$(q "select s.slug||'/posts/'||p.slug from posts p join subreddits s on s.id=p.subreddit_id order by p.comment_count desc limit 3")
 MID=$(q "select s.slug||'/posts/'||p.slug from posts p join subreddits s on s.id=p.subreddit_id where p.comment_count between 20 and 40 order by p.id limit 3")
