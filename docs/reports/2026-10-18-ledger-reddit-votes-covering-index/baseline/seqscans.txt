@@ -1,0 +1,14 @@
+            relname            | seq_scan | seq_tup_read | idx_scan 
+-------------------------------+----------+--------------+----------
+ votes                         |       15 |     14957145 |        0
+ users                         |        6 |       600000 |      818
+ subreddits                    |        5 |         5000 |       35
+ tags                          |       10 |         1505 |       22
+ autumn_feature_flags          |       10 |           20 |        0
+ autumn_jobs                   |      110 |            0 |        0
+ autumn_experiment_assignments |        0 |            0 |        0
+ post_tags                     |        0 |            0 |       32
+ feature_flag_changes          |        0 |            0 |        0
+ _autumn_shard_map             |        0 |            0 |        0
+(10 rows)
+
