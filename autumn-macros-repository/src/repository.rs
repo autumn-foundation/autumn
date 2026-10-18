@@ -126,6 +126,24 @@ fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result
     Ok(output)
 }
 
+/// [`generate_topic_format`] for a site that only *borrows* the topic.
+///
+/// A topic with no `{` is emitted as its own `&'static str` literal rather than
+/// `ToString::to_string(literal)`, so publishing on a static topic (the default:
+/// the table name) no longer allocates a fresh copy of it per broadcast; any
+/// other topic is `generate_topic_format`'s owned `String`. The two arms have
+/// different types, so splice this only where the topic is read by reference
+/// (`&__topic`, `__prev != __topic`, a `format!` argument) — never into a
+/// `String`-typed slot (`Option<String>` previous topics, the `(String, String)`
+/// delete tuples, a `Value::String` context entry).
+fn generate_topic_ref(topic: &str, record_ident: &TokenStream) -> syn::Result<TokenStream> {
+    if topic.contains('{') {
+        generate_topic_format(topic, record_ident)
+    } else {
+        Ok(quote! { #topic })
+    }
+}
+
 /// Which of the generated CRUD routes the `mcp` key opts in as MCP tools.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum McpExpose {
@@ -2285,16 +2303,28 @@ fn vh_insert_ts(
     // overridable by a `before_*` hook). Non-hooked repos have no `ctx`, so they
     // read the ambient current actor directly. Both fall back to the canonical
     // `SYSTEM_ACTOR` when no actor is in scope.
-    let actor_ts = if with_ctx {
+    //
+    // The resolved actor is only ever read as `&str` (`VersionHistoryWrite.actor`,
+    // `LedgerAppend.actor`), so it is borrowed rather than owned: straight out of
+    // `ctx` on the hooked path (the same borrow `__vh_request_id` already holds
+    // across the awaits below), out of a local holding the ambient actor on the
+    // non-hooked one, and the `&'static` `SYSTEM_ACTOR` otherwise. That saves a
+    // `String` per versioned write — the `ctx.actor` copy, or the
+    // `SYSTEM_ACTOR.to_string()` fallback.
+    let actor_bind_ts = if with_ctx {
         quote! {
-            ctx.actor
-                .clone()
-                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+            let __vh_actor: &str = ctx
+                .actor
+                .as_deref()
+                .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR);
         }
     } else {
         quote! {
-            ::autumn_web::current::Current::actor()
-                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+            let __vh_actor_scoped: ::core::option::Option<::std::string::String> =
+                ::autumn_web::current::Current::actor();
+            let __vh_actor: &str = __vh_actor_scoped
+                .as_deref()
+                .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR);
         }
     };
     let request_id_ts = if with_ctx {
@@ -2377,7 +2407,7 @@ fn vh_insert_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_tenant_id()
             };
-            let __vh_actor: ::std::string::String = #actor_ts;
+            #actor_bind_ts
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
             // The statement itself — both backend arms, all seven binds — lives
             // in `autumn_web::version_history` rather than here. It is fully
@@ -2391,7 +2421,7 @@ fn vh_insert_ts(
                     tenant_id: __vh_tenant_id,
                     record_id: __vh_record_id,
                     op: #op_variant,
-                    actor: __vh_actor.as_str(),
+                    actor: __vh_actor,
                     request_id: __vh_request_id,
                     changes_json: __vh_changes_str.as_str(),
                 },
@@ -2602,7 +2632,8 @@ fn ledger_append_ts(
                     tenant_id: __lg_tenant_id,
                     record_id: __lg_record_id,
                     op: #op_variant,
-                    actor: __vh_actor.as_str(),
+                    // `vh_insert_ts`'s borrowed `&str` actor binding.
+                    actor: __vh_actor,
                     request_id: __vh_request_id,
                     snapshot: __lg_snapshot,
                     valid_from: __lg_valid_from,
@@ -10830,7 +10861,9 @@ fn emit_crud_bodies_hooked(
     };
 
     let (broadcast_create, broadcast_update, broadcast_delete) = if config.broadcasts {
-        let base_topic_expr = match generate_topic_format(
+        // Every use of this topic below is a `let __topic = ...;` read only by
+        // reference, so a static topic stays its `&'static str` literal.
+        let base_topic_expr = match generate_topic_ref(
             config
                 .broadcast_topic
                 .as_deref()
@@ -10857,6 +10890,9 @@ fn emit_crud_bodies_hooked(
             .unwrap_or(&default_container);
         let model_prefix = to_snake_case(&config.model_name.to_string());
 
+        // `container_expr` is a macro-time string, so the create swap id is
+        // spliced as its `&'static str` literal: `publish_oob` only borrows it,
+        // and a `.to_string()` here was one more allocation per broadcast create.
         let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
             if let Some(ref render_path) = config.broadcast_render {
                 let extract_id = quote! {
@@ -10865,7 +10901,7 @@ fn emit_crud_bodies_hooked(
                 };
                 (
                     quote! { #render_path(__record_ref) },
-                    quote! { #container_expr.to_string() },
+                    quote! { #container_expr },
                     quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
                     extract_id.clone(),
                     extract_id,
@@ -10874,7 +10910,7 @@ fn emit_crud_bodies_hooked(
                 let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
                 (
                     quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
-                    quote! { #container_expr.to_string() },
+                    quote! { #container_expr },
                     quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
                     dom_id.clone(),
                     dom_id,
@@ -10887,11 +10923,11 @@ fn emit_crud_bodies_hooked(
                 if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                     let __topic = #topic_expr;
                     let __fragment = #render_expr;
-                    let __create_id = #create_swap_id;
+                    let __create_id: &str = #create_swap_id;
                     let __create_swap = #create_swap_strategy;
                     if let ::core::result::Result::Err(__err) = __channels
                         .broadcast()
-                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        .publish_oob(&__topic, __create_id, &__create_swap, &__fragment)
                     {
                         ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                     }
@@ -14340,10 +14376,11 @@ fn emit_dependent_cascade(
             quote! {
                 {
                     let __broadcast_rec: &#model_name = &__record;
-                    let __del_topic: ::std::string::String =
-                        ::std::string::ToString::to_string(&#topic_expr);
-                    let __del_id: ::std::string::String =
-                        ::std::string::ToString::to_string(&#dom_id_expr);
+                    // Both expressions already yield an owned `String`;
+                    // `ToString::to_string(&..)` around them only copied it
+                    // again, per destroyed child row.
+                    let __del_topic: ::std::string::String = #topic_expr;
+                    let __del_id: ::std::string::String = #dom_id_expr;
                     __ret_broadcasts.push((__del_topic, __del_id));
                 }
             }
@@ -20358,19 +20395,42 @@ fn emit_write_bodies(
             }
         };
 
-        let topic_expr_outer = if config.tenant_scoped {
-            quote! {
-                ::std::format!(
-                    "tenant:{}:{}",
-                    ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
-                        &__record_ref.tenant_id
-                    ),
-                    #base_topic_expr_outer
-                )
+        // Borrow-only twin of `base_topic_expr_outer` for the `let __topic = ...;`
+        // publish sites, where a static topic stays a `&'static str` rather than
+        // being re-owned per broadcast. The `String`-typed slots
+        // (`__autumn_prev_topic`, the delete tuples, the delete_many pre-fetch
+        // vec) keep the owned `topic_expr_outer`.
+        let base_topic_ref_outer = match generate_topic_ref(
+            config
+                .broadcast_topic
+                .as_deref()
+                .unwrap_or(&config.table_name),
+            &quote! { __record_ref },
+        ) {
+            Ok(expr) => expr,
+            Err(err) => {
+                let compile_err = err.to_compile_error();
+                return Err(quote! { #compile_err });
             }
-        } else {
-            base_topic_expr_outer
         };
+
+        let scope_topic_to_tenant = |base_topic: TokenStream| {
+            if config.tenant_scoped {
+                quote! {
+                    ::std::format!(
+                        "tenant:{}:{}",
+                        ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                            &__record_ref.tenant_id
+                        ),
+                        #base_topic
+                    )
+                }
+            } else {
+                base_topic
+            }
+        };
+        let topic_expr_outer = scope_topic_to_tenant(base_topic_expr_outer);
+        let topic_ref_outer = scope_topic_to_tenant(base_topic_ref_outer);
 
         let model_prefix_outer = to_snake_case(&config.model_name.to_string());
         let default_container_outer = format!("{}-list", config.table_name);
@@ -20379,6 +20439,9 @@ fn emit_write_bodies(
             .as_deref()
             .unwrap_or(&default_container_outer);
 
+        // As in the commit-hook runner, the create swap id is the container's
+        // `&'static str` literal: `publish_oob` only borrows it. (The update
+        // path's `(String, OobSwap)` target tuple still owns its copy.)
         let (render_expr_outer, create_swap_id_outer, create_swap_outer, update_id_outer) =
             if let Some(ref render_path) = config.broadcast_render {
                 let extract_id = quote! {
@@ -20395,7 +20458,7 @@ fn emit_write_bodies(
                 };
                 (
                     quote! { #render_path(__record_ref) },
-                    quote! { #container_expr_outer.to_string() },
+                    quote! { #container_expr_outer },
                     quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
                     extract_id,
                 )
@@ -20406,7 +20469,7 @@ fn emit_write_bodies(
                             __record_ref
                         )
                     },
-                    quote! { #container_expr_outer.to_string() },
+                    quote! { #container_expr_outer },
                     quote! {
                         <#model_name as ::autumn_web::live::LiveFragment>::insert_swap()
                     },
@@ -20464,13 +20527,13 @@ fn emit_write_bodies(
                 if let ::core::option::Option::Some(__channels) =
                     ::autumn_web::__private::get_global_channels()
                 {
-                    let __topic = #topic_expr_outer;
+                    let __topic = #topic_ref_outer;
                     let __fragment = #render_expr_outer;
-                    let __create_id = #create_swap_id_outer;
+                    let __create_id: &str = #create_swap_id_outer;
                     let __create_swap = #create_swap_outer;
                     if let ::core::result::Result::Err(__err) = __channels
                         .broadcast()
-                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        .publish_oob(&__topic, __create_id, &__create_swap, &__fragment)
                     {
                         ::autumn_web::reexports::tracing::warn!(
                             error = %__err,
@@ -20522,7 +20585,7 @@ fn emit_write_bodies(
                     if let ::core::option::Option::Some(__channels) =
                         ::autumn_web::__private::get_global_channels()
                     {
-                        let __topic = #topic_expr_outer;
+                        let __topic = #topic_ref_outer;
                         let __fragment = #render_expr_outer;
                         let __id = #update_id_outer;
 
@@ -20605,7 +20668,7 @@ fn emit_write_bodies(
                     if let ::core::option::Option::Some(__channels) =
                         ::autumn_web::__private::get_global_channels()
                     {
-                        let __topic = #topic_expr_outer;
+                        let __topic = #topic_ref_outer;
                         let __fragment = #render_expr_outer;
                         let __id = #update_id_outer;
                         if let ::core::result::Result::Err(__err) = __channels
@@ -20733,7 +20796,7 @@ fn emit_write_bodies(
                     {
                         for __autumn_record in __autumn_result_vec {
                             let __record_ref = __autumn_record;
-                            let __topic = #topic_expr_outer;
+                            let __topic = #topic_ref_outer;
                             let __fragment = #render_expr_outer;
                             let __id = #update_id_outer;
                             if let ::core::result::Result::Err(__err) = __channels
@@ -23908,9 +23971,56 @@ mod tests {
             "hooked versioned save_many must record history for each inserted record before moving chunk results: {section}"
         );
         assert!(
-            section.contains("ctx . actor . clone"),
+            section.contains("ctx . actor . as_deref ()"),
             "hooked versioned save_many history should use the per-record MutationContext: {section}"
         );
+    }
+
+    /// The version-history actor is only read as `&str`, so both the hooked
+    /// (`ctx.actor`) and non-hooked (`Current::actor()`) paths borrow it and
+    /// fall back to the `&'static` `SYSTEM_ACTOR` — no per-write `String`.
+    #[test]
+    fn versioned_history_actor_is_borrowed_not_reallocated() {
+        for (args, actor_source) in [
+            (
+                quote! { Post, versioned = true },
+                "let __vh_actor_scoped : :: core :: option :: Option < :: std :: string :: String > = :: autumn_web :: current :: Current :: actor () ;",
+            ),
+            (
+                quote! { Post, hooks = PostHooks, versioned = true },
+                "let __vh_actor : & str = ctx . actor . as_deref ()",
+            ),
+        ] {
+            let generated =
+                repository_macro(args, quote! { pub trait PostRepository {} }).to_string();
+            assert!(generated.contains("append_version_history"), "{generated}");
+            assert!(
+                !generated.contains("SYSTEM_ACTOR . to_string ()"),
+                "the SYSTEM_ACTOR fallback must stay a &'static str: {generated}"
+            );
+            assert!(
+                !generated.contains("ctx . actor . clone ()"),
+                "the hooked actor must be borrowed from ctx: {generated}"
+            );
+            assert!(
+                !generated.contains("__vh_actor . as_str ()"),
+                "the actor binding is already a &str: {generated}"
+            );
+            assert!(
+                generated.contains(
+                    ". unwrap_or (:: autumn_web :: version_history :: VersionEntry :: SYSTEM_ACTOR) ;"
+                ),
+                "the actor must still fall back to SYSTEM_ACTOR: {generated}"
+            );
+            assert!(
+                generated.contains("actor : __vh_actor ,"),
+                "the version-history write must take the borrowed actor: {generated}"
+            );
+            assert!(
+                generated.contains(actor_source),
+                "the actor must be read from `{actor_source}`: {generated}"
+            );
+        }
     }
 
     #[test]
@@ -25467,6 +25577,138 @@ mod tests {
         );
     }
 
+    /// The cascade's topic and dom id expressions already yield owned
+    /// `String`s, so the accumulated `(topic, dom_id)` pair takes them as-is
+    /// instead of copying each through `ToString::to_string(&..)` per row.
+    #[test]
+    fn repository_macro_dependent_destroy_broadcast_does_not_recopy_topic_or_dom_id() {
+        let generated = repository_macro(
+            quote! { Comment, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("__ret_broadcasts . push"),
+            "{destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("ToString :: to_string (&"),
+            "the cascade must not copy an already-owned topic / dom id: {destroy_arm}"
+        );
+        // The pushed values themselves are unchanged: the static topic and the
+        // model's own `LiveFragment::dom_id`.
+        assert!(
+            destroy_arm.contains(
+                "let __del_topic : :: std :: string :: String = :: std :: string :: ToString :: to_string (\"comments\") ;"
+            ),
+            "{destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains(
+                "let __del_id : :: std :: string :: String = < Comment as :: autumn_web :: live :: LiveFragment > :: dom_id (__broadcast_rec) ;"
+            ),
+            "{destroy_arm}"
+        );
+    }
+
+    /// A static broadcast topic and the create container are spliced as
+    /// `&'static str` literals at the publish sites that only borrow them,
+    /// rather than re-owned per publish — on both the inline (`--live`) path
+    /// and the commit-hook runner.
+    #[test]
+    fn repository_macro_broadcast_static_topic_and_container_are_borrowed() {
+        for args in [
+            quote! { Post, broadcasts = true },
+            quote! { Post, hooks = PostHooks, commit_hooks = true, broadcasts = true },
+        ] {
+            let generated =
+                repository_macro(args, quote! { pub trait PostRepository {} }).to_string();
+            assert!(
+                generated.contains("let __topic = \"posts\" ;"),
+                "a static topic must be borrowed at the publish site: {generated}"
+            );
+            assert!(
+                !generated.contains(
+                    "let __topic = :: std :: string :: ToString :: to_string (\"posts\")"
+                ),
+                "a static topic must not be re-owned per publish: {generated}"
+            );
+            assert!(
+                generated.contains("let __create_id : & str = \"posts-list\" ;")
+                    && !generated.contains("\"posts-list\" . to_string ()"),
+                "the create container must be a borrowed literal: {generated}"
+            );
+            assert!(
+                generated.contains("publish_oob (& __topic , __create_id ,"),
+                "the create publish must pass the borrowed container id: {generated}"
+            );
+        }
+    }
+
+    /// A tenant-scoped static topic still formats as `tenant:{id}:{topic}`; only
+    /// the inner topic argument is now the literal rather than a fresh `String`.
+    #[test]
+    fn repository_macro_broadcast_tenant_scoped_static_topic_formats_the_literal() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, broadcasts = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("\"tenant:{}:{}\""),
+            "a tenant-scoped topic keeps its tenant prefix: {generated}"
+        );
+        assert!(
+            generated.contains("__record_ref . tenant_id) , \"posts\")"),
+            "the static base topic is a format! argument literal: {generated}"
+        );
+    }
+
+    /// `generate_topic_ref` only diverges from `generate_topic_format` for a
+    /// topic without `{`: that one becomes its own literal. Placeholder topics
+    /// and an unclosed `{` keep the owned expression, byte-for-byte.
+    #[test]
+    fn generate_topic_ref_borrows_only_static_topics() {
+        let record = quote! { __record_ref };
+        assert_eq!(
+            generate_topic_ref("posts", &record)
+                .expect("static topic")
+                .to_string(),
+            "\"posts\""
+        );
+        assert_eq!(
+            generate_topic_format("posts", &record)
+                .expect("static topic")
+                .to_string(),
+            ":: std :: string :: ToString :: to_string (\"posts\")",
+            "the owned form, still used by String-typed slots, is unchanged"
+        );
+        // A `}` alone is not a placeholder: the literal is the same bytes the
+        // owned form copies.
+        assert_eq!(
+            generate_topic_ref("a}b", &record)
+                .expect("static topic")
+                .to_string(),
+            "\"a}b\""
+        );
+        for topic in ["feed:{category}", "a{b", "{tenant}:{category}"] {
+            assert_eq!(
+                generate_topic_ref(topic, &record)
+                    .expect("valid topic")
+                    .to_string(),
+                generate_topic_format(topic, &record)
+                    .expect("valid topic")
+                    .to_string(),
+                "`{topic}` must keep the owned expression"
+            );
+        }
+        assert!(
+            generate_topic_ref("{}", &record).is_err(),
+            "an empty placeholder is still rejected"
+        );
+    }
+
     #[test]
     fn repository_generates_typed_list_method() {
         // #1126: `list()` is generated alongside `page()` and delegates
@@ -26814,7 +27056,7 @@ mod tests {
             "tenant_id : __vh_tenant_id",
             "record_id : __vh_record_id",
             "op : :: autumn_web :: version_history :: VersionOp :: Insert",
-            "actor : __vh_actor . as_str ()",
+            "actor : __vh_actor ,",
             "request_id : __vh_request_id",
             "changes_json : __vh_changes_str . as_str ()",
         ] {
