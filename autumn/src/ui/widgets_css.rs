@@ -162,6 +162,28 @@ mod tests {
     /// applies when the token is undefined.
     fn resolve(value: &str) -> String {
         let value = value.trim();
+        if let Some(args) = value
+            .strip_prefix("color-mix(in srgb,")
+            .and_then(|v| v.strip_suffix(')'))
+        {
+            // `<color> <pct>%, <color>`
+            let (first, second) = args.split_once("%,").unwrap();
+            let (a, pct) = first.trim().rsplit_once(' ').unwrap();
+            let weight = pct.parse::<f64>().unwrap() / 100.0;
+            let (a, b) = (resolve(a), resolve(second));
+            let mixed: String = (0..3)
+                .map(|i| {
+                    let c = |h: &str| {
+                        f64::from(u8::from_str_radix(&h[1 + i * 2..3 + i * 2], 16).unwrap())
+                    };
+                    format!(
+                        "{:02x}",
+                        (c(&a) * weight + c(&b) * (1.0 - weight)).round() as u8
+                    )
+                })
+                .collect();
+            return format!("#{mixed}");
+        }
         let Some(inner) = value.strip_prefix("var(").and_then(|v| v.strip_suffix(')')) else {
             return value.to_owned();
         };
@@ -188,7 +210,8 @@ mod tests {
         let body = &body[..body.find('}').unwrap()];
         let line = body
             .lines()
-            .find_map(|l| l.trim().strip_prefix(&format!("{prop}:")))
+            .filter_map(|l| l.trim().strip_prefix(&format!("{prop}:")))
+            .last()
             .unwrap_or_else(|| panic!("`{selector}` has no `{prop}`"));
         resolve(line.trim_end_matches(';'))
     }

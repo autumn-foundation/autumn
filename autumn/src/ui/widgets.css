@@ -978,7 +978,8 @@
 
 .autumn-job-status__success {
     font-size: 0.875rem;
-    color: var(--success-text, #065f46);
+    color: #065f46;
+    color: color-mix(in srgb, var(--success, #059669) 60%, var(--text, #111827));
 }
 
 .autumn-job-status__error {
@@ -1015,13 +1016,15 @@
 
 .badge--success {
     background: var(--success-light, #ecfdf5);
-    color: var(--success-text, #065f46);
+    color: #065f46;
+    color: color-mix(in srgb, var(--success, #059669) 60%, var(--text, #111827));
     border-color: var(--success);
 }
 
 .badge--warning {
     background: var(--warning-light, #fffbeb);
-    color: var(--warning-text, #92400e);
+    color: #92400e;
+    color: color-mix(in srgb, var(--warning, #d97706) 60%, var(--text, #111827));
     border-color: var(--warning, #fcd34d);
 }
 
@@ -1177,13 +1180,15 @@
 
 .alert-success {
     background: var(--success-light, #ecfdf5);
-    color: var(--success-text, #065f46);
+    color: #065f46;
+    color: color-mix(in srgb, var(--success, #059669) 60%, var(--text, #111827));
     border-color: var(--success);
 }
 
 .alert-warning {
     background: var(--warning-light, #fffbeb);
-    color: var(--warning-text, #92400e);
+    color: #92400e;
+    color: color-mix(in srgb, var(--warning, #d97706) 60%, var(--text, #111827));
     border-color: var(--warning, #fcd34d);
 }
 
