@@ -3,8 +3,9 @@
 Findings and decision context: #3325.
 
 ## Workload
-reddit-clone `/`, `/r/{sub}`, `/r/{sub}/posts/{slug}` over HTTP, 27 requests (5 front page, 9 sub pages, 9 post pages),
-Postgres 16 + `pg_stat_statements`. Fixture: `examples/reddit-clone/perf/seed.sql` (100k users, 1k subs, 500k posts,
+reddit-clone `/`, `/r/{sub}`, `/r/{sub}/posts/{slug}` over HTTP, **41 requests**: 5 front page, 9 subreddit pages
+(3 subs x 3), 27 post pages (9 posts - 3 hot, 3 mid, 3 cold - x 3). The comment-thread statement's 27 `calls` are the post pages,
+the leaderboard's 5 `calls` are the front pages. Postgres 16 + `pg_stat_statements`. Fixture: `examples/reddit-clone/perf/seed.sql` (100k users, 1k subs, 500k posts,
 3M comments, ~3M votes, power-law skew). The seed ends with `VACUUM (ANALYZE)` on every table, so the visibility map is set
 (index-only scans need it) — both runs were taken in that state.
 
