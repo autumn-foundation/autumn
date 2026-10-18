@@ -1494,3 +1494,10 @@ workspace = true
 [[test]]
 name = "tls_client_auth_metrics"
 path = "tests/tls_client_auth_metrics.rs"
+
+# Query-string decode workload for profilers: `from_query_str`, the function
+# behind every `Query<T>` extraction. Asserts nothing beyond output shape — see
+# the file header for the exact commands.
+[[bench]]
+name = "query_decode"
+harness = false
