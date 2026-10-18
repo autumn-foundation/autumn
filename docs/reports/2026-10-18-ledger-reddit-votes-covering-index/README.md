@@ -35,7 +35,7 @@ supply `value` without a heap visit. A covering index `(post_id) INCLUDE (value)
 ordered by the group key, so no hash spill and no heap reads.
 
 ## Change
-`examples/reddit-clone/migrations/20261018000000_add_votes_post_id_value_covering_index`:
+`examples/reddit-clone/migrations/20261018055123_add_votes_post_id_value_covering_index`:
 `CREATE INDEX CONCURRENTLY idx_votes_post_id_value ON votes (post_id) INCLUDE (value) WHERE post_id IS NOT NULL`.
 Lock: `SHARE UPDATE EXCLUSIVE` only (sampled `pg_locks` during apply: only that mode on `votes`); does not block reads/writes.
 `run_in_transaction = false` as in the cms precedent. No `IF NOT EXISTS`: a cancelled build leaves an INVALID index; detect with

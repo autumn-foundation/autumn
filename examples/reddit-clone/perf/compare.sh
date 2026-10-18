@@ -5,7 +5,7 @@
 set -euo pipefail
 OUT=${1:?outdir}
 HERE=$(cd "$(dirname "$0")" && pwd)
-MIG="$HERE/../migrations/20261018000000_add_votes_post_id_value_covering_index"
+MIG="$HERE/../migrations/20261018055123_add_votes_post_id_value_covering_index"
 DATABASE_URL=${DATABASE_URL:-postgres://autumn:autumn@127.0.0.1:5433/reddit}
 export DATABASE_URL
 P="psql -q -v ON_ERROR_STOP=1 $DATABASE_URL"
