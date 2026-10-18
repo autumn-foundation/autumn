@@ -388,7 +388,9 @@ async fn revisions_author_batch_profile() {
         "SELECT * FROM users WHERE users.id = ANY(ARRAY[61,64,67,70,73,76,79,82,85,88,91,94])",
     );
 
-    println!("\n#################### MEASURED: GET /admin/content/post/{{id}}/revisions ####################");
+    println!(
+        "\n#################### MEASURED: GET /admin/content/post/{{id}}/revisions ####################"
+    );
     let mut summary = Vec::new();
     for (id, k, names) in &measured {
         reset_stats(&mut conn);
