@@ -625,6 +625,13 @@ harness = false
 name = "admission"
 harness = false
 
+# Criterion benches for recording through the app-metrics facade: a held,
+# labeled handle vs the per-call `counter(..).with_label(..)` idiom. The
+# allocation half is pinned by `tests/metrics_alloc_gate.rs`.
+[[bench]]
+name = "metrics_record"
+harness = false
+
 [[bench]]
 name = "form_render"
 harness = false
@@ -816,6 +823,14 @@ path = "tests/form_render_alloc_gate.rs"
 [[test]]
 name = "version_history_alloc_gate"
 path = "tests/version_history_alloc_gate.rs"
+
+# Allocation gate for recording through the app-metrics facade: a label set the
+# registry has already seen is found with a borrowed lookup, not a fresh owned
+# copy of every label per sample. Own binary for the same `allocation-counter`
+# global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "metrics_alloc_gate"
+path = "tests/metrics_alloc_gate.rs"
 
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
