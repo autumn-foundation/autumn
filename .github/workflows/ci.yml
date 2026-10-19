@@ -2457,6 +2457,14 @@ jobs:
             tests::fleet_subcommands db::replica:: \
             | tee "$RUNNER_TEMP/cli-fleet-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
+          # Issue #2753: same gap for `generate::auth::`. PR #3358 merged
+          # three near-identical Cargo-feature-injector functions into one
+          # shared `ensure_autumn_web_feature`, backed by unit tests on the
+          # `autumn` bin target that no other lane instruments. Check the
+          # count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::auth:: \
+            | tee "$RUNNER_TEMP/cli-generate-auth-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-auth-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
