@@ -20,12 +20,28 @@ pub struct Post {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+/// One row of the admin post list: everything it renders, no `body`.
+#[derive(Queryable)]
+pub struct PostListing {
+    pub id: i64,
+    pub title: String,
+    pub slug: String,
+    pub published: bool,
+    pub created_at: chrono::NaiveDateTime,
+}
+
 impl Post {
-    /// Load all posts ordered by creation date (newest first).
-    pub async fn all(db: &mut AsyncPgConnection) -> AutumnResult<Vec<Self>> {
+    /// Load every post for the admin list (newest first), without `body`.
+    pub async fn all_listings(db: &mut AsyncPgConnection) -> AutumnResult<Vec<PostListing>> {
         Ok(posts::table
             .order(posts::created_at.desc())
-            .select(Self::as_select())
+            .select((
+                posts::id,
+                posts::title,
+                posts::slug,
+                posts::published,
+                posts::created_at,
+            ))
             .load(db)
             .await?)
     }
