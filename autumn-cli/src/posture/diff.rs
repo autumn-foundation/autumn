@@ -1437,18 +1437,33 @@ fn exempts(prefix: &str, path: &str) -> bool {
         .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/'))
 }
 
-/// Whether any URL a route template matches falls under an exemption prefix.
+/// The routes that serve a URL under an exemption prefix.
 ///
-/// The prefix is a concrete URL prefix and the template is a shape, so the
-/// question is whether the two intersect — `/api/me` exempts `/api/{id}` for
-/// exactly the request `/api/me`, which is the whole reason the per-route row
-/// keeps saying "enforced" while those requests stop being validated. Either
-/// the prefix names the route's own URLs or it sits above them, hence the
-/// catch-all form.
-fn exempts_shape(prefix: &str, template: &str) -> bool {
-    let prefix = normalize_captures(prefix);
-    intersect(template, &prefix).is_some()
-        || intersect(template, &format!("{prefix}/{CATCH_ALL}")).is_some()
+/// A prefix is a URL, a route is a shape, so the two are compared by overlap.
+/// Overlap alone is too wide: a static route can win a URL over a dynamic one,
+/// and then the dynamic route never serves it. `undominated` drops such routes.
+/// It runs twice: for the prefix itself, and for everything below it. A prefix
+/// that ends in `/` has no URL of its own.
+fn exempt_servers<'a>(prefix: &str, routes: &[&'a RouteKey]) -> Vec<&'a RouteKey> {
+    // The prefix is a concrete URL, never a template: its braces stay literal.
+    let base = prefix.strip_suffix('/').unwrap_or(prefix);
+    let below = format!("{base}/{CATCH_ALL}");
+    let subjects = if prefix.ends_with('/') {
+        vec![below]
+    } else {
+        vec![base.to_owned(), below]
+    };
+    subjects
+        .iter()
+        .flat_map(|subject| {
+            let overlapping: Vec<&RouteKey> = routes
+                .iter()
+                .filter(|(path, _)| intersect(path, subject).is_some())
+                .copied()
+                .collect();
+            undominated(subject, &overlapping)
+        })
+        .collect()
 }
 
 /// Configured exemption prefixes, which the per-route rows cannot show.
@@ -1485,9 +1500,13 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
         let csrf = csrf_index(head);
         let bindings = authz_index(head);
         let mtls = mtls_index(head);
-        let mut guards: Vec<String> = routes
-            .keys()
-            .filter(|(path, _)| added.iter().any(|prefix| exempts_shape(prefix, path)))
+        let mounted: Vec<&RouteKey> = routes.keys().collect();
+        let served: BTreeSet<&RouteKey> = added
+            .iter()
+            .flat_map(|prefix| exempt_servers(prefix, &mounted))
+            .collect();
+        let mut guards: Vec<String> = served
+            .into_iter()
             .filter_map(|key| {
                 effective_posture(key, &routes, &csrf, &bindings, &mtls)
                     .map(|posture| escape_list(&[key.1.clone(), key.0.clone(), posture]))
@@ -4832,6 +4851,185 @@ mod tests {
 
         assert_ne!(exempting_with(&["mfa"]), exempting_with(&[]));
     }
+
+    /// The exemption finding for `/users/me`, with a static `/users/me` and a
+    /// dynamic `/users/{id}` mounted. Each takes its own scopes.
+    fn exempting_users_me(static_scopes: &[&str], dynamic_scopes: &[&str]) -> String {
+        let routes = |s: &[&str], d: &[&str]| {
+            format!(
+                "{},{}",
+                route("/users/me", "POST", "gated", &["admin"], s, false),
+                route("/users/{id}", "POST", "gated", &["admin"], d, false),
+            )
+        };
+        let csrf = r#"{"path":"/users/me","method":"POST","csrf_enforced":true,"exempt":false},
+                      {"path":"/users/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#;
+        let base = manifest_exempt(&routes(&["mfa"], &["mfa"]), csrf, &[]);
+        diff(
+            &base,
+            &manifest_exempt(&routes(static_scopes, dynamic_scopes), csrf, &["/users/me"]),
+        )
+        .into_iter()
+        .find(|f| f.kind == "csrf_exemption_added")
+        .expect("a new exemption is a widening")
+        .canonical()
+    }
+
+    /// `POST /users/{id}` never gets `/users/me`: the static node wins it. The
+    /// dynamic route is not in the identity, so loosening it alone does not
+    /// re-ask for an exemption whose posture did not move.
+    #[test]
+    fn an_exemption_ignores_a_route_that_never_serves_the_exempt_url() {
+        assert_eq!(
+            exempting_users_me(&["mfa"], &["mfa"]),
+            exempting_users_me(&["mfa"], &[]),
+        );
+    }
+
+    /// The static route does serve the exempt URL, so loosening it re-asks.
+    #[test]
+    fn an_exemption_still_binds_to_the_route_that_wins_the_url() {
+        assert_ne!(
+            exempting_users_me(&["mfa"], &["mfa"]),
+            exempting_users_me(&[], &["mfa"]),
+        );
+    }
+
+    /// A prefix above both routes splits its URLs between them. Neither
+    /// covers the other's share, so both stay bound.
+    #[test]
+    fn an_exemption_binds_every_route_that_wins_part_of_the_prefix() {
+        let finding = |static_scopes: &[&str], dynamic_scopes: &[&str]| {
+            let routes = format!(
+                "{},{}",
+                route("/api/me", "POST", "gated", &["admin"], static_scopes, false),
+                route(
+                    "/api/{id}",
+                    "POST",
+                    "gated",
+                    &["admin"],
+                    dynamic_scopes,
+                    false
+                ),
+            );
+            let csrf = r#"{"path":"/api/me","method":"POST","csrf_enforced":true,"exempt":false},
+                          {"path":"/api/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#;
+            diff(
+                &manifest_exempt(&routes, csrf, &[]),
+                &manifest_exempt(&routes, csrf, &["/api"]),
+            )
+            .into_iter()
+            .find(|f| f.kind == "csrf_exemption_added")
+            .expect("a new exemption is a widening")
+            .canonical()
+        };
+        assert_ne!(finding(&["mfa"], &["mfa"]), finding(&[], &["mfa"]));
+        assert_ne!(finding(&["mfa"], &["mfa"]), finding(&["mfa"], &[]));
+    }
+
+    /// Exemption finding for `prefixes`, over `(path, method, scopes)` routes.
+    fn exemption_digest(routes: &[(&str, &str, &[&str])], prefixes: &[&str]) -> String {
+        let entries = routes
+            .iter()
+            .map(|(p, m, scopes)| route(p, m, "gated", &["admin"], scopes, false))
+            .collect::<Vec<_>>()
+            .join(",");
+        let csrf = routes
+            .iter()
+            .map(|(p, m, _)| {
+                format!(r#"{{"path":"{p}","method":"{m}","csrf_enforced":true,"exempt":false}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        diff(
+            &manifest_exempt(&entries, &csrf, &[]),
+            &manifest_exempt(&entries, &csrf, prefixes),
+        )
+        .into_iter()
+        .find(|f| f.kind == "csrf_exemption_added")
+        .expect("a new exemption is a widening")
+        .canonical()
+    }
+
+    /// A node answers every method, so a static node without `POST` still
+    /// shadows the dynamic one: the request gets 405, it does not fall through.
+    #[test]
+    fn an_exemption_ranks_nodes_before_methods() {
+        let digest = |dynamic: &[&str]| {
+            exemption_digest(
+                &[
+                    ("/users/me", "GET", &["mfa"]),
+                    ("/users/{id}", "POST", dynamic),
+                ],
+                &["/users/me"],
+            )
+        };
+        assert_eq!(digest(&["mfa"]), digest(&[]));
+    }
+
+    /// A trailing slash exempts the URLs below the prefix, so the routes below
+    /// it are bound.
+    #[test]
+    fn a_trailing_slash_prefix_binds_the_routes_below_it() {
+        let digest =
+            |scopes: &[&str]| exemption_digest(&[("/api/{id}", "POST", scopes)], &["/api/"]);
+        assert_ne!(digest(&["mfa"]), digest(&[]));
+    }
+
+    /// The root prefix exempts every URL, so every route is bound.
+    #[test]
+    fn a_root_prefix_binds_every_route() {
+        let digest = |scopes: &[&str]| exemption_digest(&[("/api/{id}", "POST", scopes)], &["/"]);
+        assert_ne!(digest(&["mfa"]), digest(&[]));
+    }
+
+    /// A prefix is a concrete URL. Its `{{` is two literal braces, not the
+    /// route escape for one, so the static route `/{{foo}}` (which serves
+    /// `/{foo}`) does not shadow the dynamic route here.
+    #[test]
+    fn an_exemption_prefix_keeps_its_literal_braces() {
+        let digest = |dynamic: &[&str]| {
+            exemption_digest(
+                &[("/{{foo}}", "POST", &["mfa"]), ("/{id}", "POST", dynamic)],
+                &["/{{foo}}"],
+            )
+        };
+        assert_ne!(digest(&["mfa"]), digest(&[]));
+    }
+
+    /// Request paths never hold `//`, so `/api//` exempts no URL. It binds
+    /// no route, and a route under `/api` does not move the digest.
+    #[test]
+    fn a_double_slash_prefix_binds_no_route() {
+        let digest =
+            |scopes: &[&str]| exemption_digest(&[("/api/{id}", "POST", scopes)], &["/api//"]);
+        assert_eq!(digest(&["mfa"]), digest(&[]));
+    }
+
+    /// A route below the prefix is shadowed by a more specific one.
+    #[test]
+    fn an_exemption_below_the_prefix_ignores_a_shadowed_route() {
+        let digest = |dynamic: &[&str]| {
+            exemption_digest(
+                &[
+                    ("/api/me/x", "POST", &["mfa"]),
+                    ("/api/{id}/x", "POST", dynamic),
+                ],
+                &["/api/me"],
+            )
+        };
+        assert_eq!(digest(&["mfa"]), digest(&[]));
+    }
+
+    /// Two prefixes that reach one route bind it once, and each still binds.
+    #[test]
+    fn an_exemption_with_overlapping_prefixes_still_binds() {
+        let digest = |scopes: &[&str]| {
+            exemption_digest(&[("/api/me", "POST", scopes)], &["/api", "/api/me/"])
+        };
+        assert_ne!(digest(&["mfa"]), digest(&[]));
+    }
+
     /// The header findings were the last constant fingerprints, and I said two
     /// rounds ago that they were fine because a header is emitted or it is not
     /// — true of the *value*, and beside the point. The identity has to carry
