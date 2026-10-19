@@ -9188,8 +9188,14 @@ fn graph_declared_route_summary(
         // A `RouteInfo` carries no repository metadata: these are plugin and
         // framework mounts, which no `#[repository]` generated.
         repository_api: None,
-        // The caller clears this for framework endpoints.
-        auth_declared: true,
+        // Only a proven posture is a declaration. An unclassified route has
+        // none, so it stays name-only. The caller clears this for framework
+        // endpoints.
+        auth_declared: matches!(
+            route.classification,
+            crate::route_listing::RouteClassification::Gated
+                | crate::route_listing::RouteClassification::Public
+        ),
     }
 }
 
@@ -18378,6 +18384,21 @@ mod tests {
             mounted.iter().all(|route| !route.auth_declared),
             "framework endpoints are not declared plugin mounts"
         );
+    }
+
+    /// Only a proven posture is a declaration. An unclassified plugin route
+    /// stays name-only, so the graph never claims `auth none` for it.
+    #[test]
+    fn graph_declared_summary_declares_auth_only_when_classified() {
+        use crate::route_listing::{RouteClassification, RouteInfo};
+        let summary = |classification| {
+            let mut info = RouteInfo::framework_get("/plugin/ping".to_owned(), "ping");
+            info.classification = classification;
+            graph_declared_route_summary(&info).auth_declared
+        };
+        assert!(summary(RouteClassification::Gated));
+        assert!(summary(RouteClassification::Public));
+        assert!(!summary(RouteClassification::Unclassified));
     }
 
     #[derive(Clone)]

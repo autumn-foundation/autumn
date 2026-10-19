@@ -425,7 +425,7 @@ const fn is_false(b: &bool) -> bool {
 impl RouteInfo {
     /// Construct a framework-owned `GET` route entry. Framework routes are
     /// pre-classified and exempt from the audit gate.
-    fn framework_get(path: String, handler: &str) -> Self {
+    pub(crate) fn framework_get(path: String, handler: &str) -> Self {
         Self::framework_route("GET", path, handler)
     }
 
