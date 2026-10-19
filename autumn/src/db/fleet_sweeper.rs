@@ -804,7 +804,12 @@ impl FleetLifecycle for SweeperLifecycle {
             if let Err(error) = &settled {
                 tracing::warn!(database = %name, %error, "fleet derivation backfill failed");
             }
-            if !matches!(settled, Ok((true, _))) {
+            // Not settled, or a newer epoch landed during the round (see
+            // `FleetSweeper::work`): leave a row for the sweeper.
+            let current = handle
+                .block_on(self.index.epoch_is_current())
+                .map_err(|error| error.to_string())?;
+            if !current || !matches!(settled, Ok((true, _))) {
                 handle
                     .block_on(self.index.mark(&name, PendingKind::Backfill))
                     .map_err(|error| error.to_string())?;
@@ -1241,7 +1246,14 @@ impl FleetSweeper {
         if !inner.index.epoch_is_current().await? {
             return Ok(handled);
         }
-        let (_, batches) = backfill(pool, options.max_backfill_rounds, &inner.stop).await?;
+        let backfilled = backfill(pool, options.max_backfill_rounds, &inner.stop).await;
+        // A newer epoch landed during the work: this binary may have written
+        // old definitions after the new worker finished. Mark the database,
+        // so the new worker reconciles it again.
+        if !inner.index.epoch_is_current().await? {
+            inner.index.mark(&key.name(), PendingKind::Backfill).await?;
+        }
+        let (_, batches) = backfilled?;
         Ok(handled + batches)
     }
 

@@ -228,7 +228,9 @@ databases that nobody asks for:
   with a new fingerprint records it, then lists the files and marks each
   database `backfill`. It opens none to do this. Only the binary with the
   newest fingerprint runs a backfill (checked before each database) or
-  removes a `backfill` row (checked in the same `DELETE`). A fingerprint seen before is never recorded again, so an
+  removes a `backfill` row (checked in the same `DELETE`). When a newer
+  fingerprint lands during a backfill, the old binary marks the database
+  again, so the new one reconciles it. A fingerprint seen before is never recorded again, so an
   old binary that restarts in a rolling deploy cannot undo the new
   definitions. A rollback to older derivations needs a `resweep`. When a
   database opens, the current binary runs up to 8 backfill batches before
