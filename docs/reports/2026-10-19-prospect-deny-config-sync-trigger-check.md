@@ -27,8 +27,10 @@ ledger audit. No assay-ledger entry covers this question.
 ## 🧪 Apparatus
 
 None built. One throwaway `tomllib` comparison of the parsed `[advisories].ignore`,
-`[licenses].allow` and `[sources]` tables across the three configs (run from the scratchpad,
-not committed). **Stubs/limits:** the checkout is shallow (50 commits), so file creation dates
+`[licenses].allow` and `[sources]` tables of `deny.toml` against `deny-sqlite.toml` (run from the scratchpad,
+not committed); the snippet under Reproduce is exactly that comparison. The satellite configs
+were assessed by reading them, not by that comparison: neither has a `[licenses]` table and
+their policy differs from the root by documented design. **Stubs/limits:** the checkout is shallow (50 commits), so file creation dates
 for `fuzz/deny.toml` and `island-flock/deny.toml` cannot be read from history. The Ballast audit
 (`2026-09-07-ballast-dependency-ledger-audit.md`, "Change") records both files as **new**,
 added after ADR 0013. The ADR's evidence item 5 named the two satellite workspaces, not their
