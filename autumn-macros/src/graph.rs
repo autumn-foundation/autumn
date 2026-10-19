@@ -17,6 +17,18 @@
 //! while a candidate that resolves to nothing is simply dropped at link time.
 //! There is no stop-list of "obviously not a model" names for the same reason:
 //! a name an app is free to choose is a name this module must not discard.
+//!
+//! ## SQL scope
+//!
+//! A literal counts as SQL when a statement in it has a known shape. A literal
+//! may hold many statements, split on `;` outside quotes. Each one counts. The
+//! literal mutates if any statement mutates. Quoted text is blanked for the verb
+//! scan only. Table symbols keep every word.
+//!
+//! Data access is in scope: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+//! `TRUNCATE`, `WITH`, `COPY` and bare `TABLE name`. DDL is out by design:
+//! `CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` belong to migrations, not to
+//! data access. A route or job does not depend on a table through them.
 
 use proc_macro2::{Ident, Spacing, TokenStream, TokenTree};
 use quote::quote;
@@ -396,20 +408,124 @@ fn is_truncate_operands(rest: &[&str]) -> bool {
     named_a_table
 }
 
-/// The SQL statement shape a literal matches, if any; `true` when it mutates.
+/// Split comment-free SQL into statements for the verb scan.
+///
+/// Splits on `;` outside quotes. Blanks the text inside single quotes and
+/// dollar quotes, so a verb word in a string is never read as a verb. Keeps
+/// double-quoted identifiers as they are. An unterminated quote runs to the end
+/// of the text.
+///
+/// Only the verb scan uses this. Table symbols come from the unblanked text, so
+/// a quoted word is still a candidate and no edge is lost.
+fn verb_statements(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == ';' {
+            statements.push(std::mem::take(&mut current));
+            i += 1;
+        } else if ch == '\'' {
+            current.push(' ');
+            i += 1;
+            while i < chars.len() {
+                // `''` is an escaped quote. Both halves stay inside the string.
+                let closes = chars[i] == '\'' && chars.get(i + 1) != Some(&'\'');
+                let escaped = chars[i] == '\'' && chars.get(i + 1) == Some(&'\'');
+                i += if escaped { 2 } else { 1 };
+                if closes {
+                    break;
+                }
+            }
+        } else if ch == '"' {
+            current.push(ch);
+            i += 1;
+            while i < chars.len() {
+                current.push(chars[i]);
+                i += 1;
+                if chars[i - 1] == '"' {
+                    if chars.get(i) == Some(&'"') {
+                        current.push('"');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if let Some(tag) = dollar_tag(&chars, i) {
+            let width = tag.chars().count();
+            current.push(' ');
+            i += width;
+            while i < chars.len() && !chars[i..].iter().take(width).copied().eq(tag.chars()) {
+                i += 1;
+            }
+            i = (i + width).min(chars.len());
+        } else {
+            current.push(ch);
+            i += 1;
+        }
+    }
+    statements.push(current);
+    statements
+}
+
+/// Whether the text after a leading `TABLE` is one table name.
+///
+/// The statement is `TABLE [ONLY] name`. A name has no space in it, so prose
+/// like "Table of contents" fails.
+fn is_table_operand(rest: &str) -> bool {
+    let rest = rest.trim();
+    let name = match rest.strip_prefix("ONLY") {
+        Some(after) if after.starts_with(char::is_whitespace) => after.trim_start(),
+        _ => rest,
+    };
+    name != "ONLY"
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '"')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '"' | '*'))
+}
+
+/// Whether the words and text of a `COPY` statement read as a statement, and if
+/// so whether it writes.
+///
+/// `COPY x FROM` loads rows into a table. `COPY x TO` and `COPY (query) TO`
+/// only read. Needs one of `FROM` or `TO`.
+fn copy_shape(rest_text: &str, rest: &[&str]) -> Option<bool> {
+    if !rest.iter().any(|w| matches!(*w, "FROM" | "TO")) {
+        return None;
+    }
+    if rest_text.trim_start().starts_with('(') {
+        return Some(false);
+    }
+    let direction = rest.iter().find(|w| matches!(**w, "FROM" | "TO"))?;
+    Some(*direction == "FROM")
+}
+
+/// The shape of one statement; `true` when it mutates.
 ///
 /// Word-boundary aware in both directions, so `"selection"` is not a `SELECT`
 /// and `"Delete this post?"` is not a `DELETE` — it carries no `FROM`.
-fn sql_shape(literal: &str) -> Option<bool> {
-    let text = strip_sql_comments(&literal_text(literal)).to_ascii_uppercase();
+fn statement_shape(statement: &str) -> Option<bool> {
+    let text = statement.to_ascii_uppercase();
     let mut words = text
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|w| !w.is_empty());
     let first = words.next()?;
     let rest: Vec<&str> = words.collect();
-    // Two verbs are matched on their whole grammar rather than a companion.
+    // After the verb, in source form: `COPY` and `TABLE` read the raw text.
+    let rest_text = text.trim_start().get(first.len()..).unwrap_or("");
+    // Some verbs are matched on their grammar rather than a companion.
     if first == "TRUNCATE" {
         return is_truncate_operands(&rest).then_some(true);
+    }
+    if first == "COPY" {
+        return copy_shape(rest_text, &rest);
+    }
+    if first == "TABLE" {
+        return is_table_operand(rest_text).then_some(false);
     }
     if first == "WITH" {
         // A CTE statement writes if anything in it does — a CTE body and the
@@ -422,6 +538,18 @@ fn sql_shape(literal: &str) -> Option<bool> {
         first == *verb && companions.iter().all(|c| rest.contains(c))
     })?;
     Some(*mutating)
+}
+
+/// The SQL shape a literal matches, if any; `true` when it mutates.
+///
+/// Classifies each statement of the literal. The literal mutates if any
+/// recognised statement does. It reads as SQL if any statement has a shape.
+fn sql_shape(literal: &str) -> Option<bool> {
+    let text = strip_sql_comments(&literal_text(literal));
+    verb_statements(&text)
+        .iter()
+        .filter_map(|statement| statement_shape(statement))
+        .reduce(|a, b| a || b)
 }
 
 /// Whether a string literal reads as a SQL statement.
@@ -1005,6 +1133,116 @@ mod tests {
             sql_shape("\"Truncate a title that runs past 80 chars\""),
             None
         );
+    }
+
+    /// Text inside single quotes or dollar quotes is data. A verb word in it
+    /// must not make a CTE statement a writer.
+    #[test]
+    fn a_cte_verb_inside_quoted_text_is_not_mutation_evidence() {
+        let single = "\"WITH a AS (SELECT 'DELETE' FROM posts) SELECT * FROM a\"";
+        assert_eq!(sql_shape(single), Some(false), "single quotes");
+        let dollar = "\"WITH a AS (SELECT $$UPDATE$$ FROM posts) SELECT * FROM a\"";
+        assert_eq!(sql_shape(dollar), Some(false), "dollar quotes");
+        let tagged = "\"WITH a AS (SELECT $t$ delete $t$ FROM posts) SELECT * FROM a\"";
+        assert_eq!(sql_shape(tagged), Some(false), "tagged dollar quotes");
+        let real = "\"WITH a AS (DELETE FROM posts RETURNING 'x') SELECT * FROM a\"";
+        assert_eq!(sql_shape(real), Some(true), "a real verb still counts");
+    }
+
+    /// Only the verb scan ignores quoted text. Symbols keep every word.
+    #[test]
+    fn quoted_words_stay_table_symbols() {
+        let literal = "\"SELECT 'tags' FROM posts\"";
+        let symbols = sql_symbols(literal);
+        assert!(symbols.contains(&"tags".to_owned()));
+        assert!(symbols.contains(&"posts".to_owned()));
+    }
+
+    /// An unterminated quote runs to the end of the text.
+    #[test]
+    fn an_unterminated_quote_is_treated_as_a_string() {
+        let literal = "\"WITH a AS (SELECT 'DELETE FROM posts) SELECT 1\"";
+        assert_eq!(sql_shape(literal), Some(false));
+        let dollar = "\"WITH a AS (SELECT $$ UPDATE x) SELECT 1\"";
+        assert_eq!(sql_shape(dollar), Some(false));
+    }
+
+    /// A literal can hold many statements. Each one counts.
+    #[test]
+    fn every_statement_of_a_multi_statement_literal_is_classified() {
+        let read_first = "\"SELECT id FROM posts; DELETE FROM comments\"";
+        assert_eq!(sql_shape(read_first), Some(true));
+        let wrapped = "\"BEGIN; UPDATE posts SET a = 1; COMMIT\"";
+        assert_eq!(sql_shape(wrapped), Some(true));
+        assert!(looks_like_sql(wrapped));
+        let reads = "\"SELECT 1; SELECT id FROM posts\"";
+        assert_eq!(sql_shape(reads), Some(false));
+        let commented = "\"-- note; more\nSELECT 1; DELETE FROM t\"";
+        assert_eq!(sql_shape(commented), Some(true));
+        assert!(is_mutating(
+            &quote! { sql_query("SELECT 1 FROM a; INSERT INTO b VALUES (1)") }
+        ));
+    }
+
+    /// A `;` inside a quote does not end a statement.
+    #[test]
+    fn a_semicolon_inside_a_quote_does_not_split() {
+        let single = "\"SELECT id FROM posts WHERE a = ';DELETE FROM x'\"";
+        assert_eq!(sql_shape(single), Some(false));
+        let dollar = "\"SELECT id FROM posts WHERE a = $$; DELETE FROM x$$\"";
+        assert_eq!(sql_shape(dollar), Some(false));
+        let ident = r##"r#"SELECT "a;b" FROM posts"#"##;
+        assert_eq!(sql_shape(ident), Some(false));
+    }
+
+    /// Prose with a `;` stays prose.
+    #[test]
+    fn prose_with_a_semicolon_is_not_sql() {
+        assert_eq!(
+            sql_shape("\"Delete this post; this cannot be undone\""),
+            None
+        );
+        assert!(!is_mutating(
+            &quote! { "Delete this post; this cannot be undone" }
+        ));
+    }
+
+    /// `COPY x FROM` writes. `COPY x TO` reads. Both name a table.
+    #[test]
+    fn copy_is_a_statement_and_mutates_only_from() {
+        let from = "\"COPY posts FROM STDIN\"";
+        assert_eq!(sql_shape(from), Some(true));
+        assert!(sql_symbols(from).contains(&"posts".to_owned()));
+        let cols = "\"COPY posts (id, title) FROM '/tmp/x.csv'\"";
+        assert_eq!(sql_shape(cols), Some(true));
+        let to = "\"COPY posts TO STDOUT\"";
+        assert_eq!(sql_shape(to), Some(false));
+        assert!(sql_symbols(to).contains(&"posts".to_owned()));
+        let query = "\"COPY (SELECT id FROM posts) TO STDOUT\"";
+        assert_eq!(sql_shape(query), Some(false));
+        assert!(sql_symbols(query).contains(&"posts".to_owned()));
+        assert_eq!(sql_shape("\"Copy the link\""), None);
+    }
+
+    /// Bare `TABLE name` is a read. Prose that starts with "Table" is not SQL.
+    #[test]
+    fn a_bare_table_statement_is_a_read() {
+        let plain = "\"TABLE posts\"";
+        assert_eq!(sql_shape(plain), Some(false));
+        assert!(sql_symbols(plain).contains(&"posts".to_owned()));
+        assert_eq!(sql_shape("\"TABLE ONLY posts\""), Some(false));
+        assert_eq!(sql_shape("\"TABLE public.posts\""), Some(false));
+        assert_eq!(sql_shape("\"Table of contents\""), None);
+        assert_eq!(sql_shape("\"Table\""), None);
+        assert_eq!(sql_shape("\"Table 1\""), None);
+    }
+
+    /// DDL is out by design. It is migration, not data access.
+    #[test]
+    fn ddl_is_not_a_statement() {
+        assert_eq!(sql_shape("\"CREATE TABLE posts (id int)\""), None);
+        assert_eq!(sql_shape("\"ALTER TABLE posts ADD COLUMN a int\""), None);
+        assert_eq!(sql_shape("\"DROP TABLE posts\""), None);
     }
 
     #[test]
