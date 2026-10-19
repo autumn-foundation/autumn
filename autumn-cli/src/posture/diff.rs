@@ -1446,7 +1446,7 @@ fn exempts(prefix: &str, path: &str) -> bool {
 /// that ends in `/` has no URL of its own.
 fn exempt_servers<'a>(prefix: &str, routes: &[&'a RouteKey]) -> Vec<&'a RouteKey> {
     // The prefix is a concrete URL, never a template: its braces stay literal.
-    let base = prefix.trim_end_matches('/');
+    let base = prefix.strip_suffix('/').unwrap_or(prefix);
     let below = format!("{base}/{CATCH_ALL}");
     let subjects = if prefix.ends_with('/') {
         vec![below]
@@ -4995,6 +4995,15 @@ mod tests {
             )
         };
         assert_ne!(digest(&["mfa"]), digest(&[]));
+    }
+
+    /// Request paths never hold `//`, so `/api//` exempts no URL. It binds
+    /// no route, and a route under `/api` does not move the digest.
+    #[test]
+    fn a_double_slash_prefix_binds_no_route() {
+        let digest =
+            |scopes: &[&str]| exemption_digest(&[("/api/{id}", "POST", scopes)], &["/api//"]);
+        assert_eq!(digest(&["mfa"]), digest(&[]));
     }
 
     /// A route below the prefix is shadowed by a more specific one.
