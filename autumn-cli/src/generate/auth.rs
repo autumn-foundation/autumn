@@ -9023,8 +9023,8 @@ fn totp_confirm_branch_src(snake_name: &str) -> String {
 /// `totp_enabled = true` and ignores it for accounts that don't.
 fn totp_reauth_field_src() -> String {
     "            div {{\n\
-     \x20               label {{ \"Authenticator code\" }}\n\
-     \x20               input type=\"text\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
+     \x20               label for=\"totp_code\" {{ \"Authenticator code\" }}\n\
+     \x20               input type=\"text\" id=\"totp_code\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
      \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" placeholder=\"6-digit code or recovery code\";\n\
      \x20               small {{ \"Required if your account uses two-factor authentication.\" }}\n\
      \x20           }}\n"
@@ -9053,9 +9053,9 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(return_to);
                     div {{
-                        label {{ "Authenticator code" }}
-                        input type="text" name="totp_code" autocomplete="one-time-code"
-                            inputmode="numeric" pattern="[0-9 ]*" required
+                        label for="totp_code" {{ "Authenticator code" }}
+                        input type="text" id="totp_code" name="totp_code" autocomplete="one-time-code"
+                            inputmode="text" pattern="[0-9a-fA-F \\-]*" required
                             placeholder="6-digit code or recovery code";
                         small {{ "Required if your account uses two-factor authentication." }}
                     }}
@@ -9119,9 +9119,9 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(return_to);
                     div {{
-                        label {{ "Authenticator code" }}
-                        input type="text" name="totp_code" autocomplete="one-time-code"
-                            inputmode="numeric" pattern="[0-9 ]*" required
+                        label for="totp_code" {{ "Authenticator code" }}
+                        input type="text" id="totp_code" name="totp_code" autocomplete="one-time-code"
+                            inputmode="text" pattern="[0-9a-fA-F \\-]*" required
                             placeholder="6-digit code or recovery code";
                         small {{ "Required if your account uses two-factor authentication." }}
                     }}
@@ -13991,6 +13991,49 @@ mod tests {
         assert!(
             reauth_body.contains("totp_code"),
             "reauth form must include totp_code input field: {reauth_body}"
+        );
+    }
+
+    #[test]
+    fn totp_reauth_code_inputs_accept_recovery_codes_and_have_labels() {
+        // Every `totp_code` input in the generated reauth flow (the initial
+        // form and its re-render, plus both TOTP re-prompts) invites a "recovery code" in its
+        // placeholder and the handler accepts one (`xxxxx-xxxxx`, hex plus a
+        // dash). The input must therefore not carry a numeric-only `pattern`
+        // or `inputmode`, and its visible label must be programmatically
+        // associated (`for` + `id`) rather than a bare `label`.
+        let tmp = project_with_main();
+        totp_plan(tmp.path()).execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let reauth_pos = routes
+            .find("pub async fn reauth_form(")
+            .expect("reauth_form handler missing");
+        let reauth_src = &routes[reauth_pos..];
+        let inputs: Vec<&str> = reauth_src
+            .match_indices("name=\"totp_code\"")
+            .map(|(i, _)| {
+                let end = reauth_src[i..]
+                    .find(';')
+                    .map_or(reauth_src.len(), |e| i + e);
+                &reauth_src[i..end]
+            })
+            .collect();
+        assert_eq!(inputs.len(), 4, "expected 4 totp_code inputs: {reauth_src}");
+        for input in inputs {
+            assert!(
+                !input.contains("inputmode=\"numeric\"") && !input.contains("[0-9 ]*"),
+                "totp_code input rejects recovery codes: {input}"
+            );
+        }
+        assert_eq!(
+            reauth_src.matches("label for=\"totp_code\"").count(),
+            4,
+            "every totp_code input needs a for-associated label"
+        );
+        assert_eq!(
+            reauth_src.matches("id=\"totp_code\"").count(),
+            4,
+            "every totp_code input needs the matching id"
         );
     }
 
