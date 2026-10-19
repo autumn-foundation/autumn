@@ -6892,14 +6892,31 @@ impl AppBuilder {
         // Publish the architecture graph this process serves (#1747) before the
         // router is built, so `/actuator/graph` can answer from the first
         // request rather than after some later warm-up.
+        // The agent documents list the API that `dist/openapi.json` (written
+        // below) describes. The build writes that file at the site root
+        // whatever path the runtime serves it on, and writes no Swagger UI. The
+        // router below always mounts it, so the census sees the same config
+        // with the runtime gate open.
+        #[cfg(feature = "openapi")]
+        let static_openapi = openapi
+            .clone()
+            .map(|api| api.openapi_json_path("/openapi.json").swagger_ui_path(None));
+        #[cfg(feature = "openapi")]
+        let census_config = {
+            let mut census = config.clone();
+            census.openapi_runtime.enabled = true;
+            census
+        };
+        #[cfg(not(feature = "openapi"))]
+        let census_config = config.clone();
         crate::graph::install(crate::graph::manifest::audit(
             &graph_mounted_routes(
                 &all_routes,
                 &scoped_groups,
                 &[],
-                &config,
+                &census_config,
                 #[cfg(feature = "openapi")]
-                openapi.as_ref(),
+                static_openapi.as_ref(),
             ),
             // The static-build path builds its router with no nest mounts and
             // no declared plugin routes (see the `RouterContext` below), so the
@@ -6924,14 +6941,8 @@ impl AppBuilder {
                 #[cfg(feature = "maud")]
                 error_page_renderer: None,
                 session_store,
-                // The agent documents list the API that `dist/openapi.json`
-                // (written below) describes. The build writes that file at the
-                // site root whatever path the runtime serves it on, and writes
-                // no Swagger UI, so the documents link only what `dist` holds.
                 #[cfg(feature = "openapi")]
-                openapi: openapi
-                    .clone()
-                    .map(|api| api.openapi_json_path("/openapi.json").swagger_ui_path(None)),
+                openapi: static_openapi,
                 #[cfg(feature = "mcp")]
                 mcp: None,
             },
