@@ -37,6 +37,11 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      posture_ack:
+        description: "Posture gate: acknowledge an example widening (the /ack-posture digest and ceiling)"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -69,7 +74,10 @@ jobs:
   # manifest. It then diffs the manifest against the one committed next to the
   # example. A change that widens the security surface fails here, such as a
   # route that more callers can reach, or a removed guard.
-  # fails here, with the same acknowledgment escape hatch the product ships.
+  # fails here, with the same acknowledgment escape hatch the product ships:
+  #   - pull request: a /ack-posture comment from a user with write access.
+  #   - workflow_dispatch: the posture_ack input.
+  #   - tag push: none. Acknowledge and merge the widening before the tag.
   # See scripts/check-posture-gate.sh and docs/guide/posture-gate.md.
   # ---------------------------------------------------------------------------
   posture-gate:
@@ -84,7 +92,43 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
+      # Only commenters with admin, write or maintain permission count. The
+      # job asks GitHub for the permission, and does not trust author_association.
+      # Each comment goes to its own file, so one comment cannot change another.
+      # A GitHub API error leaves the directory empty: nothing is acknowledged.
+      - name: Harvest acknowledgments from authorized reviewers
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/acks"
+          authors_and_bodies() {
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/$1" \
+              --jq '.[] | select((.user.login // "") != "github-actions[bot]") | "\(.user.login // "")\t\((.body // "") | @base64)"' || true
+          }
+          n=0
+          {
+            authors_and_bodies "issues/${PR_NUMBER}/comments"
+            authors_and_bodies "pulls/${PR_NUMBER}/reviews"
+          } | while IFS=$'\t' read -r login body64; do
+            [ -n "$login" ] || continue
+            PERM=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${login}/permission" \
+                     --jq '.permission' 2>/dev/null || echo none)
+            case "$PERM" in
+              admin|write|maintain) ;;
+              *) continue ;;
+            esac
+            n=$((n + 1))
+            printf '%s\n' "$body64" | base64 -d \
+              > "$RUNNER_TEMP/acks/$(printf '%06d' "$n").md"
+          done
       - name: Run the posture gate over the example apps
+        env:
+          # Empty on pull_request and tag pushes. The script ignores empty values.
+          AUTUMN_POSTURE_ACK: ${{ inputs.posture_ack }}
+          AUTUMN_POSTURE_ACK_DIR: ${{ github.event_name == 'pull_request' && format('{0}/acks', runner.temp) || '' }}
         run: ./scripts/check-posture-gate.sh
 
   # ---------------------------------------------------------------------------

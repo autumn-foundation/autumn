@@ -9580,3 +9580,189 @@ fn ci_lints_the_kubernetes_manifests_and_slo_files() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Example posture gate: acknowledgment reaches CI (issue #2502)
+// ---------------------------------------------------------------------------
+
+/// The `posture-gate` job of `publish-gate.yml`.
+fn posture_gate_job(root: &Path) -> String {
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/publish-gate.yml"))
+        .expect("read publish-gate.yml");
+    workflow
+        .split("\n  posture-gate:")
+        .nth(1)
+        .and_then(|job| job.split("\n  # ---").next())
+        .expect("publish-gate.yml must define a posture-gate job")
+        .to_owned()
+}
+
+#[test]
+fn posture_gate_job_harvests_pull_request_acknowledgments() {
+    let job = posture_gate_job(&workspace_root());
+    assert!(
+        job.contains("AUTUMN_POSTURE_ACK_DIR"),
+        "the job must hand the script an acknowledgment directory"
+    );
+    assert!(
+        job.contains("collaborators/") && job.contains("admin|write|maintain"),
+        "only commenters with admin, write or maintain permission may acknowledge"
+    );
+    let harvest = job
+        .split("- name: ")
+        .find(|step| step.contains("collaborators/"))
+        .expect("a harvest step");
+    assert!(
+        harvest.contains("github.event_name == 'pull_request'"),
+        "harvest runs on pull requests only: tag pushes and dispatch have no comments"
+    );
+}
+
+#[test]
+fn posture_gate_job_takes_a_dispatch_acknowledgment_through_env() {
+    let root = workspace_root();
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/publish-gate.yml"))
+        .expect("read publish-gate.yml");
+    assert!(
+        workflow.contains("posture_ack:"),
+        "workflow_dispatch must have a posture_ack input"
+    );
+    let job = posture_gate_job(&root);
+    assert!(
+        job.contains("AUTUMN_POSTURE_ACK: ${{ inputs.posture_ack }}"),
+        "the input must reach the script through env"
+    );
+    let run_blocks_inline_input = job
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("AUTUMN_POSTURE_ACK:"))
+        .any(|line| line.contains("inputs.posture_ack"));
+    assert!(
+        !run_blocks_inline_input,
+        "never expand the input inside a shell script"
+    );
+}
+
+#[test]
+fn posture_gate_script_documents_the_acknowledgment_scope() {
+    let root = workspace_root();
+    let script = std::fs::read_to_string(root.join("scripts/check-posture-gate.sh"))
+        .expect("read check-posture-gate.sh");
+    let header = script.split("set -euo pipefail").next().expect("header");
+    assert!(
+        header.contains("AUTUMN_POSTURE_ACK_DIR")
+            && header.contains("tag")
+            && header.contains("workflow_dispatch"),
+        "the header must name the directory variable and the tag and dispatch scope"
+    );
+}
+
+/// Run the posture script against a stub `cargo` and a stub `autumn`.
+/// Returns the stub's log of calls and the script output.
+#[cfg(unix)]
+fn run_posture_script_with_stubs(envs: &[(&str, &str)]) -> (String, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = workspace_root();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("scripts")).expect("mkdir scripts");
+    std::fs::copy(
+        root.join("scripts/check-posture-gate.sh"),
+        repo.join("scripts/check-posture-gate.sh"),
+    )
+    .expect("copy script");
+    for example in ["hello", "flock", "invoice", "todo-app"] {
+        let dir = repo.join("examples").join(example);
+        std::fs::create_dir_all(&dir).expect("mkdir example");
+        std::fs::write(dir.join("security-posture.json"), "{}").expect("baseline");
+    }
+
+    let target = tmp.path().join("target");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir bin");
+    let log = tmp.path().join("calls.log");
+    let write_exec = |path: &Path, body: &str| {
+        std::fs::write(path, body).expect("write stub");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    // The stub CLI logs its arguments and writes an empty manifest on `audit`.
+    let cli_stub = r#"#!/usr/bin/env bash
+echo "$*" >> "$STUB_LOG"
+if [ "$1 $2" = "routes audit" ]; then
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--manifest" ]; then echo '{}' > "$2"; fi
+    shift
+  done
+fi
+if [ "$1 $2" = "routes posture" ] && [ "$3" = "digest" ]; then echo digest; fi
+exit 0
+"#;
+    write_exec(
+        &bin.join("cargo"),
+        &format!(
+            "#!/usr/bin/env bash\nmkdir -p \"{t}/debug\"\ncat > \"{t}/debug/autumn\" <<'STUB'\n{cli_stub}STUB\nchmod +x \"{t}/debug/autumn\"\n",
+            t = target.display()
+        ),
+    );
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = bash_command();
+    cmd.arg(repo.join("scripts/check-posture-gate.sh"))
+        .current_dir(&repo)
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", &target)
+        .env("STUB_LOG", &log)
+        .env_remove("AUTUMN_POSTURE_ACK")
+        .env_remove("AUTUMN_POSTURE_ACK_DIR")
+        .env_remove("GITHUB_BASE_REF");
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().expect("run script");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "script failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (std::fs::read_to_string(&log).unwrap_or_default(), stdout)
+}
+
+#[cfg(unix)]
+#[test]
+fn posture_script_passes_the_ack_dir_to_the_diff_and_logs_it() {
+    let (calls, out) = run_posture_script_with_stubs(&[("AUTUMN_POSTURE_ACK_DIR", "/acks")]);
+    let diffs: Vec<_> = calls
+        .lines()
+        .filter(|l| l.starts_with("routes posture diff"))
+        .collect();
+    assert_eq!(diffs.len(), 4, "one diff per example: {calls}");
+    assert!(
+        diffs.iter().all(|l| l.contains("--ack-dir /acks")),
+        "every diff must carry --ack-dir: {diffs:?}"
+    );
+    assert!(
+        out.contains("AUTUMN_POSTURE_ACK_DIR"),
+        "the job log must record the directory: {out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn posture_script_passes_both_ack_forms_and_never_unprompted() {
+    let (calls, _) = run_posture_script_with_stubs(&[
+        ("AUTUMN_POSTURE_ACK", "abc ceiling=x"),
+        ("AUTUMN_POSTURE_ACK_DIR", "/acks"),
+    ]);
+    assert!(calls.contains("--ack abc ceiling=x") && calls.contains("--ack-dir /acks"));
+
+    let (calls, _) = run_posture_script_with_stubs(&[("AUTUMN_POSTURE_ACK_DIR", "")]);
+    assert!(
+        !calls.contains("--ack"),
+        "an empty directory variable must not acknowledge anything: {calls}"
+    );
+}
