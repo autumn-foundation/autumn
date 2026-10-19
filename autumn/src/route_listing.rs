@@ -734,12 +734,11 @@ pub fn collect_route_infos(
     Ok(infos)
 }
 
-/// Append framework-internal routes (probes, actuator, htmx assets).
+/// Append the routes a worker replica serves: the probes and the actuator.
 ///
-/// Paths are taken from `config` so custom probe/actuator prefix settings
-/// are reflected accurately.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn append_framework_routes(
+/// This matches `router::try_build_probe_only_router`. It adds no htmx asset,
+/// docs UI, static route or dev route.
+pub(crate) fn append_probe_and_actuator_routes(
     infos: &mut Vec<RouteInfo>,
     config: &crate::config::AutumnConfig,
 ) {
@@ -800,6 +799,27 @@ pub(crate) fn append_framework_routes(
             "actuator",
         ));
     }
+}
+
+/// Append framework-internal routes (probes, actuator, assets, dev routes).
+///
+/// Paths are taken from `config` so custom probe/actuator prefix settings
+/// are reflected accurately. Dev routes follow the process environment.
+pub(crate) fn append_framework_routes(
+    infos: &mut Vec<RouteInfo>,
+    config: &crate::config::AutumnConfig,
+) {
+    append_framework_routes_with_env(infos, config, &crate::config::OsEnv);
+}
+
+/// [`append_framework_routes`] with an explicit environment for the dev gate.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn append_framework_routes_with_env(
+    infos: &mut Vec<RouteInfo>,
+    config: &crate::config::AutumnConfig,
+    env: &dyn crate::config::Env,
+) {
+    append_probe_and_actuator_routes(infos, config);
 
     #[cfg(feature = "htmx")]
     for asset in crate::htmx::framework_scripts() {
@@ -816,6 +836,20 @@ pub(crate) fn append_framework_routes(
         ));
         infos.push(RouteInfo::framework_get(asset.url().to_owned(), handler));
     }
+
+    // Flash and widget stylesheets: mounted whenever their feature is on.
+    #[cfg(feature = "flash")]
+    infos.push(RouteInfo::framework_get(
+        crate::flash::FLASH_CSS_PATH.to_owned(),
+        "flash_css",
+    ));
+    #[cfg(feature = "maud")]
+    infos.push(RouteInfo::framework_get(
+        crate::ui::WIDGETS_CSS_PATH.to_owned(),
+        "widgets_css",
+    ));
+
+    append_dev_reload_routes_with_env(infos, env);
 
     #[cfg(feature = "mail")]
     if config
@@ -927,10 +961,10 @@ pub(crate) fn append_openapi_routes(
 
 /// Append dev live-reload routes (`/__autumn/live-reload`, `/__autumn/live-reload.js`).
 ///
-/// Routes are only appended when the Autumn dev server is active
-/// (`AUTUMN_DEV=1` and `AUTUMN_ENV != production`).
-pub(crate) fn append_dev_reload_routes(infos: &mut Vec<RouteInfo>) {
-    if crate::middleware::dev::is_enabled_with_env(&crate::config::OsEnv) {
+/// Routes are only appended when the dev server sets the live-reload
+/// variables, the same gate the router uses.
+fn append_dev_reload_routes_with_env(infos: &mut Vec<RouteInfo>, env: &dyn crate::config::Env) {
+    if crate::middleware::dev::is_enabled_with_env(env) {
         for (path, handler) in [
             (crate::middleware::dev::LIVE_RELOAD_PATH, "dev_live_reload"),
             (
@@ -2292,18 +2326,101 @@ mod tests {
 
     #[test]
     fn append_dev_reload_routes_empty_when_dev_disabled() {
-        // In the test environment AUTUMN_DEV is not set, so this should be a no-op.
-        let guard = std::env::var("AUTUMN_DEV");
-        if guard.is_ok() {
-            // Skip: dev mode is active in this test process.
-            return;
-        }
+        let env = crate::config::MockEnv::new();
         let mut infos = Vec::new();
-        append_dev_reload_routes(&mut infos);
+        append_dev_reload_routes_with_env(&mut infos, &env);
+        assert!(infos.is_empty(), "expected no dev routes without dev env");
+    }
+
+    fn dev_env() -> crate::config::MockEnv {
+        crate::config::MockEnv::new()
+            .with("AUTUMN_DEV_RELOAD", "1")
+            .with("AUTUMN_DEV_RELOAD_STATE", "state.json")
+    }
+
+    /// Framework routes list the dev live-reload paths under the router's
+    /// gate, so `autumn routes` and the graph both see them (#2520 item 7).
+    #[test]
+    fn append_framework_routes_lists_dev_reload_when_dev_env_is_set() {
+        let config = AutumnConfig::default();
+        let mut infos = Vec::new();
+        append_framework_routes_with_env(&mut infos, &config, &dev_env());
+        for path in [
+            crate::middleware::dev::LIVE_RELOAD_PATH,
+            crate::middleware::dev::LIVE_RELOAD_SCRIPT_PATH,
+        ] {
+            assert_eq!(infos.iter().filter(|i| i.path == path).count(), 1, "{path}");
+        }
+        let mut quiet = Vec::new();
+        append_framework_routes_with_env(&mut quiet, &config, &crate::config::MockEnv::new());
         assert!(
-            infos.is_empty(),
-            "expected no dev routes when AUTUMN_DEV unset"
+            !quiet
+                .iter()
+                .any(|i| i.path == crate::middleware::dev::LIVE_RELOAD_PATH)
         );
+    }
+
+    #[cfg(feature = "flash")]
+    #[test]
+    fn append_framework_routes_lists_flash_css() {
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &AutumnConfig::default());
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|i| i.path == crate::flash::FLASH_CSS_PATH)
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn append_framework_routes_lists_widgets_css() {
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &AutumnConfig::default());
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|i| i.path == crate::ui::WIDGETS_CSS_PATH)
+                .count(),
+            1
+        );
+    }
+
+    /// The widget runtime script comes from `framework_scripts`; it must be
+    /// listed once, not once there and once as a separate asset entry.
+    #[cfg(feature = "htmx")]
+    #[test]
+    fn append_framework_routes_lists_widgets_js_once() {
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &AutumnConfig::default());
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|i| i.path == crate::htmx::AUTUMN_WIDGETS_JS_PATH)
+                .count(),
+            1
+        );
+    }
+
+    /// A worker mounts the probes and the actuator only (#2520 item 2).
+    #[test]
+    fn append_probe_and_actuator_routes_lists_only_those() {
+        let config = AutumnConfig::default();
+        let mut infos = Vec::new();
+        append_probe_and_actuator_routes(&mut infos, &config);
+        let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&config.health.path.as_str()), "{paths:?}");
+        assert!(
+            paths.iter().any(|p| p.starts_with(&config.actuator.prefix)),
+            "{paths:?}"
+        );
+        assert!(
+            infos.iter().all(|i| !i.path.starts_with("/static/")),
+            "no asset or static routes: {paths:?}"
+        );
+        assert!(!paths.contains(&"/static/{*path}"), "{paths:?}");
     }
 
     // ── SecurityDump::from_config (declared-vs-runtime honesty) ─────────────

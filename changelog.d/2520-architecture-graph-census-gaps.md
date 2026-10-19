@@ -1,0 +1,13 @@
+### Fixed
+
+- **graph:** close the served-surface gaps in the architecture graph
+  (issue #2520). The census now lists OpenAPI routes, framework asset
+  routes, and a worker's probe and actuator routes. `autumn graph` uses
+  the app's config loader and role.
+- **graph:** `--check` names a changed secondary mount and a changed
+  declared plugin mount. Declared plugin mounts keep their auth in
+  `completeness.declared_mounts`.
+- **graph:** SQL scan ignores quoted text, reads each statement of a
+  batch, and reads `COPY` and `TABLE`. A cron job records its timezone.
+- **graph:** repository edges match the model by name and table. Git
+  dependency paths no longer leak the build user's home directory.

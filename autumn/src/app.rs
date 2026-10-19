@@ -3835,7 +3835,7 @@ impl AppBuilder {
         // not about the annotation alone. Runs before any database or port is
         // touched.
         if crate::graph::manifest::is_dump_mode() {
-            self.run_dump_graph_mode();
+            self.run_dump_graph_mode().await;
             return;
         }
 
@@ -4995,7 +4995,14 @@ impl AppBuilder {
         // does this process serve".
         let (graph_mounted, graph_opaque) = if role.serves_http() {
             (
-                graph_mounted_routes(&all_routes, &scoped_groups, &declared_routes, &config),
+                graph_mounted_routes(
+                    &all_routes,
+                    &scoped_groups,
+                    &declared_routes,
+                    &config,
+                    #[cfg(feature = "openapi")]
+                    openapi.as_ref(),
+                ),
                 omitted_router_count(
                     merge_routers.len(),
                     nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
@@ -5003,7 +5010,7 @@ impl AppBuilder {
                 ),
             )
         } else {
-            (Vec::new(), 0)
+            (graph_worker_mounted_routes(&config), 0)
         };
         crate::graph::install(crate::graph::manifest::audit(&graph_mounted, graph_opaque));
 
@@ -6886,7 +6893,14 @@ impl AppBuilder {
         // router is built, so `/actuator/graph` can answer from the first
         // request rather than after some later warm-up.
         crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(&all_routes, &scoped_groups, &[], &config),
+            &graph_mounted_routes(
+                &all_routes,
+                &scoped_groups,
+                &[],
+                &config,
+                #[cfg(feature = "openapi")]
+                openapi.as_ref(),
+            ),
             // The static-build path builds its router with no nest mounts and
             // no declared plugin routes (see the `RouterContext` below), so the
             // merge count is the whole opaque surface here.
@@ -7080,26 +7094,37 @@ impl AppBuilder {
     ///
     /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
     /// Does not connect to a database or bind a TCP port.
-    fn run_dump_graph_mode(&self) {
-        // The framework's mounts depend on configuration — the health probe
-        // paths and the actuator prefix are both configurable — so the census
-        // needs the app's own config, not defaults. `AutumnConfig::load()` is
-        // the plain five-layer TOML + env read with no telemetry or database
-        // work, which keeps this dump's promise of touching neither. A config
-        // that fails to load is not this command's error to report: fall back
-        // to defaults so the graph still dumps, exactly as the routes listing
-        // would still list.
-        let config = crate::config::AutumnConfig::load().unwrap_or_default();
+    async fn run_dump_graph_mode(self) {
+        let (mounted, opaque) = self.dump_graph_surface().await;
+        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(
+            &mounted, opaque,
+        ));
+    }
+
+    /// The served surface the graph dump joins against.
+    ///
+    /// The framework's mounts depend on configuration, so this reads the app's
+    /// own config through the builder's loader and plugin roots, as normal
+    /// startup does. It starts no telemetry and opens no database. A config
+    /// that fails to load falls back to defaults, so the graph still dumps.
+    /// A worker role gets the worker census, as at runtime.
+    async fn dump_graph_surface(self) -> (Vec<crate::graph::MountedRoute>, usize) {
+        let opaque = self.graph_opaque_router_count();
+        let config = try_load_config(self.config_loader_factory, self.plugin_config_roots)
+            .await
+            .unwrap_or_default();
+        if !config.role.serves_http() {
+            return (graph_worker_mounted_routes(&config), 0);
+        }
         let mounted = graph_mounted_routes(
             &self.routes,
             &self.scoped_groups,
             &self.declared_routes,
             &config,
+            #[cfg(feature = "openapi")]
+            self.openapi.as_ref(),
         );
-        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(
-            &mounted,
-            self.graph_opaque_router_count(),
-        ));
+        (mounted, opaque)
     }
 
     /// Raw `merge`/`nest` routers whose endpoints the graph cannot enumerate.
@@ -7296,7 +7321,6 @@ impl AppBuilder {
         if let Some(ref oa) = openapi {
             crate::route_listing::append_openapi_routes(&mut infos, oa);
         }
-        crate::route_listing::append_dev_reload_routes(&mut infos);
         crate::route_listing::sort_route_infos(&mut infos);
 
         let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
@@ -8890,7 +8914,15 @@ impl AppBuilder {
         // See the matching call in `run()`: the graph is published before the
         // router is built so `/actuator/graph` answers from the first request.
         crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(&routes, &scoped_groups, &declared_routes, &config),
+            &graph_mounted_routes(
+                &routes,
+                &scoped_groups,
+                &declared_routes,
+                &config,
+                // The replay router mounts no `OpenAPI` routes.
+                #[cfg(feature = "openapi")]
+                None,
+            ),
             omitted_router_count(
                 merge_routers.len(),
                 nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
@@ -9046,6 +9078,7 @@ fn graph_mounted_routes(
     scoped_groups: &[ScopedGroup],
     declared_routes: &[crate::route_listing::RouteInfo],
     config: &crate::config::AutumnConfig,
+    #[cfg(feature = "openapi")] openapi: Option<&crate::openapi::OpenApiConfig>,
 ) -> Vec<crate::graph::MountedRoute> {
     // The framework's own mounts — probes, the actuator, htmx assets, the docs
     // UI — are served by `router.rs` and belong in the census: the manifest and
@@ -9056,6 +9089,11 @@ fn graph_mounted_routes(
     // what the framework mounts.
     let mut framework: Vec<crate::route_listing::RouteInfo> = Vec::new();
     crate::route_listing::append_framework_routes(&mut framework, config);
+    // The router merges the `OpenAPI` routes only when the runtime gate is open.
+    #[cfg(feature = "openapi")]
+    if let Some(openapi) = openapi.filter(|_| config.openapi_runtime.enabled) {
+        crate::route_listing::append_openapi_routes(&mut framework, openapi);
+    }
 
     routes
         .iter()
@@ -9067,8 +9105,23 @@ fn graph_mounted_routes(
                 .map(move |route| graph_route_summary(route, Some(&group.prefix)))
         }))
         .chain(declared_routes.iter().map(graph_declared_route_summary))
-        .chain(framework.iter().map(graph_declared_route_summary))
+        // Framework endpoints are named only; their auth is not a declaration.
+        .chain(framework.iter().map(|route| crate::graph::MountedRoute {
+            auth_declared: false,
+            ..graph_declared_route_summary(route)
+        }))
         .collect()
+}
+
+/// The census of a process that does not serve HTTP routes (a worker).
+///
+/// A worker builds `try_build_probe_only_router`: probes and actuator only.
+fn graph_worker_mounted_routes(
+    config: &crate::config::AutumnConfig,
+) -> Vec<crate::graph::MountedRoute> {
+    let mut framework: Vec<crate::route_listing::RouteInfo> = Vec::new();
+    crate::route_listing::append_probe_and_actuator_routes(&mut framework, config);
+    framework.iter().map(graph_declared_route_summary).collect()
 }
 
 /// The architecture-graph view of a route declared through
@@ -9111,6 +9164,8 @@ fn graph_declared_route_summary(
         // A `RouteInfo` carries no repository metadata: these are plugin and
         // framework mounts, which no `#[repository]` generated.
         repository_api: None,
+        // The caller clears this for framework endpoints.
+        auth_declared: true,
     }
 }
 
@@ -9179,7 +9234,11 @@ fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::grap
         repository_api: route
             .repository
             .as_ref()
-            .map(|meta| meta.api_path.to_owned()),
+            .map(|meta| crate::graph::RepositoryApiOwner {
+                api: meta.api_path.to_owned(),
+                model: meta.resource_type_name.to_owned(),
+            }),
+        auth_declared: false,
     }
 }
 
@@ -12450,6 +12509,19 @@ async fn load_config_only(
     config_loader: Option<ConfigLoaderFactory>,
     plugin_config_roots: BTreeSet<String>,
 ) -> AutumnConfig {
+    try_load_config(config_loader, plugin_config_roots)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to load configuration: {e}");
+            std::process::exit(1);
+        })
+}
+
+/// [`load_config_only`] that returns a load error instead of exiting.
+async fn try_load_config(
+    config_loader: Option<ConfigLoaderFactory>,
+    plugin_config_roots: BTreeSet<String>,
+) -> Result<AutumnConfig, crate::config::ConfigError> {
     // 1. Load configuration via the installed loader, falling back to the
     //    five-layer TOML + env default.
     //
@@ -12467,11 +12539,7 @@ async fn load_config_only(
                 .load()
                 .await
         }
-    }
-    .unwrap_or_else(|e| {
-        eprintln!("Failed to load configuration: {e}");
-        std::process::exit(1);
-    });
+    }?;
 
     // `autumn serve --daemon` binds the app on a private Unix socket and then
     // discovers/health-probes it by path. A custom `with_config_loader` can
@@ -12509,7 +12577,7 @@ async fn load_config_only(
     // and opens nothing, so it does not violate what those modes promise.
     crate::metrics::set_limits(config.metrics.limits());
 
-    config
+    Ok(config)
 }
 
 /// Register the embedded `static/` tree (if any) as the process-wide asset
@@ -18197,6 +18265,128 @@ mod tests {
                  /actuator/graph"
             );
         }
+    }
+
+    // ── Architecture-graph census (#2520) ──────────────────────────────────
+
+    fn census_paths(mounted: &[crate::graph::MountedRoute]) -> Vec<&str> {
+        mounted.iter().map(|m| m.path.as_str()).collect()
+    }
+
+    /// The router merges the `OpenAPI` routes when the feature is on and the
+    /// runtime gate is open, so the census must name them (#2520 item 1).
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn graph_census_names_openapi_routes_when_enabled() {
+        let config = AutumnConfig::default();
+        let openapi =
+            crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/spec.json");
+        let mounted = graph_mounted_routes(&[], &[], &[], &config, Some(&openapi));
+        assert!(
+            census_paths(&mounted).contains(&"/spec.json"),
+            "{:?}",
+            census_paths(&mounted)
+        );
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn graph_census_omits_openapi_routes_when_runtime_disabled() {
+        let mut config = AutumnConfig::default();
+        config.openapi_runtime.enabled = false;
+        let openapi =
+            crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/spec.json");
+        let mounted = graph_mounted_routes(&[], &[], &[], &config, Some(&openapi));
+        assert!(
+            !census_paths(&mounted).contains(&"/spec.json"),
+            "{:?}",
+            census_paths(&mounted)
+        );
+    }
+
+    /// `health.enabled = false` mounts no probe, so the census lists none
+    /// (#2520 item 12).
+    #[test]
+    fn graph_census_lists_no_probe_when_health_is_off() {
+        let mut config = AutumnConfig::default();
+        config.health.enabled = false;
+        let mounted = graph_mounted_routes(
+            &[],
+            &[],
+            &[],
+            &config,
+            #[cfg(feature = "openapi")]
+            None,
+        );
+        let paths = census_paths(&mounted);
+        for probe in [
+            &config.health.path,
+            &config.health.live_path,
+            &config.health.ready_path,
+            &config.health.startup_path,
+        ] {
+            assert!(!paths.contains(&probe.as_str()), "{probe} in {paths:?}");
+        }
+    }
+
+    /// A worker mounts the probes and the actuator, nothing else (#2520 item 2).
+    #[test]
+    fn graph_worker_census_is_probes_and_actuator_only() {
+        let mut config = AutumnConfig::default();
+        config.role = crate::config::ProcessRole::Worker;
+        config.actuator.sensitive = true;
+        let mounted = graph_worker_mounted_routes(&config);
+        let paths = census_paths(&mounted);
+        assert!(
+            paths.contains(&config.health.live_path.as_str()),
+            "{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("/graph")),
+            "the actuator graph endpoint is served: {paths:?}"
+        );
+        assert!(!paths.contains(&"/static/{*path}"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/static/")),
+            "no asset routes on a worker: {paths:?}"
+        );
+    }
+
+    #[derive(Clone)]
+    struct CensusLoader(Result<AutumnConfig, String>);
+
+    impl crate::config::ConfigLoader for CensusLoader {
+        async fn load(&self) -> Result<AutumnConfig, crate::config::ConfigError> {
+            self.0
+                .clone()
+                .map_err(crate::config::ConfigError::Validation)
+        }
+    }
+
+    /// The dump reads config through the builder's loader and picks the worker
+    /// census for a worker role (#2520 items 4 and 6).
+    #[tokio::test]
+    async fn dump_graph_surface_uses_builder_loader_and_worker_role() {
+        let mut config = AutumnConfig::default();
+        config.role = crate::config::ProcessRole::Worker;
+        config.health.live_path = "/custom-live".to_owned();
+        let builder = app().with_config_loader(CensusLoader(Ok(config)));
+        let (mounted, opaque) = builder.dump_graph_surface().await;
+        let paths = census_paths(&mounted);
+        assert!(paths.contains(&"/custom-live"), "{paths:?}");
+        assert!(!paths.contains(&"/static/{*path}"), "{paths:?}");
+        assert_eq!(opaque, 0);
+    }
+
+    #[tokio::test]
+    async fn dump_graph_surface_falls_back_to_defaults_when_loader_fails() {
+        let builder = app().with_config_loader(CensusLoader(Err("boom".to_owned())));
+        let (mounted, _) = builder.dump_graph_surface().await;
+        assert!(
+            census_paths(&mounted).contains(&"/static/{*path}"),
+            "{:?}",
+            census_paths(&mounted)
+        );
     }
 
     #[test]
