@@ -673,6 +673,12 @@ fn mutating_statement_words(literal: &str) -> Vec<String> {
 /// every name after `TRUNCATE`. A `WITH` statement can hold several. A
 /// schema-qualified name gives both parts.
 fn write_targets(statement: &str) -> Vec<String> {
+    // `public . posts` is one name: close the space around each dot.
+    let statement = statement
+        .split('.')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(".");
     let tokens: Vec<&str> = statement
         .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '"')))
         .filter(|t| !t.is_empty())
@@ -1610,6 +1616,10 @@ mod tests {
             vec!["a".to_owned(), "b".to_owned()]
         );
         assert!(words("SELECT id FROM users").is_empty());
+        assert_eq!(
+            words("UPDATE public . posts SET n = 1"),
+            vec!["public".to_owned(), "posts".to_owned()]
+        );
         let quoted = words("UPDATE posts SET note = 'UPDATE users'");
         assert_eq!(quoted, vec!["posts".to_owned()]);
     }
