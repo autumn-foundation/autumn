@@ -1445,8 +1445,8 @@ fn exempts(prefix: &str, path: &str) -> bool {
 /// It runs twice: for the prefix itself, and for everything below it. A prefix
 /// that ends in `/` has no URL of its own.
 fn exempt_servers<'a>(prefix: &str, routes: &[&'a RouteKey]) -> Vec<&'a RouteKey> {
-    let base = normalize_captures(prefix);
-    let base = base.trim_end_matches('/');
+    // The prefix is a concrete URL, never a template: its braces stay literal.
+    let base = prefix.trim_end_matches('/');
     let below = format!("{base}/{CATCH_ALL}");
     let subjects = if prefix.ends_with('/') {
         vec![below]
@@ -4980,6 +4980,20 @@ mod tests {
     #[test]
     fn a_root_prefix_binds_every_route() {
         let digest = |scopes: &[&str]| exemption_digest(&[("/api/{id}", "POST", scopes)], &["/"]);
+        assert_ne!(digest(&["mfa"]), digest(&[]));
+    }
+
+    /// A prefix is a concrete URL. Its `{{` is two literal braces, not the
+    /// route escape for one, so the static route `/{{foo}}` (which serves
+    /// `/{foo}`) does not shadow the dynamic route here.
+    #[test]
+    fn an_exemption_prefix_keeps_its_literal_braces() {
+        let digest = |dynamic: &[&str]| {
+            exemption_digest(
+                &[("/{{foo}}", "POST", &["mfa"]), ("/{id}", "POST", dynamic)],
+                &["/{{foo}}"],
+            )
+        };
         assert_ne!(digest(&["mfa"]), digest(&[]));
     }
 
