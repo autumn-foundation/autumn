@@ -286,6 +286,8 @@ impl FleetPendingIndex {
         }
     }
 
+    /// Insert a row, or end the backoff of the row that exists: new work is
+    /// due at once. Keeps the time of an existing row.
     async fn insert(
         &self,
         conn: &mut RuntimeConnection,
@@ -294,7 +296,7 @@ impl FleetPendingIndex {
     ) -> AutumnResult<()> {
         diesel::sql_query(format!(
             "INSERT INTO {PENDING_TABLE} (key, kind, since) VALUES (?, ?, ?) \
-             ON CONFLICT (key, kind) DO NOTHING"
+             ON CONFLICT (key, kind) DO UPDATE SET visit_after = 0, attempts = 0"
         ))
         .bind::<Text, _>(key)
         .bind::<Text, _>(kind.as_str())
@@ -1587,6 +1589,17 @@ mod tests {
             index.due(None, 10).await.unwrap().len(),
             1,
             "slot 2 is due again"
+        );
+        // A new epoch marks every database: a deferred one is due at once.
+        index.defer("slot:00002").await.unwrap();
+        index
+            .mark_many(&["slot:00002".to_owned()], PendingKind::Outbox)
+            .await
+            .unwrap();
+        assert_eq!(
+            index.due(None, 10).await.unwrap().len(),
+            1,
+            "due after mark_many"
         );
         assert_eq!(
             index.pending(10).await.unwrap().len(),
