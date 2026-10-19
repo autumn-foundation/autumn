@@ -6580,8 +6580,10 @@ fn run_deprecations_check(package: Option<&str>, bin: Option<&str>) {
     routes::compile_binary(package, bin);
     let binary = routes::find_binary(package, bin);
 
-    let output = std::process::Command::new(&binary)
-        .env("AUTUMN_DUMP_ROUTES", "1")
+    let mut command = std::process::Command::new(&binary);
+    command.env(routes::DUMP_ENV, "1");
+    routes::clear_other_dump_modes(&mut command, routes::DUMP_ENV);
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()
