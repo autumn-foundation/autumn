@@ -175,11 +175,23 @@ autumn-web = { path = "${root}/autumn" }
 TOML
     (
       cd "${work}/${name}"
-      # The app pins its toolchain, as it does in a user's CI. rustup 1.28
-      # does not install a missing one on its own.
+      # The app pins its toolchain, as it does in a user's CI. rustup does
+      # not install a missing one on its own, so install it explicitly —
+      # but only when it isn't already there. `rustup toolchain install`
+      # always talks to the toolchain server to check for updates unless
+      # told not to, and the flag for that differs by rustup version:
+      # `--no-update` (skip entirely if installed) only exists from rustup
+      # 1.29 on, while `--no-self-update` (skip rustup's own self-update,
+      # but still sync the toolchain) exists on older releases too but
+      # still means a network round-trip per generated-app flavor even
+      # when nothing needs installing. Checking `rustup toolchain list`
+      # first avoids the version-dependent flag entirely and skips the
+      # network call outright once the toolchain is present.
       toolchain="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null)"
       if [ -n "${toolchain}" ] && command -v rustup >/dev/null 2>&1; then
-        rustup toolchain install --no-update --profile minimal "${toolchain}" >/dev/null
+        if ! rustup toolchain list | grep -q "^${toolchain}-"; then
+          rustup toolchain install --no-self-update --profile minimal "${toolchain}" >/dev/null
+        fi
       fi
       cargo fetch
       cargo deny --offline check advisories
