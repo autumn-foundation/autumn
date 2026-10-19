@@ -1437,18 +1437,30 @@ fn exempts(prefix: &str, path: &str) -> bool {
         .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/'))
 }
 
-/// Whether any URL a route template matches falls under an exemption prefix.
+/// The routes that serve some URL an exemption prefix covers.
 ///
-/// The prefix is a concrete URL prefix and the template is a shape, so the
-/// question is whether the two intersect — `/api/me` exempts `/api/{id}` for
-/// exactly the request `/api/me`, which is the whole reason the per-route row
-/// keeps saying "enforced" while those requests stop being validated. Either
-/// the prefix names the route's own URLs or it sits above them, hence the
-/// catch-all form.
-fn exempts_shape(prefix: &str, template: &str) -> bool {
+/// The prefix is a concrete URL prefix and a template is a shape, so the two
+/// are compared by intersection — `/api/me` exempts `/api/{id}` for exactly
+/// the request `/api/me`. Two subjects cover the prefix: itself, and the
+/// catch-all form for the URLs below it.
+///
+/// Overlap alone over-binds. `/users/me` overlaps `/users/{id}`, but the static
+/// node wins that URL, so the dynamic route never serves it. `undominated`
+/// ranks the overlapping nodes the same way the removal analysis does, and
+/// drops a node that a more specific one fully covers.
+fn exempt_servers<'a>(prefix: &str, routes: &[&'a RouteKey]) -> Vec<&'a RouteKey> {
     let prefix = normalize_captures(prefix);
-    intersect(template, &prefix).is_some()
-        || intersect(template, &format!("{prefix}/{CATCH_ALL}")).is_some()
+    [prefix.clone(), format!("{prefix}/{CATCH_ALL}")]
+        .iter()
+        .flat_map(|subject| {
+            let overlapping: Vec<&RouteKey> = routes
+                .iter()
+                .filter(|(path, _)| intersect(path, subject).is_some())
+                .copied()
+                .collect();
+            undominated(subject, &overlapping)
+        })
+        .collect()
 }
 
 /// Configured exemption prefixes, which the per-route rows cannot show.
@@ -1485,9 +1497,13 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
         let csrf = csrf_index(head);
         let bindings = authz_index(head);
         let mtls = mtls_index(head);
-        let mut guards: Vec<String> = routes
-            .keys()
-            .filter(|(path, _)| added.iter().any(|prefix| exempts_shape(prefix, path)))
+        let mounted: Vec<&RouteKey> = routes.keys().collect();
+        let served: BTreeSet<&RouteKey> = added
+            .iter()
+            .flat_map(|prefix| exempt_servers(prefix, &mounted))
+            .collect();
+        let mut guards: Vec<String> = served
+            .into_iter()
             .filter_map(|key| {
                 effective_posture(key, &routes, &csrf, &bindings, &mtls)
                     .map(|posture| escape_list(&[key.1.clone(), key.0.clone(), posture]))
@@ -4832,6 +4848,82 @@ mod tests {
 
         assert_ne!(exempting_with(&["mfa"]), exempting_with(&[]));
     }
+
+    /// The exemption finding for `/users/me`, with a static `/users/me` and a
+    /// dynamic `/users/{id}` mounted. Each takes its own scopes.
+    fn exempting_users_me(static_scopes: &[&str], dynamic_scopes: &[&str]) -> String {
+        let routes = |s: &[&str], d: &[&str]| {
+            format!(
+                "{},{}",
+                route("/users/me", "POST", "gated", &["admin"], s, false),
+                route("/users/{id}", "POST", "gated", &["admin"], d, false),
+            )
+        };
+        let csrf = r#"{"path":"/users/me","method":"POST","csrf_enforced":true,"exempt":false},
+                      {"path":"/users/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#;
+        let base = manifest_exempt(&routes(&["mfa"], &["mfa"]), csrf, &[]);
+        diff(
+            &base,
+            &manifest_exempt(&routes(static_scopes, dynamic_scopes), csrf, &["/users/me"]),
+        )
+        .into_iter()
+        .find(|f| f.kind == "csrf_exemption_added")
+        .expect("a new exemption is a widening")
+        .canonical()
+    }
+
+    /// `POST /users/{id}` never gets `/users/me`: the static node wins it. The
+    /// dynamic route is not in the identity, so loosening it alone does not
+    /// re-ask for an exemption whose posture did not move.
+    #[test]
+    fn an_exemption_ignores_a_route_that_never_serves_the_exempt_url() {
+        assert_eq!(
+            exempting_users_me(&["mfa"], &["mfa"]),
+            exempting_users_me(&["mfa"], &[]),
+        );
+    }
+
+    /// The static route does serve the exempt URL, so loosening it re-asks.
+    #[test]
+    fn an_exemption_still_binds_to_the_route_that_wins_the_url() {
+        assert_ne!(
+            exempting_users_me(&["mfa"], &["mfa"]),
+            exempting_users_me(&[], &["mfa"]),
+        );
+    }
+
+    /// A prefix above both routes splits its URLs between them. Neither
+    /// covers the other's share, so both stay bound.
+    #[test]
+    fn an_exemption_binds_every_route_that_wins_part_of_the_prefix() {
+        let finding = |static_scopes: &[&str], dynamic_scopes: &[&str]| {
+            let routes = format!(
+                "{},{}",
+                route("/api/me", "POST", "gated", &["admin"], static_scopes, false),
+                route(
+                    "/api/{id}",
+                    "POST",
+                    "gated",
+                    &["admin"],
+                    dynamic_scopes,
+                    false
+                ),
+            );
+            let csrf = r#"{"path":"/api/me","method":"POST","csrf_enforced":true,"exempt":false},
+                          {"path":"/api/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#;
+            diff(
+                &manifest_exempt(&routes, csrf, &[]),
+                &manifest_exempt(&routes, csrf, &["/api"]),
+            )
+            .into_iter()
+            .find(|f| f.kind == "csrf_exemption_added")
+            .expect("a new exemption is a widening")
+            .canonical()
+        };
+        assert_ne!(finding(&["mfa"], &["mfa"]), finding(&[], &["mfa"]));
+        assert_ne!(finding(&["mfa"], &["mfa"]), finding(&["mfa"], &[]));
+    }
+
     /// The header findings were the last constant fingerprints, and I said two
     /// rounds ago that they were fine because a header is emitted or it is not
     /// — true of the *value*, and beside the point. The identity has to carry
