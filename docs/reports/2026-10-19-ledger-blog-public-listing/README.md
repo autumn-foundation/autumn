@@ -82,6 +82,6 @@ initdb; start with shared_preload_libraries=pg_stat_statements; create db blog +
 cargo build -p blog --release   # app runs migrations on boot
 psql -v n=100000 -f fixture.sql blog
 ./explain.sh baseline && ./profile.sh baseline 100000   # on the parent commit
-./explain.sh after card && ./profile.sh after 100000
+./explain.sh after listing && ./profile.sh after 100000
 ```
 Not run: migration rollback (no migration), insert-throughput (no index), `cargo test --all-features` workspace-wide (blog crate only).
