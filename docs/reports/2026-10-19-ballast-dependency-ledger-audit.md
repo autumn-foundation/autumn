@@ -165,7 +165,7 @@ before anything else.
 **Queue triage**: no forcing fact needed for the merges — each is a
 routine minor/patch bump (or, for #3169, closes a real CVE) with CI green
 on the head actually being merged, which is exactly what "the scheduled
-batch" and ordinary hygiene PRs look like. The six left-open majors have
+batch" and ordinary hygiene PRs look like. The seven left-open majors have
 *no* forcing fact (no advisory, no EOL, no named consumer waiting on a new
 feature) and real reproduced breakage for two of them, so leaving them
 alone is the correct call under "majors ride forcing facts, never fashion"
@@ -193,7 +193,7 @@ work this pass didn't attempt.
 | Advisory gate self-test (4 policies) | OK | OK |
 | Root/SQLite licenses + sources | clean | clean |
 | Duplicate crate names (warn-level, `cargo deny check bans`) | 90 | 91 |
-| Open Dependabot PRs | 0 | 12 → **6** after this pass's triage |
+| Open Dependabot PRs | 0 | 12 → **8** after this pass's triage (3 merged, 1 closed as superseded; 7 majors left open plus #3146, still open pending its requested rebase) |
 | GitHub-native Dependabot alert count | 16 (4 high, 10 moderate, 2 low) | 16 (4 high, 10 moderate, 2 low) — unchanged |
 | Waivers' review-by date (`deny.toml` ×3, `deny-sqlite.toml` ×3, `fuzz/deny.toml` ×1, `island-flock/deny.toml` ×2) | 2026-11-02 | 2026-11-02 — not yet due, not re-dated this pass |
 
