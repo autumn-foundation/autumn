@@ -1,0 +1,7 @@
+                                q                                | calls |  rows  | buffers | shared_blks_hit | shared_blks_read | temp_blks_read | temp_blks_written | wal_bytes | pct_buffers | pct_calls 
+-----------------------------------------------------------------+-------+--------+---------+-----------------+------------------+----------------+-------------------+-----------+-------------+-----------
+ SELECT "posts"."id", "posts"."title", "posts"."slug", "posts... |     6 | 570000 | 2291268 |         1704083 |           587185 |              0 |                 0 |         0 |        74.0 |       1.9
+ SELECT "posts"."id", "posts"."title", "posts"."slug", "posts... |     2 | 200000 |  802450 |          598178 |           204272 |           1988 |              1992 |         0 |        25.9 |       0.6
+ SELECT "posts"."id", "posts"."title", "posts"."slug", "posts... |   300 |    285 |    2340 |            1645 |              695 |              0 |                 0 |         0 |         0.1 |      97.4
+(3 rows)
+
