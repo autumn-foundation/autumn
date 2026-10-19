@@ -9608,6 +9608,14 @@ fn posture_gate_job_harvests_pull_request_acknowledgments() {
         job.contains("collaborators/") && job.contains("admin|write|maintain"),
         "only commenters with admin, write or maintain permission may acknowledge"
     );
+    assert!(
+        job.contains("pull-requests: read"),
+        "the job needs read access to pull request comments"
+    );
+    assert!(
+        job.contains("does not re-run") && job.contains("acknowledgment accepted from"),
+        "the job must explain the re-run path and log each accepted acknowledger"
+    );
     let harvest = job
         .split("- name: ")
         .find(|step| step.contains("collaborators/"))

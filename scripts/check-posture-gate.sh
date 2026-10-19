@@ -36,6 +36,7 @@
 #   - pull_request: the job reads the pull request comments. It keeps only
 #     comments from users with admin, write or maintain permission.
 #   - workflow_dispatch: the `posture_ack` input sets AUTUMN_POSTURE_ACK.
+#   - A comment does not re-run the workflow. Re-run the job after you comment.
 #   - tag push: no acknowledgment. A release tag has no pull request. Acknowledge
 #     and merge the widening first.
 #
@@ -236,7 +237,7 @@ for example in "${EXAMPLES[@]}"; do
     1)
       echo "error: $example: this change widens the example's security surface." >&2
       echo "       To accept it, comment the /ack-posture line printed above on the" >&2
-      echo "       pull request, then re-run the job. Locally, set" >&2
+      echo "       pull request, then re-run the failed job (comments do not start a run). Locally, set" >&2
       echo "       AUTUMN_POSTURE_ACK=<digest printed above>." >&2
       echo "       Then refresh the baseline with $0 --update in the same change." >&2
       failed=1

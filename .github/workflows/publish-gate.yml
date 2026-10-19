@@ -78,11 +78,17 @@ jobs:
   #   - pull request: a /ack-posture comment from a user with write access.
   #   - workflow_dispatch: the posture_ack input.
   #   - tag push: none. Acknowledge and merge the widening before the tag.
+  # A comment does not re-run this workflow. After you comment, re-run the
+  # job (Actions, Publish Gate, Re-run failed jobs) or push a commit.
   # See scripts/check-posture-gate.sh and docs/guide/posture-gate.md.
   # ---------------------------------------------------------------------------
   posture-gate:
     name: Security posture gate (examples)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # To read pull request comments and reviews for acknowledgments.
+      pull-requests: read
     steps:
       # Full history: the script resolves each example's *accepted* posture from
       # the base revision, so that refreshing a committed baseline in the same
@@ -122,6 +128,7 @@ jobs:
               *) continue ;;
             esac
             n=$((n + 1))
+            echo "acknowledgment accepted from ${login} (${PERM})"
             printf '%s\n' "$body64" | base64 -d \
               > "$RUNNER_TEMP/acks/$(printf '%06d' "$n").md"
           done
