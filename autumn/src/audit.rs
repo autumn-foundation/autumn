@@ -368,6 +368,29 @@ impl JsonlFileAuditSink {
     }
 }
 
+/// Split an archive into the lines to keep and a count of stale ones.
+///
+/// A line that does not decode as an [`AuditEvent`] is kept, never counted
+/// as stale.
+fn keep_entries_since(existing: &str, cutoff: DateTime<Utc>) -> (String, u64) {
+    let mut kept = String::with_capacity(existing.len());
+    let mut removed: u64 = 0;
+    for line in existing.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let stale =
+            serde_json::from_str::<AuditEvent>(line).is_ok_and(|event| event.timestamp < cutoff);
+        if stale {
+            removed = removed.saturating_add(1);
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    (kept, removed)
+}
+
 impl AuditSink for JsonlFileAuditSink {
     fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_> {
         Box::pin(async move {
@@ -460,21 +483,7 @@ impl AuditSink for JsonlFileAuditSink {
                 }
             };
 
-            let mut kept = String::with_capacity(existing.len());
-            let mut removed: u64 = 0;
-            for line in existing.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let stale = serde_json::from_str::<AuditEvent>(line)
-                    .is_ok_and(|event| event.timestamp < cutoff);
-                if stale {
-                    removed = removed.saturating_add(1);
-                } else {
-                    kept.push_str(line);
-                    kept.push('\n');
-                }
-            }
+            let (kept, removed) = keep_entries_since(&existing, cutoff);
 
             if dry_run || removed == 0 {
                 return Ok(AuditPurgeOutcome::purged(removed));
