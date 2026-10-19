@@ -102,6 +102,8 @@ jobs:
       # The job asks GitHub for the permission. It does not use author_association.
       # Each comment goes to its own file, so one comment cannot change another.
       # A GitHub API error leaves the directory empty: nothing is acknowledged.
+      # A comment does not re-run this workflow. After you comment, re-run the
+      # job (Actions, Publish Gate, Re-run failed jobs) or push a commit.
       - name: Harvest acknowledgments from authorized reviewers
         if: github.event_name == 'pull_request'
         env:
