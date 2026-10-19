@@ -1,2 +1,2 @@
--- Intentionally empty. The full framework set creates and owns this index.
--- Dropping it here would remove it from apps that use both sets.
+-- Intentionally empty. The full framework set also creates this index.
+-- Neither set drops it on rollback, so an app that runs both keeps it.

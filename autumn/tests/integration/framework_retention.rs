@@ -954,3 +954,22 @@ fn the_standalone_commit_hook_migrations_carry_the_sweep_index() {
         "the version must differ from the full set: {versions:?}"
     );
 }
+
+#[test]
+fn no_rollback_drops_the_index_both_migration_sets_share() {
+    // Either set can be rolled back alone. Neither may drop the index the
+    // other one created.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for down in [
+        "migrations/20260831191622_retention_sweep_indexes/down.sql",
+        "repository_commit_hook_migrations/20261019120000_commit_hook_sweep_index/down.sql",
+    ] {
+        let sql = std::fs::read_to_string(root.join(down)).expect("down.sql");
+        let drops = sql.lines().any(|line| {
+            !line.trim_start().starts_with("--")
+                && line.contains("DROP INDEX")
+                && line.contains("idx_autumn_commit_hooks_finished")
+        });
+        assert!(!drops, "{down} drops the shared index");
+    }
+}
