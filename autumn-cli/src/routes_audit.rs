@@ -960,12 +960,14 @@ pub fn run(opts: &AuditOptions<'_>) {
     // Capture stderr (rather than inheriting it) so we can detect the app's
     // omitted-routes marker; forward it verbatim afterwards so warnings stay
     // visible to the user.
-    let output = Command::new(&binary)
-        .env("AUTUMN_DUMP_ROUTES", "1")
-        // Ask the app to also dump its resolved security config (CSRF + headers)
-        // so we can build the `declared` manifest dimensions. Only `audit` sets
-        // this; plain `autumn routes` leaves the marker off its stderr.
-        .env("AUTUMN_DUMP_SECURITY", "1")
+    let mut command = Command::new(&binary);
+    command.env(routes::DUMP_ENV, "1");
+    // Ask the app to also dump its resolved security config (CSRF + headers)
+    // so we can build the `declared` manifest dimensions. Only `audit` sets
+    // this; plain `autumn routes` leaves the marker off its stderr.
+    command.env("AUTUMN_DUMP_SECURITY", "1");
+    routes::clear_other_dump_modes(&mut command, routes::DUMP_ENV);
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
