@@ -35,6 +35,14 @@ async fn create_order(ApiToken(principal): ApiToken) -> AutumnResult<String> {
     Ok(format!("order-for-{principal}"))
 }
 
+/// Same as [`create_order`] without the counter, so the rotation test running
+/// in parallel cannot move `VERIFIED_ORDER_CALLS`.
+#[post("/agent-orders")]
+#[autumn_web::secured(scopes = ["orders:write"])]
+async fn create_agent_order(ApiToken(principal): ApiToken) -> AutumnResult<String> {
+    Ok(format!("order-for-{principal}"))
+}
+
 /// Checks the credential inside the handler, the way a durable workflow
 /// route resolves its own scope. No layer has verified anything before the
 /// idempotency layer computes its key.
@@ -128,18 +136,18 @@ async fn verified_principal_replays_across_token_rotation() {
     let store = Arc::new(InMemoryApiTokenStore::default());
     let app = TestApp::new()
         .idempotent()
-        .routes(routes![create_order])
+        .routes(routes![create_agent_order])
         .layer(RequireApiToken::new(store.clone()))
         .build();
 
     let old_token = format!("Bearer {}", issue(&store, "agent-1", "old").await);
     let new_token = format!("Bearer {}", issue(&store, "agent-1", "new").await);
 
-    let first = post_with(&app, "/orders", Some(&old_token), "rotate-key").await;
+    let first = post_with(&app, "/agent-orders", Some(&old_token), "rotate-key").await;
     first.assert_ok();
     assert_eq!(first.header("x-idempotent-replayed"), None);
 
-    let retry = post_with(&app, "/orders", Some(&new_token), "rotate-key").await;
+    let retry = post_with(&app, "/agent-orders", Some(&new_token), "rotate-key").await;
     retry.assert_ok();
     assert_eq!(retry.text(), "order-for-agent-1");
     assert_eq!(retry.header("x-idempotent-replayed"), Some("true"));
