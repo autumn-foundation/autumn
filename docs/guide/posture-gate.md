@@ -463,7 +463,7 @@ doesn't. It inherits every boundary of
   itself as posture: adding a prefix blocks, whatever the per-route rows say.
   Expect the report to name the prefix rather than the routes it touches.
   The acknowledgment binds only to routes that serve a URL under the prefix.
-  A dynamic route that a more specific static route fully shadows is left out.
+  A route is left out when a more specific route wins every URL it would serve.
 - **A build you do not audit.** The gate audits the build in
   `POSTURE_AUDIT_FLAGS`. A route that exists only in another build is not in
   the manifest. Keep the flags the same as your image build. The `build`
