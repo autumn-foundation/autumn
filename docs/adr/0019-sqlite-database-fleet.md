@@ -253,7 +253,10 @@ databases that nobody asks for:
 - **Bounds.** Each pass visits at most 64 databases, 4 at a time, with 256
   messages and 4 backfill rounds each. When a visit leaves work and does
   nothing, the database waits 1 s, then twice as long each time, up to
-  5 min. New work of the same kind ends the wait. The index stores this wait, so a stuck database never hides the
+  5 min. New work of the same kind ends the wait. A visit that made
+  progress and left work moves the database behind the others that are
+  due, so busy databases take turns. A worker runs its first pass when it
+  starts, before it waits for the interval. The index stores this wait, so a stuck database never hides the
   others. `/actuator/health` reports `fleet:sweeper`: the backlog
   (databases), the oldest pending age, and the counts of the last pass.
 

@@ -335,7 +335,7 @@ impl FleetPendingIndex {
         let Some(keys) = keys else {
             let rows: Vec<EntryRow> = diesel::sql_query(format!(
                 "SELECT key, kind, since FROM {PENDING_TABLE} WHERE visit_after <= ? \
-                 ORDER BY since, key, kind LIMIT ?"
+                 ORDER BY visit_after, since, key, kind LIMIT ?"
             ))
             .bind::<BigInt, _>(now)
             .bind::<BigInt, _>(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -349,7 +349,8 @@ impl FleetPendingIndex {
             let marks = vec!["?"; chunk.len()].join(", ");
             let mut query = diesel::sql_query(format!(
                 "SELECT key, kind, since FROM {PENDING_TABLE} \
-                 WHERE visit_after <= ? AND key IN ({marks}) ORDER BY since, key, kind"
+                 WHERE visit_after <= ? AND key IN ({marks}) \
+                 ORDER BY visit_after, since, key, kind"
             ))
             .into_boxed::<diesel::sqlite::Sqlite>()
             .bind::<BigInt, _>(now);
@@ -385,12 +386,13 @@ impl FleetPendingIndex {
         .map_err(|error| index_error("defer", error))
     }
 
-    /// End the backoff of `key`: a visit made progress.
-    async fn undefer(&self, key: &str) -> AutumnResult<()> {
+    /// A visit made progress and left work: end the backoff of `key` and
+    /// move it behind the other due databases, so busy databases take turns.
+    async fn requeue(&self, key: &str) -> AutumnResult<()> {
         diesel::sql_query(format!(
-            "UPDATE {PENDING_TABLE} SET visit_after = 0, attempts = 0 \
-             WHERE key = ? AND attempts > 0"
+            "UPDATE {PENDING_TABLE} SET visit_after = ?, attempts = 0 WHERE key = ?"
         ))
+        .bind::<BigInt, _>(self.clock.now().timestamp_millis())
         .bind::<Text, _>(key)
         .execute(&mut *self.conn().await?)
         .await
@@ -1004,15 +1006,17 @@ impl FleetSweeper {
         });
         tokio::spawn(async move {
             let interval = sweeper.inner.options.interval;
+            // The first pass runs at once: it records this binary's
+            // derivation epoch before requests open databases.
             loop {
+                let report = sweeper.sweep_once().await;
+                if report.failed > 0 {
+                    tracing::warn!(?report, "fleet sweeper pass had failures");
+                }
                 tokio::select! {
                     biased;
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(interval) => {}
-                }
-                let report = sweeper.sweep_once().await;
-                if report.failed > 0 {
-                    tracing::warn!(?report, "fleet sweeper pass had failures");
                 }
             }
         })
@@ -1185,9 +1189,9 @@ impl FleetSweeper {
         match (worked, remaining) {
             (Ok(handled), Ok(remaining)) => {
                 let cleared = remaining.is_empty();
-                if cleared || handled > 0 {
-                    self.forget_backoff(&name).await;
-                } else {
+                if !cleared && handled > 0 {
+                    self.requeue(&name).await;
+                } else if !cleared {
                     self.back_off(&name).await;
                 }
                 Visit::Done { cleared, handled }
@@ -1329,9 +1333,9 @@ impl FleetSweeper {
         }
     }
 
-    async fn forget_backoff(&self, name: &str) {
-        if let Err(error) = self.inner.index.undefer(name).await {
-            tracing::warn!(database = %name, %error, "fleet sweeper could not reset a backoff");
+    async fn requeue(&self, name: &str) {
+        if let Err(error) = self.inner.index.requeue(name).await {
+            tracing::warn!(database = %name, %error, "fleet sweeper could not requeue a database");
         }
     }
 }
@@ -1626,7 +1630,17 @@ mod tests {
         assert_eq!(later.due(None, 10).await.unwrap().len(), 2, "1 s passed");
         later.defer("slot:00001").await.unwrap();
         assert_eq!(later.due(None, 10).await.unwrap().len(), 1, "now 2 s");
-        later.undefer("slot:00001").await.unwrap();
+        // Progress with work left: due again, but behind the other databases,
+        // so busy databases take turns.
+        later.requeue("slot:00001").await.unwrap();
+        let order: Vec<String> = later
+            .due(None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(order, vec!["slot:00002", "slot:00001"]);
         assert_eq!(
             later
                 .due(Some(&["slot:00001".to_owned()]), 0)
