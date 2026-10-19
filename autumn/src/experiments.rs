@@ -622,10 +622,70 @@ impl<T: ExperimentStore> ExperimentStore for Arc<T> {
 #[derive(Default)]
 struct StoreInner {
     experiments: HashMap<String, ExperimentConfig>,
-    assignments: HashMap<(String, String), Assignment>,
-    overrides: HashMap<(String, String), String>,
+    /// Keyed `(experiment, actor)`. Probed through `PairKey`, so a lookup
+    /// builds no owned key.
+    assignments: HashMap<PairKeyOwned, Assignment>,
+    /// Keyed `(experiment, actor)`, probed like `assignments`.
+    overrides: HashMap<PairKeyOwned, String>,
     changes: HashMap<String, Vec<ChangeRecord>>,
 }
+
+/// A borrowed view of an `(experiment, actor)` key, so the in-memory maps can
+/// be probed with two `&str`s instead of a fresh `PairKeyOwned`.
+trait PairKey {
+    fn pair(&self) -> (&str, &str);
+}
+
+/// The owned `(experiment, actor)` key of the in-memory maps.
+///
+/// A private newtype rather than a bare `(String, String)`, so the
+/// `Borrow<dyn PairKey>` impl below stays out of downstream crates: a second
+/// `Borrow` impl on `(String, String)` would break inference in their
+/// unannotated `map.get(k.borrow())` calls.
+#[derive(Debug, PartialEq, Eq)]
+struct PairKeyOwned(String, String);
+
+impl PairKey for PairKeyOwned {
+    fn pair(&self) -> (&str, &str) {
+        (self.0.as_str(), self.1.as_str())
+    }
+}
+
+// Hashes exactly what `dyn PairKey` hashes, so the owned key and its borrowed
+// form agree by construction (the `Borrow` contract).
+impl std::hash::Hash for PairKeyOwned {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.pair(), state);
+    }
+}
+
+impl PairKey for (&str, &str) {
+    fn pair(&self) -> (&str, &str) {
+        (self.0, self.1)
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn PairKey + 'a> for PairKeyOwned {
+    fn borrow(&self) -> &(dyn PairKey + 'a) {
+        self
+    }
+}
+
+// `Borrow` requires the borrowed form to hash and compare like the owned key:
+// a `PairKeyOwned` hashes as its two `str`s in order, and so does this.
+impl std::hash::Hash for dyn PairKey + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.pair(), state);
+    }
+}
+
+impl PartialEq for dyn PairKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.pair() == other.pair()
+    }
+}
+
+impl Eq for dyn PairKey + '_ {}
 
 /// In-memory [`ExperimentStore`] implementation.
 ///
@@ -768,9 +828,10 @@ impl ExperimentStore for InMemoryExperimentStore {
         actor: &str,
     ) -> Result<Option<Assignment>, ExperimentStoreError> {
         let inner = self.inner.read().unwrap();
+        // Probe by borrow (see `PairKey`): a lookup copies neither string.
         Ok(inner
             .assignments
-            .get(&(experiment.to_owned(), actor.to_owned()))
+            .get(&(experiment, actor) as &dyn PairKey)
             .cloned())
     }
 
@@ -792,7 +853,9 @@ impl ExperimentStore for InMemoryExperimentStore {
                     if exp_config.exclusion_group.as_ref() == Some(group)
                         && inner
                             .assignments
-                            .contains_key(&(exp_name.clone(), assignment.actor.clone()))
+                            .contains_key(
+                                &(exp_name.as_str(), assignment.actor.as_str()) as &dyn PairKey
+                            )
                     {
                         return Err(ExperimentStoreError::Backend(format!(
                             "ExcludedByGroup:{group}"
@@ -803,7 +866,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         }
 
         let variant = assignment.variant.clone();
-        let key = (assignment.experiment.clone(), assignment.actor.clone());
+        let key = PairKeyOwned(assignment.experiment.clone(), assignment.actor.clone());
         inner.assignments.insert(key, assignment);
         drop(inner);
         Ok(variant)
@@ -817,7 +880,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         let inner = self.inner.read().unwrap();
         Ok(inner
             .overrides
-            .get(&(experiment.to_owned(), actor.to_owned()))
+            .get(&(experiment, actor) as &dyn PairKey)
             .cloned())
     }
 
@@ -827,7 +890,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         actor: &str,
         variant: &str,
     ) -> Result<(), ExperimentStoreError> {
-        let key = (experiment.to_owned(), actor.to_owned());
+        let key = PairKeyOwned(experiment.to_owned(), actor.to_owned());
         self.inner
             .write()
             .unwrap()
@@ -852,7 +915,7 @@ impl ExperimentStore for InMemoryExperimentStore {
             }
             if inner
                 .assignments
-                .contains_key(&(exp_name.clone(), actor.to_owned()))
+                .contains_key(&(exp_name.as_str(), actor) as &dyn PairKey)
             {
                 return Ok(true);
             }
@@ -889,14 +952,15 @@ fn now_secs() -> u64 {
     crate::time::clock_unix_secs(&crate::time::AmbientClock)
 }
 
-/// FNV-1a 64-bit hash of a byte slice.
+/// FNV-1a 64-bit hash of `parts` laid end to end: exactly the hash of their
+/// concatenation, since FNV-1a folds one byte at a time.
 ///
 /// Stable, dependency-free, and specified by the FNV standard.
-fn fnv1a_64(data: &[u8]) -> u64 {
+fn fnv1a_64(parts: &[&[u8]]) -> u64 {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
     let mut hash = FNV_OFFSET;
-    for &byte in data {
+    for &byte in parts.iter().copied().flatten() {
         #[allow(clippy::cast_lossless)]
         {
             hash ^= byte as u64;
@@ -923,8 +987,9 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 /// the regression test below.
 #[must_use]
 pub fn experiment_bucket(experiment: &str, actor_id: &str) -> u64 {
-    let key = format!("{experiment}:{actor_id}");
-    fnv1a_64(key.as_bytes()) % 10_000
+    // `"<experiment>:<actor_id>"`, hashed part by part so no joined key is
+    // built. Pinned by `stable_hash_regression_known_fixtures`.
+    fnv1a_64(&[experiment.as_bytes(), b":".as_slice(), actor_id.as_bytes()]) % 10_000
 }
 
 /// Select a variant from `variants` given a `bucket` in `[0, 10 000)`.
@@ -3113,6 +3178,182 @@ mod tests {
             6_602,
             "onboarding_v3:user:100 bucket changed — hash regression"
         );
+    }
+
+    /// `fnv1a_64` and `experiment_bucket` as they were before the hash took
+    /// parts, verbatim: `format!` joins the key, then one slice is hashed.
+    fn joined_fnv1a_64(data: &[u8]) -> u64 {
+        const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+        const FNV_PRIME: u64 = 1_099_511_628_211;
+        let mut hash = FNV_OFFSET;
+        for &byte in data {
+            #[allow(clippy::cast_lossless)]
+            {
+                hash ^= byte as u64;
+            }
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    fn joined_experiment_bucket(experiment: &str, actor_id: &str) -> u64 {
+        let key = format!("{experiment}:{actor_id}");
+        joined_fnv1a_64(key.as_bytes()) % 10_000
+    }
+
+    #[test]
+    fn experiment_bucket_is_fnv1a_of_the_joined_key() {
+        // Hashing the parts must give the joined key's bucket bit for bit,
+        // or every running experiment re-buckets its actors.
+        let edge_cases = [
+            ("checkout_v2", "user:1"),
+            ("", ""),
+            ("e", ""),
+            ("", "a"),
+            (":", ":"),
+            ("a:b", "c:d"),
+            ("ab", "c:d"),
+            ("a:b:", ":c"),
+            ("ünï", "çødé"),
+            ("exp🧪", "用户:42"),
+            ("tab\texp", "line\nactor"),
+        ];
+        for (experiment, actor) in edge_cases {
+            assert_eq!(
+                experiment_bucket(experiment, actor),
+                joined_experiment_bucket(experiment, actor),
+                "{experiment:?}/{actor:?}"
+            );
+        }
+        for experiment in ["checkout_v2", "onboarding_v3", "exp", "a:b"] {
+            for i in 0..1_000_u32 {
+                let actor = format!("user:{i}");
+                assert_eq!(
+                    experiment_bucket(experiment, &actor),
+                    joined_experiment_bucket(experiment, &actor),
+                    "{experiment:?}/{actor:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fnv1a_64_of_parts_equals_fnv1a_64_of_their_concatenation() {
+        // Every way of cutting a key into three (possibly empty) parts hashes
+        // like the uncut key.
+        for key in ["", ":", "checkout_v2:user:1", "ünï:çødé", "a::b"] {
+            let whole = joined_fnv1a_64(key.as_bytes());
+            let bytes = key.as_bytes();
+            for i in 0..=bytes.len() {
+                for j in i..=bytes.len() {
+                    let (head, rest) = bytes.split_at(i);
+                    let (middle, tail) = rest.split_at(j - i);
+                    assert_eq!(fnv1a_64(&[head, middle, tail]), whole, "{key:?} {i} {j}");
+                }
+            }
+            assert_eq!(fnv1a_64(&[bytes]), whole, "{key:?} in one part");
+        }
+        assert_eq!(fnv1a_64(&[]), joined_fnv1a_64(&[]), "no parts at all");
+    }
+
+    // ── In-memory store: `(experiment, actor)` keys probed by borrow ─────────
+
+    #[test]
+    fn pair_key_hashes_and_compares_like_the_owned_key() {
+        // The `Borrow<dyn PairKey>` contract: the borrowed form must hash and
+        // compare exactly like the `PairKeyOwned` key it stands for.
+        use std::hash::BuildHasher as _;
+        let state = std::collections::hash_map::RandomState::new();
+        for (experiment, actor) in [("exp", "user:1"), ("", ""), ("ex", "puser:1"), ("ünï", "ø")]
+        {
+            let owned = PairKeyOwned(experiment.to_owned(), actor.to_owned());
+            let owned_view: &dyn PairKey = &owned;
+            let borrowed: &dyn PairKey = &(experiment, actor);
+            assert_eq!(
+                state.hash_one(&owned),
+                state.hash_one(borrowed),
+                "{owned:?}"
+            );
+            assert_eq!(
+                state.hash_one(owned_view),
+                state.hash_one(borrowed),
+                "{owned:?}"
+            );
+            assert!(owned_view == borrowed, "{owned:?}");
+        }
+        // The same bytes, split elsewhere, are a different key.
+        let split_elsewhere: &dyn PairKey = &("ex", "puser:1");
+        let owned = PairKeyOwned("exp".to_owned(), "user:1".to_owned());
+        let owned_view: &dyn PairKey = &owned;
+        assert!(owned_view != split_elsewhere);
+    }
+
+    #[test]
+    fn in_memory_store_probes_pair_keys_by_borrow() {
+        let store = InMemoryExperimentStore::new();
+        store.set_override("exp", "qa:1", "treatment").unwrap();
+        store
+            .record_assignment(Assignment::new("exp", "user:1", "control", false))
+            .unwrap();
+        assert_eq!(
+            store.get_override("exp", "qa:1").unwrap().as_deref(),
+            Some("treatment")
+        );
+        assert_eq!(store.get_override("exp", "qa:2").unwrap(), None);
+        // Moving the split point must not collide.
+        assert_eq!(store.get_override("ex", "pqa:1").unwrap(), None);
+        assert_eq!(store.get_override("exp:", "qa:1").unwrap(), None);
+        assert_eq!(
+            store
+                .get_assignment("exp", "user:1")
+                .unwrap()
+                .unwrap()
+                .variant,
+            "control"
+        );
+        assert!(store.get_assignment("exp:user", "1").unwrap().is_none());
+        assert!(store.get_assignment("exp", "user:2").unwrap().is_none());
+    }
+
+    #[test]
+    fn exclusion_group_probe_finds_a_sibling_assignment_by_borrow() {
+        // `record_assignment` and `has_assignment_in_group` probe the sibling
+        // experiment's `(experiment, actor)` key without building it.
+        let store = InMemoryExperimentStore::new();
+        for name in ["exp_a", "exp_b"] {
+            store
+                .upsert(
+                    ExperimentConfig::new(name, vec![VariantConfig::new("v1", 1)])
+                        .exclusion_group("group"),
+                )
+                .unwrap();
+        }
+        store
+            .record_assignment(Assignment::new("exp_a", "user:1", "v1", false))
+            .unwrap();
+        assert!(
+            store
+                .has_assignment_in_group("user:1", "group", "exp_b")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_assignment_in_group("user:2", "group", "exp_b")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_assignment_in_group("user:1", "group", "exp_a")
+                .unwrap(),
+            "the excluded experiment itself does not count"
+        );
+        let err = store
+            .record_assignment(Assignment::new("exp_b", "user:1", "v1", false))
+            .unwrap_err();
+        assert!(err.to_string().contains("ExcludedByGroup:group"), "{err}");
+        store
+            .record_assignment(Assignment::new("exp_b", "user:2", "v1", false))
+            .unwrap();
     }
 
     // ── AC: weights — 0% weight variant is never assigned ────────────────────

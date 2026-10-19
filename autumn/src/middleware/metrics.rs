@@ -145,6 +145,16 @@ impl RouteMetrics {
             histogram.observe(elapsed);
         }
     }
+
+    /// Count one database query and keep its latency sample. A query series
+    /// records no per-status-class histogram, so `durations` is untouched.
+    fn observe_query(&mut self, latency_ms: u64) {
+        self.count = self.count.saturating_add(1);
+        if self.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+            self.latencies_ms.pop_front();
+        }
+        self.latencies_ms.push_back(latency_ms);
+    }
 }
 
 // ── Latency histograms ──────────────────────────────────────────
@@ -593,13 +603,50 @@ impl MetricsCollector {
         if let Some(lock) = self.inner.shards.get(shard_idx)
             && let Ok(mut shard) = lock.write()
         {
-            let entry = shard.by_query.entry(key.to_owned()).or_default();
-            entry.count = entry.count.saturating_add(1);
-            if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
-                entry.latencies_ms.pop_front();
+            // Probe by borrow first: every query after a key's first sighting
+            // finds its entry without building an owned key just to drop it.
+            if let Some(entry) = shard.by_query.get_mut(key) {
+                entry.observe_query(latency_ms);
+            } else {
+                shard
+                    .by_query
+                    .entry(key.to_owned())
+                    .or_default()
+                    .observe_query(latency_ms);
             }
-            entry.latencies_ms.push_back(latency_ms);
         }
+    }
+
+    /// [`record_db_query`](Self::record_db_query) under the key `key` formats
+    /// to, composed into a stack buffer rather than a fresh `String` per query
+    /// (the `Db` extractor records one per request). A key longer than the
+    /// buffer falls back to an owned `String`; the recorded key is
+    /// byte-identical either way.
+    #[cfg(feature = "db")]
+    pub(crate) fn record_db_query_fmt(&self, key: std::fmt::Arguments<'_>, latency_ms: u64) {
+        // Same stack-buffer composition as `record_route`: `Cursor::position`
+        // reports the bytes written, so the filled prefix is read back without
+        // deriving a length from the remaining slice.
+        let mut buf = [0u8; 256];
+        let written = {
+            let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
+            if std::io::Write::write_fmt(&mut cursor, key).is_ok() {
+                usize::try_from(cursor.position()).unwrap_or_default()
+            } else {
+                0
+            }
+        };
+        // A write that overflowed the buffer leaves `written == 0`. An empty
+        // prefix therefore takes the owned path, which records the same text.
+        let composed = buf
+            .get(..written)
+            .and_then(|filled| std::str::from_utf8(filled).ok())
+            .filter(|composed| !composed.is_empty());
+        if let Some(composed) = composed {
+            self.record_db_query(composed, latency_ms);
+            return;
+        }
+        self.record_db_query(&std::fmt::format(key), latency_ms);
     }
 
     fn increment_active(&self) {
@@ -1158,6 +1205,95 @@ mod tests {
 
         let snap = collector.snapshot();
         assert_eq!(snap.db_queries["SELECT 1"].count, u64::MAX);
+    }
+
+    /// A key seen before is found by borrow and updated in place: one entry,
+    /// every sample counted, the latency ring still capped, and no duration
+    /// histogram touched (a query series has no status class).
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions read the shard under the one lock they inspect"
+    )]
+    fn db_query_with_a_seen_key_updates_its_one_entry() {
+        let collector = MetricsCollector::new();
+        let key = "GET /users/{id} SELECT";
+        let total = MAX_LATENCY_SAMPLES + 5;
+        for latency_ms in 0..u64::try_from(total).expect("fits in u64") {
+            collector.record_db_query(key, latency_ms);
+        }
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.db_queries.len(), 1, "one key, one series");
+        assert_eq!(
+            snap.db_queries[key].count,
+            u64::try_from(total).expect("fits in u64")
+        );
+
+        let lock = collector
+            .inner
+            .shards
+            .get(shard_index(key))
+            .expect("shard_index always yields an in-bounds shard");
+        let (samples, oldest, durations_untouched) = {
+            let shard = lock.read().expect("shard lock is not poisoned");
+            let entry = &shard.by_query[key];
+            (
+                entry.latencies_ms.len(),
+                entry.latencies_ms.front().copied(),
+                entry.durations.iter().all(|h| h.snapshot().count() == 0),
+            )
+        };
+        assert_eq!(samples, MAX_LATENCY_SAMPLES);
+        assert_eq!(oldest, Some(5), "the oldest samples are evicted first");
+        assert!(
+            durations_untouched,
+            "a query series records no per-status-class histogram"
+        );
+    }
+
+    /// `record_db_query_fmt` records under exactly the text its arguments
+    /// format to, whether the key fits the stack buffer or not, and lands in
+    /// the same entry as a plain `record_db_query` of that text.
+    #[cfg(feature = "db")]
+    #[test]
+    fn db_query_fmt_records_under_the_formatted_key() {
+        let collector = MetricsCollector::new();
+        let route = "GET /users/{id}";
+        collector.record_db_query_fmt(format_args!("{route} SELECT"), 5);
+        collector.record_db_query("GET /users/{id} SELECT", 7);
+        // Past the stack buffer: the owned fallback, same key text.
+        let long_route = format!("GET /{}", "a".repeat(300));
+        collector.record_db_query_fmt(format_args!("{long_route} INSERT"), 9);
+        let snap = collector.snapshot();
+        assert_eq!(snap.db_queries.len(), 2);
+        assert_eq!(snap.db_queries["GET /users/{id} SELECT"].count, 2);
+        assert_eq!(
+            snap.db_queries[format!("{long_route} INSERT").as_str()].count,
+            1
+        );
+    }
+
+    /// The buffer boundary: a key of exactly 256 bytes fits, and a key whose
+    /// last character straddles the boundary is never truncated mid-way.
+    #[cfg(feature = "db")]
+    #[test]
+    fn db_query_fmt_keeps_keys_at_the_buffer_boundary_whole() {
+        let collector = MetricsCollector::new();
+        // "GET /" + 244 + " SELECT" = 256 bytes.
+        let exact = format!("/{}", "b".repeat(244));
+        let exact_key = format!("GET {exact} SELECT");
+        assert_eq!(exact_key.len(), 256);
+        collector.record_db_query_fmt(format_args!("GET {exact} SELECT"), 1);
+        // 255 ASCII bytes then a 2-byte `é`: the write overflows inside it.
+        let straddle = format!("{}é", "c".repeat(255));
+        assert_eq!(straddle.len(), 257);
+        collector.record_db_query_fmt(format_args!("{straddle}"), 2);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.db_queries.len(), 2);
+        assert_eq!(snap.db_queries[exact_key.as_str()].count, 1);
+        assert_eq!(snap.db_queries[straddle.as_str()].count, 1);
     }
 
     #[test]

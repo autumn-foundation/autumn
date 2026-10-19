@@ -89,12 +89,40 @@ impl ParameterFilter {
 
     #[must_use]
     pub fn matches_key(&self, key: &str) -> bool {
-        let Some(normalized) = normalize_key(key) else {
-            return false;
-        };
-        self.keys.contains(&normalized) || self.normalized_keys.contains(&normalized)
+        // `normalize_key` keeps a key's ASCII alphanumerics, lowercased. A
+        // non-ASCII char's UTF-8 bytes are all >= 0x80, so filtering the bytes
+        // keeps exactly the same characters, and the normalized key can be
+        // built on the stack rather than in a fresh `String` per probe: this
+        // runs once per field of every captured log event and scrubbed map.
+        let mut buf = [0u8; INLINE_KEY_CAPACITY];
+        let mut len = 0;
+        for byte in key.bytes().filter(u8::is_ascii_alphanumeric) {
+            let Some(slot) = buf.get_mut(len) else {
+                // Longer than the inline buffer: take the allocating path.
+                return normalize_key(key)
+                    .is_some_and(|normalized| self.contains_normalized(&normalized));
+            };
+            *slot = byte.to_ascii_lowercase();
+            len += 1;
+        }
+        // An empty normalized key matches nothing, as `normalize_key`'s `None`
+        // does. Every byte is ASCII, so the slice is always valid UTF-8.
+        len > 0
+            && buf
+                .get(..len)
+                .and_then(|normalized| std::str::from_utf8(normalized).ok())
+                .is_some_and(|normalized| self.contains_normalized(normalized))
+    }
+
+    fn contains_normalized(&self, normalized: &str) -> bool {
+        self.keys.contains(normalized) || self.normalized_keys.contains(normalized)
     }
 }
+
+/// Inline capacity of the stack buffer [`ParameterFilter::matches_key`]
+/// normalizes into. Every default key fits with room to spare; a longer input
+/// falls back to the allocating `normalize_key`.
+const INLINE_KEY_CAPACITY: usize = 64;
 
 fn normalize_key(key: &str) -> Option<String> {
     let normalized: String = key
@@ -189,5 +217,59 @@ mod tests {
         assert!(filter.matches_key("apiKey"));
         assert!(filter.matches_key("apikey"));
         assert!(filter.matches_key("API-KEY"));
+    }
+
+    /// The stack-buffer normalization in `matches_key` must agree with the
+    /// allocating `normalize_key` it replaced on the hot path, including
+    /// non-ASCII input, empty results and keys past the inline capacity.
+    #[test]
+    fn matches_key_agrees_with_allocating_normalization() {
+        let long_custom = "k".repeat(70);
+        let filter = ParameterFilter::new(
+            &["x-real-ip".to_owned(), long_custom.clone()],
+            &["cookie".to_owned()],
+        );
+        let at_cap = "a".repeat(INLINE_KEY_CAPACITY);
+        let at_cap_with_noise = format!("{}-_-", "B".repeat(INLINE_KEY_CAPACITY));
+        let over_cap = format!("{}password", "a".repeat(80));
+        let long_upper = "K".repeat(70);
+        for key in [
+            "password",
+            "PASSWORD",
+            "Pass_Word",
+            "password_confirmation",
+            "set-cookie",
+            "api-key",
+            "apiKey",
+            "x_real_ip",
+            "X-Real-IP",
+            "cookie",
+            "email",
+            "",
+            "___",
+            "p\u{e4}ssword",
+            "pass\u{301}word",
+            "\u{130}token",
+            at_cap.as_str(),
+            at_cap_with_noise.as_str(),
+            over_cap.as_str(),
+            long_upper.as_str(),
+            long_custom.as_str(),
+        ] {
+            let expected = normalize_key(key).is_some_and(|normalized| {
+                filter.keys.contains(&normalized) || filter.normalized_keys.contains(&normalized)
+            });
+            assert_eq!(filter.matches_key(key), expected, "key {key:?}");
+        }
+
+        // Spot-check the expected answers, so the comparison above cannot
+        // pass by both sides being wrong in the same way.
+        assert!(filter.matches_key("Pass_Word"));
+        assert!(filter.matches_key("X-Real-IP"));
+        assert!(filter.matches_key(&long_upper));
+        assert!(!filter.matches_key("cookie"));
+        assert!(!filter.matches_key("p\u{e4}ssword"));
+        assert!(!filter.matches_key(""));
+        assert!(!filter.matches_key(&over_cap));
     }
 }

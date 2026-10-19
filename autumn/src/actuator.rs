@@ -910,6 +910,27 @@ struct QueueGaugeState {
     pg_marks_seq_order: std::collections::BTreeMap<u64, String>,
 }
 
+impl QueueGaugeState {
+    /// The queue `name` drains from (`default` when unregistered), borrowed
+    /// from the registration map rather than copied out per lookup.
+    fn queue_of(&self, name: &str) -> &str {
+        self.name_to_queue
+            .get(name)
+            .map_or("default", String::as_str)
+    }
+
+    /// The waiting marks of `name`'s queue, when that queue has an entry.
+    fn waiting_for_mut(&mut self, name: &str) -> Option<&mut std::collections::VecDeque<u64>> {
+        // Disjoint fields: `name_to_queue` is read while `waiting` is borrowed
+        // mutably, so the queue name is never copied out.
+        let queue = self
+            .name_to_queue
+            .get(name)
+            .map_or("default", String::as_str);
+        self.waiting.get_mut(queue)
+    }
+}
+
 /// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
 /// realistic count of Postgres jobs sitting `enqueued` at once — enough that
 /// a job an operator wants to cancel is essentially always still tracked —
@@ -1115,15 +1136,6 @@ impl JobRegistry {
         }
     }
 
-    /// The queue a job name drains from (defaults to `default`).
-    fn queue_for(&self, name: &str) -> String {
-        self.queues
-            .read()
-            .ok()
-            .and_then(|g| g.name_to_queue.get(name).cloned())
-            .unwrap_or_else(|| "default".to_string())
-    }
-
     /// Snapshot per-queue depth and oldest-waiting-job age.
     ///
     /// On the durable backends a periodic survey has populated an authoritative
@@ -1245,17 +1257,34 @@ impl JobRegistry {
     /// Shared enqueue bookkeeping: bump the per-name `queued` counter and push a
     /// per-queue waiting mark stamped with the job's ready-at time.
     fn record_enqueue_at(&self, name: &str, ready_at_ms: u64) {
+        // Probe both maps by borrow: the name is registered at runtime start,
+        // so owned keys are only built for a never-seen name or queue.
         if let Ok(mut guard) = self.inner.write() {
-            let status = guard.entry(name.to_string()).or_insert(JobStatus::empty());
-            status.queued = status.queued.saturating_add(1);
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            if let Some(status) = guard.get_mut(name) {
+                status.queued = status.queued.saturating_add(1);
+            } else {
+                guard.insert(
+                    name.to_owned(),
+                    JobStatus {
+                        queued: 1,
+                        ..JobStatus::empty()
+                    },
+                );
+            }
         }
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write() {
-            guard
-                .waiting
-                .entry(queue)
-                .or_default()
-                .push_back(ready_at_ms);
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            if let Some(waiting) = guard.waiting_for_mut(name) {
+                waiting.push_back(ready_at_ms);
+            } else {
+                let queue = guard.queue_of(name).to_owned();
+                guard
+                    .waiting
+                    .entry(queue)
+                    .or_default()
+                    .push_back(ready_at_ms);
+            }
         }
     }
 
@@ -1637,10 +1666,11 @@ impl JobRegistry {
     /// one. If no mark in the preferred category exists we fall back to the
     /// oldest mark so every enqueue still has a matching removal (no leak).
     fn pop_waiting(&self, name: &str, prefer_ready: bool) {
-        let queue = self.queue_for(name);
         let now = self.now_ms();
+        // The queue is looked up by borrow under the write lock taken here
+        // anyway, instead of copied out under a separate read lock first.
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
         {
             let idx = waiting
                 .iter()
@@ -1656,9 +1686,8 @@ impl JobRegistry {
     /// on whatever timeline the caller resolved it against. A queue with no
     /// marks removes nothing — there is nothing to leak.
     fn pop_waiting_nearest(&self, name: &str, candidates: &[u64]) {
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
         {
             let idx = waiting
                 .iter()
@@ -1682,9 +1711,8 @@ impl JobRegistry {
     /// removed — so the caller can fall back to a heuristic guess rather
     /// than silently leaving the job's real, current mark in place.
     fn pop_waiting_exact(&self, name: &str, exact_ms: u64) -> bool {
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
             && let Some(idx) = waiting.iter().position(|mark| *mark == exact_ms)
         {
             waiting.remove(idx);
@@ -1701,11 +1729,14 @@ impl JobRegistry {
     /// timeline would otherwise contaminate.
     #[cfg(test)]
     pub(crate) fn waiting_marks_for_test(&self, name: &str) -> Vec<u64> {
-        let queue = self.queue_for(name);
         self.queues
             .read()
             .ok()
-            .and_then(|g| g.waiting.get(&queue).map(|w| w.iter().copied().collect()))
+            .and_then(|g| {
+                g.waiting
+                    .get(g.queue_of(name))
+                    .map(|w| w.iter().copied().collect())
+            })
             .unwrap_or_default()
     }
 
@@ -5729,6 +5760,48 @@ mod tests {
         assert_eq!(drained.get("critical").unwrap().depth, 0);
         assert_eq!(drained.get("critical").unwrap().oldest_waiting_age_ms, 0);
         assert_eq!(drained.get("bulk").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn job_registry_unregistered_name_counts_on_the_default_queue() {
+        // Never registered: the first enqueue inserts the name's status and
+        // the `default` queue's marks; later ones hit both by borrow.
+        let registry = JobRegistry::new();
+        registry.record_enqueue("ghost");
+        registry.record_enqueue("ghost");
+        assert_eq!(registry.snapshot().get("ghost").unwrap().queued, 2);
+        assert_eq!(registry.queue_snapshot().get("default").unwrap().depth, 2);
+        assert_eq!(registry.waiting_marks_for_test("ghost").len(), 2);
+        registry.record_start("ghost");
+        assert_eq!(registry.queue_snapshot().get("default").unwrap().depth, 1);
+        let status = registry.snapshot().get("ghost").cloned().unwrap();
+        assert_eq!((status.queued, status.in_flight), (1, 1));
+        // A first enqueue lands as exactly one queued job, all else empty.
+        registry.record_enqueue("fresh");
+        let fresh = registry.snapshot().get("fresh").cloned().unwrap();
+        assert_eq!(fresh.queued, 1);
+        assert_eq!(fresh.in_flight, 0);
+        assert_eq!(fresh.total_successes, 0);
+        assert!(fresh.last_error.is_none());
+    }
+
+    #[test]
+    fn job_registry_registered_queue_marks_stay_on_that_queue() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("send_email", "mail");
+        // The queue's mark list exists from registration, so every enqueue is
+        // a borrowed hit, and nothing leaks onto `default`.
+        for _ in 0..3 {
+            registry.record_enqueue("send_email");
+        }
+        let queues = registry.queue_snapshot();
+        assert_eq!(queues.get("mail").unwrap().depth, 3);
+        assert!(!queues.contains_key("default"));
+        assert_eq!(registry.waiting_marks_for_test("send_email").len(), 3);
+        registry.record_start("send_email");
+        registry.record_start("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 1);
+        assert_eq!(registry.snapshot().get("send_email").unwrap().in_flight, 2);
     }
 
     /// Clones share marks, so they must share the clock that judges them.

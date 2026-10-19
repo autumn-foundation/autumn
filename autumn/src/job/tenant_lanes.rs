@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use crate::bulkhead::{TenantBulkhead, TenantPermit, shuffle_shard};
+use crate::bulkhead::{TenantBulkhead, TenantPermit, shuffle_shard_contains};
 
 /// The jobs of one queue, served round-robin by tenant.
 ///
@@ -34,7 +34,13 @@ impl<T> FairBucket<T> {
     }
 
     pub fn push(&mut self, tenant: Option<String>, item: T) {
-        let queue = self.jobs.entry(tenant.clone()).or_default();
+        // Probe by borrow: a tenant that already has jobs here needs no
+        // second copy of its id.
+        #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+        let queue = match self.jobs.get_mut(&tenant) {
+            Some(queue) => queue,
+            None => self.jobs.entry(tenant.clone()).or_default(),
+        };
         if queue.is_empty() {
             self.ring.push_back(tenant);
         }
@@ -136,8 +142,10 @@ impl TenantJobIsolation {
         let Some(tenant) = tenant else {
             return Some(JobAdmit { permit: None });
         };
+        // Runs per tenant on every pop attempt, so ask about one lane rather
+        // than building the tenant's whole lane list.
         if let Some(lane) = lane
-            && !shuffle_shard(tenant, self.lanes, self.lanes_per_tenant).contains(&lane)
+            && !shuffle_shard_contains(tenant, self.lanes, self.lanes_per_tenant, lane)
         {
             return None;
         }

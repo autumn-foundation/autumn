@@ -176,11 +176,17 @@ pub(crate) const DEFAULT_QUEUE: &str = "default";
 
 /// Normalize a declared queue name, mapping empty/whitespace to `"default"`.
 pub(crate) fn normalize_queue_name(name: &str) -> String {
+    normalized_queue_name(name).to_owned()
+}
+
+/// [`normalize_queue_name`] without the copy, for callers that only look the
+/// queue up (slot accounting, bucket probes, list keys).
+pub(crate) fn normalized_queue_name(name: &str) -> &str {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        DEFAULT_QUEUE.to_string()
+        DEFAULT_QUEUE
     } else {
-        trimmed.to_string()
+        trimmed
     }
 }
 
@@ -273,11 +279,16 @@ impl QueueSchedule {
 
     /// A per-worker cursor producing each claim iteration's attempt order.
     pub(crate) fn cursor(&self) -> QueueCursor {
+        let names: Arc<Vec<String>> =
+            Arc::new(self.queues.iter().map(|(n, _)| n.clone()).collect());
+        let order = Arc::clone(&names);
         QueueCursor {
-            names: Arc::new(self.queues.iter().map(|(n, _)| n.clone()).collect()),
+            names,
             weights: self.queues.iter().map(|(_, w)| *w).collect(),
             current: vec![0_i64; self.queues.len()],
             strict: self.strict,
+            order,
+            rest_scratch: Vec::new(),
         }
     }
 }
@@ -291,6 +302,11 @@ pub(crate) struct QueueCursor {
     weights: Vec<u32>,
     current: Vec<i64>,
     strict: bool,
+    /// The weighted order handed out last. The next call refills it in
+    /// place once the caller has dropped it. It starts out sharing `names`.
+    order: Arc<Vec<String>>,
+    /// Scratch for the non-chosen queue indices, reused across calls.
+    rest_scratch: Vec<usize>,
 }
 
 impl QueueCursor {
@@ -320,12 +336,24 @@ impl QueueCursor {
         }
         self.current[best] = self.current[best].saturating_sub(total);
         // Chosen queue first, then the rest by descending remaining credit.
-        let mut rest: Vec<usize> = (0..self.names.len()).filter(|&i| i != best).collect();
+        let mut rest = std::mem::take(&mut self.rest_scratch);
+        rest.clear();
+        rest.extend((0..self.names.len()).filter(|&i| i != best));
         rest.sort_by(|&a, &b| self.current[b].cmp(&self.current[a]));
-        let mut order = Vec::with_capacity(self.names.len());
-        order.push(self.names[best].clone());
-        order.extend(rest.into_iter().map(|i| self.names[i].clone()));
-        Arc::new(order)
+        // Refill last iteration's buffer: once the caller has dropped the
+        // previous order this `Arc` is unique, so `make_mut` returns it without
+        // copying and `clone_from` reuses each slot's capacity. A caller still
+        // holding an earlier order keeps it intact (copy-on-write). `order`
+        // always has `names.len()` slots.
+        let order = Arc::make_mut(&mut self.order);
+        for (slot, i) in order
+            .iter_mut()
+            .zip(std::iter::once(best).chain(rest.iter().copied()))
+        {
+            slot.clone_from(&self.names[i]);
+        }
+        self.rest_scratch = rest;
+        Arc::clone(&self.order)
     }
 }
 
@@ -539,40 +567,70 @@ impl QueueSlots {
 
     /// Filter `order` down to the queues that may claim right now, preserving
     /// the input order. A no-op passthrough when no limits are configured.
-    #[allow(clippy::significant_drop_tightening)]
+    ///
+    /// The owned form of [`Self::claimable_borrowed`], kept for the `SQLite`
+    /// poll loop, which iterates the result by value.
+    #[cfg_attr(not(any(test, feature = "sqlite")), allow(dead_code))]
     pub(crate) fn claimable(&self, order: &[String]) -> Vec<String> {
+        self.claimable_borrowed(order).into_owned()
+    }
+
+    /// [`Self::claimable`] without the passthrough copy: with no limits the
+    /// order comes back borrowed, so the default claim loops copy nothing.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn claimable_borrowed<'a>(
+        &self,
+        order: &'a [String],
+    ) -> std::borrow::Cow<'a, [String]> {
         if self.limits.is_empty() {
-            return order.to_vec();
+            return std::borrow::Cow::Borrowed(order);
         }
         let guard = self
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (running, total) = &*guard;
-        order
-            .iter()
-            .filter(|q| queue_may_claim(q, running, *total, &self.limits, self.total_slots))
-            .cloned()
-            .collect()
+        std::borrow::Cow::Owned(
+            order
+                .iter()
+                .filter(|q| queue_may_claim(q, running, *total, &self.limits, self.total_slots))
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Record that a job on `queue` has started; the returned guard releases the
     /// slot when dropped.
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn acquire(self: &Arc<Self>, queue: &str) -> QueueSlotGuard {
+        // No caps/reservations: the running counts are read only by
+        // `queue_may_claim`, which never runs without limits (`claimable` and
+        // `try_reserve` both return early, and limits are fixed at
+        // construction). Skip the bookkeeping, its lock and its key copies.
+        if self.limits.is_empty() {
+            return QueueSlotGuard {
+                slots: Arc::clone(self),
+                queue: None,
+            };
+        }
         {
             let mut guard = self
                 .running
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (running, total) = &mut *guard;
-            let slot = running.entry(queue.to_string()).or_insert(0);
-            *slot = slot.saturating_add(1);
+            // Probe by borrow: the queue is tracked after its first job.
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            if let Some(slot) = running.get_mut(queue) {
+                *slot = slot.saturating_add(1);
+            } else {
+                running.insert(queue.to_owned(), 1);
+            }
             *total = total.saturating_add(1);
         }
         QueueSlotGuard {
             slots: Arc::clone(self),
-            queue: queue.to_string(),
+            queue: Some(queue.to_owned()),
         }
     }
 
@@ -590,7 +648,8 @@ impl QueueSlots {
     ///
     /// When no limits are configured this is a passthrough that always succeeds
     /// (the active-path callers never take this branch — they use the fast path
-    /// — but keeping it balanced makes the guard safe to hold either way).
+    /// — and the passthrough guard counts nothing, so it is safe to hold either
+    /// way).
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn try_reserve(self: &Arc<Self>, queue: &str) -> Option<QueueSlotGuard> {
         if self.limits.is_empty() {
@@ -609,12 +668,17 @@ impl QueueSlots {
         if !queue_may_claim(queue, running, *total, &self.limits, self.total_slots) {
             return None;
         }
-        let slot = running.entry(queue.to_string()).or_insert(0);
-        *slot = slot.saturating_add(1);
+        // Probe by borrow: the queue is tracked after its first job.
+        #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+        if let Some(slot) = running.get_mut(queue) {
+            *slot = slot.saturating_add(1);
+        } else {
+            running.insert(queue.to_owned(), 1);
+        }
         *total = total.saturating_add(1);
         Some(QueueSlotGuard {
             slots: Arc::clone(self),
-            queue: queue.to_string(),
+            queue: Some(queue.to_owned()),
         })
     }
 }
@@ -622,19 +686,24 @@ impl QueueSlots {
 /// RAII release for a slot acquired via [`QueueSlots::acquire`].
 pub(crate) struct QueueSlotGuard {
     slots: Arc<QueueSlots>,
-    queue: String,
+    /// `None` for a slot taken with no limits configured: nothing was
+    /// counted, so nothing is given back.
+    queue: Option<String>,
 }
 
 impl Drop for QueueSlotGuard {
     #[allow(clippy::significant_drop_tightening)]
     fn drop(&mut self) {
+        let Some(queue) = self.queue.as_deref() else {
+            return;
+        };
         let mut guard = self
             .slots
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (running, total) = &mut *guard;
-        if let Some(count) = running.get_mut(&self.queue) {
+        if let Some(count) = running.get_mut(queue) {
             *count = count.saturating_sub(1);
         }
         *total = total.saturating_sub(1);
@@ -6490,11 +6559,14 @@ pub(crate) fn start_local_runtime_inner(
                     // Fast path (no caps/reserved): single multi-queue pop across
                     // the (possibly pinned) order, bounding the never-strand
                     // fallback to the pinned set. Unchanged behavior (AC4).
-                    let order = slots.claimable(&cursor.next_order());
-                    let allowed: Option<std::collections::HashSet<String>> =
-                        pin_active.then(|| order.iter().cloned().collect());
-                    if let Some(job) = buffer.try_pop(&order, allowed.as_ref()) {
-                        let _slot = slots.acquire(&normalize_queue_name(&job.queue));
+                    // Borrow the cursor's order rather than copying it per
+                    // iteration (idle wakes included).
+                    let next = cursor.next_order();
+                    let order = slots.claimable_borrowed(&next);
+                    // With a pin, bound the never-strand sweep to this order.
+                    let allowed = pin_active.then_some(&*order);
+                    if let Some(job) = buffer.try_pop(&order, allowed) {
+                        let _slot = slots.acquire(normalized_queue_name(&job.queue));
                         execute_local_job(
                             job,
                             &jobs_by_name,
@@ -6671,9 +6743,15 @@ impl LocalQueueBuffer {
                 let mut map = fair
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let bucket = map
-                    .entry(normalize_queue_name(&job.queue))
-                    .or_insert_with(tenant_lanes::FairBucket::new);
+                // Probe by borrow: an owned key is only built for a new bucket.
+                let queue = normalized_queue_name(&job.queue);
+                #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+                let bucket = match map.get_mut(queue) {
+                    Some(bucket) => bucket,
+                    None => map
+                        .entry(queue.to_owned())
+                        .or_insert_with(tenant_lanes::FairBucket::new),
+                };
                 if bucket.len() == LOCAL_QUEUE_WARN_THRESHOLD {
                     tracing::warn!(
                         queue = %job.queue,
@@ -6695,7 +6773,13 @@ impl LocalQueueBuffer {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let bucket = map.entry(normalize_queue_name(&job.queue)).or_default();
+            // Probe by borrow: the queue's bucket exists after its first job.
+            let queue = normalized_queue_name(&job.queue);
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            let bucket = match map.get_mut(queue) {
+                Some(bucket) => bucket,
+                None => map.entry(queue.to_owned()).or_default(),
+            };
             if bucket.len() == LOCAL_QUEUE_WARN_THRESHOLD {
                 tracing::warn!(
                     queue = %job.queue,
@@ -6716,11 +6800,7 @@ impl LocalQueueBuffer {
     /// queue outside its allocation (issue #1623); `None` preserves the
     /// original "drain anything rather than strand work" behavior (AC4).
     #[allow(clippy::significant_drop_tightening)]
-    fn try_pop(
-        &self,
-        order: &[String],
-        allowed: Option<&std::collections::HashSet<String>>,
-    ) -> Option<QueuedJob> {
+    fn try_pop(&self, order: &[String], allowed: Option<&[String]>) -> Option<QueuedJob> {
         let mut map = self
             .inner
             .lock()
@@ -6733,6 +6813,8 @@ impl LocalQueueBuffer {
         // Never strand work: drain any queue outside the configured order,
         // subject to the pin/cap allow-set when one is in effect.
         for (name, queue) in map.iter_mut() {
+            // A linear scan of the borrowed order: a handful of queues, so it
+            // beats hashing, and nothing is copied into a set per iteration.
             if allowed.is_some_and(|set| !set.contains(name)) {
                 continue;
             }
@@ -7260,7 +7342,8 @@ fn redis_record_key(record_prefix: &str, id: &str) -> String {
 /// keeps draining its existing backlog unchanged.
 #[cfg(feature = "redis")]
 fn redis_queue_key(key_prefix: &str, queue: &str) -> String {
-    let queue = normalize_queue_name(queue);
+    // Borrowed: the name is only compared and formatted into the key.
+    let queue = normalized_queue_name(queue);
     if queue == DEFAULT_QUEUE {
         format!("{key_prefix}:queue")
     } else {
@@ -9881,7 +9964,9 @@ fn spawn_redis_worker(
 
             // Fast path (no caps/reserved): a single multi-queue claim across the
             // full (possibly pinned) priority order. Unchanged behavior (AC4).
-            let order = worker_config.slots.claimable(&queue_cursor.next_order());
+            // Borrowed, not copied: this runs on every poll, idle ones included.
+            let next = queue_cursor.next_order();
+            let order = worker_config.slots.claimable_borrowed(&next);
             if order.is_empty() {
                 tokio::time::sleep(idle_sleep).await;
                 continue;
@@ -9913,7 +9998,7 @@ fn spawn_redis_worker(
             // caps/reserved accounting reflects the true in-flight count.
             let _slot = worker_config
                 .slots
-                .acquire(&normalize_queue_name(&record.queue));
+                .acquire(normalized_queue_name(&record.queue));
             process_redis_job_record(
                 &mut connection,
                 record,
@@ -12509,7 +12594,9 @@ async fn pg_worker_loop(
 
         // Fast path (no caps/reserved): a single multi-queue claim across the
         // full (possibly pinned) priority order. Unchanged behavior (AC4).
-        let queue_order = slots.claimable(&cursor.next_order());
+        // Borrowed, not copied: this runs on every poll, idle ones included.
+        let next = cursor.next_order();
+        let queue_order = slots.claimable_borrowed(&next);
         if queue_order.is_empty() {
             tokio::select! {
                 () = shutdown.cancelled() => break,
@@ -12524,7 +12611,7 @@ async fn pg_worker_loop(
             .await
         {
             Some(row) => {
-                let _slot = slots.acquire(&normalize_queue_name(&row.queue));
+                let _slot = slots.acquire(normalized_queue_name(&row.queue));
                 pg_execute_job(
                     row,
                     claimed_at,
@@ -25521,6 +25608,110 @@ mod queue_schedule_tests {
         }
     }
 
+    /// The pre-reuse weighted `next_order`, copied with the cursor fields as
+    /// locals: a fresh `rest` and order `Vec` per call. The oracle for the
+    /// in-place refill.
+    fn reference_weighted_orders(weights: &[(&str, u32)], steps: usize) -> Vec<Vec<String>> {
+        let names: Vec<String> = weights.iter().map(|(n, _)| (*n).to_string()).collect();
+        let weights: Vec<u32> = weights.iter().map(|(_, w)| (*w).max(1)).collect();
+        let mut current = vec![0_i64; names.len()];
+        let total: i64 = weights.iter().map(|w| i64::from(*w)).sum();
+        let mut out = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let mut best = 0_usize;
+            for i in 0..names.len() {
+                current[i] = current[i].saturating_add(i64::from(weights[i]));
+                if current[i] > current[best] {
+                    best = i;
+                }
+            }
+            current[best] = current[best].saturating_sub(total);
+            let mut rest: Vec<usize> = (0..names.len()).filter(|&i| i != best).collect();
+            rest.sort_by(|&a, &b| current[b].cmp(&current[a]));
+            let mut order = Vec::with_capacity(names.len());
+            order.push(names[best].clone());
+            order.extend(rest.into_iter().map(|i| names[i].clone()));
+            out.push(order);
+        }
+        out
+    }
+
+    #[test]
+    fn weighted_cursor_keeps_its_sequence_and_reuses_its_buffer() {
+        // Hand-derived from the smooth weighted round-robin credits; one cycle
+        // is sum(weights) = 7 steps.
+        let expected: [[&str; 3]; 7] = [
+            ["critical", "default", "low"],
+            ["default", "low", "critical"],
+            ["critical", "low", "default"],
+            ["low", "critical", "default"],
+            ["critical", "default", "low"],
+            ["default", "critical", "low"],
+            ["critical", "default", "low"],
+        ];
+        let cfg = JobQueuesConfig::weighted([("critical", 4), ("default", 2), ("low", 1)]);
+        let schedule = QueueSchedule::from_config(&cfg);
+        // Dropped each step: the cursor keeps the only other handle.
+        let mut cursor = schedule.cursor();
+        for (step, want) in expected.iter().cycle().take(14).enumerate() {
+            let order = cursor.next_order();
+            assert_eq!(order.as_slice(), want.as_slice(), "step {step}");
+            assert_eq!(
+                Arc::strong_count(&order),
+                2,
+                "step {step}: cursor keeps a handle"
+            );
+        }
+        // Reused, not just kept: the first call copies off `names`, then every
+        // call after a dropped order refills that same allocation. A fresh
+        // `Vec` would get a new address, since the cursor still holds the old
+        // one while the new one is built.
+        let mut cursor = schedule.cursor();
+        drop(cursor.next_order());
+        let first = cursor.next_order();
+        let buffer = first.as_ptr();
+        drop(first);
+        for step in 0..12 {
+            let order = cursor.next_order();
+            assert_eq!(order.as_ptr(), buffer, "step {step}: buffer reused");
+        }
+        // Held: copy-on-write leaves every earlier order intact.
+        let mut cursor = schedule.cursor();
+        let held: Vec<_> = (0..7).map(|_| cursor.next_order()).collect();
+        for (step, (order, want)) in held.iter().zip(&expected).enumerate() {
+            assert_eq!(order.as_slice(), want.as_slice(), "held step {step}");
+        }
+    }
+
+    #[test]
+    fn weighted_cursor_matches_the_fresh_vec_reference() {
+        // Ties, unequal name lengths (so `clone_from` grows and shrinks a
+        // slot), a unicode name and weights that clamp to 1.
+        let tables: [&[(&str, u32)]; 4] = [
+            &[("critical", 4), ("default", 2), ("low", 1)],
+            &[
+                ("a", 1),
+                ("a-much-longer-queue-name", 1),
+                ("日本語", 3),
+                ("b", 0),
+            ],
+            &[("x", 5), ("y", 5)],
+            &[("q1", 7), ("q2", 3), ("q3", 3), ("q4", 1), ("q5", 2)],
+        ];
+        for weights in tables {
+            let cfg = JobQueuesConfig::weighted(weights.iter().copied());
+            let schedule = QueueSchedule::from_config(&cfg);
+            let reference = reference_weighted_orders(weights, 64);
+            let mut dropped = schedule.cursor();
+            let mut held_cursor = schedule.cursor();
+            let held: Vec<_> = (0..64).map(|_| held_cursor.next_order()).collect();
+            for (step, want) in reference.iter().enumerate() {
+                assert_eq!(*dropped.next_order(), *want, "{weights:?} step {step}");
+                assert_eq!(*held[step], *want, "{weights:?} held step {step}");
+            }
+        }
+    }
+
     #[test]
     fn effective_appends_unconfigured_declared_queue_at_lowest_priority() {
         let cfg = JobQueuesConfig::strict_list(["critical", "default"]);
@@ -25935,6 +26126,177 @@ mod queue_schedule_tests {
         let _g = slots.acquire("a");
         // Without limits, claimable is an unchanged passthrough.
         assert_eq!(slots.claimable(&order), order);
+    }
+
+    #[test]
+    fn queue_slots_passthrough_borrows_the_order() {
+        let slots = QueueSlots::new(4, QueueLimits::default());
+        let order = vec!["a".to_string(), "b".to_string()];
+        let passthrough = slots.claimable_borrowed(&order);
+        assert!(matches!(passthrough, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*passthrough, order.as_slice());
+        // With limits the filtered order is owned, and filtered as before.
+        let capped = QueueSlots::new(2, limits(&[("a", 1)], &[]));
+        let _a = capped.acquire("a");
+        let filtered = capped.claimable_borrowed(&order);
+        assert!(matches!(filtered, std::borrow::Cow::Owned(_)));
+        assert_eq!(&*filtered, ["b".to_string()].as_slice());
+        assert_eq!(capped.claimable(&order), vec!["b".to_string()]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions inspect the state under the one lock they read"
+    )]
+    fn queue_slots_passthrough_skips_bookkeeping() {
+        let slots = QueueSlots::new(4, QueueLimits::default());
+        let acquired = slots.acquire("a");
+        let reserved = slots.try_reserve("b").expect("no limits: always reserves");
+        {
+            let guard = slots.running.lock().unwrap();
+            assert!(guard.0.is_empty(), "no per-queue key without limits");
+            assert_eq!(guard.1, 0);
+        }
+        drop((acquired, reserved));
+        // Nothing was counted, so the drops give nothing back.
+        let guard = slots.running.lock().unwrap();
+        assert!(guard.0.is_empty());
+        assert_eq!(guard.1, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions inspect the state under the one lock they read"
+    )]
+    fn queue_slots_reacquire_of_a_tracked_queue_counts_and_releases() {
+        let slots = QueueSlots::new(4, limits(&[("bulk", 3)], &[]));
+        let first = slots.acquire("bulk");
+        // The second take hits the already-tracked key (borrowed probe).
+        let second = slots.try_reserve("bulk").expect("under the cap");
+        {
+            let guard = slots.running.lock().unwrap();
+            assert_eq!(guard.0.get("bulk").copied(), Some(2));
+            assert_eq!(guard.1, 2);
+        }
+        drop(first);
+        assert_eq!(
+            slots.running.lock().unwrap().0.get("bulk").copied(),
+            Some(1)
+        );
+        // A guard dropped during a panic releases its slot too.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = second;
+            panic!("job panicked while holding its slot");
+        }));
+        assert!(unwound.is_err());
+        let guard = slots.running.lock().unwrap();
+        assert_eq!(guard.0.get("bulk").copied(), Some(0));
+        assert_eq!(guard.1, 0);
+    }
+
+    #[test]
+    fn normalized_queue_name_matches_normalize_queue_name() {
+        // Expected values, not one function checked against the other:
+        // `normalize_queue_name` is `normalized_queue_name(..).to_owned()`.
+        for (raw, want) in [
+            ("", "default"),
+            (" ", "default"),
+            ("  \t\n", "default"),
+            ("mail", "mail"),
+            (" mail ", "mail"),
+            ("\tmail\n", "mail"),
+            ("default", "default"),
+            (" default ", "default"),
+            ("a b", "a b"),
+            ("日本語", "日本語"),
+            (" ünï ", "ünï"),
+        ] {
+            assert_eq!(normalized_queue_name(raw), want, "{raw:?}");
+            assert_eq!(normalize_queue_name(raw), want, "{raw:?}");
+        }
+        assert_eq!(normalized_queue_name("   "), DEFAULT_QUEUE);
+    }
+
+    fn buffered(id: &str, queue: &str) -> QueuedJob {
+        QueuedJob {
+            id: id.to_owned(),
+            name: "probe".to_owned(),
+            queue: queue.to_owned(),
+            payload: serde_json::Value::Null,
+            attempt: 1,
+            max_attempts: 1,
+            initial_backoff_ms: 0,
+            tenant: None,
+            cost_waited: false,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        }
+    }
+
+    #[test]
+    fn local_buffer_push_normalizes_onto_one_bucket_per_queue() {
+        let buffer = LocalQueueBuffer::new();
+        buffer.push(buffered("1", "mail"));
+        // The bucket exists now: a borrowed probe hit, same bucket.
+        buffer.push(buffered("2", " mail "));
+        // Blank names land on the default queue.
+        buffer.push(buffered("3", "  "));
+        assert_eq!(buffer.inner.lock().unwrap().len(), 2);
+        assert_eq!(
+            buffer.try_pop_from("mail").map(|j| j.id),
+            Some("1".to_owned())
+        );
+        assert_eq!(
+            buffer.try_pop_from("mail").map(|j| j.id),
+            Some("2".to_owned())
+        );
+        assert!(buffer.try_pop_from("mail").is_none());
+        assert_eq!(
+            buffer.try_pop_from(DEFAULT_QUEUE).map(|j| j.id),
+            Some("3".to_owned())
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions inspect the state under the one lock they read"
+    )]
+    fn local_fair_buffer_push_normalizes_onto_one_bucket_per_queue() {
+        let buffer = LocalQueueBuffer::with_tenant_fairness();
+        buffer.push(buffered("1", "mail"));
+        buffer.push(buffered("2", " mail "));
+        buffer.push(buffered("3", ""));
+        let mut names = buffer.fair_queue_names();
+        names.sort();
+        assert_eq!(names, vec![DEFAULT_QUEUE.to_string(), "mail".to_string()]);
+        let fair = buffer.fair.as_ref().expect("fair buffer").lock().unwrap();
+        assert_eq!(fair.get("mail").map(tenant_lanes::FairBucket::len), Some(2));
+    }
+
+    #[test]
+    fn local_buffer_fallback_sweep_respects_the_allowed_order() {
+        let buffer = LocalQueueBuffer::new();
+        buffer.push(buffered("1", "other"));
+        let order = vec!["mail".to_string()];
+        assert!(
+            buffer.try_pop(&order, Some(order.as_slice())).is_none(),
+            "pinned: no sweep outside the order"
+        );
+        let widened = vec!["mail".to_string(), "other".to_string()];
+        assert!(
+            buffer.try_pop(&order, Some(widened.as_slice())).is_some(),
+            "a queue in the allowed set is swept"
+        );
+        buffer.push(buffered("2", "other"));
+        assert!(
+            buffer.try_pop(&order, None).is_some(),
+            "unpinned: the sweep drains it"
+        );
     }
 
     #[test]

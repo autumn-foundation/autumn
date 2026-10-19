@@ -54,6 +54,7 @@
     )
 )]
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -454,19 +455,33 @@ impl ProxyResolver {
             .map(|ConnectInfo(addr)| addr.ip())
     }
 
-    fn x_forwarded_for<B>(req: &Request<B>) -> Option<String> {
-        let all: Vec<&str> = req
+    /// Every `X-Forwarded-For` line, joined with `", "` as if it were one
+    /// header. Lines that are not visible ASCII are skipped.
+    ///
+    /// Borrowed for the usual single line, so resolving a request behind a
+    /// proxy does not copy its chain (in hop-count mode the addr, host and
+    /// scheme resolvers each read it); only a request carrying several lines
+    /// pays for the joined string.
+    fn x_forwarded_for<B>(req: &Request<B>) -> Option<Cow<'_, str>> {
+        let mut lines = req
             .headers()
             .get_all("x-forwarded-for")
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-
-        if all.is_empty() {
-            None
-        } else {
-            Some(all.join(", "))
+            .filter_map(|v| v.to_str().ok());
+        let first = lines.next()?;
+        let Some(second) = lines.next() else {
+            return Some(Cow::Borrowed(first));
+        };
+        let mut joined =
+            String::with_capacity(first.len().saturating_add(2).saturating_add(second.len()));
+        joined.push_str(first);
+        joined.push_str(", ");
+        joined.push_str(second);
+        for line in lines {
+            joined.push_str(", ");
+            joined.push_str(line);
         }
+        Some(Cow::Owned(joined))
     }
 }
 
@@ -1127,6 +1142,152 @@ mod tests {
 
         let host = resolver.resolve_client_host(&req).unwrap();
         assert_eq!(host, "real.example.com");
+    }
+
+    // ── X-Forwarded-For line joining ───────────────────────────────────────
+
+    #[test]
+    fn x_forwarded_for_borrows_one_line_and_joins_several() {
+        let req = req_with_xff("192.0.2.1, 10.0.1.200");
+        assert!(matches!(
+            ProxyResolver::x_forwarded_for(&req),
+            Some(Cow::Borrowed("192.0.2.1, 10.0.1.200"))
+        ));
+
+        // A proxy that appends a header line instead of extending the
+        // existing one: the lines read as one comma-joined chain.
+        let req = Request::builder()
+            .header("x-forwarded-for", "192.0.2.1")
+            .header("x-forwarded-for", "203.0.113.10")
+            .header("x-forwarded-for", "10.0.1.200")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            ProxyResolver::x_forwarded_for(&req).as_deref(),
+            Some("192.0.2.1, 203.0.113.10, 10.0.1.200")
+        );
+
+        assert!(ProxyResolver::x_forwarded_for(&Request::builder().body(()).unwrap()).is_none());
+    }
+
+    #[test]
+    fn x_forwarded_for_skips_non_ascii_lines_before_joining() {
+        // A line that is not visible ASCII is dropped before the lines are
+        // counted, so the one valid line left is still borrowed as-is.
+        let req = Request::builder()
+            .header(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
+            )
+            .header("x-forwarded-for", "192.0.2.1")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            ProxyResolver::x_forwarded_for(&req),
+            Some(Cow::Borrowed("192.0.2.1"))
+        ));
+
+        // Every line invalid reads as no header at all.
+        let req = Request::builder()
+            .header(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
+            )
+            .body(())
+            .unwrap();
+        assert!(ProxyResolver::x_forwarded_for(&req).is_none());
+    }
+
+    #[test]
+    fn trusted_hops_reads_multiple_xff_lines_as_one_chain() {
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+        let req = Request::builder()
+            .header("x-forwarded-for", "192.0.2.1")
+            .header("x-forwarded-for", "10.0.1.200")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            resolver.resolve_client_addr(&req),
+            Some("192.0.2.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn split_xff_lines_resolve_exactly_like_one_joined_line() {
+        // Regression guard for the borrowed single-line fast path: whatever
+        // the trust mode, a chain split over several lines must resolve the
+        // same addr, host and scheme as the same chain sent on one line.
+        let configs = [
+            TrustedProxiesConfig {
+                ranges: Vec::new(),
+                trusted_hops: Some(1),
+                trust_forwarded_headers: true,
+            },
+            TrustedProxiesConfig {
+                ranges: vec!["10.0.0.0/8".to_owned()],
+                trusted_hops: None,
+                trust_forwarded_headers: true,
+            },
+            TrustedProxiesConfig {
+                ranges: Vec::new(),
+                trusted_hops: None,
+                trust_forwarded_headers: true,
+            },
+        ];
+        let build = |lines: &[&str]| {
+            let mut builder = Request::builder()
+                .header("host", "internal.example")
+                .header("x-forwarded-host", "app.example")
+                .header("x-forwarded-proto", "HTTPS");
+            for line in lines {
+                builder = builder.header("x-forwarded-for", *line);
+            }
+            let mut req = builder.body(()).unwrap();
+            let peer: SocketAddr = "10.0.1.200:443".parse().unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+        let one_line = build(&["192.0.2.1, 10.0.0.7"]);
+        let split = build(&["192.0.2.1", "10.0.0.7"]);
+
+        for config in &configs {
+            let resolver = ProxyResolver::from_config(config);
+            assert_eq!(
+                resolver.resolve_client_addr(&one_line),
+                resolver.resolve_client_addr(&split),
+            );
+            assert_eq!(
+                resolver.resolve_client_host(&one_line),
+                resolver.resolve_client_host(&split),
+            );
+            assert_eq!(
+                resolver.resolve_client_scheme(&one_line),
+                resolver.resolve_client_scheme(&split),
+            );
+            assert_eq!(
+                resolver.is_trusted_peer(&one_line),
+                resolver.is_trusted_peer(&split),
+            );
+        }
+
+        // And the values themselves, pinned for the hop-count mode.
+        let resolver = ProxyResolver::from_config(&configs[0]);
+        assert_eq!(
+            resolver.resolve_client_addr(&split),
+            Some("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(
+            resolver.resolve_client_host(&split).as_deref(),
+            Some("app.example")
+        );
+        assert_eq!(
+            resolver.resolve_client_scheme(&split).as_deref(),
+            Some("https")
+        );
     }
 }
 

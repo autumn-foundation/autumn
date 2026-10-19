@@ -135,7 +135,11 @@ const BODY_CAPTURE_LIMIT: usize = 64 * 1024;
 /// so the error page filter knows whether to render HTML or pass through JSON.
 ///
 /// This layer runs before the exception filter and stores [`WantsHtml`]
-/// and [`ErrorPageRequestContext`] in the response extensions.
+/// and [`ErrorPageRequestContext`] in the response extensions of an error
+/// response (one carrying [`AutumnErrorInfo`](crate::middleware::AutumnErrorInfo)),
+/// the only kind the exception filter chain inspects. It must sit directly
+/// inside `ExceptionFilterLayer`, with nothing between them that could add
+/// `AutumnErrorInfo` to a response after this layer has passed it through.
 #[derive(Clone)]
 pub struct ErrorPageContextLayer {
     pub is_dev: bool,
@@ -182,16 +186,18 @@ where
     fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
         let wants_html = accepts_html(&req);
         let uri = req.uri().clone();
+        // Kept as the id itself, and the method as a `Method`: both are
+        // rendered to text only for an error response, below. The headers are
+        // the one input that must be copied now, before the request moves into
+        // the inner service; the cookies parsed from them wait as well.
         let request_id = req
             .extensions()
             .get::<crate::middleware::RequestId>()
-            .map(std::string::ToString::to_string);
-
-        let query = uri.query().map(str::to_owned);
-        let headers = Some(req.headers().clone());
-        let method = Some(req.method().to_string());
+            .cloned();
+        let headers = req.headers().clone();
+        let method = req.method().clone();
         let is_dev = self.is_dev;
-        let captures_body = is_dev && should_capture_body(method.as_deref());
+        let captures_body = is_dev && should_capture_body(Some(method.as_str()));
         let content_type = if captures_body {
             req.headers()
                 .get(axum::http::header::CONTENT_TYPE)
@@ -241,14 +247,33 @@ where
 
             let mut response = inner.call(req).await?;
 
+            // `WantsHtml` and `ErrorPageRequestContext` are read only by the
+            // exception-filter chain, which `ExceptionFilterService` (the layer
+            // directly outside this one) runs only for a response carrying
+            // `AutumnErrorInfo`. Any other response would carry both unread, so
+            // a success response skips building them, and the context text
+            // (request id, query, method, cookies) is rendered for errors only.
+            if response
+                .extensions()
+                .get::<crate::middleware::AutumnErrorInfo>()
+                .is_none()
+            {
+                return Ok(response);
+            }
+
             response.extensions_mut().insert(WantsHtml(wants_html));
-            let request_id = request_id.or_else(|| {
-                response
-                    .headers()
-                    .get("x-request-id")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned)
-            });
+            let request_id = request_id
+                .as_ref()
+                .map(std::string::ToString::to_string)
+                .or_else(|| {
+                    response
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                });
+            let query = uri.query().map(str::to_owned);
+            let method = Some(method.to_string());
             let matched_path = response
                 .extensions()
                 .get::<crate::middleware::dev::DevMatchedPath>()
@@ -257,10 +282,10 @@ where
                 .as_deref()
                 .map(|pattern| extract_path_params(pattern, uri.path()));
             let cookies = headers
-                .as_ref()
-                .and_then(|h| h.get(axum::http::header::COOKIE))
+                .get(axum::http::header::COOKIE)
                 .and_then(|v| v.to_str().ok())
                 .map(parse_cookie_header);
+            let headers = Some(headers);
             let sql_queries = response
                 .extensions()
                 .get::<crate::inspector::RequestQueryList>()
@@ -1488,6 +1513,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"all good");
+    }
+
+    /// `ErrorPageContextLayer` builds `WantsHtml` and `ErrorPageRequestContext`
+    /// only for a response the exception filter chain will inspect (one
+    /// carrying `AutumnErrorInfo`), and builds the same context it always did
+    /// for an error response, in both profiles: the deferred request id,
+    /// query, method and cookie parse render the same text as before.
+    #[tokio::test]
+    async fn context_is_attached_only_to_error_responses() {
+        const INBOUND_ID: &str = "0192F3A4-5B6C-7D8E-9F01-23456789ABCD";
+
+        for is_dev in [false, true] {
+            let app = Router::new()
+                .route("/ok", get(|| async { "all good" }))
+                .route(
+                    "/fail",
+                    get(|| async {
+                        Err::<String, AutumnError>(AutumnError::not_found_msg("gone"))
+                    }),
+                )
+                .layer(ErrorPageContextLayer { is_dev });
+
+            let request = |uri: &'static str| {
+                let mut req = Request::builder()
+                    .uri(uri)
+                    .header("accept", "text/html")
+                    .header("cookie", "a=b; flag")
+                    .body(Body::empty())
+                    .unwrap();
+                req.extensions_mut()
+                    .insert(crate::middleware::RequestId::parse_inbound(INBOUND_ID).unwrap());
+                req
+            };
+
+            let ok = app.clone().oneshot(request("/ok?x=1")).await.unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            assert!(ok.extensions().get::<WantsHtml>().is_none());
+            assert!(ok.extensions().get::<ErrorPageRequestContext>().is_none());
+
+            let fail = app.oneshot(request("/fail?x=1")).await.unwrap();
+            assert_eq!(fail.status(), StatusCode::NOT_FOUND);
+            assert!(fail.extensions().get::<WantsHtml>().is_some_and(|w| w.0));
+            let ctx = fail
+                .extensions()
+                .get::<ErrorPageRequestContext>()
+                .expect("error response carries the context");
+            assert_eq!(ctx.uri.path(), "/fail", "is_dev={is_dev}");
+            assert_eq!(ctx.request_id.as_deref(), Some(INBOUND_ID));
+            assert_eq!(ctx.query.as_deref(), Some("x=1"));
+            assert_eq!(ctx.method.as_deref(), Some("GET"));
+            assert_eq!(
+                ctx.headers
+                    .as_ref()
+                    .and_then(|h| h.get("cookie"))
+                    .and_then(|v| v.to_str().ok()),
+                Some("a=b; flag")
+            );
+            assert_eq!(
+                ctx.cookies,
+                Some(serde_json::json!({ "a": "b", "flag": "" }))
+            );
+            assert!(ctx.body_bytes.is_none() && ctx.content_type.is_none());
+            assert!(!ctx.body_truncated);
+        }
+    }
+
+    /// With no `RequestId` extension, the error context still falls back to
+    /// the response's `x-request-id` header, as before.
+    #[tokio::test]
+    async fn context_request_id_falls_back_to_response_header() {
+        let app = Router::new()
+            .route(
+                "/fail",
+                get(|| async {
+                    let mut resp = AutumnError::not_found_msg("gone").into_response();
+                    resp.headers_mut().insert(
+                        "x-request-id",
+                        axum::http::HeaderValue::from_static("from-header"),
+                    );
+                    resp
+                }),
+            )
+            .layer(ErrorPageContextLayer { is_dev: false });
+
+        let fail = app
+            .oneshot(
+                Request::builder()
+                    .uri("/fail")
+                    .header("accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fail.status(), StatusCode::NOT_FOUND);
+        assert!(fail.extensions().get::<WantsHtml>().is_some_and(|w| !w.0));
+        let ctx = fail
+            .extensions()
+            .get::<ErrorPageRequestContext>()
+            .expect("error response carries the context");
+        assert_eq!(ctx.request_id.as_deref(), Some("from-header"));
+        assert!(ctx.query.is_none());
     }
 
     #[tokio::test]
