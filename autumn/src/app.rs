@@ -4076,10 +4076,15 @@ impl AppBuilder {
         // `framework_retention_task` returns `None` unless at least one
         // `[retention]` window is set, so an app that never mentions the section
         // gets no extra scheduler loop.
-        if let Some(retention_task) =
-            crate::data_retention::framework_retention_task(&config.retention)
-        {
-            tasks.push(retention_task);
+        let retention_tasks: Vec<_> = [
+            crate::data_retention::framework_retention_task(&config.retention),
+            crate::data_retention::framework_archive_retention_task(&config.retention),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !retention_tasks.is_empty() {
+            tasks.extend(retention_tasks);
             // Re-validate: the merged-name check above ran before this task
             // existed, and an app is free to declare a `#[scheduled]` fn
             // named `autumn-retention-sweep`, which would otherwise spawn two
@@ -7915,6 +7920,18 @@ impl AppBuilder {
         )
         .await;
 
+        // The CLI guard only knows the profile name it passes down. Check the
+        // profile this app resolved, next to the deletion.
+        if mode == FrameworkRetentionMode::Purge {
+            let forced = std::env::var(FRAMEWORK_RETENTION_FORCE_ENV).is_ok_and(|v| v == "1");
+            if let Some(refusal) =
+                crate::data_retention::purge_refusal(config.profile.as_deref(), forced)
+            {
+                eprintln!("autumn db retention: {refusal}");
+                std::process::exit(1);
+            }
+        }
+
         #[cfg(feature = "db")]
         let database = match setup_database(
             &config,
@@ -9509,6 +9526,9 @@ mod data_capsule_mode_tests {
 
 /// The env var `autumn db retention` sets to select the one-shot mode.
 pub(crate) const FRAMEWORK_RETENTION_ENV: &str = "AUTUMN_DB_RETENTION";
+
+/// Set to `1` by `autumn db retention --force`.
+pub(crate) const FRAMEWORK_RETENTION_FORCE_ENV: &str = "AUTUMN_DB_RETENTION_FORCE";
 
 /// The env var `autumn db retention --dataset <key>` sets to narrow the run.
 pub(crate) const FRAMEWORK_RETENTION_DATASET_ENV: &str = "AUTUMN_DB_RETENTION_DATASET";
@@ -14695,10 +14715,12 @@ fn merge_framework_scheduled_tasks(
 ) -> Vec<crate::task::TaskInfo> {
     #[cfg(feature = "db")]
     tasks.extend(crate::retention::collect_retention_tasks());
-    if let Some(retention_task) = crate::data_retention::framework_retention_task(&config.retention)
-    {
-        tasks.push(retention_task);
-    }
+    tasks.extend(crate::data_retention::framework_retention_task(
+        &config.retention,
+    ));
+    tasks.extend(crate::data_retention::framework_archive_retention_task(
+        &config.retention,
+    ));
     tasks
 }
 

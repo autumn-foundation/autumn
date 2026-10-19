@@ -1,0 +1,2 @@
+-- Intentionally empty. The full framework set creates and owns this index.
+-- Dropping it here would remove it from apps that use both sets.

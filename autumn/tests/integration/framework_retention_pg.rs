@@ -245,6 +245,8 @@ fn config_with_windows() -> AutumnConfig {
     // The job-tracking window competes with this knob; keep it wide so the
     // policy window is the bound under test.
     config.jobs.tracking.ttl_secs = 365 * 86_400;
+    // Both jobs datasets are swept only on the Postgres jobs backend.
+    config.jobs.backend = "postgres".to_owned();
     config
 }
 

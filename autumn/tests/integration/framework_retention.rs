@@ -13,7 +13,8 @@ use std::time::Duration;
 use autumn_web::config::AutumnConfig;
 use autumn_web::data_retention::{
     RETENTION_DATASETS, RetentionDataset, RetentionEnforcement, RetentionSource,
-    effective_retention, framework_retention_task, legal_hold_for,
+    effective_retention, framework_archive_retention_task, framework_retention_task,
+    legal_hold_for,
 };
 use autumn_web::gdpr::{GdprRegistry, ModelRegistration};
 
@@ -293,6 +294,36 @@ fn one_window_registers_a_fleet_coordinated_recurring_task() {
     }
 }
 
+#[test]
+fn the_archive_window_registers_a_per_replica_task_not_a_fleet_one() {
+    // The archive is a local file. A fleet task would purge one replica's
+    // file only.
+    let mut config = AutumnConfig::default();
+    config.retention.audit_archives = Some("400d".to_owned());
+
+    assert!(
+        framework_retention_task(&config.retention).is_none(),
+        "no shared dataset has a window"
+    );
+    let task = framework_archive_retention_task(&config.retention).expect("archive task");
+    assert_eq!(
+        task.name,
+        autumn_web::data_retention::RETENTION_ARCHIVE_TASK_NAME
+    );
+    assert_eq!(
+        task.coordination,
+        autumn_web::task::TaskCoordination::PerReplica
+    );
+}
+
+#[test]
+fn a_shared_window_alone_registers_no_archive_task() {
+    let mut config = AutumnConfig::default();
+    config.retention.job_history = Some("90d".to_owned());
+    assert!(framework_retention_task(&config.retention).is_some());
+    assert!(framework_archive_retention_task(&config.retention).is_none());
+}
+
 // ── Runtime enforcement of TTL-native datasets (AC #2/#3) ────────────────
 
 #[test]
@@ -458,13 +489,19 @@ async fn the_registered_task_handler_runs_a_real_sweep() {
     let mut config = AutumnConfig::default();
     config.retention.audit_archives = Some("1h".to_owned());
 
-    let task = framework_retention_task(&config.retention).expect("a window registers the task");
-    let state = autumn_web::AppState::for_test();
-    state.insert_extension(config);
+    config.retention.job_history = Some("1h".to_owned());
 
-    (task.handler)(state)
-        .await
-        .expect("the sweep handler must run to completion with no database configured");
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config.clone());
+    for task in [
+        framework_retention_task(&config.retention).expect("a shared window registers the task"),
+        framework_archive_retention_task(&config.retention)
+            .expect("an archive window registers the archive task"),
+    ] {
+        (task.handler)(state.clone())
+            .await
+            .expect("the sweep handler must run to completion with no database configured");
+    }
 }
 
 #[tokio::test]
@@ -889,5 +926,31 @@ async fn a_redis_session_backend_reports_write_time_enforcement() {
     assert!(
         !skipped.contains("NOT enforced"),
         "a store that does expire records must not be reported as unenforced: {skipped}"
+    );
+}
+
+#[test]
+fn the_standalone_commit_hook_migrations_carry_the_sweep_index() {
+    // Apps that use commit hooks without the full framework set get only
+    // this directory. The sweep needs the index there too, under a version
+    // that differs from the full set's copy.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut versions = Vec::new();
+    for entry in std::fs::read_dir(root.join("repository_commit_hook_migrations")).expect("dir") {
+        let dir = entry.expect("entry").path();
+        let up = std::fs::read_to_string(dir.join("up.sql")).expect("up.sql");
+        if up.contains("idx_autumn_commit_hooks_finished") {
+            versions.push(
+                dir.file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    assert_eq!(versions.len(), 1, "{versions:?}");
+    assert!(
+        !versions[0].starts_with("20260831191622"),
+        "the version must differ from the full set: {versions:?}"
     );
 }
