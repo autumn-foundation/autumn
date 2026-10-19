@@ -29,9 +29,10 @@ ledger audit. No assay-ledger entry covers this question.
 None built. One throwaway `tomllib` comparison of the parsed `[advisories].ignore`,
 `[licenses].allow` and `[sources]` tables across the three configs (run from the scratchpad,
 not committed). **Stubs/limits:** the checkout is shallow (50 commits), so file creation dates
-for `fuzz/deny.toml` and `island-flock/deny.toml` cannot be read from history. ADR 0013 itself
-already lists both as existing and outside the two configs on 2026-09-07, so they predate the
-ADR.
+for `fuzz/deny.toml` and `island-flock/deny.toml` cannot be read from history. The Ballast audit
+(`2026-09-07-ballast-dependency-ledger-audit.md`, "Change") records both files as **new**,
+added after ADR 0013. The ADR's evidence item 5 named the two satellite workspaces, not their
+`deny.toml` files.
 
 ## 📊 Assay
 
@@ -45,8 +46,12 @@ ADR.
 | Third cargo-deny config? | `fuzz/deny.toml` and `examples/island-flock/deny.toml` exist, but they are satellite workspaces with their own lockfiles. `fuzz/deny.toml` gates advisories and sources only, by documented design (NCSA license question). They are not mutually-exclusive backend graphs of the main workspace. |
 
 Trigger 1: **false**. The date passed and the files were updated together, so they are
-consistent. Trigger 2: **false**. The satellite configs differ from the root policy by
-documented design, and they were already named in the ADR's own evidence item 5.
+consistent. Trigger 2: **false, as worded**. Two further cargo-deny configs were added after the ADR
+(Ballast, 2026-09-07), so the count of configs did grow. But the trigger asks for a config
+"for another mutually-exclusive backend graph", and these cover separate satellite workspaces
+with their own lockfiles and a deliberately narrower policy (advisories and sources only).
+Whether that wording should extend to satellite configs is Keystone's call. Neither file
+shares the root's waiver list, so there is no new by-hand sync obligation.
 
 ## 🏁 Verdict
 
