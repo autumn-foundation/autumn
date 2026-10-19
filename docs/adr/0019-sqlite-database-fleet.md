@@ -225,10 +225,10 @@ databases that nobody asks for:
   the row cannot be written, the open fails.
 - **Derivations.** `_autumn_fleet_derivation_epochs` on the control database
   records each derivation fingerprint a worker has seen, in order. A worker
-  with a new fingerprint lists the files and marks each database
-  `backfill`, then records its fingerprint. It opens none to do this. Only
-  the binary with the newest fingerprint runs a backfill or removes a
-  `backfill` row. A fingerprint seen before is never recorded again, so an
+  with a new fingerprint records it, then lists the files and marks each
+  database `backfill`. It opens none to do this. Only the binary with the
+  newest fingerprint runs a backfill (checked before each database) or
+  removes a `backfill` row (checked in the same `DELETE`). A fingerprint seen before is never recorded again, so an
   old binary that restarts in a rolling deploy cannot undo the new
   definitions. A rollback to older derivations needs a `resweep`. When a
   database opens, the current binary runs up to 8 backfill batches before
@@ -251,7 +251,7 @@ databases that nobody asks for:
 - **Bounds.** Each pass visits at most 64 databases, 4 at a time, with 256
   messages and 4 backfill rounds each. When a visit leaves work and does
   nothing, the database waits 1 s, then twice as long each time, up to
-  5 min. The index stores this wait, so a stuck database never hides the
+  5 min. New work of the same kind ends the wait. The index stores this wait, so a stuck database never hides the
   others. `/actuator/health` reports `fleet:sweeper`: the backlog
   (databases), the oldest pending age, and the counts of the last pass.
 

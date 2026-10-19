@@ -89,7 +89,8 @@ CREATE INDEX IF NOT EXISTS idx_autumn_fleet_pending_due
     ON _autumn_fleet_pending (visit_after, since);
 CREATE TABLE IF NOT EXISTS _autumn_fleet_derivation_epochs (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint TEXT    NOT NULL UNIQUE
+    fingerprint TEXT    NOT NULL UNIQUE,
+    marked      INTEGER NOT NULL DEFAULT 0
 );";
 
 /// Rows per transaction when many databases are marked at once. Small, so a
@@ -260,18 +261,29 @@ impl FleetPendingIndex {
     /// Returns an error when the control database cannot be read or written.
     pub async fn mark(&self, key: &str, kind: PendingKind) -> AutumnResult<()> {
         let mut conn = self.conn().await?;
-        let found: CountRow = diesel::sql_query(format!(
-            "SELECT COUNT(*) AS n FROM {PENDING_TABLE} WHERE key = ? AND kind = ?"
+        let found: Vec<CountRow> = diesel::sql_query(format!(
+            "SELECT attempts AS n FROM {PENDING_TABLE} WHERE key = ? AND kind = ?"
         ))
         .bind::<Text, _>(key)
         .bind::<Text, _>(kind.as_str())
-        .get_result(&mut *conn)
+        .load(&mut *conn)
         .await
         .map_err(|error| index_error("read", error))?;
-        if found.n > 0 {
-            return Ok(());
+        match found.into_iter().next() {
+            None => self.insert(&mut conn, key, kind).await,
+            // New work ends the backoff of older work of the same kind.
+            Some(row) if row.n > 0 => diesel::sql_query(format!(
+                "UPDATE {PENDING_TABLE} SET visit_after = 0, attempts = 0 \
+                 WHERE key = ? AND kind = ?"
+            ))
+            .bind::<Text, _>(key)
+            .bind::<Text, _>(kind.as_str())
+            .execute(&mut *conn)
+            .await
+            .map(drop)
+            .map_err(|error| index_error("mark", error)),
+            Some(_) => Ok(()),
         }
-        self.insert(&mut conn, key, kind).await
     }
 
     async fn insert(
@@ -449,14 +461,11 @@ impl FleetPendingIndex {
         })
     }
 
-    /// Make the rows of `key` name exactly the kinds in `remaining`, but never
-    /// remove a row of kind `keep`. Writes nothing when they already do.
-    async fn reconcile(
-        &self,
-        key: &str,
-        remaining: &BTreeSet<PendingKind>,
-        keep: Option<PendingKind>,
-    ) -> AutumnResult<()> {
+    /// Make the rows of `key` name exactly the kinds in `remaining`. Writes
+    /// nothing when they already do. A `backfill` row goes only while this
+    /// binary owns the newest epoch, checked in the same statement: an old
+    /// binary never clears the work of new definitions.
+    async fn reconcile(&self, key: &str, remaining: &BTreeSet<PendingKind>) -> AutumnResult<()> {
         let mut conn = self.conn().await?;
         let rows: Vec<EntryRow> = diesel::sql_query(format!(
             "SELECT key, kind, since FROM {PENDING_TABLE} WHERE key = ?"
@@ -469,18 +478,28 @@ impl FleetPendingIndex {
         for kind in remaining.difference(&marked) {
             self.insert(&mut conn, key, *kind).await?;
         }
-        for kind in marked
-            .difference(remaining)
-            .filter(|kind| Some(**kind) != keep)
-        {
-            diesel::sql_query(format!(
-                "DELETE FROM {PENDING_TABLE} WHERE key = ? AND kind = ?"
-            ))
-            .bind::<Text, _>(key)
-            .bind::<Text, _>(kind.as_str())
-            .execute(&mut *conn)
-            .await
-            .map_err(|error| index_error("clear", error))?;
+        let epoch = own_epoch();
+        for kind in marked.difference(remaining) {
+            let cleared = if *kind == PendingKind::Backfill {
+                diesel::sql_query(format!(
+                    "DELETE FROM {PENDING_TABLE} WHERE key = ? AND kind = ? AND \
+                     (SELECT fingerprint FROM {EPOCH_TABLE} ORDER BY seq DESC LIMIT 1) = ?"
+                ))
+                .bind::<Text, _>(key)
+                .bind::<Text, _>(kind.as_str())
+                .bind::<Text, _>(&epoch)
+                .execute(&mut *conn)
+                .await
+            } else {
+                diesel::sql_query(format!(
+                    "DELETE FROM {PENDING_TABLE} WHERE key = ? AND kind = ?"
+                ))
+                .bind::<Text, _>(key)
+                .bind::<Text, _>(kind.as_str())
+                .execute(&mut *conn)
+                .await
+            };
+            cleared.map_err(|error| index_error("clear", error))?;
         }
         Ok(())
     }
@@ -499,16 +518,28 @@ impl FleetPendingIndex {
             .map_err(|error| index_error("clear", error))
     }
 
-    /// Whether `fingerprint` was ever recorded.
-    async fn has_epoch(&self, fingerprint: &str) -> AutumnResult<bool> {
+    /// Whether `fingerprint` was recorded and its databases all marked.
+    async fn epoch_marked(&self, fingerprint: &str) -> AutumnResult<bool> {
         let found: CountRow = diesel::sql_query(format!(
-            "SELECT COUNT(*) AS n FROM {EPOCH_TABLE} WHERE fingerprint = ?"
+            "SELECT COUNT(*) AS n FROM {EPOCH_TABLE} WHERE fingerprint = ? AND marked = 1"
         ))
         .bind::<Text, _>(fingerprint)
         .get_result(&mut *self.conn().await?)
         .await
         .map_err(|error| index_error("read", error))?;
         Ok(found.n > 0)
+    }
+
+    /// Record that every database was marked for `fingerprint`.
+    async fn set_epoch_marked(&self, fingerprint: &str) -> AutumnResult<()> {
+        diesel::sql_query(format!(
+            "UPDATE {EPOCH_TABLE} SET marked = 1 WHERE fingerprint = ?"
+        ))
+        .bind::<Text, _>(fingerprint)
+        .execute(&mut *self.conn().await?)
+        .await
+        .map(drop)
+        .map_err(|error| index_error("write", error))
     }
 
     /// Record `fingerprint` as the newest epoch, unless it is recorded
@@ -990,18 +1021,11 @@ impl FleetSweeper {
             tracing::warn!(%error, "fleet sweeper could not mark derivation backfills");
         }
         let mut report = SweepReport::default();
-        let backfill_current = match self.backfill_current().await {
-            Ok(current) => current,
-            Err(error) => {
-                tracing::warn!(%error, "fleet sweeper could not read the derivation fingerprint");
-                false
-            }
-        };
         match self.candidates().await {
             Ok(candidates) => {
                 let concurrency = inner.options.concurrency.max(1);
                 let visits: Vec<Visit> = futures::stream::iter(candidates)
-                    .map(|key| self.visit(key, backfill_current))
+                    .map(|key| self.visit(key))
                     .buffer_unordered(concurrency)
                     .collect()
                     .await;
@@ -1031,22 +1055,20 @@ impl FleetSweeper {
         report
     }
 
-    /// Whether this binary's derivations are the newest epoch.
-    async fn backfill_current(&self) -> AutumnResult<bool> {
-        self.inner.index.epoch_is_current().await
-    }
-
-    /// When this binary's derivations are a new epoch, mark every database
-    /// for a backfill, then record the epoch. Lists files; opens none. An
-    /// epoch seen before is never recorded again, so an old binary that
-    /// restarts in a rolling deploy does not take over.
+    /// When this binary's derivations are a new epoch, record it, then mark
+    /// every database for a backfill. Lists files; opens none. An epoch seen
+    /// before is never recorded again, so an old binary that restarts in a
+    /// rolling deploy does not take over.
     async fn mark_derivation_changes(&self) -> AutumnResult<()> {
         let inner = &self.inner;
         if AtomicBool::load(&inner.fingerprint_checked, Ordering::Acquire) {
             return Ok(());
         }
         let epoch = own_epoch();
-        if !inner.index.has_epoch(&epoch).await? {
+        if !inner.index.epoch_marked(&epoch).await? {
+            // Record first: from now on no older binary backfills or clears
+            // a backfill row. A crash before the flag marks again next time.
+            inner.index.record_epoch(&epoch).await?;
             let keys: Vec<String> = if crate::derivation::has_derivation_descriptors() {
                 inner
                     .fleet
@@ -1058,9 +1080,8 @@ impl FleetSweeper {
             } else {
                 Vec::new()
             };
-            // Marks first: a crash before the record marks again next time.
             inner.index.mark_many(&keys, PendingKind::Backfill).await?;
-            inner.index.record_epoch(&epoch).await?;
+            inner.index.set_epoch_marked(&epoch).await?;
             if !keys.is_empty() {
                 tracing::info!(
                     databases = keys.len(),
@@ -1118,7 +1139,7 @@ impl FleetSweeper {
         Ok(chosen)
     }
 
-    async fn visit(&self, name: String, backfill_current: bool) -> Visit {
+    async fn visit(&self, name: String) -> Visit {
         let inner = &self.inner;
         // A pass in progress at shutdown opens nothing more.
         if inner.stop.is_cancelled() {
@@ -1147,8 +1168,8 @@ impl FleetSweeper {
                 None => return Visit::Skipped,
             }
         };
-        let worked = self.work(&db, &key, backfill_current).await;
-        let remaining = self.settle(&db, &name, backfill_current).await;
+        let worked = self.work(&db, &key).await;
+        let remaining = self.settle(&db, &name).await;
         drop(db);
         // Also when an earlier visit opened it and could not close it then.
         if opened || inner.options.relay {
@@ -1176,12 +1197,7 @@ impl FleetSweeper {
 
     /// Drain hooks, relay the outbox, run the backfill. Returns how much it
     /// did.
-    async fn work(
-        &self,
-        db: &FleetDatabase,
-        key: &FleetDbKey,
-        backfill_current: bool,
-    ) -> AutumnResult<usize> {
+    async fn work(&self, db: &FleetDatabase, key: &FleetDbKey) -> AutumnResult<usize> {
         let inner = &self.inner;
         let options = &inner.options;
         let pool = db.pool();
@@ -1217,9 +1233,10 @@ impl FleetSweeper {
             )
             .await?;
         }
-        // Only the newest epoch backfills. Cheap when every backfill is
-        // complete: one read.
-        if !backfill_current {
+        // Only the newest epoch backfills, checked here for each database: a
+        // newer worker may have recorded its epoch during this pass. Cheap
+        // when every backfill is complete: one read.
+        if !inner.index.epoch_is_current().await? {
             return Ok(handled);
         }
         let (_, batches) = backfill(pool, options.max_backfill_rounds, &inner.stop).await?;
@@ -1228,12 +1245,7 @@ impl FleetSweeper {
 
     /// Under the tenant write lock, find the kinds of work the database still
     /// has and make its rows say exactly that.
-    async fn settle(
-        &self,
-        db: &FleetDatabase,
-        name: &str,
-        backfill_current: bool,
-    ) -> AutumnResult<BTreeSet<PendingKind>> {
+    async fn settle(&self, db: &FleetDatabase, name: &str) -> AutumnResult<BTreeSet<PendingKind>> {
         let index = Arc::clone(&self.inner.index);
         let name = name.to_owned();
         let mut conn = db
@@ -1254,8 +1266,7 @@ impl FleetSweeper {
                     remaining.insert(PendingKind::Backfill);
                 }
                 // Still under the tenant write lock: no enqueue interleaves.
-                let keep = (!backfill_current).then_some(PendingKind::Backfill);
-                index.reconcile(&name, &remaining, keep).await?;
+                index.reconcile(&name, &remaining).await?;
                 Ok(remaining)
             }
             .scope_boxed()
@@ -1441,7 +1452,7 @@ mod tests {
 
         // Reconcile: outbox done, a backfill found.
         index
-            .reconcile("slot:00001", &BTreeSet::from([PendingKind::Backfill]), None)
+            .reconcile("slot:00001", &BTreeSet::from([PendingKind::Backfill]))
             .await
             .unwrap();
         let rows = index.pending_for(&["slot:00001".to_owned()]).await.unwrap();
@@ -1449,9 +1460,9 @@ mod tests {
             rows.iter().map(|e| e.kind).collect::<Vec<_>>(),
             vec![PendingKind::Backfill]
         );
-        // An older binary (`keep`) never clears a backfill row.
+        // Without this binary's epoch as the newest, a backfill row stays.
         index
-            .reconcile("slot:00001", &BTreeSet::new(), Some(PendingKind::Backfill))
+            .reconcile("slot:00001", &BTreeSet::new())
             .await
             .unwrap();
         assert_eq!(
@@ -1462,9 +1473,10 @@ mod tests {
                 .len(),
             1
         );
+        index.record_epoch(&own_epoch()).await.unwrap();
         index.clear_database("slot:00002").await.unwrap();
         index
-            .reconcile("slot:00001", &BTreeSet::new(), None)
+            .reconcile("slot:00001", &BTreeSet::new())
             .await
             .unwrap();
         assert!(index.pending(10).await.unwrap().is_empty());
@@ -1483,7 +1495,9 @@ mod tests {
         assert_eq!(index.latest_epoch().await.unwrap(), None);
         index.record_epoch("old").await.unwrap();
         index.record_epoch("new").await.unwrap();
-        assert!(index.has_epoch("old").await.unwrap());
+        assert!(!index.epoch_marked("old").await.unwrap());
+        index.set_epoch_marked("old").await.unwrap();
+        assert!(index.epoch_marked("old").await.unwrap());
         // The old binary restarts in a rolling deploy: the new epoch stays.
         index.record_epoch("old").await.unwrap();
         assert_eq!(index.latest_epoch().await.unwrap().as_deref(), Some("new"));
@@ -1565,6 +1579,15 @@ mod tests {
             .map(|e| e.key)
             .collect();
         assert_eq!(due, vec!["slot:00002"], "a stuck database hides no other");
+        // New work of the same kind ends the backoff.
+        index.mark("slot:00002", PendingKind::Outbox).await.unwrap();
+        index.defer("slot:00002").await.unwrap();
+        index.mark("slot:00002", PendingKind::Outbox).await.unwrap();
+        assert_eq!(
+            index.due(None, 10).await.unwrap().len(),
+            1,
+            "slot 2 is due again"
+        );
         assert_eq!(
             index.pending(10).await.unwrap().len(),
             2,
