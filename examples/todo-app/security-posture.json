@@ -204,6 +204,28 @@
           "provenance": "provable"
         },
         {
+          "path": "/static/css/autumn-flash.css",
+          "method": "GET",
+          "name": "flash_css",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/css/autumn-widgets.css",
+          "method": "GET",
+          "name": "widgets_css",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
           "path": "/static/js/autumn-htmx-csrf.ba2cd05f.js",
           "method": "GET",
           "name": "htmx_csrf",
@@ -606,6 +628,16 @@
         },
         {
           "path": "/startup",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/css/autumn-flash.css",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/css/autumn-widgets.css",
           "method": "GET",
           "mtls_required": false
         },
