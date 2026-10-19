@@ -25,6 +25,7 @@ use autumn_web::{AutumnResult, post, routes};
 static VERIFIED_ORDER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static HANDLER_AUTH_CALLS: AtomicUsize = AtomicUsize::new(0);
 static OPTED_OUT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SCOPED_OPTED_OUT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Body echoes the calling token's principal so a cross-principal replay is
 /// visible in the response text.
@@ -60,6 +61,14 @@ async fn handler_auth(headers: HeaderMap) -> String {
 #[post("/opted-out", idempotent = false)]
 async fn opted_out() -> String {
     let call = OPTED_OUT_CALLS.fetch_add(1, Ordering::SeqCst);
+    format!("call-{call}")
+}
+
+/// The same opt-out, mounted inside a `.scoped(...)` group, whose routes
+/// otherwise always get the fail-closed layer.
+#[post("/scoped-opted-out", idempotent = false)]
+async fn scoped_opted_out() -> String {
+    let call = SCOPED_OPTED_OUT_CALLS.fetch_add(1, Ordering::SeqCst);
     format!("call-{call}")
 }
 
@@ -206,5 +215,34 @@ async fn idempotent_false_route_is_not_cached() {
     let retry = post_with(&app, "/opted-out", Some("Bearer token-a"), "k").await;
     retry.assert_ok();
     assert_eq!(retry.text(), "call-1", "an opted-out route must run again");
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+}
+
+/// A scoped group mounts its routes on a separate path that always chose the
+/// fail-closed layer. The opt-out must hold there too: the retry runs the
+/// handler, not a `409`.
+#[tokio::test]
+async fn idempotent_false_route_in_a_scoped_group_is_not_cached() {
+    SCOPED_OPTED_OUT_CALLS.store(0, Ordering::SeqCst);
+    let app = TestApp::new()
+        .idempotent()
+        .scoped(
+            "/api",
+            tower::layer::util::Identity::new(),
+            routes![scoped_opted_out],
+        )
+        .build();
+
+    let first = post_with(&app, "/api/scoped-opted-out", Some("Bearer token-a"), "k").await;
+    first.assert_ok();
+    assert_eq!(first.text(), "call-0");
+
+    let retry = post_with(&app, "/api/scoped-opted-out", Some("Bearer token-a"), "k").await;
+    retry.assert_ok();
+    assert_eq!(
+        retry.text(),
+        "call-1",
+        "an opted-out scoped route must run again, not fail closed"
+    );
     assert_eq!(retry.header("x-idempotent-replayed"), None);
 }

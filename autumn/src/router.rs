@@ -3738,8 +3738,11 @@ fn mount_scoped_groups(
             // know whether that layer authorizes, audits, or resolves tenant
             // state from non-whitelisted headers/extensions, so cached hits
             // fail closed instead of replaying through a generated stop inside
-            // the scoped route.
-            let selected_layer = idempotency_layers.map(|layers| &layers.manual);
+            // the scoped route. A route that opted out with `idempotent =
+            // false` gets no layer here either.
+            let selected_layer = idempotency_layers
+                .filter(|_| !matches!(route.idempotency, crate::route::RouteIdempotency::Off))
+                .map(|layers| &layers.manual);
             let seo = route.seo;
             let mut handler = route.handler;
             if let Some(layer) = selected_layer {
