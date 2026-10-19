@@ -5,6 +5,7 @@
 //!   database closes.
 //! - Queued commit hooks drain without a request.
 //! - A derivation added in a migration backfills a closed tenant.
+//! - Rows of a deleted or unknown database are dropped.
 //! - The sweeper never opens past `max_open` and never closes a leased
 //!   database.
 //!
@@ -618,4 +619,91 @@ async fn an_old_binary_in_a_rolling_deploy_never_runs_or_clears_a_backfill() {
         .await
         .unwrap();
     assert_eq!(reconciled.n, 0, "the old definitions were never applied");
+}
+
+#[tokio::test]
+async fn rows_of_a_deleted_or_unknown_database_are_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 4);
+    let client = app(tmp.path(), fleet.clone());
+    let sweeper = install(&client).await;
+
+    assert_eq!(post(&client, "acme", "/orders/1").await, 200);
+    let acme = key(&fleet, "acme");
+    fleet.close(&acme).await;
+    assert!(fleet.delete(&acme).await.unwrap(), "acme is deleted");
+    // A slot name is not a database of a tenant fleet.
+    sweeper
+        .index()
+        .mark("slot:00001", PendingKind::Outbox)
+        .await
+        .unwrap();
+    assert_eq!(pending(&sweeper).await.len(), 2);
+
+    let report = sweeper.sweep_once().await;
+    assert_eq!((report.visited, report.cleared), (2, 2), "{report:?}");
+    assert!(pending(&sweeper).await.is_empty(), "both rows are dropped");
+    assert!(!fleet.exists(&acme), "the sweeper creates nothing");
+    assert!(relayed(client.state()).is_empty());
+}
+
+#[tokio::test]
+async fn a_busy_database_takes_its_turn_again_after_its_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 4);
+    let client = app(tmp.path(), fleet.clone());
+    let sweeper = install_with(
+        &client,
+        FleetSweeperOptions {
+            max_messages_per_database: 1,
+            ..FleetSweeperOptions::default()
+        },
+    )
+    .await;
+    for id in 1..=3 {
+        assert_eq!(post(&client, "acme", &format!("/orders/{id}")).await, 200);
+    }
+    fleet.close(&key(&fleet, "acme")).await;
+
+    for pass in 1..=2 {
+        let report = sweeper.sweep_once().await;
+        assert_eq!(
+            (report.visited, report.cleared, report.handled),
+            (1, 0, 1),
+            "pass {pass} relays one row: {report:?}"
+        );
+        assert_eq!(relayed(client.state()).len(), pass);
+        assert_eq!(
+            pending(&sweeper).await,
+            vec![("tenant:acme".to_owned(), PendingKind::Outbox)],
+            "the row stays and is due at once"
+        );
+    }
+    let report = sweeper.sweep_once().await;
+    assert_eq!((report.visited, report.cleared), (1, 1), "{report:?}");
+    assert_eq!(relayed(client.state()).len(), 3);
+    assert!(pending(&sweeper).await.is_empty());
+}
+
+#[tokio::test]
+async fn install_refuses_a_second_sweeper_and_skips_an_app_without_a_fleet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 4);
+    let client = app(tmp.path(), fleet.clone());
+    let sweeper = install(&client).await;
+    assert!(format!("{sweeper:?}").starts_with("FleetSweeper"));
+    assert!(format!("{:?}", sweeper.index()).starts_with("FleetPendingIndex"));
+    assert!(
+        FleetSweeper::install(client.state()).await.is_err(),
+        "one sweeper per app"
+    );
+
+    let plain = TestApp::new().config(config()).build();
+    assert!(
+        FleetSweeper::install(plain.state())
+            .await
+            .unwrap()
+            .is_none(),
+        "no fleet, no sweeper"
+    );
 }

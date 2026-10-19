@@ -1612,7 +1612,9 @@ jobs:
         # PR #1985. The prior step ran in ~25 min against the old 45-minute
         # budget, and these are typical single-Postgres-container tests
         # (seconds to low minutes each), so +30 min is a conservative margin.
-        timeout-minutes: 75
+        # 75 -> 90 (#3347): on trunk-dev the step took 73m21s, and a PR run
+        # hit the 75-minute limit in the `examples/cms` tests with no failure.
+        timeout-minutes: 90
         env:
           # `feature_flags_pg_integration` below builds with `managed-pg-bundled`,
           # which compiles `postgresql_embedded`; its build script downloads
