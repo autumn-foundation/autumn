@@ -373,6 +373,8 @@ mod ledger_postgres;
 #[cfg(feature = "db")]
 mod ledger_as_of_deep_chain_profile;
 #[cfg(feature = "db")]
+mod ledger_bulk_write_profile;
+#[cfg(feature = "db")]
 mod repository_audit_actor;
 #[cfg(feature = "db")]
 mod repository_authorization;

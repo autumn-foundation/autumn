@@ -1,0 +1,139 @@
+running 1 test
+test ledger_bulk_write_profile::ledger_bulk_write_profile ... 
+phase    rows                     stmts  stmts/row      buffers      wal_bytes  temp_blks
+
+=== pg_stat_statements: save_many(100) ===
+calls=100    ( 19.9%) buffers=1214     ( 32.4%) wal=94217     INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=100    ( 19.9%) buffers=814      ( 21.7%) wal=56497     INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=100    ( 19.9%) buffers=605      ( 16.2%) wal=32012     INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=100    ( 19.9%) buffers=400      ( 10.7%) wal=0         SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=100    ( 19.9%) buffers=300      (  8.0%) wal=263       SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.2%) buffers=412      ( 11.0%) wal=14597     INSERT INTO "ledger_bulk_accounts" ("external_ref", "balance_cents") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12), ($13, $14),
+calls=1      (  0.2%) buffers=0        (  0.0%) wal=0         SELECT $1
+calls=1      (  0.2%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+-- TOTAL statements=503 (5.03/row) buffers=3745 wal_bytes=197586 temp_blks_written=0 --
+RESULT save_many   n=100 stmts=503 per_row=5.03 buffers=3745 wal=197586 temp=0
+
+=== pg_stat_statements: update_many(100) ===
+calls=100    ( 19.8%) buffers=1213     ( 29.1%) wal=74581     INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=100    ( 19.8%) buffers=897      ( 21.5%) wal=38974     INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=100    ( 19.8%) buffers=812      ( 19.5%) wal=68189     INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=100    ( 19.8%) buffers=600      ( 14.4%) wal=63        SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=100    ( 19.8%) buffers=300      (  7.2%) wal=0         SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.2%) buffers=224      (  5.4%) wal=7097      UPDATE "ledger_bulk_accounts" SET "balance_cents" = $1 WHERE ("ledger_bulk_accounts"."id" = ANY($2)) RETURNING "ledger_bulk_accounts"."id", "ledger_bu
+calls=1      (  0.2%) buffers=124      (  3.0%) wal=5644      SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.2%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+calls=1      (  0.2%) buffers=0        (  0.0%) wal=0         SELECT $1
+-- TOTAL statements=504 (5.04/row) buffers=4170 wal_bytes=194548 temp_blks_written=0 --
+RESULT update_many n=100 stmts=504 per_row=5.04 buffers=4170 wal=194548 temp=0
+
+=== pg_stat_statements: delete_many(100) ===
+calls=100    ( 19.8%) buffers=1214     ( 26.2%) wal=97993     INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=100    ( 19.8%) buffers=1020     ( 22.0%) wal=36457     INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=100    ( 19.8%) buffers=812      ( 17.5%) wal=70685     INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=100    ( 19.8%) buffers=796      ( 17.2%) wal=369       SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=100    ( 19.8%) buffers=328      (  7.1%) wal=510       SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.2%) buffers=337      (  7.3%) wal=11744     UPDATE "ledger_bulk_accounts" SET "deleted_at" = $1 WHERE (("ledger_bulk_accounts"."id" = ANY($2)) AND ("ledger_bulk_accounts"."deleted_at" IS NULL)) 
+calls=1      (  0.2%) buffers=124      (  2.7%) wal=5400      SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.2%) buffers=0        (  0.0%) wal=0         SELECT $1
+calls=1      (  0.2%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+-- TOTAL statements=504 (5.04/row) buffers=4631 wal_bytes=223158 temp_blks_written=0 --
+RESULT delete_many n=100 stmts=504 per_row=5.04 buffers=4631 wal=223158 temp=0
+
+=== pg_stat_statements: save_many(400) ===
+calls=400    ( 20.0%) buffers=4853     ( 32.5%) wal=370400    INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=400    ( 20.0%) buffers=3233     ( 21.7%) wal=224268    INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=400    ( 20.0%) buffers=2417     ( 16.2%) wal=127136    INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=400    ( 20.0%) buffers=1600     ( 10.7%) wal=0         SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=400    ( 20.0%) buffers=1200     (  8.0%) wal=0         SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.0%) buffers=1609     ( 10.8%) wal=61758     INSERT INTO "ledger_bulk_accounts" ("external_ref", "balance_cents") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12), ($13, $14),
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SELECT $1
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+-- TOTAL statements=2003 (5.01/row) buffers=14912 wal_bytes=783562 temp_blks_written=0 --
+RESULT save_many   n=400 stmts=2003 per_row=5.01 buffers=14912 wal=783562 temp=0
+
+=== pg_stat_statements: update_many(400) ===
+calls=400    ( 20.0%) buffers=4846     ( 26.1%) wal=309500    INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=400    ( 20.0%) buffers=3634     ( 19.5%) wal=164912    INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=400    ( 20.0%) buffers=3255     ( 17.5%) wal=283900    INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=400    ( 20.0%) buffers=2400     ( 12.9%) wal=0         SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=400    ( 20.0%) buffers=1600     (  8.6%) wal=0         SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.0%) buffers=2438     ( 13.1%) wal=93484     UPDATE "ledger_bulk_accounts" SET "balance_cents" = $1 WHERE ("ledger_bulk_accounts"."id" = ANY($2)) RETURNING "ledger_bulk_accounts"."id", "ledger_bu
+calls=1      (  0.0%) buffers=428      (  2.3%) wal=21600     SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SELECT $1
+-- TOTAL statements=2004 (5.01/row) buffers=18601 wal_bytes=873396 temp_blks_written=0 --
+RESULT update_many n=400 stmts=2004 per_row=5.01 buffers=18601 wal=873396 temp=0
+
+=== pg_stat_statements: delete_many(400) ===
+calls=400    ( 20.0%) buffers=4862     ( 25.1%) wal=389972    INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=400    ( 20.0%) buffers=3748     ( 19.3%) wal=154537    INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=400    ( 20.0%) buffers=3249     ( 16.7%) wal=277820    INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=400    ( 20.0%) buffers=2800     ( 14.4%) wal=1240      SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=400    ( 20.0%) buffers=1680     (  8.7%) wal=0         SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.0%) buffers=2639     ( 13.6%) wal=93487     UPDATE "ledger_bulk_accounts" SET "deleted_at" = $1 WHERE (("ledger_bulk_accounts"."id" = ANY($2)) AND ("ledger_bulk_accounts"."deleted_at" IS NULL)) 
+calls=1      (  0.0%) buffers=430      (  2.2%) wal=22620     SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SELECT $1
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+-- TOTAL statements=2004 (5.01/row) buffers=19408 wal_bytes=939676 temp_blks_written=0 --
+RESULT delete_many n=400 stmts=2004 per_row=5.01 buffers=19408 wal=939676 temp=0
+
+=== pg_stat_statements: save_many(1600) ===
+calls=1600   ( 20.0%) buffers=19416    ( 32.5%) wal=1483779   INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=1600   ( 20.0%) buffers=12961    ( 21.7%) wal=901051    INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=1600   ( 20.0%) buffers=9670     ( 16.2%) wal=505997    INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=1600   ( 20.0%) buffers=6400     ( 10.7%) wal=0         SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=1600   ( 20.0%) buffers=4800     (  8.0%) wal=0         SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.0%) buffers=4017     (  6.7%) wal=156218    INSERT INTO "ledger_bulk_accounts" ("external_ref", "balance_cents") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12), ($13, $14),
+calls=1      (  0.0%) buffers=2410     (  4.0%) wal=93902     INSERT INTO "ledger_bulk_accounts" ("external_ref", "balance_cents") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12), ($13, $14),
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SELECT $1
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+-- TOTAL statements=8004 (5.00/row) buffers=59674 wal_bytes=3140947 temp_blks_written=0 --
+RESULT save_many   n=1600 stmts=8004 per_row=5.00 buffers=59674 wal=3140947 temp=0
+
+=== pg_stat_statements: update_many(1600) ===
+calls=1600   ( 20.0%) buffers=19437    ( 26.1%) wal=1265864   INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=1600   ( 20.0%) buffers=14595    ( 19.6%) wal=670160    INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=1600   ( 20.0%) buffers=13039    ( 17.5%) wal=1162384   INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=1600   ( 20.0%) buffers=9600     ( 12.9%) wal=0         SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=1600   ( 20.0%) buffers=6400     (  8.6%) wal=0         SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=2      (  0.0%) buffers=9746     ( 13.1%) wal=376788    UPDATE "ledger_bulk_accounts" SET "balance_cents" = $1 WHERE ("ledger_bulk_accounts"."id" = ANY($2)) RETURNING "ledger_bulk_accounts"."id", "ledger_bu
+calls=2      (  0.0%) buffers=1690     (  2.3%) wal=86400     SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SELECT $1
+-- TOTAL statements=8006 (5.00/row) buffers=74507 wal_bytes=3561596 temp_blks_written=0 --
+RESULT update_many n=1600 stmts=8006 per_row=5.00 buffers=74507 wal=3561596 temp=0
+
+=== pg_stat_statements: delete_many(1600) ===
+calls=1600   ( 20.0%) buffers=19437    ( 25.1%) wal=1557619   INSERT INTO _autumn_version_history (table_name, tenant_id, record_id, op, actor, request_id, changes) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+calls=1600   ( 20.0%) buffers=15486    ( 20.0%) wal=625503    INSERT INTO _autumn_ledger_high_water (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) VALUES ($1, COALESCE($2::text, $7), $3, $4
+calls=1600   ( 20.0%) buffers=12995    ( 16.8%) wal=1107083   INSERT INTO _autumn_ledger_revisions (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, valid_from, recorded_at, prev_hash, hash
+calls=1600   ( 20.0%) buffers=11118    ( 14.4%) wal=4850      SELECT clock_timestamp() AS db_now, __head.seq AS head_seq, __head.hash AS head_hash, __head.recorded_at AS head_recorded_at, __mark.high_seq AS mark_
+calls=1600   ( 20.0%) buffers=5665     (  7.3%) wal=0         SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=2      (  0.0%) buffers=10892    ( 14.1%) wal=377942    UPDATE "ledger_bulk_accounts" SET "deleted_at" = $1 WHERE (("ledger_bulk_accounts"."id" = ANY($2)) AND ("ledger_bulk_accounts"."deleted_at" IS NULL)) 
+calls=2      (  0.0%) buffers=1714     (  2.2%) wal=90260     SELECT "ledger_bulk_accounts"."id", "ledger_bulk_accounts"."external_ref", "ledger_bulk_accounts"."balance_cents", "ledger_bulk_accounts"."deleted_at"
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SELECT $1
+calls=1      (  0.0%) buffers=0        (  0.0%) wal=0         SET statement_timeout = 0
+-- TOTAL statements=8006 (5.00/row) buffers=77307 wal_bytes=3763257 temp_blks_written=0 --
+RESULT delete_many n=1600 stmts=8006 per_row=5.00 buffers=77307 wal=3763257 temp=0
+
+_autumn_ledger_revisions rows at end: 11400
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): chain-head read as issued per row on append ===
+SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions WHERE table_name = 'ledger_bulk_accounts' AND record_id = 1 ORDER BY seq DESC LIMIT 1
+Limit  (cost=0.29..2.68 rows=1 width=81) (actual time=0.035..0.036 rows=1 loops=1)
+  Output: seq, hash, recorded_at
+  Buffers: shared hit=6
+  ->  Index Scan Backward using idx_autumn_ledger_revisions_record on public._autumn_ledger_revisions  (cost=0.29..24.24 rows=10 width=81) (actual time=0.035..0.035 rows=1 loops=1)
+        Output: seq, hash, recorded_at
+        Index Cond: ((_autumn_ledger_revisions.table_name = 'ledger_bulk_accounts'::text) AND (_autumn_ledger_revisions.record_id = 1))
+        Buffers: shared hit=6
+Query Identifier: 2248767244831562983
+Planning:
+  Buffers: shared hit=34
+Planning Time: 0.262 ms
+Execution Time: 0.053 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.87s
+
