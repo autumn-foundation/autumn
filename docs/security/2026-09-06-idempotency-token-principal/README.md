@@ -118,3 +118,38 @@ repo's convention for negative-result commits — see #2505).
 ## 🗂 Ledger
 
 This directory. `after.txt` has the full green test run.
+
+## 🔁 Follow-up (2026-10-19): the path this ledger did not cover
+
+The negative result holds for every way of mounting `RequireApiToken`. It did
+not cover a route that checks the bearer credential **inside the handler**,
+with no auth layer at all. Autumn Harvest's durable routes hit it (Harvest
+`DESIGN-durable-routes.md`, R21): an ordinary `routes![]` route takes the
+`replay_through_inner()` path, its storage key carried no principal for a
+session-less request, and client B sending client A's `Idempotency-Key` and
+body was served A's stored `2xx`. The handler never ran, so its own check of
+the token never ran either. That *was* a cross-principal replay.
+
+The fix teaches the storage key about the bearer principal, as the
+regression test above required before any allowlist change:
+
+- `BearerScope::Verified` — the principal `RequireApiToken` verified, read
+  from its crate-private `ApiTokenPrincipal` extension (a client cannot
+  forge it). It survives token rotation.
+- `BearerScope::Header` — a SHA-256 digest of the raw `Authorization` header,
+  pushed only when there is no verified principal and no cookie-backed
+  session.
+
+Both components are pushed only when present, so a session-only app keeps
+byte-identical keys. With the principal in the key, `RequireApiToken`
+registered directly through `AppBuilder::layer`/`static_gate` joined
+`is_idempotency_transparent_app_layer`: a same-client retry now replays
+instead of answering `409`. A `ServiceBuilder` stack that wraps it, a
+`.scoped(...)` group and a merged router still fail closed.
+
+`idempotency_token_principal.rs` now pins the new behaviour: each token
+principal replays only its own response, a rotated token replays, a
+handler-checked bearer is isolated by its header, and an `idempotent = false`
+route is never cached. `test_authorization_header_does_not_split_idempotency_scope`
+in `idempotency_middleware.rs`, which asserted that a request with *no*
+credential replayed a bearer client's response, was reversed.

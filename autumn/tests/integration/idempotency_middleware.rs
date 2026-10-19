@@ -2803,56 +2803,90 @@ async fn test_storage_key_delimits_path_principal_and_client_key() {
     assert_eq!(body2, "plain-path");
 }
 
-/// Raw `Authorization` is a request header, not a trusted principal scope.
-/// Changing or removing it on retry must not turn a completed mutation into a
-/// fresh miss.
+/// Without a cookie-backed session, raw `Authorization` is the only thing
+/// that tells two token clients apart, so it scopes the key. Dropping the
+/// header on a retry is a different caller as far as the cache can tell: it
+/// must run the handler again rather than be served the bearer client's
+/// stored response.
 #[tokio::test]
-async fn test_authorization_header_does_not_split_idempotency_scope() {
+async fn test_authorization_header_splits_idempotency_scope_without_a_session() {
     use tower::ServiceExt;
 
-    VOLATILE_HEADER_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    // A counter of its own: the shared static is reset by other tests running
+    // in parallel.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
     let store = make_store(Duration::from_secs(3600));
     let layer = IdempotencyLayer::new(store);
 
     let app = axum::Router::new()
         .route(
             "/auth-header-action",
-            axum::routing::post(volatile_header_create_handler),
+            axum::routing::post(move || {
+                let handler_calls = Arc::clone(&handler_calls);
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    "created"
+                }
+            }),
         )
         .layer(layer);
 
-    let req_a = axum::http::Request::builder()
-        .method("POST")
-        .uri("/auth-header-action")
-        .header("idempotency-key", "shared-auth-key")
-        .header("authorization", "Bearer token-user-a")
-        .body(axum::body::Body::from("same"))
+    let request = |authorization: Option<&str>| {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/auth-header-action")
+            .header("idempotency-key", "shared-auth-key");
+        if let Some(authorization) = authorization {
+            builder = builder.header("authorization", authorization);
+        }
+        builder.body(axum::body::Body::from("same")).unwrap()
+    };
+
+    let resp_a = app
+        .clone()
+        .oneshot(request(Some("Bearer token-user-a")))
+        .await
         .unwrap();
-    let resp_a = app.clone().oneshot(req_a).await.unwrap();
     assert_eq!(resp_a.status(), StatusCode::OK);
     assert!(resp_a.headers().get("x-idempotent-replayed").is_none());
 
-    let req_b = axum::http::Request::builder()
-        .method("POST")
-        .uri("/auth-header-action")
-        .header("idempotency-key", "shared-auth-key")
-        .body(axum::body::Body::from("same"))
+    let resp_anonymous = app.clone().oneshot(request(None)).await.unwrap();
+    assert_eq!(resp_anonymous.status(), StatusCode::OK);
+    assert!(
+        resp_anonymous
+            .headers()
+            .get("x-idempotent-replayed")
+            .is_none(),
+        "a request without the bearer credential must not replay the bearer client's response"
+    );
+
+    let resp_b = app
+        .clone()
+        .oneshot(request(Some("Bearer token-user-b")))
+        .await
         .unwrap();
-    let resp_b = app.clone().oneshot(req_b).await.unwrap();
     assert_eq!(resp_b.status(), StatusCode::OK);
+    assert!(
+        resp_b.headers().get("x-idempotent-replayed").is_none(),
+        "a second bearer client must not replay the first client's response"
+    );
+
+    let retry_a = app
+        .clone()
+        .oneshot(request(Some("Bearer token-user-a")))
+        .await
+        .unwrap();
+    assert_eq!(retry_a.status(), StatusCode::OK);
     assert_eq!(
-        resp_b
+        retry_a
             .headers()
             .get("x-idempotent-replayed")
             .and_then(|value| value.to_str().ok()),
         Some("true"),
-        "raw Authorization must not be able to force a fresh miss for the same completed mutation"
+        "the same bearer client's retry must replay"
     );
-    assert_eq!(
-        VOLATILE_HEADER_HANDLER_CALLS.load(Ordering::SeqCst),
-        1,
-        "changing raw Authorization must not rerun the mutating handler"
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

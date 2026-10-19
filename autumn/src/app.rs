@@ -1501,6 +1501,13 @@ impl AppBuilder {
     /// need successful cached-response replay after their own route-local
     /// checks.
     ///
+    /// The cache is scoped to the caller: the cookie-backed session, the
+    /// resolved tenant, and for a token client the principal
+    /// [`RequireApiToken`](crate::auth::RequireApiToken) verified (or, with no
+    /// verified principal and no session, a digest of the raw `Authorization`
+    /// header). A route that dedupes by its own key can opt out with
+    /// `#[post("/x", idempotent = false)]`.
+    ///
     /// The storage backend and TTL are taken from the `[idempotency]` block in
     /// `autumn.toml` (defaulting to in-process memory with a 24 h TTL).
     /// For multi-replica deployments set `backend = "redis"` and configure

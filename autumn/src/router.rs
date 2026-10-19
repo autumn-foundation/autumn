@@ -2709,8 +2709,9 @@ fn group_and_mount_routes(
         );
     }
     for route in route_list {
-        let selected_layer = idempotency_layers
-            .map(|layers| idempotency_layer_for_route(&route, layers, opaque_app_layers_present));
+        let selected_layer = idempotency_layers.and_then(|layers| {
+            idempotency_layer_for_route(&route, layers, opaque_app_layers_present)
+        });
         let mut handler = route.handler;
         if let Some(layer) = selected_layer {
             handler = handler.layer(layer.clone());
@@ -3345,17 +3346,23 @@ async fn locale_prefix_redirect_handler(
     axum::response::Redirect::permanent(&target)
 }
 
+/// The idempotency layer to mount on `route`, or `None` for a route that
+/// opted out with `idempotent = false` ([`RouteIdempotency::Off`]).
+///
+/// [`RouteIdempotency::Off`]: crate::route::RouteIdempotency::Off
 const fn idempotency_layer_for_route<'a>(
     route: &Route,
     layers: &'a BuiltIdempotencyLayers,
     opaque_app_layers_present: bool,
-) -> &'a IdempotencyLayer {
-    if opaque_app_layers_present {
-        &layers.manual
+) -> Option<&'a IdempotencyLayer> {
+    if matches!(route.idempotency, crate::route::RouteIdempotency::Off) {
+        None
+    } else if opaque_app_layers_present {
+        Some(&layers.manual)
     } else if route_uses_generated_replay_stop(route) {
-        &layers.route
+        Some(&layers.route)
     } else {
-        &layers.manual
+        Some(&layers.manual)
     }
 }
 
@@ -3385,6 +3392,21 @@ fn is_idempotency_transparent_app_layer(registered: &crate::app::CustomLayerRegi
             == std::any::TypeId::of::<crate::session::SessionLayer<crate::session::MemoryStore>>()
         || is_i18n_bundle_extension_layer(registered.type_id)
         || is_edge_fallthrough_sentinel_strip_layer(registered.type_id)
+        || is_require_api_token_layer(registered.type_id)
+}
+
+/// [`RequireApiToken`](crate::auth::RequireApiToken) registered directly via
+/// `AppBuilder::layer` or `static_gate`.
+///
+/// It rejects a missing or revoked token before the idempotency layer runs,
+/// and the principal it verifies is part of the idempotency storage key (the
+/// `bearer-principal` component), so two token principals never share a cache
+/// slot. That is the property the fail-closed path exists to provide, so
+/// forcing it here only turned every same-client retry into a `409`. Matched
+/// by `TypeId`: a `ServiceBuilder` stack that wraps it is a different type and
+/// stays opaque.
+fn is_require_api_token_layer(type_id: std::any::TypeId) -> bool {
+    type_id == std::any::TypeId::of::<crate::auth::RequireApiToken>()
 }
 
 /// The origin-only layer that strips the edge lane's internal fallthrough
