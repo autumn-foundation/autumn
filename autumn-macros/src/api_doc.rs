@@ -44,7 +44,7 @@ pub use autumn_macros_support::schema::{
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
 // Each bool models a distinct, orthogonal attribute flag (`hidden`, `mcp`,
-// `mcp = false`, `stream`, `task`); grouping them would obscure rather than clarify.
+// `mcp = false`, `stream`, `task`, `core`); grouping them would obscure rather than clarify.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 pub struct ApiDocAttr {
@@ -70,6 +70,9 @@ pub struct ApiDocAttr {
     /// `#[api_doc(mcp, task)]` — this MCP tool can return a task handle
     /// (MCP Tasks extension) instead of a blocking result.
     pub mcp_task: bool,
+    /// `#[api_doc(mcp, core)]` — a core MCP tool. A client that defers tools
+    /// loads it first. It does not opt the endpoint in.
+    pub mcp_core: bool,
 }
 
 enum KeyValue {
@@ -86,6 +89,8 @@ enum KeyValue {
     Stream,
     /// `task` flag — this MCP tool can run as a task.
     Task,
+    /// `core` flag — a client that defers tools loads this MCP tool first.
+    Core,
 }
 
 impl Parse for KeyValue {
@@ -149,6 +154,20 @@ impl Parse for KeyValue {
             return Ok(KeyValue::Task);
         }
 
+        if key_str == "core" {
+            if input.peek(Token![=]) {
+                let _eq: Token![=] = input.parse()?;
+                let value: LitBool = input.parse()?;
+                // `core = false` is the default: a no-op marker.
+                return Ok(if value.value {
+                    KeyValue::Core
+                } else {
+                    KeyValue::Tags(Vec::new())
+                });
+            }
+            return Ok(KeyValue::Core);
+        }
+
         let _eq: Token![=] = input.parse()?;
         match key_str.as_str() {
             "summary" => Ok(KeyValue::Summary(input.parse()?)),
@@ -172,7 +191,7 @@ impl Parse for KeyValue {
                 key.span(),
                 format!(
                     "unknown key `{other}` in `#[api_doc(...)]`. \
-                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp, stream, task."
+                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp, stream, task, core."
                 ),
             )),
         }
@@ -208,6 +227,7 @@ impl ApiDocAttr {
             KeyValue::Mcp(false) => self.mcp_exclude = true,
             KeyValue::Stream => self.mcp_stream = true,
             KeyValue::Task => self.mcp_task = true,
+            KeyValue::Core => self.mcp_core = true,
         }
     }
 }
@@ -296,6 +316,9 @@ impl ApiDocAttr {
         if other.mcp_task {
             self.mcp_task = true;
         }
+        if other.mcp_core {
+            self.mcp_core = true;
+        }
     }
 
     /// Emit field initializers `summary: ..., description: ..., tags: ..., hidden: ...`
@@ -318,6 +341,7 @@ impl ApiDocAttr {
         let mcp_exclude = self.mcp_exclude;
         let mcp_stream = self.mcp_stream;
         let mcp_task = self.mcp_task;
+        let mcp_core = self.mcp_core;
         quote! {
             operation_id: #op_id,
             summary: #summary,
@@ -329,6 +353,7 @@ impl ApiDocAttr {
             mcp_exclude: #mcp_exclude,
             mcp_stream: #mcp_stream,
             mcp_task: #mcp_task,
+            mcp_core: #mcp_core,
         }
     }
 }
@@ -1200,6 +1225,36 @@ pub fn schema_option(expr: Option<TokenStream>) -> TokenStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_doc_core_flag_parses() {
+        let attr: ApiDocAttr = syn::parse_str("mcp, core").unwrap();
+        assert!(attr.mcp_tool && attr.mcp_core);
+        let attr: ApiDocAttr = syn::parse_str("mcp, core = true").unwrap();
+        assert!(attr.mcp_core);
+        let attr: ApiDocAttr = syn::parse_str("mcp, core = false").unwrap();
+        assert!(!attr.mcp_core);
+    }
+
+    #[test]
+    fn api_doc_core_alone_does_not_opt_in() {
+        let attr: ApiDocAttr = syn::parse_str("core").unwrap();
+        assert!(attr.mcp_core && !attr.mcp_tool);
+    }
+
+    #[test]
+    fn api_doc_core_survives_a_merge() {
+        let mut first: ApiDocAttr = syn::parse_str("mcp").unwrap();
+        let second: ApiDocAttr = syn::parse_str("core").unwrap();
+        first.absorb(second);
+        assert!(first.mcp_tool && first.mcp_core);
+    }
+
+    #[test]
+    fn api_doc_unknown_key_error_lists_core() {
+        let err = syn::parse_str::<ApiDocAttr>("bogus = 1").err().unwrap();
+        assert!(err.to_string().contains("task, core."), "{err}");
+    }
 
     #[test]
     fn extract_path_params_handles_single() {

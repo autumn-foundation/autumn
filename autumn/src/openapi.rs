@@ -111,10 +111,10 @@ pub const OPENAPI_UNAVAILABLE_UNCONFIGURED: &str =
 /// [`post`](crate::post), etc.) from the handler's path, signature, and
 /// any [`#[api_doc(...)]`](crate::api_doc) overrides.
 #[derive(Clone, Debug, Default)]
-// A flat, generated metadata descriptor; the independent boolean flags
-// (hidden, secured, sunset_opt_out, has_policy, public, mcp_tool, mcp_exclude)
-// each model a distinct, orthogonal route property, so grouping them into a
-// sub-struct would obscure rather than clarify.
+// A flat, generated metadata descriptor. Each boolean flag (hidden, secured,
+// sunset_opt_out, has_policy, public, mcp_tool, mcp_exclude, mcp_stream,
+// mcp_task, mcp_core) models a distinct route property. A sub-struct would
+// obscure them.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
     /// HTTP method as an uppercase string (e.g. `"GET"`).
@@ -219,6 +219,11 @@ pub struct ApiDoc {
     /// `#[api_doc(mcp, task)]`. A client that declares the extension gets a
     /// task handle and polls `tasks/get` for the result.
     pub mcp_task: bool,
+    /// True for a core MCP tool, set by `#[api_doc(mcp, core)]`. The tool
+    /// carries `_meta["anthropic/alwaysLoad"]`, so a client that defers tools
+    /// loads it first. In the progressive catalog, `tools/list` holds the core
+    /// tools and the two meta-tools. The flag does not opt the endpoint in.
+    pub mcp_core: bool,
     /// Build-time authority envelope proved for this handler by
     /// `#[agent_operable(grant = ...)]` (issue #1691), or `None` for a handler
     /// that declares none.

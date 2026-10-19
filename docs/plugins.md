@@ -537,7 +537,7 @@ autumn_web::app()
 ```
 
 The full `expose_mcp()` recipe (and the `Route::mcp_exclude()` /
-`Route::mcp_stream()` / `Route::mcp_task()` toggles that mirror the other
+`Route::mcp_stream()` / `Route::mcp_task()` / `Route::mcp_core()` toggles that mirror the other
 `#[api_doc]` forms) lives in the
 [MCP guide, §11 "Plugins and route-level opt-in"](guide/mcp.md); the
 compile-checked canonical example is on

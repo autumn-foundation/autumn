@@ -270,4 +270,18 @@ impl Route {
         self.api_doc.mcp_task = true;
         self
     }
+
+    /// Opt this route in as a *core* MCP tool, equivalent to
+    /// `#[api_doc(mcp, core)]`.
+    ///
+    /// Implies [`mcp()`](Self::mcp). A core tool carries
+    /// `_meta["anthropic/alwaysLoad"]`, so a client that defers tools loads
+    /// it first. In the progressive catalog, `tools/list` holds the core tools
+    /// and the two meta-tools.
+    #[must_use]
+    pub const fn mcp_core(mut self) -> Self {
+        self.api_doc.mcp_tool = true;
+        self.api_doc.mcp_core = true;
+        self
+    }
 }
