@@ -179,7 +179,7 @@ TOML
       # does not install a missing one on its own.
       toolchain="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null)"
       if [ -n "${toolchain}" ] && command -v rustup >/dev/null 2>&1; then
-        rustup toolchain install --no-update --profile minimal "${toolchain}" >/dev/null
+        rustup toolchain install --no-self-update --profile minimal "${toolchain}" >/dev/null
       fi
       cargo fetch
       cargo deny --offline check advisories
