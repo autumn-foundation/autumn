@@ -799,6 +799,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jsonl_sink_purge_reports_an_unreadable_archive() {
+        // A directory resolves but cannot be read as a file.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sink = JsonlFileAuditSink::new(tmp.path());
+        let error = sink
+            .purge_before(Utc::now(), false)
+            .await
+            .expect_err("a directory is not an archive");
+        assert!(
+            error.message().contains("failed to read audit log file"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_sink_purge_of_a_missing_archive_is_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sink = JsonlFileAuditSink::new(tmp.path().join("absent.log"));
+        let outcome = sink.purge_before(Utc::now(), false).await.expect("no-op");
+        assert_eq!(outcome.entries_removed, 0);
+    }
+
+    #[test]
+    fn keep_entries_since_keeps_undecodable_lines() {
+        let old = Utc::now() - chrono::Duration::days(400);
+        let mut event = AuditEvent::new("a", "x", "t", None, AuditStatus::Success);
+        event.timestamp = old;
+        let stale = serde_json::to_string(&event).expect("json");
+        let input = format!("{stale}\nnot json\n\n");
+        let (kept, removed) = keep_entries_since(&input, Utc::now());
+        assert_eq!((kept.as_str(), removed), ("not json\n", 1));
+    }
+
+    #[tokio::test]
     async fn jsonl_sink_purge_dry_run_counts_without_writing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("audit.log");

@@ -4076,13 +4076,7 @@ impl AppBuilder {
         // `framework_retention_task` returns `None` unless at least one
         // `[retention]` window is set, so an app that never mentions the section
         // gets no extra scheduler loop.
-        let retention_tasks: Vec<_> = [
-            crate::data_retention::framework_retention_task(&config.retention),
-            crate::data_retention::framework_archive_retention_task(&config.retention),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let retention_tasks = crate::data_retention::framework_retention_tasks(&config.retention);
         if !retention_tasks.is_empty() {
             tasks.extend(retention_tasks);
             // Re-validate: the merged-name check above ran before this task
@@ -7922,14 +7916,13 @@ impl AppBuilder {
 
         // The CLI guard only knows the profile name it passes down. Check the
         // profile this app resolved, next to the deletion.
-        if mode == FrameworkRetentionMode::Purge {
-            let forced = std::env::var(FRAMEWORK_RETENTION_FORCE_ENV).is_ok_and(|v| v == "1");
-            if let Some(refusal) =
-                crate::data_retention::purge_refusal(config.profile.as_deref(), forced)
-            {
-                eprintln!("autumn db retention: {refusal}");
-                std::process::exit(1);
-            }
+        if let Some(refusal) = framework_purge_refusal(
+            mode,
+            config.profile.as_deref(),
+            std::env::var(FRAMEWORK_RETENTION_FORCE_ENV).ok().as_deref(),
+        ) {
+            eprintln!("autumn db retention: {refusal}");
+            std::process::exit(1);
         }
 
         #[cfg(feature = "db")]
@@ -9526,6 +9519,19 @@ mod data_capsule_mode_tests {
 
 /// The env var `autumn db retention` sets to select the one-shot mode.
 pub(crate) const FRAMEWORK_RETENTION_ENV: &str = "AUTUMN_DB_RETENTION";
+
+/// Why an on-demand purge must stop, if it must. `force_env` is the value of
+/// [`FRAMEWORK_RETENTION_FORCE_ENV`]. Report mode is never refused.
+fn framework_purge_refusal(
+    mode: FrameworkRetentionMode,
+    profile: Option<&str>,
+    force_env: Option<&str>,
+) -> Option<String> {
+    if mode != FrameworkRetentionMode::Purge {
+        return None;
+    }
+    crate::data_retention::purge_refusal(profile, force_env == Some("1"))
+}
 
 /// Set to `1` by `autumn db retention --force`.
 pub(crate) const FRAMEWORK_RETENTION_FORCE_ENV: &str = "AUTUMN_DB_RETENTION_FORCE";
@@ -14715,10 +14721,7 @@ fn merge_framework_scheduled_tasks(
 ) -> Vec<crate::task::TaskInfo> {
     #[cfg(feature = "db")]
     tasks.extend(crate::retention::collect_retention_tasks());
-    tasks.extend(crate::data_retention::framework_retention_task(
-        &config.retention,
-    ));
-    tasks.extend(crate::data_retention::framework_archive_retention_task(
+    tasks.extend(crate::data_retention::framework_retention_tasks(
         &config.retention,
     ));
     tasks
@@ -15674,6 +15677,17 @@ mod validate_repository_api_policies_tests {
     }
 
     // ── prod / production profile parity ────────────────────────
+
+    #[test]
+    fn purge_guard_uses_the_resolved_profile_and_the_force_flag() {
+        use FrameworkRetentionMode::{Purge, Report};
+        assert!(framework_purge_refusal(Purge, Some("prod"), None).is_some());
+        assert!(framework_purge_refusal(Purge, None, None).is_some());
+        assert!(framework_purge_refusal(Purge, Some("prod"), Some("0")).is_some());
+        assert!(framework_purge_refusal(Purge, Some("prod"), Some("1")).is_none());
+        assert!(framework_purge_refusal(Purge, Some("dev"), None).is_none());
+        assert!(framework_purge_refusal(Report, Some("prod"), None).is_none());
+    }
 
     #[test]
     fn is_production_profile_matches_both_aliases() {

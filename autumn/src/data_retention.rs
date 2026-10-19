@@ -1490,6 +1490,16 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
     })
 }
 
+/// Every scheduled retention task the config needs: the fleet sweep, the
+/// per-replica archive sweep, both, or none.
+#[must_use]
+pub fn framework_retention_tasks(config: &RetentionConfig) -> Vec<TaskInfo> {
+    framework_retention_task(config)
+        .into_iter()
+        .chain(framework_archive_retention_task(config))
+        .collect()
+}
+
 /// The recurring sweep of the local audit archive, or `None` when
 /// `retention.audit_archives` is unset.
 ///
@@ -1758,6 +1768,25 @@ mod tests {
     fn force_lifts_the_purge_refusal() {
         assert_eq!(purge_refusal(Some("prod"), true), None);
         assert_eq!(purge_refusal(None, true), None);
+    }
+
+    #[test]
+    fn the_task_list_follows_the_configured_windows() {
+        let names = |config: &RetentionConfig| {
+            framework_retention_tasks(config)
+                .into_iter()
+                .map(|task| task.name)
+                .collect::<Vec<_>>()
+        };
+        let mut config = RetentionConfig::default();
+        assert!(names(&config).is_empty());
+        config.audit_archives = Some("400d".to_owned());
+        assert_eq!(names(&config), [RETENTION_ARCHIVE_TASK_NAME]);
+        config.job_history = Some("90d".to_owned());
+        assert_eq!(
+            names(&config),
+            [RETENTION_SWEEP_TASK_NAME, RETENTION_ARCHIVE_TASK_NAME]
+        );
     }
 
     #[test]
