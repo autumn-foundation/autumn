@@ -956,6 +956,9 @@ pub(crate) fn append_openapi_routes(
     ));
     if let Some(ui_path) = &openapi.swagger_ui_path {
         infos.push(RouteInfo::framework_get(ui_path.clone(), "swagger_ui"));
+        for asset in crate::openapi::swagger_ui_asset_paths(ui_path) {
+            infos.push(RouteInfo::framework_get(asset, "swagger_ui_asset"));
+        }
     }
 }
 
@@ -2274,6 +2277,12 @@ mod tests {
             paths.contains(&"/swagger-ui"),
             "swagger ui path missing: {paths:?}"
         );
+        for asset in crate::openapi::swagger_ui_asset_paths("/swagger-ui") {
+            assert!(
+                paths.contains(&asset.as_str()),
+                "swagger ui asset missing: {asset} in {paths:?}"
+            );
+        }
         for info in &infos {
             assert_eq!(info.source, RouteSource::Framework);
             assert_eq!(info.method, "GET");

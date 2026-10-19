@@ -234,6 +234,10 @@ fn dollar_tag(chars: &[char], i: usize) -> Option<String> {
     if chars.get(i) != Some(&'$') {
         return None;
     }
+    // `a$b$` is one identifier. A quote cannot start right after a name char.
+    if i > 0 && (chars[i - 1].is_ascii_alphanumeric() || matches!(chars[i - 1], '_' | '$')) {
+        return None;
+    }
     let mut end = i + 1;
     // An empty tag (`$$`) is valid; a non-empty one may not start with a digit.
     if let Some(first) = chars.get(end)
@@ -494,20 +498,65 @@ fn is_table_operand(rest: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '"' | '*'))
 }
 
-/// Whether the words and text of a `COPY` statement read as a statement, and if
-/// so whether it writes.
+/// Whether the text of a `COPY` statement reads as a statement, and if so
+/// whether it writes.
 ///
 /// `COPY x FROM` loads rows into a table. `COPY x TO` and `COPY (query) TO`
-/// only read. Needs one of `FROM` or `TO`.
-fn copy_shape(rest_text: &str, rest: &[&str]) -> Option<bool> {
-    if !rest.iter().any(|w| matches!(*w, "FROM" | "TO")) {
-        return None;
+/// only read. The direction is the first top-level `FROM` or `TO`: words inside
+/// parentheses (a column list or a query) and inside double quotes do not
+/// count, because `COPY "to" FROM STDIN` is a load.
+fn copy_shape(rest_text: &str) -> Option<bool> {
+    let (writes, start, end) = copy_direction(rest_text)?;
+    // Prose ("Copy link from here") has no `COPY` target and no data source.
+    let target = rest_text[..start].split_whitespace().next()?;
+    let source = rest_text[end..].split_whitespace().next();
+    let valid_source = source.is_none_or(|w| {
+        matches!(
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric()),
+            "STDIN" | "STDOUT" | "PROGRAM" | ""
+        )
+    });
+    (valid_source && target != "TO" && target != "FROM").then_some(writes)
+}
+
+/// The direction of a `COPY` statement and where its keyword sits in the text.
+fn copy_direction(rest_text: &str) -> Option<(bool, usize, usize)> {
+    let mut depth = 0_u32;
+    let mut in_quote = false;
+    let mut word_start = 0;
+    let mut in_word = false;
+    // A trailing space ends the last word.
+    for (at, ch) in rest_text
+        .char_indices()
+        .chain(std::iter::once((rest_text.len(), ' ')))
+    {
+        if ch == '"' {
+            in_quote = !in_quote;
+            in_word = false;
+        } else if in_quote {
+            // Quoted identifier text never names the direction.
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
+            if depth == 0 && !in_word {
+                in_word = true;
+                word_start = at;
+            }
+        } else {
+            if in_word {
+                match &rest_text[word_start..at] {
+                    "FROM" => return Some((true, word_start, at)),
+                    "TO" => return Some((false, word_start, at)),
+                    _ => {}
+                }
+                in_word = false;
+            }
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
     }
-    if rest_text.trim_start().starts_with('(') {
-        return Some(false);
-    }
-    let direction = rest.iter().find(|w| matches!(**w, "FROM" | "TO"))?;
-    Some(*direction == "FROM")
+    None
 }
 
 /// The shape of one statement; `true` when it mutates.
@@ -528,7 +577,7 @@ fn statement_shape(statement: &str) -> Option<bool> {
         return is_truncate_operands(&rest).then_some(true);
     }
     if first == "COPY" {
-        return copy_shape(rest_text, &rest);
+        return copy_shape(rest_text);
     }
     if first == "TABLE" {
         return is_table_operand(rest_text).then_some(false);
@@ -675,8 +724,19 @@ fn mutates(tokens: &[TokenTree]) -> bool {
                     && i >= 2
                     && is_path_sep(tokens, i - 2))
         }
-        TokenTree::Literal(_) | TokenTree::Punct(_) | TokenTree::Group(_) => false,
+        // A mutating statement with a `{}` placeholder names its table at run
+        // time. No symbol can carry that write, so it counts for every edge.
+        TokenTree::Literal(literal) => has_placeholder_write(&literal.to_string()),
+        TokenTree::Punct(_) | TokenTree::Group(_) => false,
     })
+}
+
+/// Whether a literal holds a mutating statement with a `{` placeholder.
+fn has_placeholder_write(literal: &str) -> bool {
+    let text = strip_sql_comments(&literal_text(literal));
+    verb_statements(&text)
+        .iter()
+        .any(|(blanked, _)| statement_shape(blanked) == Some(true) && blanked.contains('{'))
 }
 
 /// Symbols of the mutating SQL statements in a flattened stream.
@@ -1423,6 +1483,52 @@ mod tests {
         assert_eq!(sql_shape(query), Some(false));
         assert!(sql_symbols(query).contains(&"posts".to_owned()));
         assert_eq!(sql_shape("\"Copy the link\""), None);
+    }
+
+    /// UI prose that holds `from` or `to` is not a `COPY` statement.
+    #[test]
+    fn copy_prose_is_not_a_statement() {
+        for prose in [
+            "Copy from template",
+            "Copy link from here",
+            "Copy the file from a to b",
+            "Copy to clipboard",
+        ] {
+            assert_eq!(sql_shape(&format!("{prose:?}")), None, "{prose}");
+        }
+    }
+
+    /// A write whose table is a `{}` placeholder names no symbol, so the job
+    /// keeps the unattributed `mutating` bit.
+    #[test]
+    fn a_placeholder_write_is_unattributed_mutation() {
+        assert!(is_mutating(
+            &quote! { sql_query(format!("UPDATE {} SET hits = hits + 1", Post::TABLE)) }
+        ));
+        assert!(!is_mutating(
+            &quote! { sql_query("SELECT id FROM posts WHERE id = {}") }
+        ));
+    }
+
+    /// `$` inside a name does not open a dollar quote.
+    #[test]
+    fn a_dollar_inside_an_identifier_is_not_a_quote() {
+        assert_eq!(
+            sql_shape("\"SELECT a$b$ FROM posts; DELETE FROM q\""),
+            Some(true)
+        );
+        assert!(sql_symbols("\"SELECT a$b$ FROM posts\"").contains(&"posts".to_owned()));
+    }
+
+    /// A quoted identifier or a column named `to`/`from` is not the direction.
+    #[test]
+    fn copy_direction_ignores_quoted_and_parenthesised_words() {
+        assert_eq!(sql_shape(r#""COPY "to" FROM STDIN""#), Some(true));
+        assert_eq!(sql_shape(r#""COPY posts ("from") TO STDOUT""#), Some(false));
+        assert_eq!(
+            sql_shape("\"COPY posts (\\\"to\\\") FROM STDIN\""),
+            Some(true)
+        );
     }
 
     /// Bare `TABLE name` is a read. Prose that starts with "Table" is not SQL.

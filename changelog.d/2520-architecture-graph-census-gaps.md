@@ -14,3 +14,10 @@
 - **graph:** a job's access is set for each edge. A job that reads one
   table and writes another no longer shows both as writes. A call such as
   `repo.update(..)` on a repository parameter counts as a write.
+
+### Changed
+
+- **graph:** run `autumn graph show` once and commit the result. The
+  `limits` text, the census and the job access changed, so an older
+  committed graph fails `--check` one time. The descriptor types in
+  `autumn::graph` are for the macros. Do not build them by hand.

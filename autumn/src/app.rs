@@ -7110,9 +7110,15 @@ impl AppBuilder {
     /// A worker role gets the worker census, as at runtime.
     async fn dump_graph_surface(self) -> (Vec<crate::graph::MountedRoute>, usize) {
         let opaque = self.graph_opaque_router_count();
-        let config = try_load_config(self.config_loader_factory, self.plugin_config_roots)
-            .await
-            .unwrap_or_default();
+        let config =
+            match try_load_config(self.config_loader_factory, self.plugin_config_roots).await {
+                Ok(config) => config,
+                Err(error) => {
+                    // Stdout carries the graph, so the warning goes to stderr.
+                    eprintln!("warning: config failed to load, graph uses defaults: {error}");
+                    crate::config::AutumnConfig::default()
+                }
+            };
         if !config.role.serves_http() {
             return (graph_worker_mounted_routes(&config), 0);
         }
@@ -9121,7 +9127,14 @@ fn graph_worker_mounted_routes(
 ) -> Vec<crate::graph::MountedRoute> {
     let mut framework: Vec<crate::route_listing::RouteInfo> = Vec::new();
     crate::route_listing::append_probe_and_actuator_routes(&mut framework, config);
-    framework.iter().map(graph_declared_route_summary).collect()
+    // Framework endpoints are named only; their auth is not a declaration.
+    framework
+        .iter()
+        .map(|route| crate::graph::MountedRoute {
+            auth_declared: false,
+            ..graph_declared_route_summary(route)
+        })
+        .collect()
 }
 
 /// The architecture-graph view of a route declared through
@@ -18350,6 +18363,10 @@ mod tests {
             !paths.iter().any(|p| p.starts_with("/static/")),
             "no asset routes on a worker: {paths:?}"
         );
+        assert!(
+            mounted.iter().all(|route| !route.auth_declared),
+            "framework endpoints are not declared plugin mounts"
+        );
     }
 
     #[derive(Clone)]
@@ -18366,7 +18383,16 @@ mod tests {
     /// The dump reads config through the builder's loader and picks the worker
     /// census for a worker role (#2520 items 4 and 6).
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard spans the config load, which resets the global metric limits"
+    )]
     async fn dump_graph_surface_uses_builder_loader_and_worker_role() {
+        // `try_load_config` resets the process-global metric limits. See
+        // `metrics::LIMITS_TEST_LOCK`.
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut config = AutumnConfig::default();
         config.role = crate::config::ProcessRole::Worker;
         config.health.live_path = "/custom-live".to_owned();
@@ -18379,7 +18405,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard spans the config load, which resets the global metric limits"
+    )]
     async fn dump_graph_surface_falls_back_to_defaults_when_loader_fails() {
+        // `try_load_config` resets the process-global metric limits. See
+        // `metrics::LIMITS_TEST_LOCK`.
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let builder = app().with_config_loader(CensusLoader(Err("boom".to_owned())));
         let (mounted, _) = builder.dump_graph_surface().await;
         assert!(
