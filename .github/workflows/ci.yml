@@ -2457,6 +2457,12 @@ jobs:
             tests::fleet_subcommands db::replica:: \
             | tee "$RUNNER_TEMP/cli-fleet-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
+          # Same gap for the `--totp` reauth templates in `generate::auth`: a
+          # change to their markup reads as 0% patch coverage. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- \
+            generate::auth::tests::totp_reauth \
+            | tee "$RUNNER_TEMP/cli-totp-reauth-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-totp-reauth-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
