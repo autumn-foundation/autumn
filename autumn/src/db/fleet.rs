@@ -673,6 +673,19 @@ struct Entry {
     last_use_at: Mutex<std::time::Instant>,
 }
 
+/// The use mark of an entry only background opens used. Foreground uses
+/// count from 1, so such an entry is the first LRU victim.
+const BACKGROUND_SEQ: u64 = 0;
+
+/// A database [`DatabaseFleet::open_background`] returned.
+#[derive(Debug)]
+pub struct BackgroundOpen {
+    /// The database. Holding it is a lease.
+    pub db: FleetDatabase,
+    /// Whether this call opened it (it was not open before).
+    pub opened: bool,
+}
+
 /// A database leaving the open map: its key, its handle, its drain marker.
 type Draining = (FleetDbKey, Option<FleetDatabase>, Arc<Drain>);
 
@@ -682,6 +695,8 @@ type Exclusive = (FleetDbKey, Option<Arc<Entry>>, Arc<Drain>);
 /// What an opener does next: wait for a drain, or open through an entry.
 enum Next {
     Wait(Arc<Drain>),
+    /// A background open found the fleet full.
+    NoRoom,
     /// The entry, and whether this caller made it and so must start its opener.
     Open(Arc<Entry>, bool),
 }
@@ -1268,19 +1283,80 @@ impl DatabaseFleet {
     }
 
     async fn open_with(&self, key: &FleetDbKey, create: bool) -> Result<FleetDatabase, FleetError> {
+        // Only a background claim reports no room.
+        self.open_entry(key, create, false)
+            .await?
+            .map(|opened| opened.db)
+            .ok_or_else(|| FleetError::Unavailable {
+                name: key.name(),
+                detail: "no room".to_owned(),
+            })
+    }
+
+    /// Open `key` for background work (ADR 0019 §6). It never creates a
+    /// database, never restores a missing one from its replica, and never
+    /// makes the fleet hold more than `max_open`: with no room it returns
+    /// `Ok(None)`. It does not count as a use, so the
+    /// database stays the first LRU victim, and
+    /// [`close_if_unused`](Self::close_if_unused) closes it again when no
+    /// request used it meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::NotFound`] when the file is missing (and no restore
+    /// produced it), or another [`open`](Self::open) error.
+    pub async fn open_background(
+        &self,
+        key: &FleetDbKey,
+    ) -> Result<Option<BackgroundOpen>, FleetError> {
+        self.open_entry(key, false, true).await
+    }
+
+    /// Close `key` if a background open opened it, nothing else used it since,
+    /// and nobody holds it (no lease, no checked-out connection). Returns
+    /// whether the close began.
+    #[must_use = "whether the close began"]
+    pub fn close_if_unused(&self, key: &FleetDbKey) -> bool {
+        let begun = self.begin_drains(|state| {
+            state
+                .open
+                .get(key)
+                .filter(|entry| {
+                    entry.last_use_seq.load(Ordering::Relaxed) == BACKGROUND_SEQ
+                        && entry.cell.get().is_some_and(is_idle)
+                })
+                .map(|_| vec![key.clone()])
+                .unwrap_or_default()
+        });
+        let closing = !begun.is_empty();
+        for (key, db, drain) in begun {
+            self.spawn_drain(key, db, drain);
+        }
+        closing
+    }
+
+    /// Open through the key's entry. A `background` open is refused for room
+    /// (`Ok(None)`) and does not mark the entry used.
+    async fn open_entry(
+        &self,
+        key: &FleetDbKey,
+        create: bool,
+        background: bool,
+    ) -> Result<Option<BackgroundOpen>, FleetError> {
         self.check_key(key)?;
         loop {
-            let next = self.claim_entry(key)?;
+            let next = self.claim_entry(key, background)?;
             let (entry, elected) = match next {
                 Next::Wait(drain) => {
                     drain.wait().await;
                     continue;
                 }
+                Next::NoRoom => return Ok(None),
                 Next::Open(entry, elected) => (entry, elected),
             };
             // No await between the claim and the spawn, so a cancelled caller
             // cannot leave an entry without an opener.
-            let opener = elected.then(|| self.spawn_opener(key, create, &entry));
+            let opener = elected.then(|| self.spawn_opener(key, create, !background, &entry));
             let result = match (entry.cell.get(), opener) {
                 (Some(db), _) => Ok(db.clone()),
                 (None, Some(opener)) => opener.await.unwrap_or_else(|error| {
@@ -1305,11 +1381,17 @@ impl DatabaseFleet {
                     if db.pool.is_closed() {
                         continue;
                     }
-                    // The claim stamped the entry before the file was created and
-                    // migrated. A slow open must not count as idle time.
-                    entry.mark_used_now();
-                    self.enforce_capacity(Some(key));
-                    return Ok(db);
+                    if !background {
+                        // The claim stamped the entry before the file was
+                        // created and migrated. A slow open must not count as
+                        // idle time.
+                        entry.mark_used_now();
+                        self.enforce_capacity(Some(key));
+                    }
+                    return Ok(Some(BackgroundOpen {
+                        db,
+                        opened: elected,
+                    }));
                 }
                 Err(error) => return Err(error),
             }
@@ -1323,6 +1405,7 @@ impl DatabaseFleet {
         &self,
         key: &FleetDbKey,
         create: bool,
+        restore: bool,
         entry: &Arc<Entry>,
     ) -> tokio::task::JoinHandle<Result<FleetDatabase, FleetError>> {
         let guard = OpenGuard {
@@ -1331,7 +1414,11 @@ impl DatabaseFleet {
             entry: Arc::clone(entry),
         };
         tokio::spawn(async move {
-            match guard.fleet.open_now(guard.key.clone(), create).await {
+            match guard
+                .fleet
+                .open_now(guard.key.clone(), create, restore)
+                .await
+            {
                 Ok(db) => {
                     let _ = guard.entry.cell.set(db.clone());
                     // The caller may be gone; the cap is the opener's to keep.
@@ -1348,8 +1435,9 @@ impl DatabaseFleet {
     }
 
     /// Under the lock: wait for a drain of `key`, or take (or make) its entry
-    /// and mark it used.
-    fn claim_entry(&self, key: &FleetDbKey) -> Result<Next, FleetError> {
+    /// and mark it used. A `background` claim marks nothing, and makes no
+    /// entry when the fleet already holds `max_open`.
+    fn claim_entry(&self, key: &FleetDbKey, background: bool) -> Result<Next, FleetError> {
         let mut state = self.lock_state();
         if state.shutting_down {
             return Err(FleetError::Unavailable {
@@ -1364,21 +1452,27 @@ impl DatabaseFleet {
             }
             return Ok(Next::Wait(drain));
         }
+        if background {
+            if let Some(entry) = state.open.get(key) {
+                return Ok(Next::Open(Arc::clone(entry), false));
+            }
+            if state.open.len() >= self.inner.max_open {
+                return Ok(Next::NoRoom);
+            }
+            let entry = Arc::new(Entry::new(BACKGROUND_SEQ));
+            state.open.insert(key.clone(), Arc::clone(&entry));
+            return Ok(Next::Open(entry, true));
+        }
         state.seq += 1;
         let seq = state.seq;
         let mut elected = false;
         let entry = Arc::clone(state.open.entry(key.clone()).or_insert_with(|| {
             elected = true;
-            Arc::new(Entry {
-                cell: OnceCell::new(),
-                finished: AtomicBool::new(false),
-                done: Notify::new(),
-                last_use_seq: AtomicU64::new(seq),
-                last_use_at: Mutex::new(crate::time::ambient_instant()),
-            })
+            Arc::new(Entry::new(seq))
         }));
-        drop(state);
+        // Under the lock: `close_if_unused` reads the mark under it too.
         entry.touch(seq);
+        drop(state);
         Ok(Next::Open(entry, elected))
     }
 
@@ -1394,12 +1488,19 @@ impl DatabaseFleet {
         }
     }
 
-    async fn open_now(&self, key: FleetDbKey, create: bool) -> Result<FleetDatabase, FleetError> {
+    /// `restore`: a missing file may come back from its replica. A background
+    /// open passes `false`, so it never brings back a deleted database.
+    async fn open_now(
+        &self,
+        key: FleetDbKey,
+        create: bool,
+        restore: bool,
+    ) -> Result<FleetDatabase, FleetError> {
         let path = self.path_of(&key);
         let name = key.name();
         check_contained(self.root(), &path)?;
         let mut existed = path.is_file();
-        if !existed {
+        if !existed && restore {
             existed = self.restore_missing(&key, &path).await?;
         }
         // Whether this open published the file (another process may have won
@@ -1600,8 +1701,11 @@ impl DatabaseFleet {
                 .open
                 .iter()
                 .filter(|(key, _)| Some(*key) != keep)
+                // The residency grace covers a request between its resolve
+                // and its checkout. A background entry has no request.
                 .filter(|(_, entry)| {
-                    now.saturating_duration_since(entry.last_used()) >= min_residency
+                    entry.last_use_seq.load(Ordering::Relaxed) == BACKGROUND_SEQ
+                        || now.saturating_duration_since(entry.last_used()) >= min_residency
                 })
                 .filter_map(|(key, entry)| {
                     let db = entry.cell.get()?;
@@ -2463,9 +2567,29 @@ impl DatabaseFleet {
         keys.sort();
         keys
     }
+
+    /// The database of `key` when it is open now. It never opens one, and it
+    /// does not count as a use. Holding the result is a lease.
+    #[must_use]
+    pub fn get_open(&self, key: &FleetDbKey) -> Option<FleetDatabase> {
+        let state = self.lock_state();
+        let db = state.open.get(key)?.cell.get()?.clone();
+        drop(state);
+        (!db.pool.is_closed()).then_some(db)
+    }
 }
 
 impl Entry {
+    fn new(seq: u64) -> Self {
+        Self {
+            cell: OnceCell::new(),
+            finished: AtomicBool::new(false),
+            done: Notify::new(),
+            last_use_seq: AtomicU64::new(seq),
+            last_use_at: Mutex::new(crate::time::ambient_instant()),
+        }
+    }
+
     /// Wait until the opener task has ended.
     async fn wait(&self) {
         loop {
@@ -3711,6 +3835,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_background_open_never_grows_the_fleet_past_max_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |c| c.max_open = 1);
+        drop(fleet.open(&FleetDbKey::Slot(2)).await.unwrap());
+        let hot = fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
+        settle(&fleet).await;
+        // Slot 2 exists on disk, but the one open slot is taken.
+        let refused = fleet.open_background(&FleetDbKey::Slot(2)).await.unwrap();
+        assert!(refused.is_none(), "no room: the background open waits");
+        settle(&fleet).await;
+        assert_eq!(fleet.open_keys(), vec![FleetDbKey::Slot(1)]);
+        assert!(!hot.closed().is_cancelled(), "the hot database stays open");
+
+        // An open database is shared, and the call says it did not open it.
+        let shared = fleet
+            .open_background(&FleetDbKey::Slot(1))
+            .await
+            .unwrap()
+            .expect("already open");
+        assert!(!shared.opened);
+        assert_eq!(fleet.stats().open, 1);
+    }
+
+    #[tokio::test]
+    async fn a_background_open_never_creates_a_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let missing = FleetDbKey::Slot(7);
+        let error = fleet.open_background(&missing).await.unwrap_err();
+        assert!(matches!(error, FleetError::NotFound { .. }), "{error}");
+        assert!(!fleet.exists(&missing));
+        assert!(fleet.open_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_if_unused_spares_a_leased_or_used_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        for slot in [1, 2] {
+            drop(fleet.open(&FleetDbKey::Slot(slot)).await.unwrap());
+            fleet.close(&FleetDbKey::Slot(slot)).await;
+        }
+
+        // Opened in the background and still held: a lease.
+        let held = fleet
+            .open_background(&FleetDbKey::Slot(1))
+            .await
+            .unwrap()
+            .expect("room");
+        assert!(held.opened);
+        assert!(!fleet.close_if_unused(&FleetDbKey::Slot(1)), "leased");
+        drop(held);
+        assert!(fleet.close_if_unused(&FleetDbKey::Slot(1)));
+        settle(&fleet).await;
+        assert!(!fleet.open_keys().contains(&FleetDbKey::Slot(1)));
+
+        // A request used it after the background open: it is the request's now.
+        let background = fleet
+            .open_background(&FleetDbKey::Slot(2))
+            .await
+            .unwrap()
+            .expect("room");
+        drop(fleet.open(&FleetDbKey::Slot(2)).await.unwrap());
+        drop(background);
+        assert!(!fleet.close_if_unused(&FleetDbKey::Slot(2)), "used");
+        settle(&fleet).await;
+        assert!(fleet.open_keys().contains(&FleetDbKey::Slot(2)));
+    }
+
+    #[tokio::test]
+    async fn a_background_database_is_the_first_lru_victim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |c| c.max_open = 2);
+        drop(fleet.open(&FleetDbKey::Slot(3)).await.unwrap());
+        fleet.close(&FleetDbKey::Slot(3)).await;
+        drop(fleet.open(&FleetDbKey::Slot(1)).await.unwrap());
+        drop(
+            fleet
+                .open_background(&FleetDbKey::Slot(3))
+                .await
+                .unwrap()
+                .expect("room"),
+        );
+        // A request past the cap evicts the background database, not slot 1.
+        drop(fleet.open(&FleetDbKey::Slot(2)).await.unwrap());
+        settle(&fleet).await;
+        let mut open = fleet.open_keys();
+        open.sort();
+        assert_eq!(open, vec![FleetDbKey::Slot(1), FleetDbKey::Slot(2)]);
+    }
+
+    #[tokio::test]
     async fn keys_of_another_mode_or_out_of_range_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let slots = fleet(tmp.path(), FleetMode::Slot, |_| {});
@@ -4564,6 +4780,68 @@ mod tests {
         assert!(db.pool().is_closed());
     }
 
+    /// Issue 3231 holds for a sweeper's close: the worker settles first.
+    #[tokio::test]
+    async fn close_if_unused_lets_a_worker_settle_before_the_pool_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(22);
+        drop(fleet.open(&key).await.unwrap());
+        fleet.close(&key).await;
+        let (worker, release, acked) = settling(false);
+        fleet.add_lifecycle(worker);
+        let opened = fleet.open_background(&key).await.unwrap().expect("room");
+        let db = opened.db.clone();
+        drop(opened);
+        let pool = db.pool().clone();
+        drop(db);
+        assert!(fleet.close_if_unused(&key));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !pool.is_closed(),
+            "the pool stays open while the worker runs"
+        );
+        release.notify_one();
+        settle(&fleet).await;
+        assert!(acked.load(Ordering::SeqCst), "the worker settled first");
+        assert!(pool.is_closed());
+    }
+
+    /// Counts the restores the fleet asks for, and produces nothing.
+    #[derive(Default)]
+    struct CountingRestore(AtomicUsize);
+
+    impl FleetLifecycle for CountingRestore {
+        fn restore_missing(&self, _key: &FleetDbKey, _path: &Path) -> Result<bool, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_background_open_never_restores_a_missing_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |c| {
+            c.create_on_demand = Some(false);
+        });
+        let restores = Arc::new(CountingRestore::default());
+        fleet.add_lifecycle(restores.clone());
+        let key = FleetDbKey::Slot(23);
+        let error = fleet.open_background(&key).await.unwrap_err();
+        assert!(matches!(error, FleetError::NotFound { .. }), "{error}");
+        assert_eq!(
+            restores.0.load(Ordering::SeqCst),
+            0,
+            "a deleted tenant stays deleted"
+        );
+        let _ = fleet.open(&key).await.unwrap_err();
+        assert_eq!(
+            restores.0.load(Ordering::SeqCst),
+            1,
+            "a request may restore it"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn close_gives_up_on_a_worker_that_never_settles() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5216,14 +5494,14 @@ mod tests {
         let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
         let key = FleetDbKey::Slot(26);
         // An opener is running when the delete takes the key.
-        let Next::Open(entry, true) = fleet.claim_entry(&key).unwrap() else {
+        let Next::Open(entry, true) = fleet.claim_entry(&key, false).unwrap() else {
             panic!("expected to make the entry");
         };
-        let opener = fleet.spawn_opener(&key, true, &entry);
+        let opener = fleet.spawn_opener(&key, true, true, &entry);
         let (taken, held, drain) = fleet.begin_exclusive(&key, true).unwrap().unwrap();
         // The drain is in first: no new opener gets an entry.
         assert!(matches!(
-            fleet.claim_entry(&key),
+            fleet.claim_entry(&key, false),
             Err(FleetError::Deleting { .. })
         ));
         // The running open ends, and the delete gets its database.

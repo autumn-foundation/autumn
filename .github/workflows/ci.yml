@@ -1612,7 +1612,9 @@ jobs:
         # PR #1985. The prior step ran in ~25 min against the old 45-minute
         # budget, and these are typical single-Postgres-container tests
         # (seconds to low minutes each), so +30 min is a conservative margin.
-        timeout-minutes: 75
+        # 75 -> 90 (#3347): on trunk-dev the step took 73m21s, and a PR run
+        # hit the 75-minute limit in the `examples/cms` tests with no failure.
+        timeout-minutes: 90
         env:
           # `feature_flags_pg_integration` below builds with `managed-pg-bundled`,
           # which compiles `postgresql_embedded`; its build script downloads
@@ -2290,6 +2292,10 @@ jobs:
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #3234: the fleet sweeper end to end. Same features, so no
+          # rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_fleet_sweeper
           # Issue #3231: the SQLite commit-hook worker loop (stop token, claim
           # heartbeat guard). No other lane measures it, so Codecov reads those
           # lines as uncovered. Same features, so no rebuild.
@@ -2656,6 +2662,7 @@ jobs:
             --test sqlite_read_only_tx \
             --test sqlite_transactional_url_pool \
             --test sqlite_fleet \
+            --test sqlite_fleet_sweeper \
             --test sqlite_version_history \
             --test sqlite_ledger \
             --test sqlite_ledger_out_of_band \
@@ -2944,7 +2951,11 @@ jobs:
             || { echo "::error::no fleet unit test ran"; exit 1; }
       - name: Fleet integration tests
         shell: bash
-        run: cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
+        # `sqlite_fleet_sweeper` (#3234) finds a fleet by the file path SQLite
+        # reports, which Windows spells differently.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_sweeper
 
   windows-tier1:
     name: Windows Tier 1 journey
