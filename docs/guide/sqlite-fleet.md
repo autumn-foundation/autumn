@@ -276,7 +276,8 @@ async fn place(mut db: ShardedDb, outbox: Outbox, Path(id): Path<i64>) -> Autumn
 - A new or changed `#[derivation]` is backfilled in every database: the
   first worker pass after the deploy marks each file. When a database opens
   first, it runs up to 8 backfill batches before its first request, and the
-  sweeper does the rest.
+  sweeper does the rest. During a rolling deploy, only the new binary runs
+  backfills. After a rollback to older derivations, run a `resweep`.
 - Write outbox rows in a transaction. Do not enqueue on a fleet database
   while you hold a write transaction on the control database: the row on the
   control database then cannot be written, and the write fails.

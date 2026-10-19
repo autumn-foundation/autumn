@@ -578,3 +578,44 @@ async fn health_reports_the_backlog_and_the_oldest_pending_age() {
         "{health}"
     );
 }
+
+#[tokio::test]
+async fn an_old_binary_in_a_rolling_deploy_never_runs_or_clears_a_backfill() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 4);
+    let client = app(tmp.path(), fleet.clone());
+    let sweeper = install(&client).await;
+    // This binary records its derivations; then a newer binary records its own.
+    sweeper.sweep_once().await;
+    let mut control = client.state().pool().unwrap().get().await.unwrap();
+    diesel::sql_query(
+        "INSERT INTO _autumn_fleet_derivation_epochs (fingerprint) VALUES ('a-newer-binary')",
+    )
+    .execute(&mut control)
+    .await
+    .unwrap();
+    drop(control);
+
+    let acme = key(&fleet, "acme");
+    drop(fleet.open(&acme).await.unwrap());
+    fleet.close(&acme).await;
+    sweeper
+        .index()
+        .mark("tenant:acme", PendingKind::Backfill)
+        .await
+        .unwrap();
+    sweeper.sweep_once().await;
+    assert_eq!(
+        pending(&sweeper).await,
+        vec![("tenant:acme".to_owned(), PendingKind::Backfill)],
+        "the newer binary's row stays"
+    );
+
+    let db = fleet.open(&acme).await.unwrap();
+    let mut conn = db.pool().get().await.unwrap();
+    let reconciled: Count = diesel::sql_query("SELECT COUNT(*) AS n FROM _autumn_derivations")
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(reconciled.n, 0, "the old definitions were never applied");
+}

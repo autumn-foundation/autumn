@@ -221,14 +221,18 @@ databases that nobody asks for:
   order is always tenant database, then control database. A rolled-back
   write can leave a row with no work; the next visit removes it.
 - **Open.** When a database opens, it gets a row for each kind of work it
-  holds. This covers work that an earlier process left without a row.
-- **Derivations.** The control database records a fingerprint of the
-  registered derivations. When it changes, a worker lists the files and
-  marks each database `backfill`. It opens none to do this. When a database
-  opens, it runs up to 8 backfill batches before its first request; the
-  sweeper does the rest. A binary whose fingerprint is not the recorded one
-  never removes a `backfill` row, so an old process in a rolling deploy
-  cannot clear the work of a new derivation.
+  holds. This covers work that an earlier process left without a row. If
+  the row cannot be written, the open fails.
+- **Derivations.** `_autumn_fleet_derivation_epochs` on the control database
+  records each derivation fingerprint a worker has seen, in order. A worker
+  with a new fingerprint lists the files and marks each database
+  `backfill`, then records its fingerprint. It opens none to do this. Only
+  the binary with the newest fingerprint runs a backfill or removes a
+  `backfill` row. A fingerprint seen before is never recorded again, so an
+  old binary that restarts in a rolling deploy cannot undo the new
+  definitions. A rollback to older derivations needs a `resweep`. When a
+  database opens, the current binary runs up to 8 backfill batches before
+  the first request; the sweeper does the rest.
 - **Visit.** A worker process (its `role` runs workers) opens each listed
   database with `DatabaseFleet::open_background`. That open never creates a
   file, never restores one from a replica, and never takes the fleet past

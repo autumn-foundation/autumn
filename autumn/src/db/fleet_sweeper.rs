@@ -71,11 +71,9 @@ pub const SWEEPER_INDICATOR: &str = "fleet:sweeper";
 /// The index table on the control database.
 const PENDING_TABLE: &str = "_autumn_fleet_pending";
 
-/// Sweeper facts that outlive a process, on the control database.
-const STATE_TABLE: &str = "_autumn_fleet_sweeper_state";
-
-/// The `STATE_TABLE` row that records the derivation fingerprint.
-const FINGERPRINT_STATE: &str = "derivations";
+/// The derivation fingerprints workers have seen, in the order they first
+/// saw them. The newest is current.
+const EPOCH_TABLE: &str = "_autumn_fleet_derivation_epochs";
 
 /// The DDL, applied at boot. Times are epoch milliseconds of the app clock.
 const SCHEMA_SQL: &str = "\
@@ -89,9 +87,9 @@ CREATE TABLE IF NOT EXISTS _autumn_fleet_pending (
 );
 CREATE INDEX IF NOT EXISTS idx_autumn_fleet_pending_due
     ON _autumn_fleet_pending (visit_after, since);
-CREATE TABLE IF NOT EXISTS _autumn_fleet_sweeper_state (
-    name  TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS _autumn_fleet_derivation_epochs (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT    NOT NULL UNIQUE
 );";
 
 /// Rows per transaction when many databases are marked at once. Small, so a
@@ -501,28 +499,54 @@ impl FleetPendingIndex {
             .map_err(|error| index_error("clear", error))
     }
 
-    async fn state_value(&self, name: &str) -> AutumnResult<Option<String>> {
-        let rows: Vec<ValueRow> =
-            diesel::sql_query(format!("SELECT value FROM {STATE_TABLE} WHERE name = ?"))
-                .bind::<Text, _>(name)
-                .load(&mut *self.conn().await?)
-                .await
-                .map_err(|error| index_error("read", error))?;
-        Ok(rows.into_iter().next().map(|row| row.value))
+    /// Whether `fingerprint` was ever recorded.
+    async fn has_epoch(&self, fingerprint: &str) -> AutumnResult<bool> {
+        let found: CountRow = diesel::sql_query(format!(
+            "SELECT COUNT(*) AS n FROM {EPOCH_TABLE} WHERE fingerprint = ?"
+        ))
+        .bind::<Text, _>(fingerprint)
+        .get_result(&mut *self.conn().await?)
+        .await
+        .map_err(|error| index_error("read", error))?;
+        Ok(found.n > 0)
     }
 
-    async fn set_state_value(&self, name: &str, value: &str) -> AutumnResult<()> {
+    /// Record `fingerprint` as the newest epoch, unless it is recorded
+    /// already: an old binary never takes back its epoch.
+    async fn record_epoch(&self, fingerprint: &str) -> AutumnResult<()> {
         diesel::sql_query(format!(
-            "INSERT INTO {STATE_TABLE} (name, value) VALUES (?, ?) \
-             ON CONFLICT (name) DO UPDATE SET value = excluded.value"
+            "INSERT INTO {EPOCH_TABLE} (fingerprint) VALUES (?) \
+             ON CONFLICT (fingerprint) DO NOTHING"
         ))
-        .bind::<Text, _>(name)
-        .bind::<Text, _>(value)
+        .bind::<Text, _>(fingerprint)
         .execute(&mut *self.conn().await?)
         .await
         .map(drop)
         .map_err(|error| index_error("write", error))
     }
+
+    /// The fingerprint of the newest epoch.
+    async fn latest_epoch(&self) -> AutumnResult<Option<String>> {
+        let rows: Vec<ValueRow> = diesel::sql_query(format!(
+            "SELECT fingerprint AS value FROM {EPOCH_TABLE} ORDER BY seq DESC LIMIT 1"
+        ))
+        .load(&mut *self.conn().await?)
+        .await
+        .map_err(|error| index_error("read", error))?;
+        Ok(rows.into_iter().next().map(|row| row.value))
+    }
+
+    /// Whether this binary's derivations are the newest epoch. Only then may
+    /// it run a backfill or clear a `backfill` row: in a rolling deploy an
+    /// old binary would undo the work of the new definitions.
+    async fn epoch_is_current(&self) -> AutumnResult<bool> {
+        Ok(self.latest_epoch().await?.as_deref() == Some(own_epoch().as_str()))
+    }
+}
+
+/// This binary's epoch: the fingerprint of its derivations, or `none`.
+fn own_epoch() -> String {
+    crate::derivation::registry_fingerprint().unwrap_or_else(|| "none".to_owned())
 }
 
 fn entries(rows: Vec<EntryRow>) -> Vec<PendingEntry> {
@@ -724,26 +748,33 @@ impl FleetLifecycle for SweeperLifecycle {
                 .map_err(|error| error.to_string())?;
         }
         // Work an earlier process left without a row (a restore from a
-        // replica, a crash after an autocommit write) gets one now.
-        let found = handle.block_on(pending_on_open(db.pool()));
-        for kind in found.unwrap_or_default() {
-            if let Err(error) = handle.block_on(self.index.mark(&db.key().name(), kind)) {
-                tracing::warn!(database = %db.key(), %error, "could not mark fleet work");
-            }
+        // replica, a crash after an autocommit write) gets one now. If that
+        // fails, the open fails: the work would be lost to the sweeper.
+        let name = db.key().name();
+        let found = handle
+            .block_on(pending_on_open(db.pool()))
+            .map_err(|error| error.to_string())?;
+        for kind in found {
+            handle
+                .block_on(self.index.mark(&name, kind))
+                .map_err(|error| error.to_string())?;
         }
-        if crate::derivation::has_derivation_descriptors() {
-            // One bounded round, so a request never reads a derived column
+        if crate::derivation::has_derivation_descriptors()
+            && handle
+                .block_on(self.index.epoch_is_current())
+                .map_err(|error| error.to_string())?
+        {
+            // One bounded round, so a request rarely reads a derived column
             // that a missed backfill left wrong (a new database, or one
             // restored from an older replica). The sweeper does the rest.
             let settled = handle.block_on(backfill(db.pool(), 1, &CancellationToken::new()));
+            if let Err(error) = &settled {
+                tracing::warn!(database = %name, %error, "fleet derivation backfill failed");
+            }
             if !matches!(settled, Ok((true, _))) {
-                if let Err(error) = &settled {
-                    tracing::warn!(database = %db.key(), %error, "fleet derivation backfill failed");
-                }
-                let name = db.key().name();
-                if let Err(error) = handle.block_on(self.index.mark(&name, PendingKind::Backfill)) {
-                    tracing::warn!(database = %name, %error, "could not mark a fleet backfill");
-                }
+                handle
+                    .block_on(self.index.mark(&name, PendingKind::Backfill))
+                    .map_err(|error| error.to_string())?;
             }
         }
         Ok(())
@@ -1000,42 +1031,42 @@ impl FleetSweeper {
         report
     }
 
-    /// Whether the control database records this binary's derivations. Only
-    /// then may a visit clear a `backfill` row: during a rolling deploy an old
-    /// binary does not know the new derivations, and would clear their rows.
+    /// Whether this binary's derivations are the newest epoch.
     async fn backfill_current(&self) -> AutumnResult<bool> {
-        let stored = self.inner.index.state_value(FINGERPRINT_STATE).await?;
-        Ok(stored == crate::derivation::registry_fingerprint())
+        self.inner.index.epoch_is_current().await
     }
 
-    /// When the derivations this binary declares changed since the last
-    /// sweeper recorded them, mark every database for a backfill. Lists
-    /// files; opens none.
+    /// When this binary's derivations are a new epoch, mark every database
+    /// for a backfill, then record the epoch. Lists files; opens none. An
+    /// epoch seen before is never recorded again, so an old binary that
+    /// restarts in a rolling deploy does not take over.
     async fn mark_derivation_changes(&self) -> AutumnResult<()> {
         let inner = &self.inner;
         if AtomicBool::load(&inner.fingerprint_checked, Ordering::Acquire) {
             return Ok(());
         }
-        if let Some(fingerprint) = crate::derivation::registry_fingerprint()
-            && inner.index.state_value(FINGERPRINT_STATE).await?.as_deref()
-                != Some(fingerprint.as_str())
-        {
-            let keys: Vec<String> = inner
-                .fleet
-                .list()
-                .await?
-                .iter()
-                .map(FleetDbKey::name)
-                .collect();
+        let epoch = own_epoch();
+        if !inner.index.has_epoch(&epoch).await? {
+            let keys: Vec<String> = if crate::derivation::has_derivation_descriptors() {
+                inner
+                    .fleet
+                    .list()
+                    .await?
+                    .iter()
+                    .map(FleetDbKey::name)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Marks first: a crash before the record marks again next time.
             inner.index.mark_many(&keys, PendingKind::Backfill).await?;
-            inner
-                .index
-                .set_state_value(FINGERPRINT_STATE, &fingerprint)
-                .await?;
-            tracing::info!(
-                databases = keys.len(),
-                "derivations changed; fleet backfill enqueued"
-            );
+            inner.index.record_epoch(&epoch).await?;
+            if !keys.is_empty() {
+                tracing::info!(
+                    databases = keys.len(),
+                    "derivations changed; fleet backfill enqueued"
+                );
+            }
         }
         inner.fingerprint_checked.store(true, Ordering::Release);
         Ok(())
@@ -1116,7 +1147,7 @@ impl FleetSweeper {
                 None => return Visit::Skipped,
             }
         };
-        let worked = self.work(&db, &key).await;
+        let worked = self.work(&db, &key, backfill_current).await;
         let remaining = self.settle(&db, &name, backfill_current).await;
         drop(db);
         // Also when an earlier visit opened it and could not close it then.
@@ -1145,7 +1176,12 @@ impl FleetSweeper {
 
     /// Drain hooks, relay the outbox, run the backfill. Returns how much it
     /// did.
-    async fn work(&self, db: &FleetDatabase, key: &FleetDbKey) -> AutumnResult<usize> {
+    async fn work(
+        &self,
+        db: &FleetDatabase,
+        key: &FleetDbKey,
+        backfill_current: bool,
+    ) -> AutumnResult<usize> {
         let inner = &self.inner;
         let options = &inner.options;
         let pool = db.pool();
@@ -1181,7 +1217,11 @@ impl FleetSweeper {
             )
             .await?;
         }
-        // Cheap when every backfill is complete: one read.
+        // Only the newest epoch backfills. Cheap when every backfill is
+        // complete: one read.
+        if !backfill_current {
+            return Ok(handled);
+        }
         let (_, batches) = backfill(pool, options.max_backfill_rounds, &inner.stop).await?;
         Ok(handled + batches)
     }
@@ -1432,7 +1472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn many_marks_and_the_state_value_persist() {
+    async fn many_marks_persist_and_an_old_epoch_never_takes_back_over() {
         let tmp = tempfile::tempdir().unwrap();
         let index = index(tmp.path(), 5).await;
         let keys: Vec<String> = (0..1_200).map(|n| format!("slot:{n:05}")).collect();
@@ -1440,13 +1480,13 @@ mod tests {
         assert_eq!(index.backlog().await.unwrap().databases, 1_200);
         assert_eq!(index.pending_for(&keys).await.unwrap().len(), 1_200);
 
-        assert_eq!(index.state_value("derivations").await.unwrap(), None);
-        index.set_state_value("derivations", "a").await.unwrap();
-        index.set_state_value("derivations", "b").await.unwrap();
-        assert_eq!(
-            index.state_value("derivations").await.unwrap().as_deref(),
-            Some("b")
-        );
+        assert_eq!(index.latest_epoch().await.unwrap(), None);
+        index.record_epoch("old").await.unwrap();
+        index.record_epoch("new").await.unwrap();
+        assert!(index.has_epoch("old").await.unwrap());
+        // The old binary restarts in a rolling deploy: the new epoch stays.
+        index.record_epoch("old").await.unwrap();
+        assert_eq!(index.latest_epoch().await.unwrap().as_deref(), Some("new"));
     }
 
     #[test]
