@@ -38,7 +38,7 @@ on:
         type: choice
         options: ["false", "true"]
       posture_ack:
-        description: "Posture gate: acknowledge an example widening (the /ack-posture digest and ceiling)"
+        description: "Posture gate: acknowledge a widening. Give the digest and ceiling from the /ack-posture line."
         required: false
         default: ""
         type: string
@@ -74,7 +74,7 @@ jobs:
   # manifest. It then diffs the manifest against the one committed next to the
   # example. A change that widens the security surface fails here, such as a
   # route that more callers can reach, or a removed guard.
-  # fails here, with the same acknowledgment escape hatch the product ships:
+  # The gate has the same acknowledgment escape hatch as the product:
   #   - pull request: a /ack-posture comment from a user with write access.
   #   - workflow_dispatch: the posture_ack input.
   #   - tag push: none. Acknowledge and merge the widening before the tag.
@@ -92,8 +92,8 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
-      # Only commenters with admin, write or maintain permission count. The
-      # job asks GitHub for the permission, and does not trust author_association.
+      # Only comments from users with admin, write or maintain permission count.
+      # The job asks GitHub for the permission. It does not use author_association.
       # Each comment goes to its own file, so one comment cannot change another.
       # A GitHub API error leaves the directory empty: nothing is acknowledged.
       - name: Harvest acknowledgments from authorized reviewers
@@ -103,6 +103,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -uo pipefail
+          rm -rf "$RUNNER_TEMP/acks"
           mkdir -p "$RUNNER_TEMP/acks"
           authors_and_bodies() {
             gh api --paginate "repos/${GITHUB_REPOSITORY}/$1" \
@@ -126,7 +127,7 @@ jobs:
           done
       - name: Run the posture gate over the example apps
         env:
-          # Empty on pull_request and tag pushes. The script ignores empty values.
+          # Each variable is empty when its source does not apply. The script ignores empty values.
           AUTUMN_POSTURE_ACK: ${{ inputs.posture_ack }}
           AUTUMN_POSTURE_ACK_DIR: ${{ github.event_name == 'pull_request' && format('{0}/acks', runner.temp) || '' }}
         run: ./scripts/check-posture-gate.sh

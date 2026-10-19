@@ -23,17 +23,18 @@
 # which is exactly what the diff — and not the byte comparison — measures.
 # Refresh the committed manifests with `--update` when they drift.
 #
-# Escape hatch, mirroring the product's. Two variables acknowledge a deliberate
-# widening. Each use is recorded in this script's output and in the CI job log.
+# Escape hatch: the same as in the product. Two variables acknowledge a
+# deliberate widening. The script prints each use. The CI job log keeps it.
 #
 #   AUTUMN_POSTURE_ACK      the marker the diff prints (digest and ceiling).
-#   AUTUMN_POSTURE_ACK_DIR  a directory with one file per pull request comment.
-#                           Each file is scanned alone for `/ack-posture`
-#                           markers, as the scaffolded gate does.
+#   AUTUMN_POSTURE_ACK_DIR  an absolute path to a directory with one file per
+#                           pull request comment. The diff scans each file
+#                           alone for `/ack-posture` markers. The scaffolded
+#                           gate does the same.
 #
 # In CI the `publish-gate` workflow sets them:
 #   - pull_request: the job reads the pull request comments. It keeps only
-#     commenters with admin, write or maintain permission.
+#     comments from users with admin, write or maintain permission.
 #   - workflow_dispatch: the `posture_ack` input sets AUTUMN_POSTURE_ACK.
 #   - tag push: no acknowledgment. A release tag has no pull request. Acknowledge
 #     and merge the widening first.
@@ -222,7 +223,7 @@ for example in "${EXAMPLES[@]}"; do
   fi
   if [ -n "$ACK_DIR" ]; then
     args+=(--ack-dir "$ACK_DIR")
-    note "$example: acknowledgments read from AUTUMN_POSTURE_ACK_DIR ($ACK_DIR)"
+    note "$example: reading acknowledgments from AUTUMN_POSTURE_ACK_DIR ($ACK_DIR)"
   fi
 
   set +e
@@ -234,10 +235,10 @@ for example in "${EXAMPLES[@]}"; do
     0) ok "$example: no unacknowledged widening" ;;
     1)
       echo "error: $example: this change widens the example's security surface." >&2
-      echo "       If that is intended, acknowledge it. On a pull request, comment the" >&2
-      echo "       /ack-posture line printed above, then re-run the job. Locally, set" >&2
+      echo "       To accept it, comment the /ack-posture line printed above on the" >&2
+      echo "       pull request, then re-run the job. Locally, set" >&2
       echo "       AUTUMN_POSTURE_ACK=<digest printed above>." >&2
-      echo "       and refresh the baseline with $0 --update in the same change." >&2
+      echo "       Then refresh the baseline with $0 --update in the same change." >&2
       failed=1
       ;;
     *)

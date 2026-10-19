@@ -9656,8 +9656,8 @@ fn posture_gate_script_documents_the_acknowledgment_scope() {
     );
 }
 
-/// Run the posture script against a stub `cargo` and a stub `autumn`.
-/// Returns the stub's log of calls and the script output.
+/// Run the posture script with a stub `cargo` and a stub `autumn`.
+/// Return the log of stub calls and the script output.
 #[cfg(unix)]
 fn run_posture_script_with_stubs(envs: &[(&str, &str)]) -> (String, String) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -9718,6 +9718,7 @@ exit 0
         .env("STUB_LOG", &log)
         .env_remove("AUTUMN_POSTURE_ACK")
         .env_remove("AUTUMN_POSTURE_ACK_DIR")
+        .env("POSTURE_BASE_REF", "refs/none")
         .env_remove("GITHUB_BASE_REF");
     for (key, value) in envs {
         cmd.env(key, value);
