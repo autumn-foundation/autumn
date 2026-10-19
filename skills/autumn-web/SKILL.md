@@ -2987,8 +2987,18 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   fresh volume — only once the old host stopped writing. A replicated fleet
   root is served by one process (one replicator per database).
 - The control database lives outside `root` (validation refuses it inside).
-- Outbox rows and derivation backfill stay on the control database.
-- Tests: `TestApp::new().with_db(control).with_fleet(fleet)`.
+- Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
+  databases, also closed ones (issue #3234). Write outbox rows in a
+  transaction on the tenant connection: the write records the database in
+  `_autumn_fleet_pending` on the control database. A worker-role process
+  (the fleet sweeper) opens each listed database, never past `max_open`,
+  does the work, then closes it. Outbox handlers of a tenant fleet run in
+  the tenant's scope. Health: `fleet:sweeper` (`backlog`,
+  `oldest_pending_secs`). Do not enqueue on a fleet database inside a
+  control-database write transaction: the write fails.
+- Tests: `TestApp::new().with_db(control).with_fleet(fleet)`; call
+  `FleetSweeper::install(client.state())` (`autumn_web::db::fleet_sweeper`)
+  before the first request, then `sweep_once()` to run a pass.
 - Out of band (stopped or live app), with the `sqlite` CLI build:
   `autumn fleet list --open`, `migrate [--key K]`, `backup <key> <dest>`,
   `delete <key> --force`, `restore <key> [--timestamp T] --force`. Keys are
