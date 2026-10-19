@@ -195,8 +195,13 @@ read as more than it is:
   them. (Without this, `autumn graph touches votes` would miss every upvote
   route, because none of them names `votes`.)
 * **Access is declared intent.** A route's access is its HTTP method — safe
-  methods read, everything else writes. A job's is whether its tokens carry
-  mutation evidence. Neither is an executed statement.
+  methods read, everything else writes. A job's is set for each edge. An edge
+  is a write when its symbol names a mutating SQL statement, or when the job
+  calls `.create`, `.delete`, `.insert` or `.update` on a parameter whose type
+  is a declared repository. Mutation evidence that names no symbol (`save`,
+  `upsert`, `diesel::update(..)`) makes every edge of the job a write. A route
+  needs no such evidence: its method decides. None of this is an executed
+  statement.
 * **Routes mounted by other mechanisms.** A `#[ws]` handler or a framework
   endpoint is not a `#[route]` and is not a node; those mounts are *named* in
   `completeness.unmodelled_mounted_routes`. This includes the OpenAPI JSON and

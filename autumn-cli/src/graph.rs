@@ -609,9 +609,12 @@ mod tests {
         module_path: "app::jobs",
         schedule: "",
         mutating: true,
+        mutating_symbols: &[],
         file: "src/jobs.rs",
         line: 1,
         signature_symbols: &[],
+        signature_bindings: &[],
+        dot_mutation_receivers: &[],
         body_symbols: &["posts"],
         sql_symbols: &[],
     }];

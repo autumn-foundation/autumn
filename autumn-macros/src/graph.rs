@@ -415,18 +415,24 @@ fn is_truncate_operands(rest: &[&str]) -> bool {
 /// double-quoted identifiers as they are. An unterminated quote runs to the end
 /// of the text.
 ///
-/// Only the verb scan uses this. Table symbols come from the unblanked text, so
-/// a quoted word is still a candidate and no edge is lost.
-fn verb_statements(text: &str) -> Vec<String> {
+/// Returns `(blanked, raw)` for each statement. Only the verb scan reads the
+/// blanked text. Table symbols come from the raw text, so a quoted word is still
+/// a candidate and no edge is lost.
+fn verb_statements(text: &str) -> Vec<(String, String)> {
     let chars: Vec<char> = text.chars().collect();
     let mut statements = Vec::new();
     let mut current = String::new();
+    let mut start = 0;
     let mut i = 0;
     while i < chars.len() {
         let ch = chars[i];
         if ch == ';' {
-            statements.push(std::mem::take(&mut current));
+            statements.push((
+                std::mem::take(&mut current),
+                chars[start..i].iter().collect(),
+            ));
             i += 1;
+            start = i;
         } else if ch == '\'' {
             current.push(' ');
             i += 1;
@@ -467,7 +473,7 @@ fn verb_statements(text: &str) -> Vec<String> {
             i += 1;
         }
     }
-    statements.push(current);
+    statements.push((current, chars[start.min(chars.len())..].iter().collect()));
     statements
 }
 
@@ -548,8 +554,21 @@ fn sql_shape(literal: &str) -> Option<bool> {
     let text = strip_sql_comments(&literal_text(literal));
     verb_statements(&text)
         .iter()
-        .filter_map(|statement| statement_shape(statement))
+        .filter_map(|(blanked, _)| statement_shape(blanked))
         .reduce(|a, b| a || b)
+}
+
+/// The words of each mutating statement in a SQL literal.
+///
+/// Reads the raw text, so a quoted word is a symbol as it is for the candidate
+/// list. Empty when no statement mutates.
+fn mutating_statement_words(literal: &str) -> Vec<String> {
+    let text = strip_sql_comments(&literal_text(literal));
+    verb_statements(&text)
+        .iter()
+        .filter(|(blanked, _)| statement_shape(blanked) == Some(true))
+        .flat_map(|(_, raw)| sql_words(raw))
+        .collect()
 }
 
 /// Whether a string literal reads as a SQL statement.
@@ -638,8 +657,10 @@ pub fn signature_symbols(sig: &syn::Signature) -> Vec<String> {
     candidate_symbols(&stream)
 }
 
-/// Whether an already-flattened token stream carries evidence that the item
-/// mutates something.
+/// Whether an already-flattened token stream carries mutation evidence that
+/// names no symbol.
+///
+/// SQL evidence is not here: [`mutating_sql_symbols`] names its symbols.
 ///
 /// Takes the flattened form so a caller that needs both the symbols and this
 /// answer pays for one walk. See [`MUTATION_IDENTS`] for why the ambiguous
@@ -654,9 +675,84 @@ fn mutates(tokens: &[TokenTree]) -> bool {
                     && i >= 2
                     && is_path_sep(tokens, i - 2))
         }
-        TokenTree::Literal(literal) => sql_shape(&literal.to_string()) == Some(true),
-        TokenTree::Punct(_) | TokenTree::Group(_) => false,
+        TokenTree::Literal(_) | TokenTree::Punct(_) | TokenTree::Group(_) => false,
     })
+}
+
+/// Symbols of the mutating SQL statements in a flattened stream.
+///
+/// An edge to one of them is a write. Other symbols of the item stay reads.
+fn mutating_sql_symbols(tokens: &[TokenTree]) -> Vec<String> {
+    let mut symbols: Vec<String> = tokens
+        .iter()
+        .filter_map(|tree| match tree {
+            TokenTree::Literal(literal) => Some(mutating_statement_words(&literal.to_string())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    symbols.sort();
+    symbols.dedup();
+    symbols
+}
+
+/// Names directly before `.create`, `.delete`, `.insert` or `.update`.
+///
+/// A name alone is no proof of a write: `HashMap::insert` has the same shape.
+/// The manifest keeps a name only when it is a parameter whose type is a
+/// declared repository. The macro cannot know that.
+fn dot_mutation_receivers(tokens: &[TokenTree]) -> Vec<String> {
+    let is_dot =
+        |i: usize| matches!(tokens.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '.');
+    let mut receivers: Vec<String> = Vec::new();
+    for (i, tree) in tokens.iter().enumerate() {
+        let TokenTree::Ident(verb) = tree else {
+            continue;
+        };
+        if i >= 2
+            && is_dot(i - 1)
+            && QUALIFIED_MUTATION_IDENTS.contains(&verb.to_string().as_str())
+            && let Some(TokenTree::Ident(receiver)) = tokens.get(i - 2)
+        {
+            receivers.push(receiver.to_string());
+        }
+    }
+    receivers.sort();
+    receivers.dedup();
+    receivers
+}
+
+/// The name a parameter pattern binds, if it binds exactly one.
+///
+/// `repo`, `mut repo` and `State(repo)` bind `repo`.
+fn bound_name(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+        syn::Pat::TupleStruct(tuple) if tuple.elems.len() == 1 => bound_name(&tuple.elems[0]),
+        syn::Pat::Reference(reference) => bound_name(&reference.pat),
+        syn::Pat::Paren(paren) => bound_name(&paren.pat),
+        _ => None,
+    }
+}
+
+/// `(parameter, type symbol)` pairs of a signature.
+///
+/// One pair for each candidate symbol of the parameter's type. The manifest
+/// uses them to tell whether a `.update` receiver is a repository.
+#[must_use]
+pub fn signature_bindings(sig: &syn::Signature) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for arg in &sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = arg
+            && let Some(name) = bound_name(&pat_type.pat)
+        {
+            let ty = &pat_type.ty;
+            for symbol in candidate_symbols(&quote! { #ty }) {
+                pairs.push((name.clone(), symbol));
+            }
+        }
+    }
+    pairs
 }
 
 /// Emit a `&'static [&'static str]` literal for a symbol list.
@@ -668,6 +764,12 @@ pub fn emit_symbol_slice(symbols: &[String]) -> TokenStream {
         let items = symbols.iter().map(String::as_str);
         quote! { &[#(#items),*] }
     }
+}
+
+/// Emit a `&'static [(&'static str, &'static str)]` literal for binding pairs.
+fn emit_binding_slice(pairs: &[(String, String)]) -> TokenStream {
+    let items = pairs.iter().map(|(a, b)| quote! { (#a, #b) });
+    quote! { &[#(#items),*] }
 }
 
 /// Emit the `inventory::submit!` for a `#[route]`/`#[static_get]` handler.
@@ -720,6 +822,9 @@ pub fn emit_job_descriptor(
     let body = emit_symbol_slice(&symbols_of(&flat));
     let sql = emit_symbol_slice(&sql_symbols_of(&flat));
     let mutating = mutates(&flat);
+    let mutating_symbols = emit_symbol_slice(&mutating_sql_symbols(&flat));
+    let receivers = emit_symbol_slice(&dot_mutation_receivers(&flat));
+    let bindings = emit_binding_slice(&signature_bindings(&input_fn.sig));
     let handler = input_fn.sig.ident.to_string();
     let kind_ident = syn::Ident::new(kind, proc_macro2::Span::call_site());
     quote! {
@@ -731,9 +836,12 @@ pub fn emit_job_descriptor(
                 module_path: ::core::module_path!(),
                 schedule: #schedule,
                 mutating: #mutating,
+                mutating_symbols: #mutating_symbols,
                 file: ::core::file!(),
                 line: ::core::line!(),
                 signature_symbols: #signature,
+                signature_bindings: #bindings,
+                dot_mutation_receivers: #receivers,
                 body_symbols: #body,
                 sql_symbols: #sql,
             }
@@ -746,11 +854,104 @@ mod tests {
     use super::*;
     use quote::quote;
 
-    /// [`mutates`] from a token stream, which is how every test spells it.
+    /// Any mutation evidence, attributed or not, from a token stream.
     fn is_mutating(stream: &TokenStream) -> bool {
         let mut tokens = Vec::new();
         flatten(stream, &mut tokens);
-        mutates(&tokens)
+        mutates(&tokens) || !mutating_sql_symbols(&tokens).is_empty()
+    }
+
+    fn flat(stream: &TokenStream) -> Vec<TokenTree> {
+        let mut tokens = Vec::new();
+        flatten(stream, &mut tokens);
+        tokens
+    }
+
+    #[test]
+    fn mutating_sql_names_the_symbols_of_the_writing_statement_only() {
+        let tokens = flat(&quote! {
+            batch_execute("SELECT * FROM users; INSERT INTO audit_events (kind) VALUES ('x')")
+        });
+        let symbols = mutating_sql_symbols(&tokens);
+        assert!(symbols.contains(&"audit_events".to_owned()), "{symbols:?}");
+        assert!(!symbols.contains(&"users".to_owned()), "{symbols:?}");
+        assert!(!mutates(&tokens), "SQL evidence is attributed, not loose");
+    }
+
+    #[test]
+    fn mutating_sql_keeps_quoted_words_of_the_writing_statement() {
+        let tokens = flat(&quote! { sql_query("UPDATE \"Posts\" SET a = 'b; c' WHERE x = 1") });
+        let symbols = mutating_sql_symbols(&tokens);
+        assert!(symbols.contains(&"Posts".to_owned()), "{symbols:?}");
+    }
+
+    #[test]
+    fn a_read_only_statement_names_no_mutating_symbols() {
+        let tokens = flat(&quote! { sql_query("SELECT * FROM users") });
+        assert!(mutating_sql_symbols(&tokens).is_empty());
+    }
+
+    #[test]
+    fn evidence_that_names_no_symbol_stays_unattributed() {
+        assert!(mutates(&flat(&quote! { repo.save(&post).await })));
+        assert!(mutates(&flat(&quote! { diesel::update(posts::table) })));
+    }
+
+    #[test]
+    fn dot_receivers_are_the_names_before_a_mutation_verb() {
+        let tokens = flat(&quote! {
+            repo.update(id, &patch).await?;
+            vars.insert("a", 1);
+            other.create(&b);
+            q.delete(1);
+            let x = repo.find(1);
+            div hx-delete=(paths::delete_post(&slug)) {}
+        });
+        let mut receivers = dot_mutation_receivers(&tokens);
+        receivers.sort();
+        assert_eq!(receivers, ["other", "q", "repo", "vars"]);
+    }
+
+    #[test]
+    fn signature_bindings_pair_a_parameter_with_each_type_symbol() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn run(mut repo: PgPostRepository, State(users): State<PgUserRepository>, n: u32)
+        };
+        let mut pairs = signature_bindings(&sig);
+        pairs.sort();
+        let pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("repo", "PgPostRepository"),
+                ("users", "PgUserRepository"),
+                ("users", "State"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_descriptor_carries_the_new_evidence() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            async fn go(repo: PgPostRepository) {
+                repo.update(1, &p).await;
+                sql_query("INSERT INTO audit_events (a) VALUES (1)");
+            }
+        };
+        let generated =
+            emit_job_descriptor(&item, &quote! { "go" }, "Job", &quote! { "" }).to_string();
+        for needle in [
+            "mutating_symbols",
+            "audit_events",
+            "signature_bindings",
+            "dot_mutation_receivers",
+            "\"repo\"",
+        ] {
+            assert!(generated.contains(needle), "{needle}: {generated}");
+        }
     }
 
     #[test]
@@ -1305,7 +1506,11 @@ mod tests {
         assert!(generated.contains("JobGraphDescriptor"), "{generated}");
         assert!(generated.contains("JobKind :: Scheduled"), "{generated}");
         assert!(generated.contains(r#"schedule : "15m""#), "{generated}");
-        assert!(generated.contains("mutating : true"), "{generated}");
-        assert!(generated.contains(r#""posts""#), "{generated}");
+        // SQL evidence names its symbols, so the job-wide bit stays off.
+        assert!(generated.contains("mutating : false"), "{generated}");
+        assert!(
+            generated.contains(r#"mutating_symbols : & ["SET" , "UPDATE" , "hot_rank" , "posts"]"#),
+            "{generated}"
+        );
     }
 }

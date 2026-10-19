@@ -59,7 +59,9 @@ pub const LIMITS: &[&str] = &[
      followed by a bare `posts.filter(…)` in the body names no candidate and produces no edge. \
      Write the table module (`posts::table`) or the model in the handler to be linked.",
     "A route's access is its declared HTTP method (safe methods read, everything else writes); a \
-     job's is whether its tokens carry mutation evidence. Either way it is the declared intent, \
+     job's is set per edge: a write when the edge's symbol names a mutating SQL statement, or when \
+     the job calls `.update`/`.create`/`.delete`/`.insert` on a repository parameter, or when \
+     mutation evidence names no symbol (then every edge). Either way it is the declared intent, \
      not an executed statement.",
     "The served graph is process-global: the first application built in a process installs it, \
      and every later application in that process (an embedded host, a test) serves the first \
@@ -547,7 +549,7 @@ struct Candidates<'a> {
 fn resolve_edges(
     from: &str,
     candidates: Candidates<'_>,
-    access: Access,
+    access: impl Fn(&str) -> Access,
     index: &BTreeMap<String, BTreeSet<String>>,
     sql_tables: &BTreeMap<String, BTreeSet<String>>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
@@ -572,19 +574,31 @@ fn resolve_edges(
             };
             for target in targets {
                 let key = (from.to_owned(), target.clone());
-                let candidate = GraphEdge {
+                let mut candidate = GraphEdge {
                     from: from.to_owned(),
                     to: target.clone(),
-                    access,
+                    access: access(symbol),
                     provenance,
                     symbol: (*symbol).to_owned(),
                 };
-                match edges.get(&key) {
+                match edges.get_mut(&key) {
                     // A signature edge outranks a body edge for the same pair:
                     // an extractor is a stronger statement than a name in the
-                    // body, and the report should say the stronger one.
-                    Some(existing) if existing.provenance <= candidate.provenance => {}
-                    _ => {
+                    // body, and the report should say the stronger one. The
+                    // access still merges: a write through any symbol is a
+                    // write to the target.
+                    Some(existing) if existing.provenance <= candidate.provenance => {
+                        if candidate.access == Access::Write {
+                            existing.access = Access::Write;
+                        }
+                    }
+                    Some(existing) => {
+                        if existing.access == Access::Write {
+                            candidate.access = Access::Write;
+                        }
+                        *existing = candidate;
+                    }
+                    None => {
                         edges.insert(key, candidate);
                     }
                 }
@@ -842,7 +856,7 @@ fn add_route_nodes(
                 body: route.body_symbols,
                 sql: route.sql_symbols,
             },
-            access,
+            |_| access,
             index,
             sql_tables,
             edges,
@@ -853,6 +867,31 @@ fn add_route_nodes(
         unmounted,
         matched: matched_mounted,
     }
+}
+
+/// The symbols a job writes through.
+///
+/// Two sources. The macro names the symbols of each mutating SQL statement.
+/// A receiver of `.create`, `.delete`, `.insert` or `.update` counts only when
+/// it is a parameter whose type resolves to a declared repository. The macro
+/// cannot know repositories, so a bare `.update` is no evidence here: it would
+/// also match `HashMap::insert`.
+fn job_write_symbols<'a>(
+    job: &'a JobGraphDescriptor,
+    index: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<&'a str> {
+    let mut writes: BTreeSet<&str> = job.mutating_symbols.iter().copied().collect();
+    for receiver in job.dot_mutation_receivers {
+        for (param, ty) in job.signature_bindings {
+            let is_repository = index
+                .get(*ty)
+                .is_some_and(|ids| ids.iter().any(|id| id.starts_with("repository:")));
+            if param == receiver && is_repository {
+                writes.insert(ty);
+            }
+        }
+    }
+    writes
 }
 
 /// One node per `#[job]`/`#[scheduled]`/`#[task]`, with its resolved edges.
@@ -886,11 +925,7 @@ fn add_job_nodes(
                 }),
             },
         );
-        let access = if job.mutating {
-            Access::Write
-        } else {
-            Access::Read
-        };
+        let writes = job_write_symbols(job, index);
         resolve_edges(
             &id,
             Candidates {
@@ -898,7 +933,13 @@ fn add_job_nodes(
                 body: job.body_symbols,
                 sql: job.sql_symbols,
             },
-            access,
+            |symbol| {
+                if job.mutating || writes.contains(symbol) {
+                    Access::Write
+                } else {
+                    Access::Read
+                }
+            },
             index,
             sql_tables,
             edges,
@@ -1154,9 +1195,12 @@ mod tests {
             module_path: "app::jobs",
             schedule: "",
             mutating: false,
+            mutating_symbols: &[],
             file: "src/jobs.rs",
             line: 40,
             signature_symbols: &[],
+            signature_bindings: &[],
+            dot_mutation_receivers: &[],
             body_symbols,
             sql_symbols: &[],
         }
@@ -1552,6 +1596,156 @@ mod tests {
             &[writer],
         );
         assert_eq!(graph.edges[0].access, Access::Write);
+    }
+
+    fn edge_access(graph: &ArchitectureGraph, to_suffix: &str) -> Access {
+        graph
+            .edges
+            .iter()
+            .find(|e| e.to.ends_with(to_suffix) && e.provenance != Provenance::Declaration)
+            .unwrap_or_else(|| panic!("no edge to {to_suffix}: {:?}", graph.edges))
+            .access
+    }
+
+    #[test]
+    fn a_job_that_reads_one_table_and_writes_another_has_two_accesses() {
+        // #2520 item 11: loading `users`, then inserting into `audit_events`.
+        let mut writer = job("audit", JobKind::Job, &["audit_events", "users"]);
+        writer.mutating_symbols = &["audit_events"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("User", "app::models::User", "users"),
+                model("AuditEvent", "app::models::AuditEvent", "audit_events"),
+            ],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "AuditEvent"), Access::Write);
+        assert_eq!(edge_access(&graph, "User"), Access::Read);
+    }
+
+    #[test]
+    fn unattributed_mutation_evidence_still_writes_every_edge() {
+        let mut writer = job("audit", JobKind::Job, &["audit_events", "users"]);
+        writer.mutating = true;
+        writer.mutating_symbols = &["audit_events"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("User", "app::models::User", "users"),
+                model("AuditEvent", "app::models::AuditEvent", "audit_events"),
+            ],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "AuditEvent"), Access::Write);
+        assert_eq!(edge_access(&graph, "User"), Access::Write);
+    }
+
+    #[test]
+    fn a_write_through_one_symbol_beats_a_read_through_another_for_one_target() {
+        // `Post` (a read) and `posts` (a write) reach the same model node.
+        let mut writer = job("rank", JobKind::Job, &["Post", "posts"]);
+        writer.mutating_symbols = &["posts"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "Post"), Access::Write);
+    }
+
+    fn repo_job(
+        bindings: &'static [(&'static str, &'static str)],
+        receivers: &'static [&'static str],
+    ) -> JobGraphDescriptor {
+        JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository"],
+            signature_bindings: bindings,
+            dot_mutation_receivers: receivers,
+            ..job("edit", JobKind::Job, &[])
+        }
+    }
+
+    fn post_graph(job: JobGraphDescriptor) -> ArchitectureGraph {
+        build(
+            &[],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
+            &[job],
+        )
+    }
+
+    #[test]
+    fn a_dot_call_on_a_repository_parameter_is_a_write() {
+        // #2520 item 8: `repo.update(id, &patch)`.
+        let graph = post_graph(repo_job(&[("repo", "PgPostRepository")], &["repo"]));
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Write);
+    }
+
+    #[test]
+    fn a_repository_parameter_with_no_dot_mutation_stays_a_read() {
+        let graph = post_graph(repo_job(&[("repo", "PgPostRepository")], &[]));
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Read);
+    }
+
+    #[test]
+    fn a_dot_call_on_a_name_that_is_not_a_repository_parameter_is_a_read() {
+        // `HashMap::insert`: `cache` is a local, not a parameter.
+        let unbound = post_graph(repo_job(&[("repo", "PgPostRepository")], &["cache"]));
+        assert_eq!(edge_access(&unbound, "PostRepository"), Access::Read);
+        // A parameter whose type is no declared repository.
+        let other = JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository", "Cache"],
+            signature_bindings: &[("repo", "PgPostRepository"), ("cache", "Cache")],
+            dot_mutation_receivers: &["cache"],
+            ..job("edit", JobKind::Job, &[])
+        };
+        assert_eq!(
+            edge_access(&post_graph(other), "PostRepository"),
+            Access::Read
+        );
+    }
+
+    #[test]
+    fn a_repository_receiver_makes_only_its_own_repository_a_write() {
+        let both = JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository", "PgUserRepository"],
+            signature_bindings: &[("posts", "PgPostRepository"), ("users", "PgUserRepository")],
+            dot_mutation_receivers: &["posts"],
+            ..job("edit", JobKind::Job, &[])
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("Post", "app::models::Post", "posts"),
+                model("User", "app::models::User", "users"),
+            ],
+            &[
+                repository("PostRepository", "PgPostRepository", "Post", "posts"),
+                repository("UserRepository", "PgUserRepository", "User", "users"),
+            ],
+            &[both],
+        );
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Write);
+        assert_eq!(edge_access(&graph, "UserRepository"), Access::Read);
     }
 
     #[test]

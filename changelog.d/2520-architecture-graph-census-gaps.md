@@ -11,3 +11,6 @@
   batch, and reads `COPY` and `TABLE`. A cron job records its timezone.
 - **graph:** repository edges match the model by name and table. Git
   dependency paths no longer leak the build user's home directory.
+- **graph:** a job's access is set for each edge. A job that reads one
+  table and writes another no longer shows both as writes. A call such as
+  `repo.update(..)` on a repository parameter counts as a write.

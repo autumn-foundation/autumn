@@ -235,14 +235,26 @@ pub struct JobGraphDescriptor {
     pub module_path: &'static str,
     /// Schedule expression for `#[scheduled]`, `""` otherwise.
     pub schedule: &'static str,
-    /// Whether the handler's tokens carry evidence of a mutation.
+    /// Mutation evidence that names no symbol, such as `save` or
+    /// `diesel::update(..)`. When true, every edge of the job is a write.
     pub mutating: bool,
+    /// Symbols that a mutation names: the words of each mutating SQL statement.
+    /// An edge to one of these is a write. Other edges stay reads, unless
+    /// [`Self::mutating`] is true.
+    pub mutating_symbols: &'static [&'static str],
     /// `file!()` of the handler.
     pub file: &'static str,
     /// `line!()` of the handler.
     pub line: u32,
     /// Candidate names read off the handler's signature.
     pub signature_symbols: &'static [&'static str],
+    /// `(parameter, type symbol)` pairs from the handler's signature. One pair
+    /// for each type symbol of each named parameter.
+    pub signature_bindings: &'static [(&'static str, &'static str)],
+    /// Names that stand directly before `.create`, `.delete`, `.insert` or
+    /// `.update` in the handler's body. The manifest keeps a name only when it
+    /// is a parameter whose type is a declared repository.
+    pub dot_mutation_receivers: &'static [&'static str],
     /// Candidate names read off the handler's body.
     pub body_symbols: &'static [&'static str],
     /// The subset of [`Self::body_symbols`] that came from a SQL literal.
