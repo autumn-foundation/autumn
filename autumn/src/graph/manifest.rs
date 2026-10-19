@@ -70,6 +70,18 @@ pub const LIMITS: &[&str] = &[
      both versions the same ids, so one node replaces the other and their edges merge.",
 ];
 
+/// Whether a schedule is a fixed delay such as `15m` or `1h 30m`.
+fn is_fixed_delay(schedule: &str) -> bool {
+    let mut parts = schedule.split_whitespace().peekable();
+    parts.peek().is_some()
+        && parts.all(|part| {
+            let digits = part.chars().take_while(char::is_ascii_digit).count();
+            digits > 0
+                && part[digits..].chars().all(|c| c.is_ascii_alphabetic())
+                && digits < part.len()
+        })
+}
+
 // ── Node facts ───────────────────────────────────────────────────────
 
 /// Facts carried by a route node.
@@ -185,13 +197,13 @@ impl GraphNode {
             (_, _, Some(r), _) => format!("{} over {}", self.name, r.model),
             (.., Some(j)) => j.schedule.as_ref().map_or_else(
                 || self.name.clone(),
-                // A cron expression has several fields, so it holds spaces; a
-                // fixed delay (`15m`) does not. Only the delay reads as "every".
+                // Only a fixed delay reads as "every". Each part of a delay is
+                // a number with a unit (`15m`, `1h 30m`); a cron field is not.
                 |s| {
-                    if s.contains(' ') {
-                        format!("{} ({s})", self.name)
-                    } else {
+                    if is_fixed_delay(s) {
                         format!("{} (every {s})", self.name)
+                    } else {
+                        format!("{} ({s})", self.name)
                     }
                 },
             ),
@@ -2348,6 +2360,8 @@ mod tests {
             }),
         };
         assert_eq!(node("15m").label(), "digest (every 15m)");
+        assert_eq!(node("1h 30m").label(), "digest (every 1h 30m)");
+        assert_eq!(node("0 0 1 1 1").label(), "digest (0 0 1 1 1)");
         assert_eq!(
             node("0 3 * * * (America/New_York)").label(),
             "digest (0 3 * * * (America/New_York))"

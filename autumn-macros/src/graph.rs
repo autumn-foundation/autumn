@@ -619,8 +619,10 @@ fn mutating_statement_words(literal: &str) -> Vec<String> {
     verb_statements(&text)
         .iter()
         .filter(|(blanked, _)| statement_shape(blanked) == Some(true))
-        .flat_map(|(_, raw)| {
-            let targets = write_targets(raw);
+        .flat_map(|(blanked, raw)| {
+            // The blanked text has no quoted values, so `SET note = 'UPDATE x'`
+            // names no target.
+            let targets = write_targets(blanked);
             if targets.is_empty() {
                 sql_words(raw)
             } else {
@@ -1573,6 +1575,8 @@ mod tests {
             vec!["a".to_owned(), "b".to_owned()]
         );
         assert!(words("SELECT id FROM users").is_empty());
+        let quoted = words("UPDATE posts SET note = 'UPDATE users'");
+        assert_eq!(quoted, vec!["posts".to_owned()]);
     }
 
     /// UI prose that holds `from` or `to` is not a `COPY` statement.

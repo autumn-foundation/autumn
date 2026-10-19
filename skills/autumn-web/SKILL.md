@@ -3542,6 +3542,7 @@ autumn graph show                # the application architecture graph the macros
 autumn graph touches posts       # which routes and jobs reach a model, table, or repository — transitively, so a handler that only takes `PgPostRepository` is included
 autumn graph impact Post         # what a change to a model would affect: the repositories over it, and every route and job reaching it directly or through one
 autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
+# `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
