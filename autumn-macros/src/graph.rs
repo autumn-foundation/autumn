@@ -481,17 +481,36 @@ fn verb_statements(text: &str) -> Vec<(String, String)> {
     statements
 }
 
+/// Words that can follow the name in `TABLE name`, as in `SELECT * FROM name`.
+const TABLE_TRAILING_CLAUSES: &[&str] = &[
+    "EXCEPT",
+    "FETCH",
+    "FOR",
+    "INTERSECT",
+    "LIMIT",
+    "OFFSET",
+    "ORDER",
+    "UNION",
+];
+
 /// Whether the text after a leading `TABLE` is one table name.
 ///
-/// The statement is `TABLE [ONLY] name`. A name has no space in it, so prose
-/// like "Table of contents" fails.
+/// The statement is `TABLE [ONLY] name`, with the clauses of a `SELECT` after
+/// it. A name has no space in it, and any word after it must be a clause
+/// keyword, so prose like "Table of contents" fails.
 fn is_table_operand(rest: &str) -> bool {
     let rest = rest.trim();
-    let name = match rest.strip_prefix("ONLY") {
+    let rest = match rest.strip_prefix("ONLY") {
         Some(after) if after.starts_with(char::is_whitespace) => after.trim_start(),
         _ => rest,
     };
+    let (name, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let tail_ok = tail
+        .split_whitespace()
+        .next()
+        .is_none_or(|word| TABLE_TRAILING_CLAUSES.contains(&word));
     name != "ONLY"
+        && tail_ok
         && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '"')
         && name
             .chars()
@@ -1593,6 +1612,16 @@ mod tests {
         assert!(words("SELECT id FROM users").is_empty());
         let quoted = words("UPDATE posts SET note = 'UPDATE users'");
         assert_eq!(quoted, vec!["posts".to_owned()]);
+    }
+
+    /// `TABLE name` may carry the clauses of a `SELECT`.
+    #[test]
+    fn a_table_statement_may_carry_select_clauses() {
+        let sql = "\"TABLE posts ORDER BY id LIMIT 10\"";
+        assert_eq!(sql_shape(sql), Some(false));
+        assert!(sql_symbols(sql).contains(&"posts".to_owned()));
+        assert_eq!(sql_shape("\"Table of contents\""), None);
+        assert_eq!(sql_shape("\"Table settings are saved\""), None);
     }
 
     /// A file `COPY` keeps its shape when options follow the blanked file name.
