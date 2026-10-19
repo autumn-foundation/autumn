@@ -513,7 +513,23 @@ fn copy_shape(rest_text: &str) -> Option<bool> {
     let valid_source = source.is_none_or(|w| {
         matches!(
             w.trim_matches(|c: char| !c.is_ascii_alphanumeric()),
-            "STDIN" | "STDOUT" | "PROGRAM" | ""
+            "STDIN"
+                | "STDOUT"
+                | "PROGRAM"
+                | ""
+                | "WITH"
+                | "WHERE"
+                | "CSV"
+                | "BINARY"
+                | "TEXT"
+                | "DELIMITER"
+                | "NULL"
+                | "HEADER"
+                | "QUOTE"
+                | "ESCAPE"
+                | "FORMAT"
+                | "FREEZE"
+                | "ENCODING"
         )
     });
     (valid_source && target != "TO" && target != "FROM").then_some(writes)
@@ -1577,6 +1593,18 @@ mod tests {
         assert!(words("SELECT id FROM users").is_empty());
         let quoted = words("UPDATE posts SET note = 'UPDATE users'");
         assert_eq!(quoted, vec!["posts".to_owned()]);
+    }
+
+    /// A file `COPY` keeps its shape when options follow the blanked file name.
+    #[test]
+    fn copy_from_a_file_with_options_is_a_write() {
+        for sql in [
+            "COPY posts FROM '/tmp/posts.csv' WITH (FORMAT csv)",
+            "COPY posts FROM '/tmp/posts.csv' CSV HEADER",
+            "COPY posts (id) FROM '/tmp/p.csv' WHERE id > 1",
+        ] {
+            assert_eq!(sql_shape(&format!("{sql:?}")), Some(true), "{sql}");
+        }
     }
 
     /// UI prose that holds `from` or `to` is not a `COPY` statement.

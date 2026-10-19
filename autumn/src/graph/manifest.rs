@@ -70,16 +70,17 @@ pub const LIMITS: &[&str] = &[
      both versions the same ids, so one node replaces the other and their edges merge.",
 ];
 
-/// Whether a schedule is a fixed delay such as `15m` or `1h 30m`.
+/// Whether a schedule is a fixed delay such as `15m`, `1h30m` or `1h 30m`.
+///
+/// A delay is a few letters-and-digits words. A cron expression has five or
+/// more fields, or a symbol such as `*`, `/` or `(`.
 fn is_fixed_delay(schedule: &str) -> bool {
-    let mut parts = schedule.split_whitespace().peekable();
-    parts.peek().is_some()
-        && parts.all(|part| {
-            let digits = part.chars().take_while(char::is_ascii_digit).count();
-            digits > 0
-                && part[digits..].chars().all(|c| c.is_ascii_alphabetic())
-                && digits < part.len()
-        })
+    schedule.split_whitespace().count() < 5
+        && schedule
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+        && schedule.chars().any(|c| c.is_ascii_alphabetic())
+        && schedule.chars().any(|c| c.is_ascii_digit())
 }
 
 // ── Node facts ───────────────────────────────────────────────────────
@@ -2361,6 +2362,8 @@ mod tests {
         };
         assert_eq!(node("15m").label(), "digest (every 15m)");
         assert_eq!(node("1h 30m").label(), "digest (every 1h 30m)");
+        assert_eq!(node("1h30m").label(), "digest (every 1h30m)");
+        assert_eq!(node("1 h").label(), "digest (every 1 h)");
         assert_eq!(node("0 0 1 1 1").label(), "digest (0 0 1 1 1)");
         assert_eq!(
             node("0 3 * * * (America/New_York)").label(),
