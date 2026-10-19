@@ -607,17 +607,86 @@ fn sql_shape(literal: &str) -> Option<bool> {
         .reduce(|a, b| a || b)
 }
 
-/// The words of each mutating statement in a SQL literal.
+/// The tables each mutating statement writes, from a SQL literal.
 ///
-/// Reads the raw text, so a quoted word is a symbol as it is for the candidate
-/// list. Empty when no statement mutates.
+/// Only the target of the write counts: `INSERT INTO audit SELECT * FROM users`
+/// writes `audit` and only reads `users`. Reads the raw text, so a quoted name
+/// is a symbol as it is for the candidate list. A mutating statement with no
+/// target found gives all its words, so a write is never lost. Empty when no
+/// statement mutates.
 fn mutating_statement_words(literal: &str) -> Vec<String> {
     let text = strip_sql_comments(&literal_text(literal));
     verb_statements(&text)
         .iter()
         .filter(|(blanked, _)| statement_shape(blanked) == Some(true))
-        .flat_map(|(_, raw)| sql_words(raw))
+        .flat_map(|(_, raw)| {
+            let targets = write_targets(raw);
+            if targets.is_empty() {
+                sql_words(raw)
+            } else {
+                targets
+            }
+        })
         .collect()
+}
+
+/// Names that follow a write verb in one statement.
+///
+/// `INSERT INTO`, `UPDATE`, `DELETE FROM`, `MERGE INTO`, `COPY` (a load), and
+/// every name after `TRUNCATE`. A `WITH` statement can hold several. A
+/// schema-qualified name gives both parts.
+fn write_targets(statement: &str) -> Vec<String> {
+    let tokens: Vec<&str> = statement
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '"')))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let upper = |i: usize| tokens.get(i).map(|t| t.to_ascii_uppercase());
+    let mut targets: Vec<String> = Vec::new();
+    let mut take = |i: usize| {
+        let mut i = i;
+        if upper(i).as_deref() == Some("ONLY") {
+            i += 1;
+        }
+        if let Some(name) = tokens.get(i) {
+            targets.extend(
+                name.split('.')
+                    .map(|part| part.trim_matches('"').to_owned())
+                    .filter(|part| !part.is_empty()),
+            );
+        }
+    };
+    for i in 0..tokens.len() {
+        let word = upper(i);
+        match word.as_deref() {
+            Some("INTO")
+                if matches!(
+                    upper(i.wrapping_sub(1)).as_deref(),
+                    Some("INSERT" | "MERGE")
+                ) =>
+            {
+                take(i + 1);
+            }
+            Some("FROM") if upper(i.wrapping_sub(1)).as_deref() == Some("DELETE") => take(i + 1),
+            Some("UPDATE" | "COPY") => take(i + 1),
+            Some("TRUNCATE") => {
+                let mut j = i + 1;
+                while let Some(next) = upper(j) {
+                    if TRUNCATE_CLAUSE_WORDS.contains(&next.as_str()) {
+                        j += 1;
+                        continue;
+                    }
+                    if next.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '"') {
+                        take(j);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    targets
 }
 
 /// Whether a string literal reads as a SQL statement.
@@ -1485,6 +1554,27 @@ mod tests {
         assert_eq!(sql_shape("\"Copy the link\""), None);
     }
 
+    /// Only the write target of a mutating statement is a write symbol.
+    #[test]
+    fn a_write_symbol_is_the_target_not_the_source() {
+        let words = |sql: &str| mutating_statement_words(&format!("{sql:?}"));
+        let insert = words("INSERT INTO audit_events SELECT id FROM users");
+        assert_eq!(insert, vec!["audit_events".to_owned()]);
+        let update = words("UPDATE posts SET n = 1 FROM users WHERE users.id = posts.uid");
+        assert_eq!(update, vec!["posts".to_owned()]);
+        assert_eq!(
+            words("DELETE FROM public.posts WHERE id = 1"),
+            vec!["public".to_owned(), "posts".to_owned()]
+        );
+        let cte = words("WITH r AS (DELETE FROM a RETURNING id) UPDATE b SET v = 0");
+        assert_eq!(cte, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(
+            words("TRUNCATE TABLE a, b CASCADE"),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert!(words("SELECT id FROM users").is_empty());
+    }
+
     /// UI prose that holds `from` or `to` is not a `COPY` statement.
     #[test]
     fn copy_prose_is_not_a_statement() {
@@ -1615,7 +1705,7 @@ mod tests {
         // SQL evidence names its symbols, so the job-wide bit stays off.
         assert!(generated.contains("mutating : false"), "{generated}");
         assert!(
-            generated.contains(r#"mutating_symbols : & ["SET" , "UPDATE" , "hot_rank" , "posts"]"#),
+            generated.contains(r#"mutating_symbols : & ["posts"]"#),
             "{generated}"
         );
     }
