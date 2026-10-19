@@ -5491,14 +5491,21 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             );
         }
-        // SQLite fleet (ADR 0019): a commit-hook worker per open database and
-        // the idle sweeper. Like replication below, its token is cancelled only
-        // after the request drain, so the final close of every database (and
-        // its last replication ship) comes after the last commit.
+        // SQLite fleet (ADR 0019): a commit-hook worker per open database, the
+        // idle sweeper and the pending-work sweeper (issue 3234). Like
+        // replication below, the idle sweeper's token is cancelled only after
+        // the request drain, so the final close of every database (and its
+        // last replication ship) comes after the last commit. The pending-work
+        // sweeper stops with the listener, and is awaited before that close.
         #[cfg(feature = "sqlite")]
         let fleet_shutdown = tokio_util::sync::CancellationToken::new();
         #[cfg(feature = "sqlite")]
-        let mut fleet_maintenance = start_fleet_runtime(&state, fleet_shutdown.clone());
+        let mut fleet_maintenance = start_fleet_runtime(
+            &state,
+            fleet_shutdown.clone(),
+            Some(server_shutdown.child_token()),
+        )
+        .await;
 
         // The replication loop runs on a dedicated OS thread, not a
         // `spawn_blocking` task: it lives for the whole process and does blocking
@@ -6343,12 +6350,27 @@ impl AppBuilder {
         // fleet replicator ships the database's last frames there. Same budget
         // and same reasoning as the control replication flush below.
         #[cfg(feature = "sqlite")]
-        if let Some(maintenance) = fleet_maintenance.take() {
-            let real_elapsed = drain_started_real
-                .get()
-                .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
-            let wait =
-                fleet_flush_budget(shutdown_budget, elapsed_since_drain_start(), real_elapsed);
+        if let Some(FleetRuntime {
+            maintenance,
+            sweeper,
+        }) = fleet_maintenance.take()
+        {
+            let flush_budget = || {
+                let real_elapsed = drain_started_real
+                    .get()
+                    .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
+                fleet_flush_budget(shutdown_budget, elapsed_since_drain_start(), real_elapsed)
+            };
+            // The sweeper's last pass ends before its databases close. It
+            // spends from the same budget.
+            if let Some(sweeper) = sweeper {
+                let abort = sweeper.abort_handle();
+                if tokio::time::timeout(flush_budget(), sweeper).await.is_err() {
+                    abort.abort();
+                    tracing::warn!("shutdown: the fleet sweeper did not stop within the budget");
+                }
+            }
+            let wait = flush_budget();
             // Fix the cutoff now. The maintenance task may wake late, and the
             // wait above counts from here.
             if let Some(replication) = state
@@ -8515,7 +8537,8 @@ impl AppBuilder {
             );
         }
         #[cfg(feature = "sqlite")]
-        let fleet_maintenance = start_fleet_runtime(&state, task_shutdown.child_token());
+        let fleet_maintenance =
+            start_fleet_runtime(&state, task_shutdown.child_token(), None).await;
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             eprintln!("startup hook failed: {error}");
@@ -8549,8 +8572,8 @@ impl AppBuilder {
         // Close the fleet databases the task opened (and ship their last
         // frames when the fleet replicates) before the process exits.
         #[cfg(feature = "sqlite")]
-        if let Some(maintenance) = fleet_maintenance {
-            let _ = maintenance.await;
+        if let Some(runtime) = fleet_maintenance {
+            let _ = runtime.maintenance.await;
         }
         run_shutdown_hooks(&shutdown_hooks).await;
         // If the generated `pg.stop()` hook errored/timed out it keeps the
@@ -13424,10 +13447,19 @@ fn apply_pending_sqlite_or_exit(
     }
 }
 
+/// The per-process fleet work [`start_fleet_runtime`] started.
+#[cfg(feature = "sqlite")]
+struct FleetRuntime {
+    /// The idle sweeper. It closes every database when its token fires.
+    maintenance: tokio::task::JoinHandle<()>,
+    /// The pending-work sweeper loop, when one runs.
+    sweeper: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Start the per-process work of a `[database.fleet]` (ADR 0019): a commit-hook
-/// worker for each database while it is open, and the idle sweeper, which
-/// closes every database when `shutdown` fires. `None` when the app has no
-/// fleet.
+/// worker for each database while it is open, the idle sweeper, which closes
+/// every database when `shutdown` fires, and the pending-work sweeper
+/// (issue 3234). `None` when the app has no fleet.
 ///
 /// The hook worker runs in every role, `web` included. A fleet database's
 /// queue can only be drained by a process that has the database open, and a
@@ -13435,17 +13467,45 @@ fn apply_pending_sqlite_or_exit(
 /// role would leave a `web` process's after-commit hooks pending forever.
 /// Rows are claimed one at a time under `BEGIN IMMEDIATE` with a lease, so two
 /// processes draining one database is safe.
+///
+/// The pending-work sweeper is installed in every role, so enqueue code marks
+/// its database. A failed install stops the process. Its loop runs only with
+/// `sweep` (a server, not a one-off task). A role that runs workers opens
+/// closed databases and relays their outbox; a `web` role drains the hooks of
+/// the databases it has open.
 #[cfg(feature = "sqlite")]
-fn start_fleet_runtime(
+async fn start_fleet_runtime(
     state: &AppState,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
+    sweep: Option<tokio_util::sync::CancellationToken>,
+) -> Option<FleetRuntime> {
     let fleet = state.shards()?.fleet()?.clone();
     fleet.add_lifecycle(Arc::new(FleetCommitHookWorkers {
         #[cfg(feature = "ws")]
         channels: state.channels().clone(),
     }));
-    Some(fleet.spawn_maintenance(shutdown))
+    let options = crate::db::fleet_sweeper::FleetSweeperOptions {
+        relay: state.role().runs_workers(),
+        ..crate::db::fleet_sweeper::FleetSweeperOptions::default()
+    };
+    // Fatal: without the sweeper, enqueue code marks nothing, and work in a
+    // database that closes waits for its next open, silently.
+    let sweeper = match crate::db::fleet_sweeper::FleetSweeper::install_with(state, options).await {
+        Ok(sweeper) => sweeper,
+        Err(error) => {
+            tracing::error!(%error, "the SQLite fleet sweeper could not start");
+            eprintln!("the SQLite fleet sweeper could not start: {error}");
+            exit_stop_managed_pg();
+            std::process::exit(1);
+        }
+    };
+    let sweeper = sweeper
+        .zip(sweep)
+        .map(|(sweeper, token)| sweeper.spawn(token));
+    Some(FleetRuntime {
+        maintenance: fleet.spawn_maintenance(shutdown),
+        sweeper,
+    })
 }
 
 /// Replicate every database of the app's fleet next to the control database
@@ -15274,33 +15334,56 @@ mod fleet_boot_tests {
         let control = crate::db::create_pool(&config.database)
             .unwrap()
             .expect("a control url is configured");
-        let state = AppState::for_test().with_shards(crate::sharding::ShardSet::from_fleet(
-            fleet.clone(),
-            control,
-        ));
+        let state = AppState::for_test().with_pool(control.clone()).with_shards(
+            crate::sharding::ShardSet::from_fleet(fleet.clone(), control),
+        );
         (config, fleet, state)
     }
 
     /// `run()`'s fleet runtime: every open database gets a commit-hook worker,
-    /// and cancelling the token closes every database before the task ends.
+    /// the pending-work sweeper runs until its token fires, and cancelling the
+    /// token closes every database before the task ends.
     #[tokio::test]
     async fn the_fleet_runtime_closes_every_database_on_shutdown() {
         let tmp = tempfile::tempdir().unwrap();
         let (_config, fleet, state) = booted(tmp.path());
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let maintenance =
-            start_fleet_runtime(&state, shutdown.clone()).expect("the app has a fleet");
+        let (shutdown, sweep) = (
+            tokio_util::sync::CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let runtime = start_fleet_runtime(&state, shutdown.clone(), Some(sweep.clone()))
+            .await
+            .expect("the app has a fleet");
+        let names: Vec<String> = state
+            .health_indicator_registry()
+            .run_all()
+            .await
+            .into_iter()
+            .map(|result| result.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "fleet:sweeper"),
+            "{names:?}"
+        );
         let db = fleet.open_for("acme").await.unwrap();
         // The worker runs against the database's own pool.
         assert!(!db.closed().is_cancelled());
         drop(db);
         assert_eq!(fleet.stats().open, 1);
+        sweep.cancel();
+        runtime
+            .sweeper
+            .expect("a server runs the sweeper loop")
+            .await
+            .unwrap();
         shutdown.cancel();
-        maintenance.await.unwrap();
+        runtime.maintenance.await.unwrap();
         assert_eq!(fleet.stats().open, 0, "shutdown closed every database");
 
         assert!(
-            start_fleet_runtime(&AppState::for_test(), shutdown).is_none(),
+            start_fleet_runtime(&AppState::for_test(), shutdown, None)
+                .await
+                .is_none(),
             "no fleet, no runtime"
         );
     }

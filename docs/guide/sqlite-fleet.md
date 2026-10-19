@@ -243,6 +243,50 @@ migrations expand-then-contract.
 - Metrics label every fleet database `shard=fleet`; the database name goes on
   spans and logs only, so a tenant fleet cannot explode metric cardinality.
 
+## Background work: the sweeper
+
+Outbox rows, commit hooks and derivation backfills work on fleet databases.
+A database does not have to be open for its work to run: the fleet sweeper
+visits it.
+
+```rust
+#[post("/orders/{id}")]
+async fn place(mut db: ShardedDb, outbox: Outbox, Path(id): Path<i64>) -> AutumnResult<()> {
+    autumn_web::db::scoped_transaction(&mut *db, |conn| async move {
+        outbox.write(conn, &format!("order:{id}"), "order.placed", &id).await?;
+        Ok(())
+    }.scope_boxed()).await
+}
+```
+
+- The write also adds a row for the database to `_autumn_fleet_pending` on
+  the control database, in the same transaction. A commit-hook enqueue does
+  the same. If the control database cannot take the row, the write fails.
+- A worker process (`role = "worker"` or `"combined"`) reads that table each
+  second. It opens each listed database, sends its outbox, drains its hooks
+  and runs its derivation backfill. Then it closes the database again, if
+  nobody else used it.
+- The sweeper never opens a database past `max_open`. With no room, it waits
+  for the next pass. It never closes a database that a request holds, and
+  it never restores a deleted database from its replica.
+- An outbox handler for a tenant fleet runs in the tenant's scope
+  (`CURRENT_TENANT`), so a `tenant_scoped` repository finds that tenant.
+- A `web` process does not open databases for the sweeper. It drains the
+  hooks of the databases it has open. A worker sends their outbox.
+- A new or changed `#[derivation]` is backfilled in every database: the
+  first worker pass after the deploy marks each file. When a database opens
+  first, it runs up to 8 backfill batches before its first request, and the
+  sweeper does the rest.
+- Write outbox rows in a transaction. Do not enqueue on a fleet database
+  while you hold a write transaction on the control database: the row on the
+  control database then cannot be written, and the write fails.
+
+`/actuator/health` reports `fleet:sweeper`: `backlog` (databases with work),
+`oldest_pending_secs`, and `last_pass` (`visited`, `cleared`, `deferred`,
+`failed`, `handled`). A `backlog` that grows, or an old
+`oldest_pending_secs`, means the sweeper cannot keep up: a handler fails, the
+fleet is full, or no worker process runs.
+
 ## Replication: object storage between volumes
 
 A cloud host attaches one volume. The volume can't be the unit of
@@ -278,16 +322,17 @@ and which database has it.
 
 ## Limits
 
-- The outbox relay, derivation backfill, shard-local jobs and the job
-  dashboard work on the control database, not on fleet databases. Enqueue
-  through the control database.
-- Each open database runs its own commit-hook worker, in every process role
-  (`web` included: a `worker` process does not open fleet databases). Hooks
-  queued in a database drain while it is open, and resume on its next open.
+- Shard-local jobs and the job dashboard work on the control database, not
+  on fleet databases.
+- Each open database runs its own commit-hook worker, in every process role.
   Before a database closes (idle, `max_open`, shutdown), its worker
   finishes the hook it runs and acks it, for up to 10 seconds. A hook that
-  does not finish in that time can run again after the next open. Hooks stay
+  does not finish in that time can run again later. Hooks stay
   at-least-once: write them to be idempotent.
+- An outbox row written outside a transaction commits before the sweeper's
+  row. If that row cannot be written, the call returns an error for a
+  committed message: do not retry it. The next open of the database writes
+  the row.
 - A replicated database takes a fresh base snapshot each time it reopens.
   Size `max_open` so busy tenants stay open.
 - A deleted database's replica stays in object storage until you remove it.

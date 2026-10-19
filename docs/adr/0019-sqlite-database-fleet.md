@@ -200,15 +200,60 @@ destination as the control database:
 Taking over a slot range needs the old owner stopped first (a fencing epoch is
 roadmap item 2).
 
-### 6. What stays on the control database
+### 6. Background work: the fleet sweeper
 
-The outbox relay, derivation backfill, the job dashboard and shard-local jobs
-enumerate configured shards at boot and do not visit fleet databases. The
-commit-hook queue does: each open database runs its own commit-hook worker,
-which stops when the database closes and resumes on the next open. It runs in
-every process role, `web` included, because only a process that has the
-database open can drain its queue; rows are claimed under `BEGIN IMMEDIATE`
-with a lease, so two processes draining one database is safe.
+A fleet database runs background work only while it is open. The fleet
+sweeper (`autumn_web::db::fleet_sweeper`, issue 3234) does the work of
+databases that nobody asks for:
+
+- **Index.** `_autumn_fleet_pending(key, kind, since)` on the control
+  database lists the databases with work. `kind` is `outbox`, `hooks` or
+  `backfill`. The sweeper never opens a file to find work. Two more columns
+  hold the backoff of a database (`visit_after`, `attempts`).
+- **Mark.** An outbox write and a commit-hook enqueue write a row for their
+  database after the insert and before the commit, while they hold the
+  tenant write lock. Enqueue code has only a connection: it finds its fleet
+  by the file of the connection (`pragma_database_list`) and its key by the
+  identity row. When the row cannot be written, the write fails.
+- **Clear.** A visit removes a row only under the tenant write lock
+  (`BEGIN IMMEDIATE`), after it finds no work of that kind. Marks and clears
+  therefore never interleave, and committed work always has a row. The lock
+  order is always tenant database, then control database. A rolled-back
+  write can leave a row with no work; the next visit removes it.
+- **Open.** When a database opens, it gets a row for each kind of work it
+  holds. This covers work that an earlier process left without a row.
+- **Derivations.** The control database records a fingerprint of the
+  registered derivations. When it changes, a worker lists the files and
+  marks each database `backfill`. It opens none to do this. When a database
+  opens, it runs up to 8 backfill batches before its first request; the
+  sweeper does the rest. A binary whose fingerprint is not the recorded one
+  never removes a `backfill` row, so an old process in a rolling deploy
+  cannot clear the work of a new derivation.
+- **Visit.** A worker process (its `role` runs workers) opens each listed
+  database with `DatabaseFleet::open_background`. That open never creates a
+  file, never restores one from a replica, and never takes the fleet past
+  `max_open`: with no room, the database waits for the next pass. It does
+  not count as a use, so the database is the first LRU victim. The visit
+  drains hooks, sends the outbox (in a tenant fleet, handlers run in the
+  tenant's scope), purges old outbox rows and runs the backfill. Then
+  `close_if_unused` closes the database, but only when nobody used it and
+  nobody holds a lease on it. A deleted database loses its rows at its next
+  visit.
+- **Roles.** Every role installs the index and the marks; a failed install
+  stops the process. A `web` process visits only the databases it has open
+  with hook rows: it drains the hooks and clears the rows. A worker leaves
+  the hook rows of a closed database alone for `hook_grace` (5 s), as the
+  process that has it open drains them.
+- **Bounds.** Each pass visits at most 64 databases, 4 at a time, with 256
+  messages and 4 backfill rounds each. When a visit leaves work and does
+  nothing, the database waits 1 s, then twice as long each time, up to
+  5 min. The index stores this wait, so a stuck database never hides the
+  others. `/actuator/health` reports `fleet:sweeper`: the backlog
+  (databases), the oldest pending age, and the counts of the last pass.
+
+The sweeper opens and closes databases through the normal fleet paths, so
+the rules of #3231 (workers stop before the pool closes) and #3230 (one
+replicator per database across processes) hold for its opens too.
 
 ## Consequences
 
@@ -228,8 +273,17 @@ with a lease, so two processes draining one database is safe.
 
 - Cross-tenant reads (`CrossShard`, `each_shard`, `across_tenants()`) open every
   database on disk. That is admin-path work, not a hot path.
-- Outbox rows and derivation backfill are not supported on fleet databases
-  yet (roadmap item 3). Enqueue through the control database.
+- Each outbox write and commit-hook enqueue on a fleet database adds three
+  reads on the tenant database and one on the control database, and one
+  control write when the database has no row yet.
+- Do not enqueue on a fleet database while you hold a write transaction on
+  the control database. The mark needs the control write lock, so it waits
+  for `busy_timeout` and then fails.
+- An outbox row written outside a transaction commits before its mark. If
+  the mark then fails, the call returns an error for a committed row: do not
+  retry it. The next open of the database writes the row.
+- The first pass of a worker after a derivation change marks every database.
+  The sweeper then opens each once.
 - A replicated database pays one base snapshot per open/close cycle, because
   the replicator's generation state lives in memory. Size `max_open` so hot
   tenants stay open.
@@ -249,8 +303,8 @@ with a lease, so two processes draining one database is safe.
    `restore_missing` serves it (CloudKit's incarnation counter, Notion's
    logical-shard moves). This joins `cell_router.rs` (tenant → cell by the
    same slot hash) to the fleet.
-3. **Fleet sweeper.** Visit databases with pending outbox rows, commit hooks
-   or derivation backfill without waiting for traffic.
+3. **Fleet sweeper.** Done: see section 6
+   ([#3234](https://github.com/autumn-foundation/autumn/issues/3234)).
 4. **Replica lifecycle.** Delete a database's replica with it; verify
    restores by sampling.
 5. **Query the lake.** Cross-tenant analytics over the replicas in object
@@ -279,6 +333,12 @@ with a lease, so two processes draining one database is safe.
   `VACUUM INTO` backup, refusal of pending migrations, lifecycle hooks.
 - `autumn-cli/tests/integration/fleet_cli.rs`: each `autumn fleet` subcommand
   against a temporary fleet root; `restore` from a local replica.
+- `autumn/src/db/fleet_sweeper.rs` tests: index marks and clears, marks from
+  a connection, two fleets in one process.
+- `autumn/tests/sqlite_fleet_sweeper.rs`: an outbox row relayed after its
+  database closes, hooks drained without a request, a derivation added in a
+  migration backfilled in a closed tenant, `max_open` and leases respected,
+  the `fleet:sweeper` health indicator.
 - `autumn/tests/sqlite_fleet.rs`: `ShardedDb`, a `#[repository(tenant_scoped,
   sharded)]` repository, `CrossShard` and `each_shard` against a tenant fleet
   and a slot fleet over HTTP; `400` / `404` / `409` paths; `db:fleet` health.
