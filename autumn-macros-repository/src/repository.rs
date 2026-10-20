@@ -4086,6 +4086,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let trait_name_lit = trait_name.to_string();
         let pg_name_lit = pg_name.to_string();
         let model_name_lit = config.model_name.to_string();
+        let crate_version = autumn_macros_support::graph::crate_version();
         quote! {
             ::autumn_web::reexports::inventory::submit! {
                 ::autumn_web::graph::RepositoryGraphDescriptor {
@@ -4095,6 +4096,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     table: #table_name,
                     api: #graph_api_path,
                     module_path: ::core::module_path!(),
+                    crate_version: #crate_version,
                     file: ::core::file!(),
                     line: ::core::line!(),
                 }

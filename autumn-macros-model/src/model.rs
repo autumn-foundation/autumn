@@ -8046,6 +8046,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let tables = graph_relation_tables.iter().map(String::as_str);
         quote! { &[#(#tables),*] }
     };
+    let graph_crate_version = autumn_macros_support::graph::crate_version();
 
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
@@ -11677,6 +11678,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 table: #table_name,
                 relations: #graph_relations,
                 module_path: ::core::module_path!(),
+                crate_version: #graph_crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
             }

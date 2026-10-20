@@ -958,6 +958,7 @@ pub fn emit_route_descriptor(
     let body = emit_symbol_slice(&candidate_symbols(&body_tokens));
     let sql = emit_symbol_slice(&sql_candidate_symbols(&body_tokens));
     let handler = input_fn.sig.ident.to_string();
+    let crate_version = autumn_macros_support::graph::crate_version();
     quote! {
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::graph::RouteGraphDescriptor {
@@ -966,6 +967,7 @@ pub fn emit_route_descriptor(
                 method: #method,
                 path: #path,
                 static_route: #static_route,
+                crate_version: #crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
                 signature_symbols: #signature,
@@ -999,6 +1001,7 @@ pub fn emit_job_descriptor(
     let bindings = emit_binding_slice(&signature_bindings(&input_fn.sig));
     let handler = input_fn.sig.ident.to_string();
     let kind_ident = syn::Ident::new(kind, proc_macro2::Span::call_site());
+    let crate_version = autumn_macros_support::graph::crate_version();
     quote! {
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::graph::JobGraphDescriptor {
@@ -1009,6 +1012,7 @@ pub fn emit_job_descriptor(
                 schedule: #schedule,
                 mutating: #mutating,
                 mutating_symbols: #mutating_symbols,
+                crate_version: #crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
                 signature_symbols: #signature,

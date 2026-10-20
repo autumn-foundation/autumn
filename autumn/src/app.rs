@@ -4983,7 +4983,7 @@ impl AppBuilder {
         // Web and combined roles build the full application router. All the
         // route/router-context inputs assembled above are simply dropped in the
         // worker branch.
-        // Publish the architecture graph this process serves (#1747) before the
+        // Publish the architecture graph this app serves (#1747) before the
         // router is built, so `/actuator/graph` answers from the first request
         // rather than after some later warm-up. This is the *serving* path —
         // the static-build and capsule-replay paths publish their own below.
@@ -5018,7 +5018,10 @@ impl AppBuilder {
         } else {
             (graph_worker_mounted_routes(&config), 0)
         };
-        crate::graph::install(crate::graph::manifest::audit(&graph_mounted, graph_opaque));
+        crate::graph::install(
+            &state,
+            crate::graph::manifest::audit(&graph_mounted, graph_opaque),
+        );
 
         let router_build = if role.serves_http() {
             crate::router::try_build_router_with_static_inner(
@@ -6927,7 +6930,7 @@ impl AppBuilder {
         state.insert_extension(config.clone());
         state.insert_extension(crate::aeo::RegisteredAgentSkills(agent_skills));
         state.insert_extension(commerce_docs);
-        // Publish the architecture graph this process serves (#1747) before the
+        // Publish the architecture graph this app serves (#1747) before the
         // router is built, so `/actuator/graph` can answer from the first
         // request rather than after some later warm-up.
         // The agent documents list the API that `dist/openapi.json` (written
@@ -6947,20 +6950,23 @@ impl AppBuilder {
         };
         #[cfg(not(feature = "openapi"))]
         let census_config = config.clone();
-        crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(
-                &all_routes,
-                &scoped_groups,
-                &[],
-                &census_config,
-                #[cfg(feature = "openapi")]
-                static_openapi.as_ref(),
+        crate::graph::install(
+            &state,
+            crate::graph::manifest::audit(
+                &graph_mounted_routes(
+                    &all_routes,
+                    &scoped_groups,
+                    &[],
+                    &census_config,
+                    #[cfg(feature = "openapi")]
+                    static_openapi.as_ref(),
+                ),
+                // The static-build path builds its router with no nest mounts and
+                // no declared plugin routes (see the `RouterContext` below), so the
+                // merge count is the whole opaque surface here.
+                omitted_router_count(merge_routers.len(), std::iter::empty::<&str>(), &[]),
             ),
-            // The static-build path builds its router with no nest mounts and
-            // no declared plugin routes (see the `RouterContext` below), so the
-            // merge count is the whole opaque surface here.
-            omitted_router_count(merge_routers.len(), std::iter::empty::<&str>(), &[]),
-        ));
+        );
         // The router build installs the AEO site in the state's shared
         // extensions; the agent documents below read its home `Link`s.
         let aeo_state = state.clone();
@@ -8983,22 +8989,25 @@ impl AppBuilder {
         let router_state = state.clone();
         // See the matching call in `run()`: the graph is published before the
         // router is built so `/actuator/graph` answers from the first request.
-        crate::graph::install(crate::graph::manifest::audit(
-            &graph_mounted_routes(
-                &routes,
-                &scoped_groups,
-                &declared_routes,
-                &config,
-                // The replay router mounts no `OpenAPI` routes.
-                #[cfg(feature = "openapi")]
-                None,
+        crate::graph::install(
+            &state,
+            crate::graph::manifest::audit(
+                &graph_mounted_routes(
+                    &routes,
+                    &scoped_groups,
+                    &declared_routes,
+                    &config,
+                    // The replay router mounts no `OpenAPI` routes.
+                    #[cfg(feature = "openapi")]
+                    None,
+                ),
+                omitted_router_count(
+                    merge_routers.len(),
+                    nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+                    &declared_routes,
+                ),
             ),
-            omitted_router_count(
-                merge_routers.len(),
-                nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
-                &declared_routes,
-            ),
-        ));
+        );
         let router = crate::router::try_build_router_inner(
             routes,
             &config,

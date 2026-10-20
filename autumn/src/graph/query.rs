@@ -63,7 +63,13 @@ pub fn resolve_all<'g>(graph: &'g ArchitectureGraph, name: &str) -> Vec<&'g Grap
     };
     let tiers: [Vec<&'g GraphNode>; 6] = [
         all(&|n: &GraphNode| n.id == name),
-        all(&|n: &GraphNode| n.id.strip_prefix("model:") == Some(name)),
+        // A model path names every version of the model: an id can end in
+        // `@<version>` (#2520 item 14).
+        all(&|n: &GraphNode| {
+            n.id.strip_prefix("model:")
+                .map(|path| path.split_once('@').map_or(path, |(path, _)| path))
+                == Some(name)
+        }),
         all(&|n: &GraphNode| n.kind == NodeKind::Model && n.name == name),
         all(&|n: &GraphNode| {
             n.model
@@ -250,6 +256,7 @@ mod tests {
         module_path: "app::models",
         file: "src/models.rs",
         line: 1,
+        crate_version: "0.1.0",
     }];
 
     const REPOSITORIES: &[RepositoryGraphDescriptor] = &[RepositoryGraphDescriptor {
@@ -261,6 +268,7 @@ mod tests {
         module_path: "app::repositories",
         file: "src/repositories.rs",
         line: 1,
+        crate_version: "0.1.0",
     }];
 
     const ROUTES: &[RouteGraphDescriptor] = &[
@@ -273,6 +281,7 @@ mod tests {
             static_route: false,
             file: "src/routes/posts.rs",
             line: 1,
+            crate_version: "0.1.0",
             signature_symbols: &["PgPostRepository"],
             body_symbols: &[],
             sql_symbols: &[],
@@ -286,6 +295,7 @@ mod tests {
             static_route: false,
             file: "src/routes/posts.rs",
             line: 2,
+            crate_version: "0.1.0",
             signature_symbols: &[],
             body_symbols: &["posts"],
             sql_symbols: &[],
@@ -299,6 +309,7 @@ mod tests {
             static_route: true,
             file: "src/routes/about.rs",
             line: 1,
+            crate_version: "0.1.0",
             signature_symbols: &[],
             body_symbols: &[],
             sql_symbols: &[],
@@ -315,6 +326,7 @@ mod tests {
         mutating_symbols: &[],
         file: "src/tasks.rs",
         line: 1,
+        crate_version: "0.1.0",
         signature_symbols: &[],
         signature_bindings: &[],
         dot_mutation_receivers: &[],
@@ -377,6 +389,7 @@ mod tests {
                 module_path: "app::models",
                 file: "src/models.rs",
                 line: 1,
+                crate_version: "0.1.0",
             },
             ModelGraphDescriptor {
                 model: "Post",
@@ -386,6 +399,7 @@ mod tests {
                 module_path: "plugin::models",
                 file: "src/lib.rs",
                 line: 1,
+                crate_version: "0.1.0",
             },
         ];
         let g = build(&[], 0, ROUTES, TWO_POSTS, REPOSITORIES, JOBS);
@@ -401,6 +415,34 @@ mod tests {
             "so must the route reaching Post through the repository: {:?}",
             answer.routes
         );
+    }
+
+    /// Item 14 of #2520: a model path names every version of the model.
+    #[test]
+    fn a_model_path_resolves_every_version_of_it() {
+        const TWO_VERSIONS: &[ModelGraphDescriptor] = &[
+            ModelGraphDescriptor {
+                crate_version: "1.0.0",
+                ..MODELS[0]
+            },
+            ModelGraphDescriptor {
+                crate_version: "2.0.0",
+                ..MODELS[0]
+            },
+        ];
+        let g = build(&[], 0, &[], TWO_VERSIONS, &[], &[]);
+        let ids: Vec<&str> = resolve_all(&g, "app::models::Post")
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "model:app::models::Post@1.0.0",
+                "model:app::models::Post@2.0.0"
+            ]
+        );
+        assert_eq!(resolve_all(&g, "model:app::models::Post@2.0.0").len(), 1);
     }
 
     #[test]

@@ -1577,6 +1577,33 @@ Most apps need no change. Two cases need a look:
 
 **Automation:** `manual` — whether a retry may run twice is the app's call.
 
+### Graph: `served()` takes the app's `AppState`
+
+**Why:** The served architecture graph was process-global. A second application
+in one process served the graph of the first, with its paths and auth (issue
+#2520). Each application now keeps its own graph in its `AppState`.
+
+**Before (`{X.Y}`):**
+
+```rust
+let graph: Option<&'static ArchitectureGraph> = autumn_web::graph::served();
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let graph: Option<Arc<ArchitectureGraph>> = autumn_web::graph::served(&state);
+```
+
+A custom `ProvideActuatorState` gets a new `architecture_graph_json` method. Its
+default returns `None`, so `/actuator/graph` answers `503` for that state.
+`AppState` overrides it.
+
+The graph descriptor types in `autumn_web::graph` have a new `crate_version`
+field. The macros fill it. Do not build these types by hand.
+
+**Automation:** `manual` — pass the state to `served`.
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /

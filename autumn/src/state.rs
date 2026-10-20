@@ -1268,6 +1268,10 @@ impl crate::actuator::ProvideActuatorState for AppState {
             .map(|handle| (*handle).clone())
     }
 
+    fn architecture_graph_json(&self) -> Option<bytes::Bytes> {
+        crate::graph::served_json(self)
+    }
+
     fn data_capsules(
         &self,
     ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::DataCapsuleError>

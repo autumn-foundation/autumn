@@ -16,9 +16,8 @@
 //! `autumn graph` therefore builds the app and runs it under
 //! `AUTUMN_DUMP_GRAPH=1` to read the graph back — the same shape as
 //! `autumn data-flow` (#1654), `autumn agents manifest` (#1691) and
-//! `autumn routes audit` (#1604). The same graph is served from the running
-//! binary at `/actuator/graph`, so nothing has to be kept in sync with a side
-//! file.
+//! `autumn routes audit` (#1604). Each application also serves its graph at
+//! `/actuator/graph`, so nothing has to be kept in sync with a side file.
 //!
 //! # What the derivation can and cannot see
 //!
@@ -41,7 +40,8 @@
 //! Name-only matching applies only where no qualified identity exists. A route
 //! body that names a bare `Post` cannot say which crate's `Post` it means, so
 //! each one gets an edge. Where a descriptor carries more — a repository's
-//! resolved table, an auto-API route's prefix and model — the join uses it.
+//! resolved table and crate version, an auto-API route's prefix and model —
+//! the join uses it.
 //!
 //! Every edge therefore carries its [`Provenance`], and the manifest carries
 //! these limits in its own `limits` section, so the document cannot be read as
@@ -52,56 +52,50 @@
 pub mod manifest;
 pub mod query;
 
-use std::sync::OnceLock;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::AppState;
 use manifest::ArchitectureGraph;
 
-/// The graph this process serves from `/actuator/graph`.
+/// The graph one application serves, and the bytes `/actuator/graph` sends.
 ///
-/// A process-wide `OnceLock` rather than a field on `AppState`: the graph is a
-/// property of the *binary*, identical for every request and every clone of the
-/// state, and threading an immutable whole-binary fact through the request state
-/// would only create a second place for it to go stale.
-static SERVED_GRAPH: OnceLock<ServedGraph> = OnceLock::new();
-
-/// The installed graph, alongside the bytes `/actuator/graph` serves.
-///
-/// The document can never change once installed, so re-serializing it per
-/// request would walk every node and edge and allocate the whole body again —
-/// on what is comfortably the largest actuator payload an app has.
+/// Kept in the application's `AppState` extensions, not in a process global.
+/// The graph holds per-application data (mounted paths, auth, completeness),
+/// so two applications in one process must not share it (#2520 item 17).
+/// The JSON is serialized once, at install.
 struct ServedGraph {
-    graph: ArchitectureGraph,
-    json: Vec<u8>,
+    graph: Arc<ArchitectureGraph>,
+    json: Bytes,
 }
 
-/// Publish the graph this process serves.
+/// Publish the graph that `state`'s application serves.
 ///
-/// `pub(crate)` on purpose: whichever caller wins decides what
-/// `/actuator/graph` reports for the life of the process, and that is the
-/// framework's own account of the binary — not something a dependency should
-/// be able to pre-empt during static initialization.
-///
-/// Idempotent: the first call wins and later ones are ignored, so a process
-/// that builds several routers cannot make the endpoint's answer depend on
-/// which one was built last.
-pub(crate) fn install(graph: ArchitectureGraph) {
-    let _ = SERVED_GRAPH.set(ServedGraph {
-        json: serde_json::to_vec(&graph).unwrap_or_default(),
-        graph,
+/// `pub(crate)`: the framework installs it when it builds the router. A later
+/// install for the same state replaces the earlier one. All clones of `state`
+/// share its extensions, so a router built from an earlier clone sees it.
+pub(crate) fn install(state: &AppState, graph: ArchitectureGraph) {
+    state.insert_extension(ServedGraph {
+        json: Bytes::from(serde_json::to_vec(&graph).unwrap_or_default()),
+        graph: Arc::new(graph),
     });
 }
 
-/// The graph this process serves, if one has been installed.
+/// The graph that `state`'s application serves, if one is installed.
 #[must_use]
-pub fn served() -> Option<&'static ArchitectureGraph> {
-    SERVED_GRAPH.get().map(|served| &served.graph)
+pub fn served(state: &AppState) -> Option<Arc<ArchitectureGraph>> {
+    state
+        .extension::<ServedGraph>()
+        .map(|served| Arc::clone(&served.graph))
 }
 
-/// The pre-serialized bytes of [`served`], if one has been installed.
-pub(crate) fn served_json() -> Option<&'static [u8]> {
-    SERVED_GRAPH.get().map(|served| served.json.as_slice())
+/// The serialized bytes of [`served`], if a graph is installed.
+pub(crate) fn served_json(state: &AppState) -> Option<Bytes> {
+    state
+        .extension::<ServedGraph>()
+        .map(|served| served.json.clone())
 }
 
 // ── Descriptors published by the macros ──────────────────────────────
@@ -127,6 +121,10 @@ pub struct RouteGraphDescriptor {
     pub path: &'static str,
     /// Whether the handler was declared with `#[static_get]`.
     pub static_route: bool,
+    /// Version of the crate that declared this element (`CARGO_PKG_VERSION`),
+    /// or `""` outside Cargo. A node id carries it only when two versions of
+    /// one crate give the same id (#2520 item 14).
+    pub crate_version: &'static str,
     /// `file!()` of the handler.
     pub file: &'static str,
     /// `line!()` of the handler.
@@ -166,6 +164,10 @@ pub struct ModelGraphDescriptor {
     pub relations: &'static [&'static str],
     /// Module path the model was declared in.
     pub module_path: &'static str,
+    /// Version of the crate that declared this element (`CARGO_PKG_VERSION`),
+    /// or `""` outside Cargo. A node id carries it only when two versions of
+    /// one crate give the same id (#2520 item 14).
+    pub crate_version: &'static str,
     /// `file!()` of the declaration.
     pub file: &'static str,
     /// `line!()` of the declaration.
@@ -192,6 +194,10 @@ pub struct RepositoryGraphDescriptor {
     pub api: &'static str,
     /// Module path the repository was declared in.
     pub module_path: &'static str,
+    /// Version of the crate that declared this element (`CARGO_PKG_VERSION`),
+    /// or `""` outside Cargo. A node id carries it only when two versions of
+    /// one crate give the same id (#2520 item 14).
+    pub crate_version: &'static str,
     /// `file!()` of the declaration.
     pub file: &'static str,
     /// `line!()` of the declaration.
@@ -242,6 +248,10 @@ pub struct JobGraphDescriptor {
     /// An edge to one of these is a write. Other edges stay reads, unless
     /// [`Self::mutating`] is true.
     pub mutating_symbols: &'static [&'static str],
+    /// Version of the crate that declared this element (`CARGO_PKG_VERSION`),
+    /// or `""` outside Cargo. A node id carries it only when two versions of
+    /// one crate give the same id (#2520 item 14).
+    pub crate_version: &'static str,
     /// `file!()` of the handler.
     pub file: &'static str,
     /// `line!()` of the handler.
@@ -575,6 +585,48 @@ mod tests {
         assert!(is_safe_method("get"));
         assert!(is_safe_method("GET"));
         assert!(!is_safe_method("post"));
+    }
+
+    /// A graph that names one unmodelled mount, so two graphs differ.
+    fn graph_serving(path: &str) -> ArchitectureGraph {
+        let mounted = MountedRoute {
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            handler: "h".to_owned(),
+            module_path: "m".to_owned(),
+            auth: RouteAuth::default(),
+            repository_api: None,
+            auth_declared: false,
+        };
+        manifest::build(&[mounted], 0, &[], &[], &[], &[])
+    }
+
+    /// Item 17 of #2520: two apps in one process serve their own graphs.
+    #[test]
+    fn each_state_serves_its_own_graph() {
+        let first = crate::AppState::test_default();
+        let second = crate::AppState::test_default();
+        install(&first, graph_serving("/first"));
+        install(&second, graph_serving("/second"));
+        assert_eq!(*served(&first).expect("first"), graph_serving("/first"));
+        assert_eq!(*served(&second).expect("second"), graph_serving("/second"));
+    }
+
+    /// The router holds a clone of the state made before the install.
+    #[test]
+    fn a_clone_made_before_install_serves_the_graph() {
+        let state = crate::AppState::test_default();
+        let router_state = state.clone();
+        install(&state, graph_serving("/a"));
+        assert_eq!(*served(&router_state).expect("graph"), graph_serving("/a"));
+        assert!(served_json(&router_state).is_some());
+    }
+
+    #[test]
+    fn a_state_with_no_install_serves_no_graph() {
+        let state = crate::AppState::test_default();
+        assert!(served(&state).is_none());
+        assert!(served_json(&state).is_none());
     }
 
     #[test]

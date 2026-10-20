@@ -414,6 +414,15 @@ pub trait ProvideActuatorState {
         None
     }
 
+    /// Returns the serialized architecture graph served at `/actuator/graph`.
+    ///
+    /// The default returns `None`, and the endpoint answers `503`.
+    /// [`crate::AppState`] overrides this to return the graph that the
+    /// framework installed when it built this application's router.
+    fn architecture_graph_json(&self) -> Option<bytes::Bytes> {
+        None
+    }
+
     /// Returns the shadow-mirroring handle, when this replica assembled a
     /// mirror (`[shadow] enabled = true` with a reachable target configured).
     ///
@@ -4804,26 +4813,28 @@ fn derivation_report(
 /// route, its auth requirement, and which table each one touches -- a map of
 /// exactly where an attacker would look first, so it is not a public surface.
 ///
-/// A build that never installed a graph answers `503` with an explanation
-/// rather than `404`, so an operator can tell "this process has not published
-/// one" apart from "this build has no such endpoint".
-pub(crate) async fn graph_endpoint() -> axum::response::Response {
-    graph_response(crate::graph::served_json())
+/// The graph is read from the state, so each application serves its own
+/// (#2520 item 17).
+///
+/// A state with no installed graph answers `503` with an explanation, not
+/// `404`. Then an operator can tell "this process has not published one"
+/// from "this build has no such endpoint".
+pub(crate) async fn graph_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> axum::response::Response {
+    graph_response(state.architecture_graph_json())
 }
 
 /// Render the `/actuator/graph` response for a given installed graph.
 ///
-/// Split from the handler because the installed graph is a process-wide
-/// `OnceLock`: a test that installed one to exercise the "present" branch would
-/// decide the answer for every other test in the process. The branch is the
-/// behaviour worth testing, and it is testable here without that coupling.
-fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
+/// Split from the handler so the two branches are testable without a state.
+fn graph_response(graph: Option<bytes::Bytes>) -> axum::response::Response {
     graph.map_or_else(
         || {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "error": "no architecture graph is installed in this process",
+                    "error": "no architecture graph is installed for this application",
                     "hint": "the graph is published when the application router is built; a \
                              process that serves requests without building one (a bare \
                              `axum::Router` in a test, say) has none to report",
@@ -5543,7 +5554,7 @@ pub(crate) fn actuator_router_with_prefix<
             )
             .route(
                 &actuator_route_path(prefix, "/graph"),
-                axum::routing::get(graph_endpoint),
+                axum::routing::get(graph_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/capsules/export"),
@@ -7855,22 +7866,10 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[tokio::test]
-    async fn actuator_graph_serves_the_installed_graph_over_http() {
-        // The one test that proves the endpoint works end to end: install a
-        // graph, mount the real sensitive actuator router, and GET it. The
-        // `graph_response` unit tests below cannot catch a missing or misplaced
-        // `crate::graph::install` call — Codex round 1 found exactly that, with
-        // every unit test passing while a running app answered 503 forever.
-        //
-        // Sole installer in this test binary, on purpose: the installed graph
-        // is a process-wide `OnceLock`, so a second test installing its own
-        // would decide this one's answer. The install-site guard lives in
-        // `app::tests::graph_installed_before_every_router_build`.
-        crate::graph::install(crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]));
-
-        let app = actuator_router(true).with_state(test_state());
-        let resp = app
+    /// GET `/actuator/graph` on a real sensitive router over `state`.
+    async fn get_graph(state: crate::AppState) -> axum::response::Response {
+        actuator_router(true)
+            .with_state(state)
             .oneshot(
                 Request::builder()
                     .uri("/actuator/graph")
@@ -7878,7 +7877,21 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
                     .unwrap(),
             )
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_serves_the_installed_graph_over_http() {
+        // End to end: install a graph, mount the real sensitive router, GET it.
+        // The install-site guard is
+        // `app::tests::graph_installed_before_every_router_build`.
+        let state = crate::AppState::test_default();
+        crate::graph::install(
+            &state,
+            crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]),
+        );
+
+        let resp = get_graph(state).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -7897,11 +7910,57 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         );
     }
 
+    /// Item 17 of #2520: the second app in a process serves its own graph,
+    /// not the first app's.
+    #[tokio::test]
+    async fn two_apps_in_one_process_serve_their_own_graphs() {
+        let graph_with = |jobs: usize| {
+            let mut graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
+            graph.completeness.jobs = jobs;
+            graph
+        };
+        let first = crate::AppState::test_default();
+        let second = crate::AppState::test_default();
+        crate::graph::install(&first, graph_with(1));
+        crate::graph::install(&second, graph_with(2));
+
+        for (state, jobs) in [(first, 1), (second, 2)] {
+            let resp = get_graph(state).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let decoded: crate::graph::manifest::ArchitectureGraph =
+                serde_json::from_slice(&body).expect("graph document");
+            assert_eq!(decoded.completeness.jobs, jobs);
+        }
+    }
+
+    /// A state with no installed graph answers 503. This includes a custom
+    /// `ProvideActuatorState` that keeps the default method.
+    #[tokio::test]
+    async fn actuator_graph_is_unavailable_for_a_state_with_no_graph() {
+        let resp = get_graph(crate::AppState::test_default()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = actuator_router(true)
+            .with_state(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test]
     async fn actuator_graph_serves_the_installed_graph() {
         let graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
         let json = serde_json::to_vec(&graph).expect("serialize");
-        let resp = graph_response(Some(json.leak()));
+        let resp = graph_response(Some(bytes::Bytes::from(json)));
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
