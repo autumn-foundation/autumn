@@ -254,7 +254,12 @@ databases that nobody asks for:
   nothing, the database waits 1 s, then twice as long each time, up to
   5 min. New work of the same kind ends the wait. A visit that made
   progress and left work moves the database behind the others that are
-  due, so busy databases take turns. A worker runs its first pass when it
+  due, so busy databases take turns. A pass reads the due rows of the open
+  databases and the oldest due rows, and puts them in one order: the row
+  due first goes first, then the oldest row. An open database goes first
+  only on a tie, as its visit opens nothing. A new row is due at the time of
+  its mark. Thus busy open databases never hold back a closed one
+  (issue 3350). A worker runs its first pass when it
   starts, before it waits for the interval. The index stores this wait, so a stuck database never hides the
   others. `/actuator/health` reports `fleet:sweeper`: the backlog
   (databases), the oldest pending age, and the counts of the last pass.

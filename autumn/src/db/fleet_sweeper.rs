@@ -292,9 +292,10 @@ impl FleetPendingIndex {
             None => self.insert(&mut conn, key, kind).await,
             // New work ends the backoff of older work of the same kind.
             Some(row) if row.n > 0 => diesel::sql_query(format!(
-                "UPDATE {PENDING_TABLE} SET visit_after = 0, attempts = 0 \
+                "UPDATE {PENDING_TABLE} SET visit_after = MIN(visit_after, ?), attempts = 0 \
                  WHERE key = ? AND kind = ?"
             ))
+            .bind::<BigInt, _>(self.clock.now().timestamp_millis())
             .bind::<Text, _>(key)
             .bind::<Text, _>(kind.as_str())
             .execute(&mut *conn)
@@ -305,21 +306,24 @@ impl FleetPendingIndex {
         }
     }
 
-    /// Insert a row, or end the backoff of the row that exists: new work is
-    /// due at once. Keeps the time of an existing row.
+    /// Insert a row, or end the backoff of the row that exists. The row is due
+    /// now, behind the rows due before it. Keeps the time of an existing row.
     async fn insert(
         &self,
         conn: &mut RuntimeConnection,
         key: &str,
         kind: PendingKind,
     ) -> AutumnResult<()> {
+        let now = self.clock.now().timestamp_millis();
         diesel::sql_query(format!(
-            "INSERT INTO {PENDING_TABLE} (key, kind, since) VALUES (?, ?, ?) \
-             ON CONFLICT (key, kind) DO UPDATE SET visit_after = 0, attempts = 0"
+            "INSERT INTO {PENDING_TABLE} (key, kind, since, visit_after) VALUES (?, ?, ?, ?) \
+             ON CONFLICT (key, kind) DO UPDATE \
+             SET visit_after = MIN(visit_after, excluded.visit_after), attempts = 0"
         ))
         .bind::<Text, _>(key)
         .bind::<Text, _>(kind.as_str())
-        .bind::<BigInt, _>(self.clock.now().timestamp_millis())
+        .bind::<BigInt, _>(now)
+        .bind::<BigInt, _>(now)
         .execute(conn)
         .await
         .map(drop)
@@ -1138,10 +1142,10 @@ impl FleetSweeper {
         Ok(())
     }
 
-    /// The databases to visit this pass: the ones open here first, then (in
-    /// a worker) those of the oldest rows. Rows in backoff are not read. A
-    /// worker leaves young hook rows of a closed database alone; a web process
-    /// takes only hook rows, as it relays nothing.
+    /// The databases to visit this pass: the due rows of the ones open here
+    /// and (in a worker) the oldest due rows, in one order. Rows in backoff
+    /// are not read. A worker leaves young hook rows of a closed database
+    /// alone; a web process takes only hook rows, as it relays nothing.
     async fn candidates(&self) -> AutumnResult<Vec<String>> {
         let inner = &self.inner;
         if inner.stop.is_cancelled() {
@@ -1371,16 +1375,29 @@ impl FleetSweeper {
     }
 }
 
-/// The databases one pass visits, at most `budget`. A worker leaves hook
-/// rows written after `hooks_before` alone in a closed database. A web
-/// process takes only hook rows.
+/// The databases one pass visits, at most `budget`. The row due first goes
+/// first, then the oldest row (issue 3350). An open database goes first only
+/// on a tie: its visit opens nothing. A worker leaves hook rows written after
+/// `hooks_before` alone in a closed database. A web process takes only hook
+/// rows.
 fn pick(
-    rows: Vec<Due>,
+    mut rows: Vec<Due>,
     open: &BTreeSet<String>,
     relay: bool,
     hooks_before: DateTime<Utc>,
     budget: usize,
 ) -> Vec<String> {
+    rows.sort_by(|a, b| {
+        a.visit_after
+            .cmp(&b.visit_after)
+            .then(a.entry.since.cmp(&b.entry.since))
+            .then(
+                open.contains(&b.entry.key)
+                    .cmp(&open.contains(&a.entry.key)),
+            )
+            .then_with(|| a.entry.key.cmp(&b.entry.key))
+            .then(a.entry.kind.cmp(&b.entry.kind))
+    });
     let mut chosen: Vec<String> = Vec::new();
     for Due { entry, .. } in rows {
         let hooks = entry.kind == PendingKind::Hooks;
