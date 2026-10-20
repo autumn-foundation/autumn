@@ -147,6 +147,12 @@ pub const MAX_RESULT_BYTES: usize = 512 * 1024;
 /// Longest accepted plugin row id, in bytes.
 pub const MAX_ROW_ID_BYTES: usize = 128;
 
+/// The longest job id a [`JobSink`] may assign.
+///
+/// The id goes back to the guest after the job is queued, so it is bounded where
+/// it enters the reply.
+pub const MAX_JOB_ID_BYTES: usize = 128;
+
 // ── Values ───────────────────────────────────────────────────────────────
 
 /// One scalar in a plugin row or job payload.
@@ -816,6 +822,39 @@ impl CapabilityCall {
         }
     }
 
+    /// [`target`](Self::target), already cut to what the ledger keeps.
+    ///
+    /// Used before any check has run, so it never copies more than
+    /// [`MAX_TARGET_CHARS`] characters of a guest string. A URL is cut first, to
+    /// keep the host parse bounded too.
+    #[must_use]
+    pub fn target_excerpt(&self) -> String {
+        /// Enough for any real authority; the excerpt is far shorter.
+        const URL_PREFIX_CHARS: usize = 4096;
+        match self {
+            Self::KvGet { key, .. } | Self::KvSet { key, .. } | Self::KvDelete { key, .. } => {
+                bounded_target(key)
+            }
+            Self::HttpFetch { url, .. } => {
+                let end = url
+                    .char_indices()
+                    .nth(URL_PREFIX_CHARS)
+                    .map_or(url.len(), |(index, _)| index);
+                let prefix = &url[..end];
+                bounded_target(
+                    &outbound::host_of(prefix)
+                        .unwrap_or_else(|| outbound::attempted_authority(prefix)),
+                )
+            }
+            Self::DbInsert { table, .. }
+            | Self::DbGet { table, .. }
+            | Self::DbQuery { table, .. }
+            | Self::DbUpdate { table, .. }
+            | Self::DbDelete { table, .. } => bounded_target(table),
+            Self::JobEnqueue { job_type, .. } => bounded_target(job_type),
+        }
+    }
+
     /// The operation name the audit ledger records.
     #[must_use]
     pub const fn operation(&self) -> &'static str {
@@ -1292,7 +1331,7 @@ impl CapabilityRuntime {
         // Bounded on the way in: `record` truncates and neutralises it, because
         // a KV key is a guest-chosen string that ends up in a log line and in
         // the rendered summary.
-        let named = call.target();
+        let named = call.target_excerpt();
 
         // The shared `calls` budget is charged first, for every dispatch —
         // including one that is about to be refused. A refusal is cheaper than
@@ -1340,6 +1379,14 @@ impl CapabilityRuntime {
             Ok(target) => target,
             Err(result) => return self.record(call, &named, result),
         };
+
+        // Shape before the per-capability charge, for the same reason: a call
+        // refused for its own malformed content never reaches a backend, and
+        // charging `db_writes` for it would deny a valid call that follows.
+        // The shared `calls` budget was already charged above.
+        if let Err(result) = self.validate(call) {
+            return self.record(call, &target, result);
+        }
 
         if let Err(field) = self.quotas.charge_capability(call) {
             return self.record(
@@ -1453,6 +1500,21 @@ impl CapabilityRuntime {
                 entry = super::manifest::rejected(entry)
             ),
         ))
+    }
+
+    /// The call's shape and size, checked without copying it or charging a quota.
+    fn validate(&self, call: &CapabilityCall) -> Result<(), CallResult> {
+        match call {
+            CapabilityCall::KvSet { .. } => kv::validate(self, call),
+            CapabilityCall::KvGet { .. } | CapabilityCall::KvDelete { .. } => Ok(()),
+            CapabilityCall::HttpFetch { .. } => outbound::check_request(self, call).map(|_| ()),
+            CapabilityCall::DbInsert { .. }
+            | CapabilityCall::DbGet { .. }
+            | CapabilityCall::DbQuery { .. }
+            | CapabilityCall::DbUpdate { .. }
+            | CapabilityCall::DbDelete { .. } => db::validate(call),
+            CapabilityCall::JobEnqueue { .. } => jobs::validate(call),
+        }
     }
 
     /// Run the call against its backend, everything already checked.
@@ -1636,6 +1698,234 @@ path = "/shop/panel"
             .iter()
             .map(|(key, value)| ((*key).to_owned(), PluginValue::Text((*value).to_owned())))
             .collect()
+    }
+
+    // ── Results an embedder's backend hands back (issue #2523) ───────
+
+    /// A store that answers with whatever it was given, to stand in for an
+    /// embedder's implementation that breaks the trait contract.
+    struct RogueStore {
+        inserted: String,
+        rows: Vec<PluginRow>,
+    }
+
+    impl db::PluginStore for RogueStore {
+        fn insert(&self, _: &db::Scope, _: PluginRow) -> Result<String, db::StoreError> {
+            Ok(self.inserted.clone())
+        }
+        fn get(&self, _: &db::Scope, _: &str) -> Result<Option<PluginRow>, db::StoreError> {
+            Ok(self.rows.first().cloned())
+        }
+        fn query(
+            &self,
+            _: &db::Scope,
+            _: &PluginRow,
+            _: usize,
+            _: usize,
+            _: Option<&str>,
+        ) -> Result<db::QueryPage, db::StoreError> {
+            Ok(db::QueryPage {
+                rows: self.rows.clone(),
+                truncated: false,
+            })
+        }
+        fn update(&self, _: &db::Scope, _: &str, _: PluginRow) -> Result<(), db::StoreError> {
+            Ok(())
+        }
+        fn delete(&self, _: &db::Scope, _: &str) -> Result<(), db::StoreError> {
+            Ok(())
+        }
+    }
+
+    struct RogueSink(String);
+
+    impl JobSink for RogueSink {
+        fn enqueue(&self, _: jobs::PluginJob) -> Result<String, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn rogue_db(inserted: &str, rows: Vec<PluginRow>) -> CapabilityRuntime {
+        let services = CapabilityServices {
+            db: Some(Arc::new(RogueStore {
+                inserted: inserted.to_owned(),
+                rows,
+            }) as Arc<dyn PluginStore>),
+            ..CapabilityServices::none()
+        };
+        CapabilityRuntime::new(&manifest(&everything()), services)
+    }
+
+    fn db_get() -> CapabilityCall {
+        CapabilityCall::DbGet {
+            id: 1,
+            table: "orders".to_owned(),
+            row_id: "r1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_stored_row_over_the_row_ceiling_is_not_served() {
+        // Between `MAX_ROW_BYTES` and `MAX_RESULT_BYTES`: `bounded_rows` let it
+        // through although the host would refuse the same row on insert.
+        let mut fat = row(&[("row_id", "r1")]);
+        for column in 0..5 {
+            fat.insert(
+                format!("c{column}"),
+                PluginValue::Text("x".repeat(MAX_VALUE_TEXT_BYTES)),
+            );
+        }
+        assert!(row_weight(&fat) > MAX_ROW_BYTES && row_weight(&fat) < MAX_RESULT_BYTES);
+        let mut runtime = rogue_db("r1", vec![fat.clone()]);
+        assert_eq!(
+            runtime.dispatch(&db_get()).denial(),
+            Some(DenialReason::BackendError)
+        );
+        let query = CapabilityCall::DbQuery {
+            id: 2,
+            table: "orders".to_owned(),
+            filter: PluginRow::new(),
+            limit: 0,
+            after: None,
+        };
+        assert_eq!(
+            runtime.dispatch(&query).denial(),
+            Some(DenialReason::BackendError)
+        );
+    }
+
+    #[test]
+    fn a_stored_row_the_host_would_not_have_accepted_is_not_served() {
+        let bad_name = row(&[("row_id", "r1"), ("Bad-Name", "x")]);
+        let too_wide: PluginRow = (0..=MAX_ROW_COLUMNS)
+            .map(|index| (format!("c{index}"), PluginValue::Int(1)))
+            .collect();
+        for stored in [bad_name, too_wide] {
+            let mut runtime = rogue_db("r1", vec![stored]);
+            assert_eq!(
+                runtime.dispatch(&db_get()).denial(),
+                Some(DenialReason::BackendError)
+            );
+        }
+    }
+
+    #[test]
+    fn a_legal_stored_row_is_still_served_with_its_row_id() {
+        let mut runtime = rogue_db("r1", vec![row(&[("row_id", "r1"), ("sku", "A-1")])]);
+        assert!(runtime.dispatch(&db_get()).denial().is_none());
+    }
+
+    #[test]
+    fn a_store_assigned_id_the_guest_could_not_use_is_a_backend_error() {
+        for bad in [String::new(), "r".repeat(MAX_ROW_ID_BYTES + 1)] {
+            let mut runtime = rogue_db(&bad, Vec::new());
+            let result = runtime.dispatch(&CapabilityCall::DbInsert {
+                id: 1,
+                table: "orders".to_owned(),
+                row: row(&[("sku", "A-1")]),
+            });
+            assert_eq!(
+                result.denial(),
+                Some(DenialReason::BackendError),
+                "{} byte id",
+                bad.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_sink_assigned_job_id_over_the_ceiling_is_refused_but_counted_as_queued() {
+        let services = CapabilityServices {
+            jobs: Some(Arc::new(RogueSink("j".repeat(MAX_JOB_ID_BYTES + 1))) as Arc<dyn JobSink>),
+            ..CapabilityServices::none()
+        };
+        let mut runtime = CapabilityRuntime::new(&manifest(&everything()), services);
+        let result = runtime.dispatch(&CapabilityCall::JobEnqueue {
+            id: 1,
+            job_type: "reindex".to_owned(),
+            payload: PluginRow::new(),
+        });
+        assert_eq!(result.denial(), Some(DenialReason::ResponseTooLarge));
+        let log = PluginActivityLog::new();
+        log.ingest("shop", runtime.take_events());
+        let summary = log.summary("shop", std::time::Duration::from_secs(60));
+        assert_eq!(
+            summary.job_types.get("reindex").copied(),
+            Some(1),
+            "the enqueue committed: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_refused_for_its_shape_spends_no_backend_quota() {
+        // Default `db_writes` is 32 and `calls` is 128: 40 malformed inserts
+        // would have spent the first and denied the valid one that follows.
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let fat: PluginRow = (0..=MAX_ROW_COLUMNS)
+            .map(|index| (format!("c{index}"), PluginValue::Int(1)))
+            .collect();
+        for _ in 0..40 {
+            let result = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+                id: 1,
+                table: "orders".to_owned(),
+                row: fat.clone(),
+            });
+            assert_eq!(result.denial(), Some(DenialReason::Malformed));
+        }
+        let ok = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
+            id: 2,
+            table: "orders".to_owned(),
+            row: row(&[("sku", "A-1")]),
+        });
+        assert!(ok.denial().is_none(), "{ok:?}");
+
+        for _ in 0..10 {
+            let bad = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+                id: 3,
+                method: "TRACE".to_owned(),
+                url: "https://api.example.com/".to_owned(),
+                headers: Vec::new(),
+                body: String::new(),
+            });
+            assert_eq!(bad.denial(), Some(DenialReason::Malformed));
+        }
+        let ok = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {
+            id: 4,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        });
+        assert_ne!(ok.denial(), Some(DenialReason::QuotaExceeded), "{ok:?}");
+    }
+
+    #[test]
+    fn a_huge_target_is_cut_before_it_is_copied() {
+        let key = "k".repeat(MAX_KV_KEY_BYTES * 1000);
+        let excerpt = CapabilityCall::KvGet {
+            id: 1,
+            key: key.clone(),
+        }
+        .target_excerpt();
+        assert!(
+            excerpt.chars().count() <= MAX_TARGET_CHARS + 1,
+            "{}",
+            excerpt.len()
+        );
+        let url = format!("https://{}.test/", "h".repeat(1 << 20));
+        let excerpt = CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url,
+            headers: Vec::new(),
+            body: String::new(),
+        }
+        .target_excerpt();
+        assert!(
+            excerpt.chars().count() <= MAX_TARGET_CHARS + 1,
+            "{}",
+            excerpt.len()
+        );
     }
 
     // ── Capability gating ────────────────────────────────────────────
@@ -2493,10 +2783,7 @@ path = "/shop/panel"
 
     #[test]
     fn a_header_a_plugin_may_not_set_is_denied_before_the_call_leaves() {
-        // A fresh fixture per case: a refused call still spends its quota (see
-        // `a_refused_call_still_spends_its_quota_so_a_guest_cannot_spin`), and
-        // four refusals in one request would exhaust `outbound_calls` and turn
-        // the fifth denial into a quota one.
+        // A fresh fixture per case, so each refusal is read on its own.
         for (name, value) in [
             ("authorization", "Bearer stolen"),
             ("cookie", "session=stolen"),
@@ -3671,10 +3958,7 @@ path = "/shop/panel"
 
     #[test]
     fn a_method_or_header_count_outside_the_allow_list_is_refused() {
-        // A fresh fixture per case: the method check happens inside `perform`,
-        // after the per-capability charge, so five cases in one request would
-        // exhaust the default `outbound_calls` of four and turn the fifth
-        // refusal into a quota one.
+        // A fresh fixture per case, so each refusal is read on its own.
         for method in ["CONNECT", "TRACE", "OPTIONS", " GET", ""] {
             let mut fixture = fixture(&everything(), Some("alpha"));
             let result = fixture.runtime.dispatch(&CapabilityCall::HttpFetch {

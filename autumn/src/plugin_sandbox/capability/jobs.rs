@@ -54,10 +54,29 @@ pub struct PluginJob {
 pub trait JobSink: Send + Sync + 'static {
     /// Enqueue `job`, returning the id assigned to it.
     ///
+    /// The id MUST be 1..=[`MAX_JOB_ID_BYTES`](super::MAX_JOB_ID_BYTES) bytes.
+    /// It goes back to the guest after the job is queued, so a longer one cannot
+    /// be reported as a failure; the host answers `ResponseTooLarge` instead.
+    ///
     /// # Errors
     ///
     /// One line for the guest and the audit ledger.
     fn enqueue(&self, job: PluginJob) -> Result<String, String>;
+}
+
+/// Check a `job-enqueue` payload, without copying it.
+///
+/// Run before the per-capability quota is charged.
+///
+/// # Errors
+///
+/// The denial to answer with.
+pub(super) fn validate(call: &CapabilityCall) -> Result<(), CallResult> {
+    match call {
+        CapabilityCall::JobEnqueue { id, payload, .. } => check_row(payload)
+            .map_err(|detail| CallResult::denied(*id, DenialReason::Malformed, detail)),
+        _ => Ok(()),
+    }
 }
 
 /// Answer one `job-enqueue`. Capability, scope and quota are already checked.
@@ -87,6 +106,21 @@ pub(super) fn perform(
         payload: payload.clone(),
     };
     match sink.enqueue(job) {
+        // The job is queued. An id the guest could not hold is reported without
+        // claiming the enqueue failed: `ResponseTooLarge` is the denial for a
+        // call that ran and whose answer was discarded, and the audit ledger
+        // counts it as an enqueue.
+        Ok(job_id) if job_id.is_empty() || job_id.len() > super::MAX_JOB_ID_BYTES => {
+            CallResult::denied(
+                id,
+                DenialReason::ResponseTooLarge,
+                format!(
+                    "the job was queued, but the queue assigned an id outside 1..={} bytes; do \
+                     not retry",
+                    super::MAX_JOB_ID_BYTES
+                ),
+            )
+        }
         Ok(job_id) => CallResult::Ok {
             id,
             value: CallValue::JobId { job_id },

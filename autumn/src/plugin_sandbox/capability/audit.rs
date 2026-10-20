@@ -341,7 +341,12 @@ impl ActivitySummary {
         // depth ceiling — enqueued nothing. Counting it would put a job in the
         // report that no runner will ever run, which is the one number an
         // operator reading this would act on.
-        let enqueued = matches!(event.outcome, CapabilityOutcome::Allowed);
+        // A `ResponseTooLarge` enqueue ran: the queue took the job and the guest's
+        // copy of the id was discarded.
+        let enqueued = matches!(
+            event.outcome,
+            CapabilityOutcome::Allowed | CapabilityOutcome::Denied(DenialReason::ResponseTooLarge)
+        );
         // Tables are the other exception: `StoreError::Backend` means the read
         // or write did not happen, so only a call that did is a table touched.
         let touched = matches!(
