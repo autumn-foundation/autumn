@@ -255,11 +255,16 @@ databases that nobody asks for:
   5 min. New work of the same kind ends the wait. A visit that made
   progress and left work moves the database behind the others that are
   due, so busy databases take turns. A pass reads the due rows of the open
-  databases and the oldest due rows, and puts them in one order: the row
-  due first goes first, then the oldest row. An open database goes first
-  only on a tie, as its visit opens nothing. A new row is due at the time of
-  its mark. Thus busy open databases never hold back a closed one
-  (issue 3350). A worker runs its first pass when it
+  databases and the 256 rows due first, and puts them in one order: by due
+  time, then by age. When both are the same, an open database goes first,
+  because its visit opens no file. A new row is due at the time of its mark.
+  A row with no backoff is due on every clock, so clock skew between hosts
+  changes only its place. Half of each pass goes first to the open
+  databases, so a backfill of the whole fleet does not stop their outbox.
+  The rest goes in that order to all databases. A pass takes no more closed
+  databases than the fleet has room for, and no database of another host.
+  A closed database therefore waits only behind the rows that were due
+  before it (issue 3350). A worker runs its first pass when it
   starts, before it waits for the interval. The index stores this wait, so a stuck database never hides the
   others. `/actuator/health` reports `fleet:sweeper`: the backlog
   (databases), the oldest pending age, and the counts of the last pass.
@@ -414,11 +419,13 @@ reach.
 - `autumn-cli/tests/integration/fleet_cli.rs`: each `autumn fleet` subcommand
   against a temporary fleet root; `restore` from a local replica.
 - `autumn/src/db/fleet_sweeper.rs` tests: index marks and clears, marks from
-  a connection, two fleets in one process.
+  a connection, two fleets in one process, the pass order (issue 3350).
 - `autumn/tests/sqlite_fleet_sweeper.rs`: an outbox row relayed after its
   database closes, hooks drained without a request, a derivation added in a
   migration backfilled in a closed tenant, `max_open` and leases respected,
-  the `fleet:sweeper` health indicator.
+  the `fleet:sweeper` health indicator, a closed database not held back by
+  busy open ones, and a full fleet that still relays its open ones
+  (issue 3350).
 - `autumn/src/db/fleet_ownership.rs` tests: the state machine (claim, renew,
   lapse, release, re-shape) and a proptest of its invariants; two hosts
   racing a claim on one store; the open path's `421`; an old owner closed

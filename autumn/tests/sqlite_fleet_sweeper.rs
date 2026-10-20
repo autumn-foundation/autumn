@@ -759,8 +759,8 @@ async fn a_full_fleet_still_relays_the_open_databases() {
     let report = sweeper.sweep_once().await;
     assert_eq!(
         (report.visited, report.deferred),
-        (2, 0),
-        "no closed database fits: {report:?}"
+        (2, 2),
+        "the closed databases wait for room: {report:?}"
     );
     sweeper.sweep_once().await;
     assert_eq!(
