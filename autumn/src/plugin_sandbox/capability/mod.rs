@@ -830,16 +830,24 @@ impl CapabilityCall {
     /// denial it can read, not a failed request.
     #[must_use]
     pub const fn reply_reserve(&self) -> usize {
-        self.reply_reserve_for(MAX_RESULT_BYTES)
+        self.reply_reserve_for(MAX_RESULT_BYTES, 500)
     }
 
     /// As [`reply_reserve`](Self::reply_reserve), with the plugin's own
-    /// `kv_value_bytes` as the ceiling for a KV read.
+    /// `kv_value_bytes` for a KV read and `db_rows` for a query.
+    ///
+    /// A DB reply adds JSON framing to the row weight: quotes, colons and
+    /// commas for each column of each row.
     #[must_use]
-    pub const fn reply_reserve_for(&self, kv_value_bytes: usize) -> usize {
+    pub const fn reply_reserve_for(&self, kv_value_bytes: usize, db_rows: usize) -> usize {
+        /// Framing bytes for one row at the column limit, with its `row_id`.
+        const ROW_FRAMING: usize = (MAX_ROW_COLUMNS + 1) * 8 + 16;
         match self {
-            Self::KvGet { .. } => kv_value_bytes + 4096,
-            Self::DbGet { .. } | Self::DbQuery { .. } => MAX_RESULT_BYTES + 4096,
+            Self::KvGet { .. } => kv_value_bytes.saturating_add(4096),
+            Self::DbGet { .. } => MAX_RESULT_BYTES + ROW_FRAMING + 4096,
+            Self::DbQuery { .. } => MAX_RESULT_BYTES
+                .saturating_add(db_rows.saturating_mul(ROW_FRAMING))
+                .saturating_add(4096),
             Self::HttpFetch { .. } => {
                 MAX_RESULT_BYTES + outbound::MAX_RESPONSE_HEADER_BYTES * 6 + 4096
             }
@@ -1436,7 +1444,10 @@ impl CapabilityRuntime {
 
         // Room for the answer, before anything is charged or committed: once a
         // write has happened its reply can no longer be refused.
-        if reply_room < call.reply_reserve_for(self.quotas().kv_value_bytes as usize) {
+        let quotas = self.quotas();
+        if reply_room
+            < call.reply_reserve_for(quotas.kv_value_bytes as usize, quotas.db_rows as usize)
+        {
             return self.record(
                 call,
                 &target,
@@ -2087,7 +2098,7 @@ path = "/shop/panel"
             id: 2,
             key: "cart".to_owned(),
         };
-        let read = get.reply_reserve_for(fixture.runtime.quotas().kv_value_bytes as usize);
+        let read = get.reply_reserve_for(fixture.runtime.quotas().kv_value_bytes as usize, 0);
         assert_eq!(
             fixture.runtime.dispatch_within(&get, read - 1).denial(),
             Some(DenialReason::QuotaExceeded)

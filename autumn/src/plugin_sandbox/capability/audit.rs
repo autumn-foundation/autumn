@@ -152,7 +152,14 @@ impl PluginActivityLog {
     /// An empty log.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        // The fold buckets count from here. No event can predate its log.
+        let state = LogState {
+            origin: Some(crate::time::ambient_instant()),
+            ..LogState::default()
+        };
+        Self {
+            state: Mutex::new(state),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LogState> {
@@ -925,5 +932,43 @@ mod tests {
         assert_eq!(recent.dropped, MAX_LOG_EVENTS as u64, "{}", recent.dropped);
         let all = log.summary("shop", 100 * hour);
         assert_eq!(all.dropped, 2 * MAX_LOG_EVENTS as u64);
+    }
+    #[test]
+    fn a_fold_from_before_the_first_overflow_keeps_its_own_hour() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+
+        // Old events, then ten hours pass, then the ledger overflows with
+        // recent records, then the old events are evicted.
+        let old: Vec<_> = (0..MAX_LOG_EVENTS)
+            .map(|_| event("kv-get", CapabilityOutcome::Allowed))
+            .collect();
+        log.ingest("shop", old);
+        clock.advance(10 * hour);
+        for _ in 0..MAX_LOG_EVENTS + 5 {
+            log.ingest_dropped("shop", 1);
+            clock.advance(Duration::from_secs(2));
+        }
+        log.ingest(
+            "shop",
+            (0..5).map(|_| event("kv-set", CapabilityOutcome::Allowed)),
+        );
+        // The ten-hour-old evictions are not in the last three hours.
+        let recent = log.summary("shop", 3 * hour);
+        assert_eq!(
+            recent.dropped,
+            MAX_LOG_EVENTS as u64 + 5,
+            "{}",
+            recent.dropped
+        );
     }
 }
