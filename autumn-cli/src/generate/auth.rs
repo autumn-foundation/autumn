@@ -15856,6 +15856,50 @@ mod tests {
         );
     }
 
+    /// Characterization: every existing subtable-form fixture for all three
+    /// `ensure_autumn_web_*_feature` copies used a multiline `features = [...]`
+    /// array, so the single-line subtable branch (`features = ["ws"]` on one
+    /// line, non-empty) had zero coverage before #3358's
+    /// `ensure_autumn_web_feature` extraction — codecov's patch-coverage check
+    /// on that PR only surfaced it once `generate::auth::` was actually
+    /// instrumented (ci.yml db-ignored lane).
+    #[test]
+    fn ensure_autumn_web_mail_feature_subtable_single_line_array_appends_feature() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\"ws\"]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"mail\""),
+            "single-line subtable features must be merged: {out}"
+        );
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
+    }
+
+    /// Same gap, the empty-array case: a single-line subtable `features = []`
+    /// has no existing entries, so the "insert the first feature" path
+    /// (rather than "append with a comma") must run instead.
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_subtable_single_line_empty_array_inserts_feature() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = []\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("features = [\"oauth2\"]"),
+            "oauth2 feature missing for single-line empty subtable array: {out}"
+        );
+    }
+
+    /// Same gap, the inline-table form: every existing inline-table fixture
+    /// either had no `features` key or a non-empty one, so the inline-table
+    /// "existing list is empty" path was never exercised either.
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_inline_table_empty_array_inserts_feature() {
+        let toml = "autumn-web = { version = \"0.3\", features = [] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("features = [\"webauthn\"]"),
+            "webauthn feature missing for empty inline-table array: {out}"
+        );
+    }
+
     #[test]
     fn ensure_webauthn_rs_features_merges_multiline_subtable_array() {
         // #2753 missed-fix #2: same gap as the two autumn-web copies, in the
