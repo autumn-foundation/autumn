@@ -15,8 +15,9 @@ comes from introspecting the live database, not from a config file, so a column
 added yesterday cannot be missing from it. A column that is neither
 PII-classified nor explicitly declared safe aborts the scrub.
 
-> **Postgres only.** Scrubbing targets the same databases `autumn migrate`
-> resolves — the control database plus every configured shard.
+> Scrubbing targets the same databases `autumn migrate` resolves — the control
+> database plus every configured shard. A target is Postgres or [SQLite](#sqlite).
+> One run cannot mix the two.
 
 ---
 
@@ -792,9 +793,53 @@ apply-time error.
 
 ---
 
+## SQLite
+
+A `sqlite://` target scrubs with the same command and the same rules:
+
+```sh
+autumn db scrub --check              # classify only
+autumn db scrub --dry-run            # print the SQL
+autumn db scrub                      # rewrite app.db in place
+autumn db scrub --artifact backups/dev/20261020T101500Z   # restore a .sqlite backup, then scrub
+```
+
+What stays the same: the classification, `scrub.toml`, `#[encrypted]` columns,
+GDPR anonymize registrations, `[framework] purge`, the production guard
+(`--force`), `--output`, and the refusals. An unclassified column aborts the
+scrub. Nothing prints a resolved URL. SQLite has no password. Output shows the
+file path only.
+
+What is different:
+
+- **No external tools.** The scrub runs in the `autumn` binary.
+- **One transaction per file.** `BEGIN IMMEDIATE` takes the write lock, so no
+  writer can add a row mid-scrub. A schema change since the plan was made
+  rolls the run back.
+- **No old bytes.** `secure_delete` is on. After the commit, `VACUUM` rewrites
+  the file and the WAL is truncated. A scrubbed file does not hold the old
+  values in free pages, indexes or the WAL. `VACUUM` needs free disk space
+  about the size of the file.
+- **Hashing.** SQLite has no `md5`. The scrub registers `autumn_sha256` on its
+  connection. `--dry-run` prints SQL that calls it, so plain `sqlite3` cannot
+  run the printed script. Use the printed SQL to audit, not to replay.
+- **Foreign keys are on.** A purge that would orphan a row rolls back.
+- **Extra refusals.** A `CHECK` column cannot get a made-up value, so it is
+  refused. `autumn` reads `CHECK` clauses from the `CREATE TABLE` text. A
+  virtual table (for example FTS5) is refused, because its shadow tables hold
+  copies of row text. `--sample` is refused. A delete trigger on a purged
+  table is refused.
+- **Type rules.** SQLite stores what you give it, so a column type does not
+  bound the length. `varchar(n)` limits do not apply. `date`, `datetime` and
+  `numeric` columns use `epoch` and `zero`.
+- **Mixed topologies.** A control database on Postgres and a shard on SQLite
+  is refused before any write.
+
+---
+
 ## Limits
 
-- **Postgres only**, and the `public` schema only. A database with base tables
+- **On Postgres, the `public` schema only.** A database with base tables
   in another non-system schema is **refused** rather than reported clean over a
   universe the classifier never looked at — and a schema holding only a
   *materialized view* counts, since it keeps its own copy of whatever it

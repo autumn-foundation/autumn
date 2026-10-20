@@ -128,7 +128,7 @@ pub fn database_path(target: &str) -> Result<PathBuf, SnapshotError> {
 ///
 /// Never creates the file. `sqlite3_open` creates an empty database, so a typo'd
 /// path would back up zero tables and report success.
-fn open(path: &Path) -> Result<SqliteConnection, SnapshotError> {
+pub(crate) fn open(path: &Path) -> Result<SqliteConnection, SnapshotError> {
     if !path.exists() {
         return Err(SnapshotError::Missing {
             path: path.display().to_string(),

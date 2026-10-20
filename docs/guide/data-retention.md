@@ -64,7 +64,7 @@ before setting those three.
 
 | Dataset | What it is | Where it lives | Default (unset) | Enforced by |
 |---|---|---|---|---|
-| `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` (`postgres` and `sqlite` jobs backends) | **forever** | sweep on `postgres`; the `sqlite` job runtime prunes it; **not enforced** on `redis` or `local` |
+| `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` (`postgres` and `sqlite` jobs backends) | **forever** | sweep on `postgres` and `sqlite` (the `sqlite` job runtime also prunes it); **not enforced** on `redis` or `local` |
 | `commit_hooks` | Finished `#[after_commit]` hook rows (`completed`/`failed`/`after_hook_failed`) | `autumn_repository_commit_hooks` | **forever** | sweep |
 | `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking`, or Redis — follows `jobs.backend` | jobs.tracking.ttl_secs (24h by default) | sweep on `postgres`, backend TTL otherwise |
 | `idempotency` | Stored `Idempotency-Key` responses | memory / Redis / `autumn_idempotency_keys` | idempotency.ttl_secs (24h by default) | backend TTL; the database store deletes expired rows as it writes |
@@ -174,9 +174,13 @@ one guards an invariant another subsystem depends on:
   the hold. Keep job tracking on a database backend if you need the hold.
 
   `job_history` is a sweep over `autumn_jobs`, so it needs a database jobs
-  backend. `postgres` uses the sweep. `sqlite` uses its own job runtime. Under
-  `redis` or `local`, the report says `NOT enforced`. Redis keeps finished
-  jobs in lists that a count limit bounds.
+  backend. `postgres` and `sqlite` use the sweep. On `sqlite` the job runtime
+  also prunes it on its own. Under `redis` or `local`, the report says
+  `NOT enforced`. Redis keeps finished jobs in lists that a count limit bounds.
+
+  On `sqlite` the sweeps run in the app's database file. The cutoff comes from
+  the SQLite clock. A dataset whose table is not in the file is skipped, and the
+  report names the table.
 
 **`backend ttl`** — the storage backend expires the record itself, so there is
 nothing for a sweep to delete and the report shows `—` rather than a fake

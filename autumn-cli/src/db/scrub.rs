@@ -71,6 +71,10 @@ use crate::schema::introspect;
 /// rows.
 pub mod sample;
 
+/// `SQLite` targets (issue #2553): the same classifier, a `SQLite` probe and
+/// apply step.
+mod sqlite;
+
 use super::{quote_ident, quote_literal};
 
 /// The per-app PII declaration file, read from the project root unless
@@ -424,6 +428,16 @@ pub enum ScrubError {
     },
     /// A scrub statement failed. The message comes from the server.
     Sql(String),
+    /// The configured targets mix `SQLite` and Postgres databases. One run
+    /// cannot apply both safely, so nothing is written.
+    MixedBackends,
+    /// A flag or schema feature has no `SQLite` form. Refused, never ignored.
+    UnsupportedOnSqlite {
+        /// What is unsupported.
+        what: &'static str,
+        /// The tables or columns involved, or a short reason.
+        detail: String,
+    },
     /// The scrub was refused because the active profile is production and
     /// `--force` was not supplied.
     ProductionRefused {
@@ -899,6 +913,17 @@ impl std::fmt::Display for ScrubError {
                 write!(f, "Could not read the schema of {label}: {detail}")
             }
             Self::Sql(message) => write!(f, "{message}"),
+            Self::MixedBackends => write!(
+                f,
+                "The configured databases mix SQLite and Postgres targets.\n  \
+                 One scrub run cannot apply both safely. Nothing was written. Scrub them \
+                 in separate runs, one backend each."
+            ),
+            Self::UnsupportedOnSqlite { what, detail } => write!(
+                f,
+                "{what} is not supported for SQLite targets: {detail}\n  \
+                 Nothing was written."
+            ),
             Self::ProductionRefused { profile } => write!(
                 f,
                 "Refusing to scrub the {profile:?} profile database.\n  \
@@ -1591,7 +1616,11 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                 });
             }
             if plan.strategy == Strategy::Auto {
-                plan.strategy = auto_strategy(column).map_err(|e| qualify(e, &qualified))?;
+                plan.strategy = match inputs.facts.dialect {
+                    Dialect::Postgres => auto_strategy(column),
+                    Dialect::Sqlite => sqlite::auto_strategy(column),
+                }
+                .map_err(|e| qualify(e, &qualified))?;
             }
             if plan.strategy == Strategy::Null {
                 if !column.nullable {
@@ -1655,23 +1684,30 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                 continue;
             }
 
-            let token = token_expr(table, &column.name, unique);
-            let value = replacement_expr(plan.strategy, column, &token, unique)
-                .map_err(|e| qualify(e, &qualified))?;
+            let value = match inputs.facts.dialect {
+                Dialect::Postgres => {
+                    let token = token_expr(table, &column.name, unique);
+                    replacement_expr(plan.strategy, column, &token, unique)
+                }
+                Dialect::Sqlite => {
+                    let token = sqlite::token_expr(table, &column.name, unique);
+                    sqlite::replacement_expr(plan.strategy, column, &token)
+                }
+            }
+            .map_err(|e| qualify(e, &qualified))?;
             assignments.push(assignment(column, &value, plan.strategy));
             resolved.push(plan);
         }
+        let (target, row_key) = match inputs.facts.dialect {
+            Dialect::Postgres => (qualified_ident(&table.name), row_key_expr(table)),
+            Dialect::Sqlite => (quote_ident(&table.name), sqlite::row_key_expr(table)),
+        };
         out.tables.push(TablePlan {
             table: table.name.clone(),
             columns: resolved,
-            sql: (!assignments.is_empty()).then(|| {
-                format!(
-                    "UPDATE {} SET {}",
-                    qualified_ident(&table.name),
-                    assignments.join(", ")
-                )
-            }),
-            row_key: row_key_expr(table),
+            sql: (!assignments.is_empty())
+                .then(|| format!("UPDATE {target} SET {}", assignments.join(", "))),
+            row_key,
             encrypted: encrypted_rewrites,
         });
     }
@@ -3160,6 +3196,9 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
 
     let mut targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
     let configured = targets.len();
+    // Decided before an `--artifact` restore writes anything, so a refusal
+    // never lands after real data is in the target.
+    let on_sqlite = sqlite::check_targets(args, &targets)?;
 
     let restored = if let Some(artifact) = &args.artifact {
         let artifact_profile = super::backup::artifact_source_profile(artifact);
@@ -3224,7 +3263,12 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
     // The classification that remains reads the schema the restore just created,
     // so it cannot run earlier — and a refusal here leaves the artifact's real
     // data in the target. Say so in the loudest possible terms.
-    classify_and_apply(args, &profile, &targets, &sources).inspect_err(|_| {
+    let applied = if on_sqlite {
+        sqlite::classify_and_apply(args, &profile, &targets, &sources)
+    } else {
+        classify_and_apply(args, &profile, &targets, &sources)
+    };
+    applied.inspect_err(|_| {
         if restored {
             warn_unscrubbed();
         }
@@ -4726,6 +4770,16 @@ pub struct ServerEndpoint {
     pub data_directory: Option<String>,
 }
 
+/// Which SQL dialect the plan's statements are written in.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// `PostgreSQL`: `md5`, `ctid`, `"public".` qualification.
+    #[default]
+    Postgres,
+    /// `SQLite`: `autumn_sha256`, `rowid`, unqualified names.
+    Sqlite,
+}
+
 /// Everything about one live database that the pure classifier cannot read from
 /// the schema IR, gathered in a single connection.
 ///
@@ -4738,6 +4792,8 @@ pub struct ServerEndpoint {
 /// they are probed here rather than assumed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DatabaseFacts {
+    /// The dialect the plan's SQL is written in. Defaults to Postgres.
+    pub dialect: Dialect,
     /// Every column on either side of any foreign key, all components of a
     /// composite key included, as `(table, column)`. Rewriting any of them
     /// breaks referential integrity (or is silently cascaded into a child).
@@ -5835,6 +5891,7 @@ fn probe_database_facts(
     );
 
     Ok(DatabaseFacts {
+        dialect: Dialect::Postgres,
         foreign_key_columns,
         checked_columns,
         generated_columns,
