@@ -760,7 +760,7 @@ pub fn build(
     let mut edges: BTreeMap<(String, String), GraphEdge> = BTreeMap::new();
 
     add_model_nodes(&ids, models, &mut nodes);
-    add_repository_nodes(&ids, repositories, models, &index, &mut nodes, &mut edges);
+    add_repository_nodes(&ids, repositories, models, &mut nodes, &mut edges);
     let route_totals = add_route_nodes(
         &ids,
         routes,
@@ -833,11 +833,10 @@ fn add_model_nodes(
 }
 
 /// One repository node per `#[repository]`, with its declared model edges.
-fn add_repository_nodes(
+fn add_repository_nodes<'a>(
     ids: &NodeIds,
     repositories: &[RepositoryGraphDescriptor],
-    models: &[ModelGraphDescriptor],
-    index: &BTreeMap<String, BTreeSet<String>>,
+    models: &'a [ModelGraphDescriptor],
     nodes: &mut BTreeMap<String, GraphNode>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
 ) {
@@ -886,35 +885,35 @@ fn add_repository_nodes(
             crate_root(m.module_path) == crate_root(repo.module_path)
                 && m.crate_version == repo.crate_version
         };
-        let named: Vec<&ModelGraphDescriptor> =
-            models.iter().filter(|m| m.model == repo.model).collect();
         // A model of the repository's crate in another version is dropped,
         // also when that version moved it to another module. A model of
         // another crate stays.
-        let has_mine = named.iter().any(|m| mine(m));
-        let named: Vec<&ModelGraphDescriptor> = named
-            .into_iter()
-            .filter(|m| {
-                !has_mine || mine(m) || crate_root(m.module_path) != crate_root(repo.module_path)
-            })
-            .collect();
+        let own_version = |found: Vec<&'a ModelGraphDescriptor>| {
+            let has_mine = found.iter().any(|m| mine(m));
+            found
+                .into_iter()
+                .filter(|m| {
+                    !has_mine
+                        || mine(m)
+                        || crate_root(m.module_path) != crate_root(repo.module_path)
+                })
+                .collect::<Vec<_>>()
+        };
+        let named = own_version(models.iter().filter(|m| m.model == repo.model).collect());
         let exact = named.iter().any(|m| m.table == repo.table);
         let own: Vec<&ModelGraphDescriptor> = named
             .into_iter()
             .filter(|m| !exact || m.table == repo.table)
             .collect();
         let mut targets: BTreeSet<String> = own.iter().map(|m| ids.model(m)).collect();
-        // A relation table is a table name, not a model name: it resolves
-        // through the index to whichever model maps that table.
+        // A relation table is a table name: it resolves to each model that
+        // maps that table, with the same version step.
         for relation in own.iter().flat_map(|m| m.relations.iter().copied()) {
-            targets.extend(
-                index
-                    .get(relation)
-                    .into_iter()
-                    .flatten()
-                    .filter(|t| t.starts_with("model:"))
-                    .cloned(),
-            );
+            let mapping = models
+                .iter()
+                .filter(|m| m.table == relation || m.model == relation)
+                .collect();
+            targets.extend(own_version(mapping).into_iter().map(|m| ids.model(m)));
         }
         for target in &targets {
             edges.insert(
@@ -2619,6 +2618,37 @@ mod tests {
         );
         let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
         assert_eq!(targets, vec!["model:plugin::models::Post"]);
+    }
+
+    /// A relation table resolves to the relation model of the repository's
+    /// own version too, not to every version of it.
+    #[test]
+    fn a_relation_table_links_the_own_version_only() {
+        let post = |version| ModelGraphDescriptor {
+            relations: &["plugin_votes"],
+            ..post_at(version)
+        };
+        let vote = |version| ModelGraphDescriptor {
+            crate_version: version,
+            module_path: "plugin::models",
+            ..model("Vote", "plugin::models::Vote", "plugin_votes")
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[post("1.0.0"), post("2.0.0"), vote("1.0.0"), vote("2.0.0")],
+            &[repository_at("1.0.0")],
+            &[],
+        );
+        let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                "model:plugin::models::Post@1.0.0",
+                "model:plugin::models::Vote@1.0.0"
+            ]
+        );
     }
 
     /// A model of another crate is not a version of the repository's crate,
