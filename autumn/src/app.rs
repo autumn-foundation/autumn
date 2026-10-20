@@ -13568,20 +13568,22 @@ struct FleetRuntime {
 /// [`finish`](Self::finish) releases the ranges.
 #[cfg(feature = "sqlite")]
 struct FleetOwnershipRuntime {
-    ownership: Arc<crate::db::fleet_ownership::FleetOwnership>,
+    fleet: crate::db::fleet::DatabaseFleet,
     stop: tokio_util::sync::CancellationToken,
     handle: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(feature = "sqlite")]
 impl FleetOwnershipRuntime {
-    /// Stop renewing and release every range, so the next owner can claim at
-    /// once. Call it after the fleet closed its databases.
+    /// Stop renewing, then release the ranges so the next owner can claim at
+    /// once. Call it after the fleet closed its databases. Another process
+    /// on the volume, or unshipped frames, keep the ranges: they lapse.
     async fn finish(self) {
         self.stop.cancel();
         let _ = self.handle.await;
-        self.ownership.release_all().await;
-        tracing::info!("shutdown: fleet slot ranges released");
+        if self.fleet.release_ownership().await {
+            tracing::info!("shutdown: fleet slot ranges released");
+        }
     }
 }
 
@@ -13612,7 +13614,7 @@ async fn start_fleet_ownership(
         .map(|(start, end)| SlotRange::new(start, end))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    let owner = OwnerId::new(config.owner.trim()).map_err(|e| e.to_string())?;
+    let owner = OwnerId::new(config.owner.as_str()).map_err(|e| e.to_string())?;
     let ownership = Arc::new(
         FleetOwnership::new(
             Arc::new(store),
@@ -13645,7 +13647,7 @@ async fn start_fleet_ownership(
     let stop = tokio_util::sync::CancellationToken::new();
     let handle = fleet.spawn_ownership(stop.clone());
     Ok(Some(FleetOwnershipRuntime {
-        ownership,
+        fleet: fleet.clone(),
         stop,
         handle,
     }))

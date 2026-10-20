@@ -56,12 +56,21 @@ it with:
 verus verification/fleet_slot_ownership.rs
 ```
 
-It proves that epochs are unique and strictly increasing, that a slot's epoch
-never goes down, that a live lease of another owner blocks a claim, and that
-the old owner cannot renew, release or write after a newer claim. It also
-proves that a restore never takes a generation of an older epoch, and that a
-fenced replicator stops. The proptest `the_table_keeps_its_invariants` checks
-the same invariants on the runtime table.
+It proves these properties:
+
+- Epochs are unique and strictly increase. A slot's epoch never goes down.
+- A live lease blocks a claim of another owner. A live row of another shape
+  blocks a claim of its own owner too.
+- A claim after a fence gets an epoch above the epoch the replicator saw.
+- After a new grant, the old owner cannot renew, release or write with any
+  epoch it held.
+- A restore never selects a generation of an older epoch, and a fenced
+  replicator stops.
+
+It does not prove that two hosts never serve at once. That depends on the
+clock bound in the guide. The epoch makes a late write of the old owner
+harmless to the replicas. The proptest `the_table_keeps_its_invariants`
+checks the same rules on the runtime table.
 
 ## Billing plan gate
 

@@ -6858,14 +6858,24 @@ impl AutumnConfig {
             &mut fleet.restore_missing,
         );
         // Setting `..._OWNER` creates the ownership section.
-        if fleet.ownership.is_none()
-            && let Ok(owner) = env.var("AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER")
-        {
-            fleet.ownership = Some(FleetOwnershipConfig {
-                owner,
-                slots: Vec::new(),
-                lease_secs: default_fleet_lease_secs(),
-            });
+        if fleet.ownership.is_none() {
+            if let Ok(owner) = env.var("AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER") {
+                fleet.ownership = Some(FleetOwnershipConfig {
+                    owner,
+                    slots: Vec::new(),
+                    lease_secs: default_fleet_lease_secs(),
+                });
+            } else if env.var("AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS").is_ok()
+                || env
+                    .var("AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS")
+                    .is_ok()
+            {
+                eprintln!(
+                    "Warning: AUTUMN_DATABASE__FLEET__OWNERSHIP__* is set without \
+                     AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER or a [database.fleet.ownership] \
+                     section, ignoring"
+                );
+            }
         }
         let Some(ownership) = fleet.ownership.as_mut() else {
             return;
@@ -6879,7 +6889,9 @@ impl AutumnConfig {
         if let Ok(slots) = env.var("AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS") {
             ownership.slots = slots
                 .split(',')
-                .map(|token| SlotSpec::Range(token.trim().to_owned()))
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(|token| SlotSpec::Range(token.to_owned()))
                 .collect();
         }
         parse_env(
@@ -10440,8 +10452,9 @@ pub struct DatabaseFleetConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct FleetOwnershipConfig {
-    /// This host's id in the ownership table. Processes that share one fleet
-    /// root use the same id. Two hosts must never share one.
+    /// This host's id in the ownership table. The processes on one volume
+    /// (one fleet root) use the same id and the same `slots`. Two volumes
+    /// must never share one.
     pub owner: String,
 
     /// The slot ranges to claim, each `"A-B"` or `N`. Each entry is one claim.
@@ -10450,7 +10463,8 @@ pub struct FleetOwnershipConfig {
     pub slots: Vec<SlotSpec>,
 
     /// The lease, in seconds. The host renews every third of it. Default:
-    /// `30`. At least `3`. Host clocks must agree within a third of it.
+    /// `30`. From `3` to `3600`. Clock skew plus the longest request must be
+    /// less than a third of it.
     #[serde(default = "default_fleet_lease_secs")]
     pub lease_secs: u64,
 }
@@ -10502,19 +10516,23 @@ impl FleetOwnershipConfig {
     ///
     /// A [`ConfigError::Validation`] naming the field.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let owner = self.owner.trim();
-        if owner.is_empty() || owner.len() > 128 || owner.chars().any(char::is_control) {
+        let owner = &self.owner;
+        if owner.is_empty()
+            || owner.len() > 128
+            || owner.chars().any(char::is_control)
+            || owner.trim() != owner
+        {
             return Err(ConfigError::Validation(
-                "database.fleet.ownership.owner must be 1 to 128 printable characters, \
-                 unique per host"
+                "database.fleet.ownership.owner must be 1 to 128 bytes, with no control \
+                 characters and no white space at the start or end"
                     .to_owned(),
             ));
         }
         self.ranges()
             .map_err(|e| ConfigError::Validation(format!("database.fleet.ownership.slots: {e}")))?;
-        if self.lease_secs < 3 {
+        if !(3..=3600).contains(&self.lease_secs) {
             return Err(ConfigError::Validation(
-                "database.fleet.ownership.lease_secs must be at least 3".to_owned(),
+                "database.fleet.ownership.lease_secs must be 3 to 3600".to_owned(),
             ));
         }
         Ok(())
@@ -20547,6 +20565,8 @@ path = "/healthz"
         assert!(bad("a", &["0-16384"], 30).contains("out of range"));
         assert!(bad("a", &["9-1"], 30).contains("inverted"));
         assert!(bad("a", &[], 2).contains("lease_secs"));
+        assert!(bad("a", &[], 3601).contains("lease_secs"));
+        assert!(bad(" a", &[], 30).contains("white space"));
     }
 
     #[test]
@@ -20556,7 +20576,7 @@ path = "/healthz"
         config.apply_env_overrides_with_env(
             &MockEnv::new()
                 .with("AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER", "host-b")
-                .with("AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS", "0-99, 200")
+                .with("AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS", "0-99, 200,")
                 .with("AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS", "12"),
         );
         let ownership = config.database.fleet.unwrap().ownership.unwrap();

@@ -24,13 +24,14 @@ pub struct State {
 }
 
 pub enum Op {
-    /// A claim of a range that holds the slot. `keep` is the re-claim of a
-    /// row with the same owner and the same bounds: the epoch stays.
-    Claim { owner: nat, now: int, ttl: nat, keep: bool },
+    /// A claim of a range that holds the slot. `same` is true when the row
+    /// of the slot has the same bounds as the claim. `floor` is the newest
+    /// epoch a replicator saw (`OwnershipTable::claim_above`).
+    Claim { owner: nat, now: int, ttl: nat, same: bool, floor: nat },
     /// A claim of a range that does not hold the slot.
     ClaimElsewhere,
-    /// A claim that removes the row of the slot (a re-shaped range).
-    Clear { owner: nat, now: int },
+    /// A claim of another shape that removes the row of the slot.
+    Clear { now: int },
     Renew { owner: nat, epoch: nat, now: int, ttl: nat },
     Release { owner: nat, epoch: nat, now: int },
 }
@@ -40,9 +41,26 @@ pub open spec fn inv(s: State) -> bool {
     s.slot.epoch <= s.last
 }
 
-/// `OwnershipTable::claim`: free, the claimer's own row, or a lapsed lease.
-pub open spec fn can_claim(slot: Slot, owner: nat, now: int) -> bool {
-    owner > 0 && (slot.owner == 0 || slot.owner == owner || slot.expires_at <= now)
+/// `OwnershipTable::claim_above`: free, a lapsed lease, or the claimer's
+/// own row with the same bounds. A live row of another shape refuses the
+/// claim, also for its own owner.
+pub open spec fn can_claim(slot: Slot, owner: nat, now: int, same: bool) -> bool {
+    owner > 0 && (slot.owner == 0 || slot.expires_at <= now || (same && slot.owner == owner))
+}
+
+/// A row of another shape goes only when no live lease covers it.
+pub open spec fn can_clear(slot: Slot, now: int) -> bool {
+    slot.owner == 0 || slot.expires_at <= now
+}
+
+/// The re-claim keeps the epoch: same owner, same bounds, above the floor.
+pub open spec fn keeps(slot: Slot, owner: nat, same: bool, floor: nat) -> bool {
+    same && slot.owner == owner && slot.epoch > floor
+}
+
+/// The new epoch: above the counter and above the floor.
+pub open spec fn next_epoch(last: nat, floor: nat) -> nat {
+    if last >= floor { last + 1 } else { floor + 1 }
 }
 
 /// `OwnershipTable::renew` and `release`: the row and the epoch must match.
@@ -58,26 +76,26 @@ pub open spec fn admits(slot: Slot, owner: nat, epoch: nat) -> bool {
 /// True when `op` grants a new epoch for the slot.
 pub open spec fn grants(s: State, op: Op) -> bool {
     match op {
-        Op::Claim { owner, now, ttl, keep } =>
-            can_claim(s.slot, owner, now) && !(keep && s.slot.owner == owner),
+        Op::Claim { owner, now, ttl, same, floor } =>
+            can_claim(s.slot, owner, now, same) && !keeps(s.slot, owner, same, floor),
         _ => false,
     }
 }
 
 pub open spec fn apply(s: State, op: Op) -> State {
     match op {
-        Op::Claim { owner, now, ttl, keep } => if !can_claim(s.slot, owner, now) {
+        Op::Claim { owner, now, ttl, same, floor } => if !can_claim(s.slot, owner, now, same) {
             s
-        } else if keep && s.slot.owner == owner {
+        } else if keeps(s.slot, owner, same, floor) {
             State { slot: Slot { expires_at: now + ttl, ..s.slot }, ..s }
         } else {
             State {
-                slot: Slot { owner, epoch: s.last + 1, expires_at: now + ttl },
-                last: s.last + 1,
+                slot: Slot { owner, epoch: next_epoch(s.last, floor), expires_at: now + ttl },
+                last: next_epoch(s.last, floor),
             }
         },
         Op::ClaimElsewhere => State { last: s.last + 1, ..s },
-        Op::Clear { owner, now } => if can_claim(s.slot, owner, now) {
+        Op::Clear { now } => if can_clear(s.slot, now) {
             State { slot: Slot { owner: 0, ..s.slot }, ..s }
         } else {
             s
@@ -129,49 +147,71 @@ pub proof fn apply_never_decreases_epoch(s: State, op: Op)
     ensures apply(s, op).slot.epoch >= s.slot.epoch
 {}
 
-/// A new epoch is above every epoch issued before it.
+/// A new epoch is above every epoch issued before it, and above the floor.
 pub proof fn grant_is_above_the_counter(s: State, op: Op)
     requires grants(s, op)
     ensures
-        apply(s, op).slot.epoch == s.last + 1,
-        apply(s, op).last == s.last + 1,
+        apply(s, op).slot.epoch > s.last,
+        apply(s, op).last == apply(s, op).slot.epoch,
 {}
 
 /// Two hosts race: a live lease of another owner blocks the claim.
-pub proof fn live_lease_blocks_claim(s: State, owner: nat, now: int, ttl: nat, keep: bool)
+pub proof fn live_lease_blocks_claim(
+    s: State, owner: nat, now: int, ttl: nat, same: bool, floor: nat)
     requires
         s.slot.owner != 0,
         s.slot.owner != owner,
         s.slot.expires_at > now,
     ensures
-        apply(s, Op::Claim { owner, now, ttl, keep }) == s,
-        apply(s, Op::Clear { owner, now }) == s,
+        apply(s, Op::Claim { owner, now, ttl, same, floor }) == s,
+        apply(s, Op::Clear { now }) == s,
+{}
+
+/// A live row of another shape blocks a claim of its own owner too: an old
+/// process of that owner may still serve the rest of the row.
+pub proof fn live_row_of_another_shape_blocks_its_owner(
+    s: State, now: int, ttl: nat, floor: nat)
+    requires
+        s.slot.owner != 0,
+        s.slot.expires_at > now,
+    ensures
+        apply(s, Op::Claim { owner: s.slot.owner, now, ttl, same: false, floor }) == s,
 {}
 
 /// A lapsed lease can be claimed by another owner, at a new epoch.
-pub proof fn lapsed_lease_can_be_claimed(s: State, owner: nat, now: int, ttl: nat, keep: bool)
+pub proof fn lapsed_lease_can_be_claimed(
+    s: State, owner: nat, now: int, ttl: nat, same: bool, floor: nat)
     requires
         inv(s),
         owner > 0,
         s.slot.owner != owner,
         s.slot.expires_at <= now,
     ensures
-        apply(s, Op::Claim { owner, now, ttl, keep }).slot.owner == owner,
-        apply(s, Op::Claim { owner, now, ttl, keep }).slot.epoch > s.slot.epoch,
+        apply(s, Op::Claim { owner, now, ttl, same, floor }).slot.owner == owner,
+        apply(s, Op::Claim { owner, now, ttl, same, floor }).slot.epoch > s.slot.epoch,
 {}
 
-/// The old owner after a new claim: it cannot renew, release or write.
+/// A claim after a fence goes above the epoch the replicator saw.
+pub proof fn claim_goes_above_the_floor(
+    s: State, owner: nat, now: int, ttl: nat, same: bool, floor: nat)
+    requires grants(s, Op::Claim { owner, now, ttl, same, floor })
+    ensures apply(s, Op::Claim { owner, now, ttl, same, floor }).slot.epoch > floor
+{}
+
+/// The old owner after a new grant: whatever epoch it held, it cannot renew,
+/// release or write.
 pub proof fn old_owner_is_fenced(
-    s: State, old: nat, old_epoch: nat, now: int, ttl: nat)
+    s: State, op: Op, old: nat, old_epoch: nat, now: int, ttl: nat)
     requires
         inv(s),
         old_epoch <= s.last,
-        s.slot.epoch == s.last,
-        s.slot.owner != old || s.slot.epoch != old_epoch,
+        grants(s, op),
     ensures
-        !admits(s.slot, old, old_epoch),
-        apply(s, Op::Renew { owner: old, epoch: old_epoch, now, ttl }) == s,
-        apply(s, Op::Release { owner: old, epoch: old_epoch, now }) == s,
+        !admits(apply(s, op).slot, old, old_epoch),
+        apply(apply(s, op), Op::Renew { owner: old, epoch: old_epoch, now, ttl })
+            == apply(s, op),
+        apply(apply(s, op), Op::Release { owner: old, epoch: old_epoch, now })
+            == apply(s, op),
 {}
 
 /// A stale epoch is never current.

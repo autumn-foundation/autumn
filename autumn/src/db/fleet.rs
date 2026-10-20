@@ -825,6 +825,8 @@ struct Inner {
     replicating: AtomicBool,
     replication: std::sync::OnceLock<Arc<super::fleet_replication::FleetReplication>>,
     ownership: std::sync::OnceLock<Arc<super::fleet_ownership::FleetOwnership>>,
+    /// The shared volume lock held while ownership is installed.
+    volume_lock: Mutex<Option<VolumeLock>>,
     state: Mutex<State>,
     lifecycle: std::sync::RwLock<Vec<Arc<dyn FleetLifecycle>>>,
     counters: Counters,
@@ -985,6 +987,7 @@ impl DatabaseFleet {
                 replicating: AtomicBool::new(false),
                 replication: std::sync::OnceLock::new(),
                 ownership: std::sync::OnceLock::new(),
+                volume_lock: Mutex::new(None),
                 state: Mutex::new(State::default()),
                 lifecycle: std::sync::RwLock::new(Vec::new()),
                 counters: Counters::default(),
@@ -1073,6 +1076,10 @@ impl DatabaseFleet {
     /// the first open, once, after a first
     /// [`refresh`](super::fleet_ownership::FleetOwnership::refresh).
     ///
+    /// The process also takes a shared OS lock on the root, so that
+    /// [`release_ownership`](Self::release_ownership) knows when it is the
+    /// last process on the volume.
+    ///
     /// # Errors
     ///
     /// The ownership that is already installed, when called twice.
@@ -1081,8 +1088,58 @@ impl DatabaseFleet {
         ownership: Arc<super::fleet_ownership::FleetOwnership>,
     ) -> Result<(), Arc<super::fleet_ownership::FleetOwnership>> {
         self.inner.ownership.set(ownership)?;
+        match VolumeLock::shared(self.root()) {
+            Ok(lock) => {
+                *self
+                    .inner
+                    .volume_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lock);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "fleet ownership: no volume lock; ranges lapse instead of being released");
+            }
+        }
         self.wire_fence_hook();
         Ok(())
+    }
+
+    /// Release this host's ranges at shutdown, after the databases closed,
+    /// so the next owner can claim them at once. Returns whether it released.
+    ///
+    /// It releases only when this is the last process on the volume (the
+    /// processes share the owner id and the epoch) and nothing committed is
+    /// left unshipped. Otherwise the leases lapse.
+    pub async fn release_ownership(&self) -> bool {
+        let Some(ownership) = self.ownership() else {
+            return false;
+        };
+        if self.replication().is_some_and(|r| r.closing() > 0) {
+            tracing::warn!("fleet ownership: unshipped frames; the ranges lapse instead");
+            return false;
+        }
+        let shared = self
+            .inner
+            .volume_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if shared.is_none() {
+            return false;
+        }
+        drop(shared);
+        let root = self.root().to_path_buf();
+        let last = crate::time::spawn_blocking(move || VolumeLock::exclusive(&root))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        let Some(_last) = last else {
+            tracing::info!("fleet ownership: another process on this volume serves; not released");
+            return false;
+        };
+        ownership.release_all().await;
+        true
     }
 
     /// With both ownership and replication: a replicator that sees a newer
@@ -1177,7 +1234,20 @@ impl DatabaseFleet {
                 let changed = ownership.changed().notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                ownership.refresh().await;
+                // Close a lapsed range first: the store may hang (a real
+                // partition), and the local lease must still end on time.
+                let _ = fleet.fence_unowned();
+                let refresh = ownership.refresh();
+                tokio::pin!(refresh);
+                loop {
+                    let lapse = ownership.next_lapse();
+                    tokio::select! {
+                        _ = &mut refresh => break,
+                        () = sleep_until_some(lapse) => {
+                            let _ = fleet.fence_unowned();
+                        }
+                    }
+                }
                 let _ = fleet.fence_unowned();
                 let wake = ownership.next_wake();
                 tokio::select! {
@@ -1529,12 +1599,25 @@ impl DatabaseFleet {
                     if db.pool.is_closed() {
                         continue;
                     }
-                    // Opened under another epoch: never serve it under this
-                    // one. Close it and open it fresh.
-                    if db.epoch != epoch {
-                        drop(db);
-                        self.close(key).await;
-                        continue;
+                    // Read the epoch again: the open can take long (a
+                    // restore), and the range can be lost meanwhile. Never
+                    // serve a database under an epoch this host does not hold
+                    // now. The fence closes it; it is not awaited here, as
+                    // the caller may hold one of its connections.
+                    match self.owned_epoch(key) {
+                        Ok(now) if now == db.epoch => {}
+                        Ok(_) => {
+                            let _ = self.fence_unowned();
+                            return Err(FleetError::Unavailable {
+                                name: key.name(),
+                                detail: "the database reopens under a new ownership epoch; retry"
+                                    .to_owned(),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = self.fence_unowned();
+                            return Err(error);
+                        }
                     }
                     if !background {
                         // The claim stamped the entry before the file was
@@ -3481,6 +3564,60 @@ fn with_path_lock<T>(
 /// Readiness indicator `db:fleet`: the root directory is usable, with the
 /// fleet's counters as details. Individual databases are not pinged — a
 /// tenant fleet can hold millions — a failed open answers its own request.
+/// An OS lock on `<root>/.fleet-locks/owner.lock`. Each process with
+/// ownership holds it shared. A process that gets it exclusive is the last one
+/// on the volume. The OS frees it when the process ends.
+struct VolumeLock {
+    _file: std::fs::File,
+}
+
+impl VolumeLock {
+    fn open(root: &Path) -> std::io::Result<fd_lock::RwLock<std::fs::File>> {
+        let dir = root.join(crate::fleet_layout::RESERVED_DIR);
+        std::fs::create_dir_all(&dir)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("owner.lock"))?;
+        Ok(fd_lock::RwLock::new(file))
+    }
+
+    /// Take the lock shared. Blocks only while a process holds it exclusive
+    /// (for a moment, at its shutdown).
+    fn shared(root: &Path) -> std::io::Result<Self> {
+        let lock = Self::open(root)?;
+        // Keep it held: closing the file frees it.
+        std::mem::forget(lock.read()?);
+        Ok(Self {
+            _file: lock.into_inner(),
+        })
+    }
+
+    /// Take the lock exclusive, without waiting. `None` while another
+    /// process holds it.
+    fn exclusive(root: &Path) -> std::io::Result<Option<Self>> {
+        let mut lock = Self::open(root)?;
+        match lock.try_write() {
+            Ok(guard) => std::mem::forget(guard),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        Ok(Some(Self {
+            _file: lock.into_inner(),
+        }))
+    }
+}
+
+/// Sleep until `at`, or forever when there is none.
+async fn sleep_until_some(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 pub(crate) struct FleetHealthIndicator {
     fleet: DatabaseFleet,
 }

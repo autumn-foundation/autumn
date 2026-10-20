@@ -464,11 +464,12 @@ impl FleetReplication {
             if let Err(error) = replicator.tick() {
                 tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
             }
-            let fenced_by = replicator.fenced_by();
-            drop(replicator);
-            if let Some(newest) = fenced_by {
+            // Under the replicator lock: an `on_open` that reuses this
+            // replica then sees the flag.
+            if let Some(newest) = replicator.fenced_by() {
                 self.fence(&key, &replica, newest);
             }
+            drop(replicator);
         }
         let parked: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
             .parked()
@@ -485,10 +486,12 @@ impl FleetReplication {
             };
             let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
             let fenced_by = replicator.fenced_by();
-            drop(replicator);
             if let Some(newest) = fenced_by {
-                // Nothing more ships: let the file go.
                 self.fence(&key, &replica, newest);
+            }
+            drop(replicator);
+            if fenced_by.is_some() {
+                // Nothing more ships: let the file go.
                 self.retire_parked(&key, &replica);
                 continue;
             }
@@ -697,12 +700,14 @@ impl FleetLifecycle for FleetReplication {
         let parked = self.parked().remove(db.key());
         if let Some(parked) = parked {
             // A new epoch starts a new generation; a fenced replica cannot
-            // be reused.
-            if !parked.fenced.load(Ordering::Acquire) {
-                if let Some(mut replicator) = lock_replicator(&parked, &|| None) {
-                    replicator.set_epoch(epoch);
-                }
-                self.active().insert(db.key().clone(), parked);
+            // be reused. The flag is read under the replicator lock, which a
+            // tick holds while it sets it.
+            if let Some(mut replicator) = lock_replicator(&parked, &|| None)
+                && !parked.fenced.load(Ordering::Acquire)
+            {
+                replicator.set_epoch(epoch);
+                drop(replicator);
+                self.active().insert(db.key().clone(), Arc::clone(&parked));
                 return Ok(());
             }
         }

@@ -77,6 +77,9 @@ pub const MIN_LEASE_TTL: Duration = Duration::from_secs(3);
 /// The default lease.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 
+/// The longest lease. A longer one stalls a failover for too long.
+pub const MAX_LEASE_TTL: Duration = Duration::from_secs(3600);
+
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 /// Why an ownership operation failed.
@@ -89,8 +92,12 @@ pub enum OwnershipError {
     /// Two configured ranges overlap.
     #[error("slot ranges {0} and {1} overlap")]
     Overlap(SlotRange, SlotRange),
-    /// An owner id is empty, too long, or has control characters.
-    #[error("invalid fleet owner id {0:?}: use 1 to 128 printable characters")]
+    /// An owner id is empty, too long, has control characters, or starts
+    /// or ends with white space.
+    #[error(
+        "invalid fleet owner id {0:?}: use 1 to 128 bytes, no control characters, no white \
+         space at the start or end"
+    )]
     InvalidOwner(String),
     /// Another owner holds a live lease on part of the range.
     #[error("slot range {range} is held by {owner} until {lease_expires_ms} ms")]
@@ -203,10 +210,11 @@ impl OwnerId {
     /// # Errors
     ///
     /// [`OwnershipError::InvalidOwner`] for an empty id, one over 128 bytes,
-    /// or one with control characters.
+    /// one with control characters, or one with white space at the start or
+    /// end (`"a"` and `" a"` would be two owners).
     pub fn new(id: impl Into<String>) -> Result<Self, OwnershipError> {
         let id = id.into();
-        if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+        if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) || id.trim() != id {
             return Err(OwnershipError::InvalidOwner(id));
         }
         Ok(Self(id))
@@ -305,18 +313,12 @@ impl OwnershipTable {
             .is_some_and(|row| row.owner == *owner && row.epoch == epoch)
     }
 
-    /// Claim `range` for `owner`.
-    ///
-    /// - A live lease of another owner on any slot of the range refuses it.
-    /// - The owner's own row with the same bounds keeps its epoch: a restart,
-    ///   or a second process on the same volume, is not a new owner.
-    /// - Otherwise the rows that overlap the range go, and one row with a new
-    ///   epoch replaces them. Slots of those rows outside the range are free.
+    /// Claim `range` for `owner`. See [`claim_above`](Self::claim_above).
     ///
     /// # Errors
     ///
-    /// [`OwnershipError::Held`] when another owner holds a live lease on a
-    /// slot of the range.
+    /// [`OwnershipError::Held`] when a live lease that is not the same claim
+    /// covers a slot of the range.
     pub fn claim(
         &mut self,
         range: SlotRange,
@@ -324,8 +326,41 @@ impl OwnershipTable {
         now_ms: i64,
         ttl: Duration,
     ) -> Result<Grant, OwnershipError> {
+        self.claim_above(range, owner, now_ms, ttl, 0)
+    }
+
+    /// Claim `range` for `owner`, at an epoch above `floor`.
+    ///
+    /// - A live lease on any slot of the range refuses the claim, unless it
+    ///   is the owner's own row with the same bounds. So a range of another
+    ///   shape is never taken while it is live, even from the same owner.
+    /// - The owner's own row with the same bounds keeps its epoch, if the
+    ///   epoch is above `floor`: a restart, or a second process on the same
+    ///   volume, is not a new owner.
+    /// - Otherwise the rows that overlap the range go (their leases ended),
+    ///   and one row with a new epoch replaces them. The new epoch is above
+    ///   the counter and above `floor`.
+    ///
+    /// `floor` is the newest epoch a replicator saw at the destination. A
+    /// counter that went back (a control database restored to an earlier
+    /// time) then cannot issue an epoch that the replicas fence.
+    ///
+    /// # Errors
+    ///
+    /// [`OwnershipError::Held`] when a live lease that is not the same claim
+    /// covers a slot of the range.
+    pub fn claim_above(
+        &mut self,
+        range: SlotRange,
+        owner: &OwnerId,
+        now_ms: i64,
+        ttl: Duration,
+        floor: u64,
+    ) -> Result<Grant, OwnershipError> {
         if let Some(row) = self.rows.iter().find(|row| {
-            row.range.overlaps(range) && row.owner != *owner && row.lease_expires_ms > now_ms
+            row.range.overlaps(range)
+                && !(row.owner == *owner && row.range == range)
+                && row.lease_expires_ms > now_ms
         }) {
             return Err(OwnershipError::Held {
                 range: row.range,
@@ -339,7 +374,7 @@ impl OwnershipTable {
         if let Some(row) = self
             .rows
             .iter_mut()
-            .find(|row| row.range == range && row.owner == *owner)
+            .find(|row| row.range == range && row.owner == *owner && row.epoch.get() > floor)
         {
             row.lease_expires_ms = lease_expires_ms;
             return Ok(Grant {
@@ -349,7 +384,7 @@ impl OwnershipTable {
                 fresh: false,
             });
         }
-        let next = self.last_epoch.saturating_add(1);
+        let next = self.last_epoch.max(floor).saturating_add(1);
         let epoch = i64::try_from(next)
             .ok()
             .and_then(|n| FencingToken::try_from(n).ok())
@@ -425,6 +460,13 @@ impl OwnershipTable {
     }
 }
 
+/// `at + by`, or `at` when that overflows.
+fn later(at: tokio::time::Instant, by: Duration) -> tokio::time::Instant {
+    // `by` is at most the lease, so this does not overflow in practice. If
+    // it did, the lease would end now: the safe side.
+    at.checked_add(by).unwrap_or(at)
+}
+
 /// `now + ttl` in epoch milliseconds, saturating.
 fn lease_end(now_ms: i64, ttl: Duration) -> i64 {
     now_ms.saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX))
@@ -435,12 +477,13 @@ fn lease_end(now_ms: i64, ttl: Duration) -> i64 {
 /// Where the ownership table lives. Every host that serves the fleet must use
 /// the same store. Each call is one atomic decision of [`OwnershipTable`].
 pub trait SlotOwnershipStore: Send + Sync + 'static {
-    /// [`OwnershipTable::claim`] at the store's time.
+    /// [`OwnershipTable::claim_above`] at the store's time.
     fn claim<'a>(
         &'a self,
         range: SlotRange,
         owner: &'a OwnerId,
         ttl: Duration,
+        floor: u64,
     ) -> BoxFuture<'a, Result<Grant, OwnershipError>>;
 
     /// [`OwnershipTable::renew`] at the store's time.
@@ -636,9 +679,10 @@ impl SlotOwnershipStore for SqlSlotOwnership {
         range: SlotRange,
         owner: &'a OwnerId,
         ttl: Duration,
+        floor: u64,
     ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
         let owner = owner.clone();
-        Box::pin(self.decide(move |table, now| table.claim(range, &owner, now, ttl)))
+        Box::pin(self.decide(move |table, now| table.claim_above(range, &owner, now, ttl, floor)))
     }
 
     fn renew<'a>(
@@ -703,6 +747,9 @@ pub struct FleetOwnership {
     held: RwLock<Vec<Held>>,
     last: Mutex<RefreshReport>,
     changed: Notify,
+    /// The newest epoch a replicator saw at the destination. Claims go
+    /// above it.
+    fence_floor: std::sync::atomic::AtomicU64,
 }
 
 impl fmt::Debug for FleetOwnership {
@@ -720,8 +767,8 @@ impl FleetOwnership {
     /// # Errors
     ///
     /// [`OwnershipError::Overlap`] when two ranges overlap, or
-    /// [`OwnershipError::InvalidRange`] for no range or a `ttl` under
-    /// [`MIN_LEASE_TTL`].
+    /// [`OwnershipError::InvalidRange`] for no range or a `ttl` outside
+    /// [`MIN_LEASE_TTL`]..=[`MAX_LEASE_TTL`].
     pub fn new(
         store: Arc<dyn SlotOwnershipStore>,
         owner: OwnerId,
@@ -731,10 +778,11 @@ impl FleetOwnership {
         if ranges.is_empty() {
             return Err(OwnershipError::InvalidRange("no slot range".to_owned()));
         }
-        if ttl < MIN_LEASE_TTL {
+        if !(MIN_LEASE_TTL..=MAX_LEASE_TTL).contains(&ttl) {
             return Err(OwnershipError::InvalidRange(format!(
-                "the lease must be at least {}s",
-                MIN_LEASE_TTL.as_secs()
+                "the lease must be {}s to {}s",
+                MIN_LEASE_TTL.as_secs(),
+                MAX_LEASE_TTL.as_secs()
             )));
         }
         let mut sorted = ranges.clone();
@@ -750,6 +798,7 @@ impl FleetOwnership {
             held: RwLock::new(Vec::new()),
             last: Mutex::new(RefreshReport::default()),
             changed: Notify::new(),
+            fence_floor: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -786,13 +835,16 @@ impl FleetOwnership {
             // Sent before the call: the local lease must not outlive the
             // store's.
             let sent = tokio::time::Instant::now();
-            let result = match held {
-                Some(epoch) => self.store.renew(range, &self.owner, epoch, self.ttl).await,
-                None => self.store.claim(range, &self.owner, self.ttl).await,
+            let result = if let Some(epoch) = held {
+                self.store.renew(range, &self.owner, epoch, self.ttl).await
+            } else {
+                let floor = self.fence_floor.load(std::sync::atomic::Ordering::Acquire);
+                self.store.claim(range, &self.owner, self.ttl, floor).await
             };
             match result {
                 Ok(grant) => {
-                    self.hold(grant, sent + self.ttl.saturating_sub(self.renew_interval()));
+                    let valid_for = self.ttl.saturating_sub(self.renew_interval());
+                    self.hold(grant, later(sent, valid_for));
                     if held.is_some() {
                         report.renewed.push(range);
                     } else {
@@ -872,6 +924,8 @@ impl FleetOwnership {
     /// `newer` (a replicator saw `newer` at the destination). Returns whether
     /// a range was dropped.
     pub fn lose(&self, slot: u16, newer: FencingToken) -> bool {
+        self.fence_floor
+            .fetch_max(newer.get(), std::sync::atomic::Ordering::AcqRel);
         let range = self
             .read_held()
             .iter()
@@ -914,12 +968,20 @@ impl FleetOwnership {
     /// first local lease that runs out before it.
     #[must_use]
     pub fn next_wake(&self) -> tokio::time::Instant {
-        let renew = tokio::time::Instant::now() + self.renew_interval();
+        let renew = later(tokio::time::Instant::now(), self.renew_interval());
+        self.next_lapse().map_or(renew, |lapse| lapse.min(renew))
+    }
+
+    /// When the first local lease that still runs will end. `None` when no
+    /// local lease runs.
+    #[must_use]
+    pub fn next_lapse(&self) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
         self.read_held()
             .iter()
             .map(|held| held.valid_until)
-            .filter(|until| *until > tokio::time::Instant::now())
-            .fold(renew, std::cmp::Ord::min)
+            .filter(|until| *until > now)
+            .min()
     }
 
     /// Wakes when a range is lost.
@@ -1020,7 +1082,13 @@ mod tests {
     #[test]
     fn owner_ids_refuse_empty_long_and_control_text() {
         assert!(OwnerId::new("host-a").is_ok());
-        for bad in [String::new(), "x".repeat(129), "a\nb".to_owned()] {
+        for bad in [
+            String::new(),
+            "x".repeat(129),
+            "a\nb".to_owned(),
+            " host-a".to_owned(),
+            "host-a ".to_owned(),
+        ] {
             assert!(OwnerId::new(bad).is_err());
         }
     }
@@ -1115,9 +1183,23 @@ mod tests {
     }
 
     #[test]
-    fn a_reshaped_range_takes_a_new_epoch_and_frees_the_rest() {
+    fn a_live_range_of_another_shape_is_refused_even_to_its_owner() {
         let mut table = OwnershipTable::new();
         table.claim(range(0, 199), &owner("a"), 0, TTL).unwrap();
+        // An old process of owner "a" may still serve 100-199.
+        assert!(matches!(
+            table.claim(range(0, 99), &owner("a"), 1_000, TTL),
+            Err(OwnershipError::Held { .. })
+        ));
+        assert_eq!(table.last_epoch(), 1);
+    }
+
+    #[test]
+    fn a_reshaped_range_takes_a_new_epoch_and_frees_the_rest() {
+        let mut table = OwnershipTable::new();
+        let wide = table.claim(range(0, 199), &owner("a"), 0, TTL).unwrap();
+        // The old shape's lease ends (released at shutdown, or lapsed).
+        assert!(table.release(range(0, 199), &owner("a"), wide.epoch, 1_000));
         let narrow = table.claim(range(0, 99), &owner("a"), 1_000, TTL).unwrap();
         assert!(narrow.fresh);
         assert_eq!(narrow.epoch, token(2));
@@ -1142,9 +1224,31 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_goes_above_the_epoch_a_replicator_saw() {
+        let mut table = OwnershipTable::new();
+        let first = table.claim(range(0, 99), &owner("a"), 0, TTL).unwrap();
+        assert_eq!(first.epoch, token(1));
+        // The counter went back (a restored control database), and a replica
+        // shows epoch 7. The owner's own row does not keep its epoch.
+        let grant = table
+            .claim_above(range(0, 99), &owner("a"), 1_000, TTL, 7)
+            .unwrap();
+        assert!(grant.fresh);
+        assert_eq!(grant.epoch, token(8));
+        assert_eq!(table.last_epoch(), 8);
+        // Above the floor, the own row keeps its epoch as before.
+        let again = table
+            .claim_above(range(0, 99), &owner("a"), 2_000, TTL, 7)
+            .unwrap();
+        assert_eq!(again.epoch, token(8));
+        assert!(!again.fresh);
+    }
+
+    #[test]
     fn epochs_are_never_reused_after_rows_are_removed() {
         let mut table = OwnershipTable::new();
-        table.claim(range(0, 99), &owner("a"), 0, TTL).unwrap();
+        let first = table.claim(range(0, 99), &owner("a"), 0, TTL).unwrap();
+        table.release(range(0, 99), &owner("a"), first.epoch, 0);
         table.claim(range(0, 49), &owner("a"), 0, TTL).unwrap();
         let rebuilt = OwnershipTable::from_parts(table.rows().to_vec(), table.last_epoch());
         let mut rebuilt = rebuilt;
@@ -1187,10 +1291,15 @@ mod tests {
         );
         let (ha, hb) = (owner("a"), owner("b"));
         let (ra, rb) = tokio::join!(
-            a.claim(SlotRange::ALL, &ha, TTL),
-            b.claim(SlotRange::ALL, &hb, TTL)
+            a.claim(SlotRange::ALL, &ha, TTL, 0),
+            b.claim(SlotRange::ALL, &hb, TTL, 0)
         );
         assert!(ra.is_ok() != rb.is_ok(), "{ra:?} {rb:?}");
+        let loser = if ra.is_ok() { rb } else { ra };
+        assert!(
+            matches!(loser, Err(OwnershipError::Held { .. })),
+            "the loser is refused, not busy: {loser:?}"
+        );
         let rows = a.rows().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].epoch, token(1));
@@ -1201,9 +1310,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let clock = clock_at(1_000_000);
         let s = store(dir.path(), &clock).await;
-        let old = s.claim(range(0, 99), &owner("a"), TTL).await.unwrap();
+        let old = s.claim(range(0, 99), &owner("a"), TTL, 0).await.unwrap();
         clock.advance(TTL);
-        let new = s.claim(range(0, 99), &owner("b"), TTL).await.unwrap();
+        let new = s.claim(range(0, 99), &owner("b"), TTL, 0).await.unwrap();
         assert_eq!(new.epoch, token(2));
         assert_eq!(
             s.renew(range(0, 99), &owner("a"), old.epoch, TTL).await,
@@ -1222,11 +1331,11 @@ mod tests {
                 .unwrap()
         );
         // Re-shaping removes the row; the counter keeps the epochs unique.
-        let c = s.claim(range(0, 49), &owner("c"), TTL).await.unwrap();
+        let c = s.claim(range(0, 49), &owner("c"), TTL, 0).await.unwrap();
         assert_eq!(c.epoch, token(3));
         let reopened = store(dir.path(), &clock).await;
         let d = reopened
-            .claim(range(50, 99), &owner("d"), TTL)
+            .claim(range(50, 99), &owner("d"), TTL, 0)
             .await
             .unwrap();
         assert_eq!(d.epoch, token(4));
@@ -1256,10 +1365,11 @@ mod tests {
             range: SlotRange,
             owner: &'a OwnerId,
             ttl: Duration,
+            floor: u64,
         ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
             Box::pin(async move {
                 self.check()?;
-                self.inner.claim(range, owner, ttl).await
+                self.inner.claim(range, owner, ttl, floor).await
             })
         }
         fn renew<'a>(
@@ -1444,9 +1554,42 @@ mod tests {
             store_clock: &crate::time::TickingClock,
             ranges: Vec<SlotRange>,
         ) -> Host {
+            host_on(dir, name, name, store_clock, ranges).await
+        }
+
+        /// A process of owner `name` on volume `volume`.
+        async fn host_on(
+            dir: &std::path::Path,
+            volume: &str,
+            name: &str,
+            store_clock: &crate::time::TickingClock,
+            ranges: Vec<SlotRange>,
+        ) -> Host {
+            let (fleet, replication, clock) = plain(dir, volume);
+            let store = Arc::new(store(dir, store_clock).await);
+            let ownership = Arc::new(FleetOwnership::new(store, owner(name), ranges, TTL).unwrap());
+            ownership.refresh().await;
+            fleet.install_ownership(Arc::clone(&ownership)).unwrap();
+            Host {
+                fleet,
+                replication,
+                ownership,
+                clock,
+            }
+        }
+
+        /// A replicated fleet on volume `volume`, with no ownership.
+        fn plain(
+            dir: &std::path::Path,
+            volume: &str,
+        ) -> (
+            DatabaseFleet,
+            Arc<FleetReplication>,
+            crate::time::TickingClock,
+        ) {
             let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
                 mode: FleetMode::Tenant,
-                root: dir.join(name).display().to_string(),
+                root: dir.join(volume).display().to_string(),
                 path: None,
                 max_open: 8,
                 pool_size: 2,
@@ -1476,16 +1619,7 @@ mod tests {
                 Arc::new(clock.clone()),
             ));
             assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
-            let store = Arc::new(store(dir, store_clock).await);
-            let ownership = Arc::new(FleetOwnership::new(store, owner(name), ranges, TTL).unwrap());
-            ownership.refresh().await;
-            fleet.install_ownership(Arc::clone(&ownership)).unwrap();
-            Host {
-                fleet,
-                replication,
-                ownership,
-                clock,
-            }
+            (fleet, replication, clock)
         }
 
         async fn exec(db: &FleetDatabase, sql: &str) -> Result<usize, String> {
@@ -1619,6 +1753,64 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn only_the_last_process_on_a_volume_releases() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            // A web and a worker process of owner "a" share one volume.
+            let web = host_on(dir.path(), "vol", "a", &clock, vec![SlotRange::ALL]).await;
+            let worker = host_on(dir.path(), "vol", "a", &clock, vec![SlotRange::ALL]).await;
+            assert_eq!(worker.ownership.held(), web.ownership.held(), "one epoch");
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+
+            // The worker stops: the web process still serves, so no release.
+            worker.fleet.close_all().await;
+            assert!(!worker.fleet.release_ownership().await);
+            assert_eq!(b.ownership.refresh().await.waiting, vec![SlotRange::ALL]);
+
+            // The last process stops and releases: B claims at once.
+            web.fleet.close_all().await;
+            assert!(web.fleet.release_ownership().await);
+            assert_eq!(
+                b.ownership.refresh().await.claimed,
+                vec![(SlotRange::ALL, token(2))]
+            );
+        }
+
+        #[tokio::test]
+        async fn generations_keep_the_newest_epoch_when_ownership_is_turned_off() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db = a.fleet.open(&key).await.unwrap();
+            exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db, "INSERT INTO notes VALUES ('epoch 1')")
+                .await
+                .unwrap();
+            drop(db);
+            a.fleet.close_all().await;
+
+            // The same data, later, on a host with ownership turned off.
+            let (plain_fleet, replication, _) = plain(dir.path(), "plain");
+            let db = plain_fleet.open(&key).await.unwrap();
+            assert_eq!(db.epoch(), None);
+            exec(&db, "INSERT INTO notes VALUES ('no ownership')")
+                .await
+                .unwrap();
+            tick(&replication).await;
+            drop(db);
+            plain_fleet.close_all().await;
+
+            // A restore takes the newer generation, not the old epoch-1 one.
+            let (fresh, _, _) = plain(dir.path(), "fresh");
+            let db = fresh.open(&key).await.unwrap();
+            assert_eq!(bodies(&db).await, vec!["epoch 1", "no ownership"]);
+            fresh.close_all().await;
+        }
+
+        #[tokio::test]
         async fn fan_out_skips_slots_this_host_does_not_own() {
             let dir = tempfile::tempdir().unwrap();
             let clock = clock_at(1_000_000);
@@ -1716,6 +1908,8 @@ mod tests {
             Claim(u8, u16, u16, i64),
             Renew(u8, u16, u16, i64),
             Release(u8, u16, u16, i64),
+            /// A renew with any epoch, stale ones included.
+            RenewAt(u8, u16, u16, i64, u64),
         }
 
         fn op() -> impl Strategy<Value = Op> {
@@ -1723,7 +1917,9 @@ mod tests {
             prop_oneof![
                 (0_u8..3, r.clone(), 0_i64..200).prop_map(|(o, (a, b), t)| Op::Claim(o, a, b, t)),
                 (0_u8..3, r.clone(), 0_i64..200).prop_map(|(o, (a, b), t)| Op::Renew(o, a, b, t)),
-                (0_u8..3, r, 0_i64..200).prop_map(|(o, (a, b), t)| Op::Release(o, a, b, t)),
+                (0_u8..3, r.clone(), 0_i64..200).prop_map(|(o, (a, b), t)| Op::Release(o, a, b, t)),
+                (0_u8..3, r, 0_i64..200, 1_u64..8)
+                    .prop_map(|(o, (a, b), t, e)| Op::RenewAt(o, a, b, t, e)),
             ]
         }
 
@@ -1738,7 +1934,6 @@ mod tests {
                 let ttl = Duration::from_millis(50);
                 let mut table = OwnershipTable::new();
                 let mut clock = 0_i64;
-                // Each owner's newest epoch per slot, to check stale writes.
                 for op in ops {
                     let before = table.clone();
                     match op {
@@ -1748,7 +1943,7 @@ mod tests {
                             let result = table.claim(range(a, b), who, clock, ttl);
                             let blocked = before.rows().iter().any(|row| {
                                 row.range.overlaps(range(a, b))
-                                    && row.owner != *who
+                                    && !(row.owner == *who && row.range == range(a, b))
                                     && row.lease_expires_ms > clock
                             });
                             prop_assert_eq!(result.is_err(), blocked);
@@ -1765,6 +1960,15 @@ mod tests {
                                 let ok = table.renew(range(a, b), who, row.epoch, clock, ttl).is_ok();
                                 prop_assert_eq!(ok, row.owner == *who);
                             }
+                        }
+                        Op::RenewAt(o, a, b, dt, e) => {
+                            clock += dt;
+                            let who = &owners[usize::from(o)];
+                            let ok = table.renew(range(a, b), who, token(e), clock, ttl).is_ok();
+                            let holds = before.rows().iter().any(|row| {
+                                row.range == range(a, b) && row.owner == *who && row.epoch == token(e)
+                            });
+                            prop_assert_eq!(ok, holds, "a stale epoch never renews");
                         }
                         Op::Release(o, a, b, dt) => {
                             clock += dt;

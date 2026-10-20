@@ -1166,11 +1166,11 @@ impl FleetSweeper {
                 Ok(None) => return Visit::Deferred,
                 // The file is gone: nothing can be pending in it.
                 Err(FleetError::NotFound { .. }) => return self.forget_database(&name).await,
-                Err(FleetError::Deleting { .. }) => return Visit::Skipped,
-                // Another host owns the slot (issue #3233): its work is not
-                // this host's to do. Keep the row for when the slot returns.
-                Err(FleetError::NotOwner { .. }) => {
-                    self.back_off(&name).await;
+                // `NotOwner`: another host owns the slot (issue #3233), so
+                // its work is not this host's to do. Keep the row as it is:
+                // on a shared control database, a back-off here would delay
+                // the owner.
+                Err(FleetError::Deleting { .. } | FleetError::NotOwner { .. }) => {
                     return Visit::Skipped;
                 }
                 Err(error) => {

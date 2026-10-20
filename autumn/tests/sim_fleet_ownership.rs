@@ -61,10 +61,11 @@ impl SlotOwnershipStore for Link {
         range: SlotRange,
         owner: &'a OwnerId,
         ttl: Duration,
+        floor: u64,
     ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
         Box::pin(async move {
             self.reach()?;
-            self.store.claim(range, owner, ttl).await
+            self.store.claim(range, owner, ttl, floor).await
         })
     }
 
@@ -104,6 +105,7 @@ struct Host {
     ownership: Arc<FleetOwnership>,
     link: Arc<Link>,
     stop: CancellationToken,
+    renewals: tokio::task::JoinHandle<()>,
 }
 
 async fn host(dir: &std::path::Path, name: &str) -> Host {
@@ -164,13 +166,14 @@ async fn host(dir: &std::path::Path, name: &str) -> Host {
     ownership.refresh().await;
     assert!(fleet.install_ownership(Arc::clone(&ownership)).is_ok());
     let stop = CancellationToken::new();
-    drop(fleet.spawn_ownership(stop.clone()));
+    let renewals = fleet.spawn_ownership(stop.clone());
     Host {
         fleet,
         replication,
         ownership,
         link,
         stop,
+        renewals,
     }
 }
 
@@ -197,11 +200,9 @@ async fn count(db: &FleetDatabase) -> i64 {
     .n
 }
 
-async fn tick(replication: &Arc<FleetReplication>) {
-    let replication = Arc::clone(replication);
-    tokio::task::spawn_blocking(move || replication.tick_all())
-        .await
-        .unwrap();
+/// On the sim thread: the replicator then reads the sim clock.
+fn tick(replication: &FleetReplication) {
+    replication.tick_all();
 }
 
 /// Let the ownership loops run their step for this instant. Their store
@@ -245,7 +246,7 @@ async fn sim_a_partitioned_old_owner_is_fenced_before_the_new_owner_serves(sim: 
     exec(&held, "INSERT INTO notes VALUES ('a1')")
         .await
         .unwrap();
-    tick(&a.replication).await;
+    tick(&a.replication);
     at_most_one_serves(&a, &b, slot);
 
     // A loses the ownership table; it still runs and holds its database.
@@ -271,8 +272,13 @@ async fn sim_a_partitioned_old_owner_is_fenced_before_the_new_owner_serves(sim: 
         a.fleet.open(&key).await,
         Err(FleetError::NotOwner { .. })
     ));
-    settle(|| b.ownership.last_report().waiting == vec![SlotRange::ALL]).await;
-    assert!(b.ownership.epoch_for(slot).is_none(), "A's lease is live");
+    // B asks now, inside the window: the store still refuses it.
+    assert_eq!(
+        b.ownership.refresh().await.waiting,
+        vec![SlotRange::ALL],
+        "A's lease is live in the store"
+    );
+    assert!(b.ownership.epoch_for(slot).is_none());
     at_most_one_serves(&a, &b, slot);
 
     // t = 30 s: the store lease lapses. B claims at epoch 2 and serves the
@@ -284,7 +290,7 @@ async fn sim_a_partitioned_old_owner_is_fenced_before_the_new_owner_serves(sim: 
     assert_eq!(db.epoch(), Some(FencingToken::try_from(2).unwrap()));
     assert_eq!(count(&db).await, 1, "restored from A's replica");
     exec(&db, "INSERT INTO notes VALUES ('b1')").await.unwrap();
-    tick(&b.replication).await;
+    tick(&b.replication);
 
     // The partition heals: A's renew is refused, and it does not serve.
     a.link.cut.store(false, Ordering::SeqCst);
@@ -299,8 +305,9 @@ async fn sim_a_partitioned_old_owner_is_fenced_before_the_new_owner_serves(sim: 
     assert_eq!(count(&db).await, 2);
 
     drop(db);
-    for host in [&a, &b] {
+    for host in [a, b] {
         host.stop.cancel();
+        host.renewals.await.unwrap();
         host.fleet.close_all().await;
     }
 }

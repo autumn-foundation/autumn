@@ -425,6 +425,23 @@ impl Replicator {
         }
     }
 
+    /// The epoch to record on a new generation. With no epoch of its own, a
+    /// replicator takes the newest epoch at the destination: ownership was
+    /// turned off, and the new generations must still order after the
+    /// fenced ones.
+    fn generation_epoch(&self) -> Result<Option<u64>, ReplicationError> {
+        if self.epoch.is_some() {
+            return Ok(self.epoch);
+        }
+        let root = &self.settings.root;
+        Ok(self
+            .destination
+            .list(&segment::epochs_prefix(root))?
+            .iter()
+            .filter_map(|key| segment::parse_epoch_marker_key(root, key))
+            .max())
+    }
+
     /// Whether the periodic fence check is due.
     fn fence_check_due(&self) -> bool {
         if self.fenced_by.is_some() {
@@ -920,6 +937,16 @@ impl Replicator {
             .max(floor_ms.map_or(i64::MIN, |ms| ms.saturating_add(1)));
         let id = segment::generation_id(created_ms, rand::random::<u64>());
 
+        // Before the upload: a retention sweep of another replicator orders
+        // generations by epoch, and must not take this one for epoch 0 while
+        // its snapshot uploads.
+        if let Some(epoch) = self.generation_epoch()? {
+            self.destination.put(
+                &segment::generation_epoch_key(&self.settings.root, &id, epoch),
+                b"{}",
+            )?;
+        }
+
         let staging = staging_path(db);
         let (sha256, uncompressed_len) = gzip_file(db, &staging)?;
         let upload = self
@@ -940,12 +967,6 @@ impl Replicator {
             op: "encode snapshot metadata",
             detail: e.to_string(),
         })?;
-        if let Some(epoch) = self.epoch {
-            self.destination.put(
-                &segment::generation_epoch_key(&self.settings.root, &id, epoch),
-                b"{}",
-            )?;
-        }
         // Written LAST: its presence is what makes the generation restorable.
         self.destination
             .put(&segment::snapshot_meta_key(&self.settings.root, &id), &body)?;
@@ -1130,57 +1151,14 @@ impl Replicator {
             .list(&segment::generations_prefix(&self.settings.root))?;
 
         let open_generation = self.state.as_ref().map(|state| state.id.clone());
-        // Ordered as a restore orders them: epoch, then time (issue #3233).
-        let epochs = restore::generation_epochs(&self.settings.root, &keys);
-        let mut generations: BTreeMap<(u64, i64, String), Vec<String>> = BTreeMap::new();
-        let mut complete: Vec<(u64, i64, String)> = Vec::new();
-        for key in keys {
-            let Some(id) = segment::generation_of_key(&self.settings.root, &key) else {
-                continue;
-            };
-            let Some(info) = segment::parse_generation_id(&id) else {
-                continue;
-            };
-            let epoch = epochs.get(&id).copied().unwrap_or(0);
-            if key.ends_with(segment::SNAPSHOT_META_OBJECT) {
-                complete.push((epoch, info.created_ms, id.clone()));
-            }
-            generations
-                .entry((epoch, info.created_ms, id))
-                .or_default()
-                .push(key);
-        }
-        complete.sort_unstable();
-
-        // The generation a restore to the cutoff picks is the floor of the
-        // retention window; everything ordered before it is droppable.
-        let Some(floor) = complete
-            .iter()
-            .rev()
-            .find(|(_, ms, _)| *ms <= cutoff_ms)
-            .cloned()
-        else {
-            return Ok(0);
-        };
-        // Keep the newest few complete generations unconditionally. A clock that
-        // steps forward past the retention window would otherwise expire the
-        // whole history in one sweep and leave nothing to restore from.
-        let keep_newest: std::collections::BTreeSet<(u64, i64, String)> = complete
-            .iter()
-            .rev()
-            .take(MIN_KEPT_GENERATIONS)
-            .cloned()
-            .collect();
-
+        let droppable = prunable(
+            &self.settings.root,
+            keys,
+            cutoff_ms,
+            open_generation.as_deref(),
+        );
         let mut pruned: u64 = 0;
-        for ((epoch, ms, id), keys) in &generations {
-            let order = (*epoch, *ms, id.clone());
-            if order >= floor
-                || keep_newest.contains(&order)
-                || open_generation.as_ref() == Some(id)
-            {
-                continue;
-            }
+        for (id, keys) in &droppable {
             // Delete the commit marker FIRST: a prune interrupted halfway then
             // leaves an *uncommitted* generation, which restore ignores, rather
             // than a complete-looking generation with no segments.
@@ -1206,6 +1184,69 @@ impl Replicator {
         }
         Ok(pruned)
     }
+}
+
+/// The generations a retention sweep at `cutoff_ms` removes, with their keys.
+///
+/// Ordered as a restore orders them: epoch, then time (issue #3233). The floor
+/// is the generation a restore to the cutoff picks. A generation is removed
+/// when it orders before the floor, is not one of the
+/// [`MIN_KEPT_GENERATIONS`] newest complete ones, and is not `open`. A
+/// generation with no `snapshot.json` that is newer in time than the floor
+/// is never removed: it can be another replicator's upload in progress, whose
+/// epoch marker is not there yet.
+fn prunable(
+    root: &str,
+    keys: Vec<String>,
+    cutoff_ms: i64,
+    open: Option<&str>,
+) -> Vec<(String, Vec<String>)> {
+    let epochs = restore::generation_epochs(root, &keys);
+    let mut generations: BTreeMap<(u64, i64, String), Vec<String>> = BTreeMap::new();
+    let mut complete: Vec<(u64, i64, String)> = Vec::new();
+    for key in keys {
+        let Some(id) = segment::generation_of_key(root, &key) else {
+            continue;
+        };
+        let Some(info) = segment::parse_generation_id(&id) else {
+            continue;
+        };
+        let epoch = epochs.get(&id).copied().unwrap_or(0);
+        if key.ends_with(segment::SNAPSHOT_META_OBJECT) {
+            complete.push((epoch, info.created_ms, id.clone()));
+        }
+        generations
+            .entry((epoch, info.created_ms, id))
+            .or_default()
+            .push(key);
+    }
+    complete.sort_unstable();
+    let Some(floor) = complete
+        .iter()
+        .rev()
+        .find(|(_, ms, _)| *ms <= cutoff_ms)
+        .cloned()
+    else {
+        return Vec::new();
+    };
+    // Keep the newest few complete generations unconditionally. A clock that
+    // steps forward past the retention window would otherwise expire the
+    // whole history in one sweep and leave nothing to restore from.
+    let keep_newest: std::collections::BTreeSet<&(u64, i64, String)> =
+        complete.iter().rev().take(MIN_KEPT_GENERATIONS).collect();
+    let is_complete: std::collections::BTreeSet<&str> =
+        complete.iter().map(|(_, _, id)| id.as_str()).collect();
+    generations
+        .into_iter()
+        .filter(|(order, _)| {
+            let (_, ms, id) = order;
+            *order < floor
+                && !keep_newest.contains(order)
+                && open != Some(id.as_str())
+                && (is_complete.contains(id.as_str()) || *ms <= floor.1)
+        })
+        .map(|((_, _, id), keys)| (id, keys))
+        .collect()
 }
 
 /// Clears the "verification in flight" flag when dropped, panic or not.
@@ -1383,6 +1424,72 @@ fn sleep_or_cancelled(shutdown: &tokio_util::sync::CancellationToken, total: Dur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keys(id: &str, epoch: Option<u64>, complete: bool) -> Vec<String> {
+        let mut keys = vec![segment::snapshot_key("r", id)];
+        if let Some(epoch) = epoch {
+            keys.push(segment::generation_epoch_key("r", id, epoch));
+        }
+        if complete {
+            keys.push(segment::snapshot_meta_key("r", id));
+        }
+        keys
+    }
+
+    fn pruned(all: &[Vec<String>], cutoff_ms: i64, open: Option<&str>) -> Vec<String> {
+        let mut ids: Vec<String> = prunable("r", all.concat(), cutoff_ms, open)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn retention_orders_by_epoch_then_time() {
+        let id = segment::generation_id;
+        let (old, stale, owner) = (id(1_000, 1), id(5_000, 2), id(2_000, 3));
+        let (newest, kept) = (id(6_000, 4), id(7_000, 5));
+        let all = vec![
+            keys(&old, Some(1), true),
+            keys(&stale, Some(1), true),
+            keys(&owner, Some(2), true),
+            keys(&newest, Some(2), true),
+            keys(&kept, Some(2), true),
+        ];
+        // A restore to 5_500 picks `owner` (epoch 2): the stale epoch-1
+        // generation, newer in time, orders below it and goes.
+        assert_eq!(pruned(&all, 5_500, None), vec![old, stale]);
+    }
+
+    #[test]
+    fn retention_keeps_an_upload_in_progress_newer_than_the_floor() {
+        let id = segment::generation_id;
+        let (floor, uploading) = (id(1_000, 1), id(9_000, 2));
+        let (later, latest) = (id(10_000, 3), id(11_000, 4));
+        let all = vec![
+            keys(&floor, Some(1), true),
+            // Another replicator's snapshot, before its markers.
+            keys(&uploading, None, false),
+            keys(&later, Some(1), true),
+            keys(&latest, Some(1), true),
+        ];
+        assert!(pruned(&all, 5_000, None).is_empty());
+        // Without epochs the old rules hold: older than the floor goes.
+        let (old, mid) = (id(1_000, 1), id(2_000, 2));
+        let (recent, newest) = (id(9_000, 3), id(9_500, 4));
+        let all = vec![
+            keys(&old, None, true),
+            keys(&mid, None, true),
+            keys(&recent, None, true),
+            keys(&newest, None, true),
+        ];
+        assert_eq!(pruned(&all, 5_000, None), vec![old.clone()]);
+        assert!(
+            pruned(&all, 5_000, Some(&old)).is_empty(),
+            "the open generation stays"
+        );
+    }
 
     #[test]
     fn staging_path_sits_next_to_the_database() {

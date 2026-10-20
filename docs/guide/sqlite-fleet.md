@@ -327,77 +327,91 @@ and which database has it.
 ## Failover: slot ownership
 
 With `[database.fleet.ownership]`, a host serves only the slot ranges that it
-owns. Each claim of a range gets an **epoch**, a number that only goes up.
-The epoch fences the old owner: its opens stop, its replicator stops, and a
-restore never takes its data over the new owner's.
+owns. Each claim of a range gets an **epoch**. An epoch is a number that only
+increases. The epoch fences the old owner:
+
+- the old owner stops opening the range's databases;
+- its replicator stops;
+- a restore never selects its data instead of the new owner's data.
 
 ```toml
 [database.fleet]
 restore_missing = true
 
 [database.fleet.ownership]
-owner = "host-a"     # unique per host; processes on one volume share it
+owner = "host-a"     # one id per volume
 slots = ["0-8191"]   # default: every slot, as one range
-lease_secs = 30      # default; at least 3
+lease_secs = 30      # default; 3 to 3600
 ```
 
 The overrides are `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER`, `..._SLOTS`
-(comma-separated) and `..._LEASE_SECS`. A tenant fleet uses the tenant's slot,
-so the same ranges work in both modes and in the
-[cell router](cell-isolation.md).
+(comma-separated) and `..._LEASE_SECS`. The processes on one volume (a `web`
+and a `worker` role) use the same `owner` and the same `slots`. A tenant fleet
+uses the slot of the tenant id, so the same ranges work in both modes and in
+the [cell router](cell-isolation.md).
 
 ### How it works
 
 | Step | Rule |
 | --- | --- |
-| Claim | At boot, before the first request. A range is free, already this owner's, or its lease ran out: the host gets it at a new epoch. Another owner's live lease refuses the claim. |
-| Renew | Every `lease_secs / 3`. A renew that finds another owner (or epoch) loses the range. |
-| Serve | `open` checks the slot first. Not owned: `421 Misdirected Request`, and nothing touches the disk, so `restore_missing` runs only for an owned key. |
-| Lose | The host closes every open database of the range at once. Its sweeper skips the range. |
-| Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after its last renew was sent: before the lease in the table runs out. |
-| Replicas | Each generation records its epoch. A restore takes the newest epoch, then the newest time. A replicator reads the epochs in the destination at each new generation and every 60 s. When it sees a newer epoch, it stops shipping and the host loses the range. |
-| Shutdown | The host closes its databases, then releases its ranges. The next owner can claim them at once. |
+| Claim | At boot, before the first request. If the range is free, or each lease on it ended, the host gets a new epoch. If the host already has the same range, it keeps its epoch. A live lease on any slot of the range refuses the claim, also a lease of the same owner on a range of another shape. |
+| Renew | Every `lease_secs / 3`. If the row has another owner or epoch, the host loses the range. |
+| Serve | `open` checks the slot first. If the host does not own the slot, `open` returns `421 Misdirected Request` and does not touch the disk. So `restore_missing` runs only for an owned key. |
+| Lose | The host closes every open database of the range. The close does not wait for workers, but it waits for connections that are in use. The sweeper and the fan-outs skip the range. |
+| Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after it sent its last renew. This is before the lease in the table ends. |
+| Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. A replicator reads the epochs at the destination at each new generation and every 60 s. If it finds a newer epoch, it stops, and the host loses the range. |
+| Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped. The next owner can then claim them at once. In all other cases, the leases end on their own. |
 
 The ownership table is `_autumn_fleet_slot_owners` on the control database.
-Every host of the fleet must use the same table. A deployment whose hosts
-cannot share the control database implements `SlotOwnershipStore` (in
-`autumn_web::db::fleet_ownership`) over a store they all reach, and installs a
-`FleetOwnership` with `DatabaseFleet::install_ownership` and
+All hosts of the fleet must use the same table. The control database is a
+local SQLite file, so the built-in table fences only the processes of one
+host. For hosts on different machines, implement `SlotOwnershipStore` (in
+`autumn_web::db::fleet_ownership`) on a store that all hosts reach. Then
+install a `FleetOwnership` with `DatabaseFleet::install_ownership`, and start
 `DatabaseFleet::spawn_ownership` before the first request.
 
 ### The failover procedure
 
 1. Give every host the same `[replication]` destination and the same
-   ownership table, `restore_missing = true`, and a unique `owner`.
+   ownership table. Set `restore_missing = true` and a unique `owner` per
+   volume.
 2. **Planned move.** Stop the old host. It releases its ranges at shutdown.
-   Start the new host with the same `slots`. It claims at once and restores
-   each database on its first request.
-3. **Unplanned failover** (the old host died or is cut off). Start the new
-   host with the old host's `slots`. It waits for the old lease to run out
-   (at most `lease_secs`), claims at a new epoch, and serves.
-4. If the old host is still alive, it stops serving when it cannot renew,
-   and answers `421`. When it can reach the table again, its renew fails and
-   it does not serve the range.
+   Start the new host with the same `slots`. It claims the ranges at once and
+   restores each database on its first request.
+3. **Unplanned failover.** The old host stopped, or the network isolates it.
+   Start the new host with the same `slots`. The new host claims the ranges
+   when the old lease ends: after at most `lease_secs`, plus one renew
+   interval and the clock skew. Then it serves at a new epoch.
+4. If the old host is still alive, it stops serving when its local lease
+   ends, and returns `421`. When it can reach the table again, its renew
+   fails. It does not serve the range again.
 5. **Move part of a range.** Change `slots` on the owner, for example from
-   `"0-8191"` to `"0-4095"`. The claim of the new shape takes a new epoch and
-   frees the rest. The other host then claims `"4096-8191"`.
+   `"0-8191"` to `"0-4095"`, and restart it. A clean shutdown releases the
+   old range, so the owner claims `"0-4095"` at once at a new epoch. Another
+   host can then claim `"4096-8191"`. If the old range was not released, each
+   claim waits until its lease ends.
 
-`/actuator/health` reports `fleet:ownership`: the `owner`, the `held` ranges
-with their epoch and whether the host serves them now, and the ranges that
-are `waiting`, `lost` or `failed`. It is `Down` when the last renew could not
-reach the table.
+`/actuator/health` reports `fleet:ownership`. The details are the `owner`,
+the `held` ranges with their epoch and whether the host serves them now, and
+the ranges that are `waiting`, `lost` or `failed`. The status is `Down` when
+the last claim or renew could not reach the table.
 
 ### Clocks
 
 The lease in the table uses the wall clock of the host that writes it. The
-holder stops on its monotonic clock, `lease_secs / 3` before the lease runs
-out. So the hosts' clocks must agree within `lease_secs / 3` (10 s by
-default). A larger skew can let two hosts serve at once for a short time. The
-epoch still protects the replicas: the restore takes the newest epoch, and the
-old replicator stops.
+holder stops on its own monotonic clock, `lease_secs / 3` before the lease
+ends. The clock skew between hosts plus the longest request must be less
+than `lease_secs / 3` (10 s by default). Otherwise two hosts can serve one
+slot for a short time. The epoch still protects the replicas: a restore
+selects the newest epoch, and the old replicator stops.
 
-Writes that the old owner accepted after the new owner claimed are lost: they
-are in the old epoch's generation, and no restore takes it.
+If the old owner accepts writes after the new owner claims the range, those
+writes are lost. They are in the old epoch's generation, and no restore
+selects that generation.
+
+Do not restore the control database to an earlier time while ownership is
+on. If its epoch counter goes back, the next claim after a fence still goes
+above the epoch that the replicator found.
 
 ## Limits
 
