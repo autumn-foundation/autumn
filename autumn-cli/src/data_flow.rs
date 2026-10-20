@@ -166,14 +166,10 @@ pub fn run(opts: &DataFlowOptions<'_>) {
     routes::compile_binary_with(opts.package, opts.bin, &opts.features, &profile);
     let binary = routes::find_binary_in_profile(opts.package, opts.bin, &profile);
 
-    let output = Command::new(&binary)
-        .env(DUMP_ENV, "1")
-        // All three are checked BEFORE the data-flow dump in `AppBuilder::run`,
-        // so an exported one in the ambient environment would silently win and
-        // hand us a marker-less stdout.
-        .env_remove("AUTUMN_BUILD_STATIC")
-        .env_remove("AUTUMN_DUMP_ROUTES")
-        .env_remove("AUTUMN_DUMP_CACHE_COHERENCE")
+    let mut command = Command::new(&binary);
+    command.env(DUMP_ENV, "1");
+    routes::clear_other_dump_modes(&mut command, DUMP_ENV);
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

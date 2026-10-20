@@ -21,6 +21,7 @@ use autumn_web::prelude::*;
 
 /// A maud-rendered page that mounts the Yew "literary boids" island.
 #[get("/")]
+#[public]
 async fn index() -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))

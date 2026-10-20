@@ -155,28 +155,46 @@ pub fn run(command: &ReplicaCommand) {
 
 /// The `[replication]` section plus the resolved app config it came from.
 #[derive(Debug)]
-struct Loaded {
-    profile: String,
-    replication: ReplicationConfig,
-    config: AutumnConfig,
+pub struct Loaded {
+    pub profile: String,
+    pub replication: ReplicationConfig,
+    pub config: AutumnConfig,
 }
 
 /// Resolve `[replication]` exactly the way the running app does.
 fn load(profile: Option<&str>) -> Result<Loaded, ReplicaError> {
+    let (profile, config) = load_app_config(profile)?;
+    Loaded::new(profile, config)
+}
+
+/// Resolve the app config the way the running app does: `autumn.toml`, the
+/// `[profile.<p>]` overlay, `.env.<profile>` and `AUTUMN_*` overrides.
+/// Returns the canonical profile with it.
+pub fn load_app_config(profile: Option<&str>) -> Result<(String, AutumnConfig), ReplicaError> {
     let profile = migrate::canonical_profile(&migrate::effective_profile(profile));
     let env = crate::db::backup::dotenv_env_for_profile(&profile);
     let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile));
-    resolve(table.as_ref(), &env, &profile)
+    let config = resolve_app_config(table.as_ref(), &env)?;
+    Ok((profile, config))
 }
 
 /// Pure core of [`load`]: build the replication view from a merged TOML table
 /// and an `Env`. Separated so the fresh-box behaviour is unit-testable without
 /// touching the filesystem or the process environment.
+#[cfg(test)]
 fn resolve(
     table: Option<&toml::Table>,
     env: &dyn autumn_web::config::Env,
     profile: &str,
 ) -> Result<Loaded, ReplicaError> {
+    Loaded::new(profile.to_owned(), resolve_app_config(table, env)?)
+}
+
+/// Pure core of [`load_app_config`].
+fn resolve_app_config(
+    table: Option<&toml::Table>,
+    env: &dyn autumn_web::config::Env,
+) -> Result<AutumnConfig, ReplicaError> {
     let mut config = match table {
         Some(table) => {
             let toml_str = toml::to_string(table).map_err(|e| ReplicaError::Config {
@@ -191,22 +209,26 @@ fn resolve(
         None => AutumnConfig::default(),
     };
     config.apply_env_overrides_with_env(env);
-
-    let replication = config
-        .replication
-        .clone()
-        .map(|boxed| *boxed)
-        .ok_or(ReplicaError::NotConfigured)?;
-    Ok(Loaded {
-        profile: profile.to_owned(),
-        replication,
-        config,
-    })
+    Ok(config)
 }
 
 impl Loaded {
+    /// The `[replication]` view of a resolved config.
+    pub fn new(profile: String, config: AutumnConfig) -> Result<Self, ReplicaError> {
+        let replication = config
+            .replication
+            .clone()
+            .map(|boxed| *boxed)
+            .ok_or(ReplicaError::NotConfigured)?;
+        Ok(Self {
+            profile,
+            replication,
+            config,
+        })
+    }
+
     /// The destination key prefix for this app/profile.
-    fn root(&self) -> String {
+    pub fn root(&self) -> String {
         segment::root_prefix(self.replication.prefix.as_deref(), &self.profile)
     }
 
@@ -228,7 +250,7 @@ impl Loaded {
             .map(|bucket| (bucket, self.config.storage.s3.endpoint.clone()))
     }
 
-    fn destination(&self) -> Result<std::sync::Arc<dyn ReplicaDestination>, ReplicaError> {
+    pub fn destination(&self) -> Result<std::sync::Arc<dyn ReplicaDestination>, ReplicaError> {
         let storage = self.storage_destination();
         autumn_web::replication::build_destination(
             &self.replication,
@@ -256,7 +278,7 @@ impl Loaded {
 }
 
 /// Create an unpredictable, owner-only scratch directory under `base`.
-fn create_private_dir(base: &std::path::Path) -> Result<PathBuf, ReplicaError> {
+pub fn create_private_dir(base: &std::path::Path, tag: &str) -> Result<PathBuf, ReplicaError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -265,7 +287,7 @@ fn create_private_dir(base: &std::path::Path) -> Result<PathBuf, ReplicaError> {
         builder.mode(0o700);
     }
     for _ in 0..8 {
-        let candidate = base.join(format!(".autumn-replica-verify-{:016x}", fastrand_u64()));
+        let candidate = base.join(format!(".autumn-{tag}-{:016x}", fastrand_u64()));
         match builder.create(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -298,7 +320,7 @@ fn fastrand_u64() -> u64 {
 }
 
 /// Parse `--timestamp` as RFC 3339.
-fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>, ReplicaError> {
+pub fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>, ReplicaError> {
     value.map_or(Ok(None), |raw| {
         DateTime::parse_from_rfc3339(raw.trim())
             .map(|t| Some(t.with_timezone(&Utc)))
@@ -437,7 +459,7 @@ fn run_verify(profile: Option<&str>) -> Result<(), ReplicaError> {
         .and_then(|db| db.parent().map(std::path::Path::to_path_buf))
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from("."));
-    let scratch = create_private_dir(&base)?;
+    let scratch = create_private_dir(&base, "replica-verify")?;
     let result = restore::restore(remote.as_ref(), &root, None, &scratch.join("verified.db"));
     let _ = std::fs::remove_dir_all(&scratch);
 
@@ -481,6 +503,52 @@ mod tests {
                 .cloned()
                 .ok_or(std::env::VarError::NotPresent)
         }
+    }
+
+    #[test]
+    fn a_config_without_replication_still_resolves() {
+        let table: toml::Table = toml::from_str(
+            r#"
+            [database]
+            url = "sqlite:///var/lib/app.db"
+            "#,
+        )
+        .expect("toml");
+        let config = resolve_app_config(Some(&table), &MapEnv::new()).expect("resolves");
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("sqlite:///var/lib/app.db")
+        );
+        let err = Loaded::new("dev".to_owned(), config).expect_err("no [replication]");
+        assert!(matches!(err, ReplicaError::NotConfigured), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_config_is_a_config_error() {
+        let table: toml::Table = toml::from_str("[database]\nurl = 42\n").expect("toml");
+        let err = resolve_app_config(Some(&table), &MapEnv::new()).expect_err("bad url");
+        assert!(matches!(err, ReplicaError::Config { .. }), "{err}");
+    }
+
+    #[test]
+    fn private_dirs_are_new_tagged_and_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = create_private_dir(tmp.path(), "fleet-backup").unwrap();
+        let second = create_private_dir(tmp.path(), "fleet-backup").unwrap();
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".autumn-fleet-backup-"), "{name}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&first).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        // A base that cannot hold a directory: the error names the base.
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let err = create_private_dir(&file, "x").unwrap_err();
+        assert!(format!("{err}").contains("scratch directory"), "{err}");
     }
 
     #[test]

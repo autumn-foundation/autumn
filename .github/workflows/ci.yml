@@ -883,15 +883,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.28
         with:
           tool: cargo-deny@0.20.2
-      # Advisories go through the shared gate (issue #1600) so PR CI, the
-      # publish gate and a local run are literally the same check: the
-      # workspace graph, the SQLite backend graph, and the day-one graph of a
-      # freshly scaffolded app audited against the `deny.toml` that `autumn
-      # new` ships. It retries the advisory-database fetch and fails closed if
-      # the database stays unreachable.
+      # The shared gate (issue #1600) makes PR CI, the publish gate and a local
+      # run the same check. It audits the workspace graph, the SQLite graph and
+      # every `autumn new` flavor (#2466). It retries the advisory-database
+      # fetch. It fails closed if the database stays unreachable.
       - name: Dependency advisory gate
         run: ./scripts/check-advisories.sh
       # A gate nobody has watched fail is indistinguishable from one that no
@@ -1614,7 +1612,9 @@ jobs:
         # PR #1985. The prior step ran in ~25 min against the old 45-minute
         # budget, and these are typical single-Postgres-container tests
         # (seconds to low minutes each), so +30 min is a conservative margin.
-        timeout-minutes: 75
+        # 75 -> 90 (#3347): on trunk-dev the step took 73m21s, and a PR run
+        # hit the 75-minute limit in the `examples/cms` tests with no failure.
+        timeout-minutes: 90
         env:
           # `feature_flags_pg_integration` below builds with `managed-pg-bundled`,
           # which compiles `postgresql_embedded`; its build script downloads
@@ -1776,6 +1776,20 @@ jobs:
           # not just the crate's own generic suite above. Testcontainer-
           # managed, so no `services:` block is needed.
           cargo test -p wiki --test search_plugin_integration -- --ignored
+          # reddit-clone (#2454): run all #[ignore]d tests (Postgres, MinIO, live event).
+          # The run is bare `--ignored`. A new test needs no workflow edit.
+          # `--lib --tests` excludes doc tests. Their `ignore` blocks are not Docker tests.
+          # Use one thread. The tests share one job runtime.
+          # Browser tests use the `system-tests` feature, so they do not compile here.
+          # Check the pass count. `cargo test` exits 0 when no test matches.
+          # This adds about 15 minutes to the 75-minute budget above.
+          (
+            set -o pipefail
+            cargo test -p reddit-clone --lib --tests -- --ignored --test-threads=1 \
+              | tee "${RUNNER_TEMP}/reddit-clone-docker-sweep.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/reddit-clone-docker-sweep.log" \
+            || { echo "::error::no reddit-clone Docker test ran. Fix the filter in ci.yml."; exit 1; }
           # autumn-billing (#1190): the Postgres `DbBillingStore` contract suite
           # is testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-billing --test mirror_db -- --ignored
@@ -2140,7 +2154,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.20
+        uses: taiki-e/install-action@v2.87.28
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)
@@ -2278,6 +2292,15 @@ jobs:
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #3234: the fleet sweeper end to end. Same features, so no
+          # rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_fleet_sweeper
+          # Issue #3233: slot ownership driven by its renew loop in virtual
+          # time. Single-threaded, like its CI step. Same features, so no
+          # rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sim_fleet_ownership -- --test-threads=1
           # Issue #3231: the SQLite commit-hook worker loop (stop token, claim
           # heartbeat guard). No other lane measures it, so Codecov reads those
           # lines as uncovered. Same features, so no rebuild.
@@ -2429,6 +2452,27 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- serve::tests::ready_payload \
             | tee "$RUNNER_TEMP/cli-ready-payload-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-ready-payload-cov.log"
+          # Issue #2476: same gap for `plugin::remove::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- plugin::remove:: \
+            | tee "$RUNNER_TEMP/cli-plugin-remove-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-plugin-remove-cov.log"
+          # Issues #2468 and #2497: same gap for `posture::` and
+          # `routes_audit::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: routes_audit:: \
+            | tee "$RUNNER_TEMP/cli-posture-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-posture-cov.log"
+          # Issue #3232: same gap for `autumn fleet` (its clap shape and the
+          # Postgres-build stub) and the `db::replica` config loader it shares.
+          # Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- fleet::imp::tests \
+            tests::fleet_subcommands db::replica:: \
+            | tee "$RUNNER_TEMP/cli-fleet-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
+          # Issue #2396: same gap for `db::retention::` (the force env and the
+          # purge pre-flight). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::retention:: \
+            | tee "$RUNNER_TEMP/cli-retention-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-retention-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2586,6 +2630,22 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
               || { echo "::error::no autumn-cli sqlite schema test ran (${log})"; exit 1; }
           done
+      - name: Run the autumn fleet CLI suite under sqlite
+        # Issue #3232. This job runs the SQLite tests of `autumn fleet`. Each
+        # test makes a fleet in a temporary directory, so no Docker. Linux
+        # only: `sqlite-fleet-windows` covers the Windows delete and restore
+        # paths in autumn-web. A filter that matches nothing exits 0, so the
+        # step checks the pass count.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --bin autumn fleet::imp::tests | tee "${RUNNER_TEMP}/cli-fleet-unit.log"
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --test cli_tests fleet_cli | tee "${RUNNER_TEMP}/cli-fleet-it.log"
+          for log in cli-fleet-unit cli-fleet-it; do
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
+              || { echo "::error::no autumn fleet test ran (${log})"; exit 1; }
+          done
       - name: Clippy autumn-search under the sqlite backend
         # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
         # does not have, so the crate did not compile under the flip. It now
@@ -2612,6 +2672,7 @@ jobs:
             --test sqlite_read_only_tx \
             --test sqlite_transactional_url_pool \
             --test sqlite_fleet \
+            --test sqlite_fleet_sweeper \
             --test sqlite_version_history \
             --test sqlite_ledger \
             --test sqlite_ledger_out_of_band \
@@ -2643,7 +2704,8 @@ jobs:
             --test sim_outbox_crash \
             --test sqlite_outbox_writers
       - name: Run the multi-replica sim suites (issue #3067)
-        # Several replicas on one sim clock and one SQLite database. Single
+        # Several replicas on one sim clock and one SQLite database, and the
+        # partitioned fleet owner of issue #3233. Single
         # threaded, like the `sim_` lane of the `test` job: `sim_fleet_trace`
         # compares two traces byte for byte, and `tracing` caches callsite
         # interest for the whole process.
@@ -2651,6 +2713,7 @@ jobs:
           cargo test -p autumn-web --features "sqlite,test-support" \
             --test sim_replicas \
             --test sim_fleet_trace \
+            --test sim_fleet_ownership \
             -- --test-threads=1
       - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
         # `sim_chaos_mail` and `sim_outbox_mail` (#3062) need the `mail`
@@ -2900,7 +2963,11 @@ jobs:
             || { echo "::error::no fleet unit test ran"; exit 1; }
       - name: Fleet integration tests
         shell: bash
-        run: cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
+        # `sqlite_fleet_sweeper` (#3234) finds a fleet by the file path SQLite
+        # reports, which Windows spells differently.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_sweeper
 
   windows-tier1:
     name: Windows Tier 1 journey

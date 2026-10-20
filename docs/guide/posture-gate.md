@@ -19,7 +19,7 @@ of the app reachable by more callers than before.
 
 To acknowledge these exact changes, comment on this pull request with:
 
-    /ack-posture 4f8a1c0d9e2b7a35
+    /ack-posture 4f8a1c0d9e2b7a35 ceiling=GET|/admin/users|public|0:|0:|0|absent|0:|0
 ```
 
 That comment is the only way past the gate, and it is recorded on the pull
@@ -167,31 +167,35 @@ required check as satisfied).
 
 ### If your app is a Cargo workspace member
 
-`autumn upgrade` will not write this workflow into a workspace *member* that
-is not its own git root. It does not write `ci.yml` there either. GitHub runs
-workflows from the git root only. A workflow in the member never runs, and
-seeding one would look like adoption while gating nothing.
-
-A nested git repository or submodule is its own git root. `autumn upgrade`
-reconciles its workflows as usual.
-
-Adopt it by hand at the root instead — three edits to the scaffolded file:
+When the git root is also the workspace root, `autumn upgrade --apply` writes
+the workflow at the git root and names your member:
 
 ```yaml
 env:
-  # Point at the member's manifest.
   POSTURE_MANIFEST: apps/my-app/security-posture.json
-
-# …in the `manifest` job:
-      - name: Build this commit's posture manifest
-        # Select the member package.
-        run: autumn routes audit -p my-app $POSTURE_AUDIT_FLAGS --manifest "$POSTURE_MANIFEST"
+  POSTURE_AUDIT_FLAGS: --release -p my-app
 ```
 
-Everything else — the base read, the acknowledgment harvest, the diff, the
-verdict — works unchanged, because it only ever reads the manifest path.
-Teaching `autumn upgrade` to reconcile root files for a member is tracked
-separately.
+It writes `ci.yml` at the git root too, and runs it in the crate directory.
+Everything else in the gate works unchanged, because it only reads the manifest
+path.
+
+One repository holds one `posture-gate.yml`. If another member already wrote
+it, `autumn upgrade` reports a conflict and does not overwrite it. A second
+member needs its own workflow. Copy the file and give it a new name. Then set
+`POSTURE_MANIFEST` and `POSTURE_AUDIT_FLAGS` for that member.
+
+If the workspace root is below the git root, the gate cannot build the member
+from the git root. Adopt the gate by hand in that layout.
+
+A nested git repository or submodule is its own git root. Its workflow stays
+in the member.
+
+The deploy workflows that `autumn release init` writes also read the manifest
+path from one variable, `POSTURE_MANIFEST`. Move a deploy workflow to the git
+root. Then change the value of `POSTURE_MANIFEST` to the path above. If the file
+is missing, the deploy prints a `::warning::` and does not attest. The deploy
+does not fail, so apps that never adopted the gate still ship.
 
 ---
 
@@ -271,7 +275,7 @@ Two checks find a wrong build:
 Comment on the pull request with the line the report prints:
 
 ```
-/ack-posture 4f8a1c0d9e2b7a35  intentional: public status page for launch week
+/ack-posture 4f8a1c0d9e2b7a35 ceiling=GET|/status|public|0:|0:|0|absent|0:|0  intentional: public status page for launch week
 ```
 
 Rules worth knowing:
@@ -291,22 +295,31 @@ Rules worth knowing:
 - **Re-running.** Posting the comment does not re-run the check: `pull_request`
   does not fire on comments. After commenting, re-run the *Security posture*
   check from the Checks tab, or push a commit.
-- **What it binds to.** The digest is computed over the *exact set of widening
-  findings*, and each one carries the whole posture of the route it names —
-  classification, roles, scopes, policy, CSRF, `#[authorize]` bindings. Push ten
-  more commits that touch none of those and the acknowledgment stays valid.
-  Widen something **new** and the digest changes, no comment carries it, and the
-  gate blocks again.
+- **What it binds to.** The report prints a marker with a `ceiling=` token.
+  Paste it as is. The token holds the approved posture of each widened route:
+  classification, roles, scopes, policy, CSRF, `#[authorize]` bindings and
+  mTLS. The gate asks one question: is the route, now, **no wider than that**?
 
-  The route's *whole* posture, because otherwise a second constraint can be
-  added and then quietly withdrawn: acknowledge "public, behind a new `mfa`
-  scope", drop `mfa` next push, and against the base the diff still shows only
-  the original widening. The cost is that a later change which **narrows** that
-  route also re-asks — the digest cannot tell a constraint that appeared from
-  one that vanished. Re-acknowledging costs a comment on a diff that shows
-  exactly what moved; the alternative loses a widening in silence.
-  [#2497](https://github.com/autumn-foundation/autumn/issues/2497) tracks the
-  format change that would satisfy both.
+  - Narrowing keeps the acknowledgment valid. Add a policy check after you
+    acknowledged a public route, and the gate does not ask again.
+  - Removing a constraint blocks again. Acknowledge "public, behind a new `mfa`
+    scope", drop `mfa` on the next push, and the route is wider than the
+    ceiling.
+  - Unrelated pushes keep it valid. A **new** widening needs a new
+    acknowledgment.
+  - The marker digest covers the ceiling text. A truncated or edited paste does
+    not match. This catches mistakes. It is not a secret: anyone can compute
+    the digest for a wider ceiling. Paste only the line the report printed.
+    Do not paste a line from another author without a check.
+
+  The gate uses the same rules as the diff: roles are OR-ed, scopes are
+  AND-ed, an open classification is widest. A finding that names no single
+  route at head (a build change, a header, a CSRF exemption prefix) has no
+  posture to order, so it stays bound to the exact set.
+
+  For an exact match, paste the second line of the report instead. It has the
+  exact digest and no `ceiling=`. A different digest from the first line is
+  normal. Any later change to the route, narrowing included, asks again.
 - **One file per comment.** The workflow writes each comment to its own file
   and passes the directory as `--ack-dir`. The diff parses each file alone, so
   an unclosed code fence in one comment cannot change another, and no comment
@@ -315,7 +328,7 @@ Rules worth knowing:
   inside fenced code blocks never acknowledge anything, so quoting a colleague
   — which GitHub's reply button does for you — cannot approve a widening by
   accident.
-- **Anything after the digest is the reason.** It is echoed back into the
+- **Text after the digest and the `ceiling=` token is the reason.** It is echoed back into the
   comment the gate posts, so the record reads as a decision, not a checksum.
 
 ### When the tool is wrong
@@ -433,9 +446,11 @@ doesn't. It inherits every boundary of
   one binding removed and another added, and no manifest can tell that from a
   genuine loss. It blocks, and the report names the pairing so you can
   acknowledge it in one step.
-- **Middleware-imposed guards.** A route protected by a `RequireApiToken` layer
-  rather than by `#[secured]` is `unclassified` to `routes audit`, so it never
-  reaches this gate in the first place — `routes audit` fails on it first.
+- **Middleware-imposed guards.** A route guarded by a layer, such as
+  `RequireApiToken`, is `unclassified` to `routes audit`. The audit then fails
+  before this gate runs. Mount the group with `scoped_guarded` to declare the
+  guard. The route is then `gated` with `provenance: "declared"`. The audit
+  cannot check that claim, and neither can this gate. Review the layer.
 - **A build that lies.** The manifest comes from compiling the pull request, so
   a build script or procedural macro in the diff can influence what the app
   reports about itself. The gate isolates the *verdict* from that code (see
@@ -447,6 +462,8 @@ doesn't. It inherits every boundary of
   /users/{id}` recorded as enforced. The gate therefore treats the prefix list
   itself as posture: adding a prefix blocks, whatever the per-route rows say.
   Expect the report to name the prefix rather than the routes it touches.
+  The acknowledgment binds only to routes that serve a URL under the prefix.
+  A route is left out when a more specific route wins every URL it would serve.
 - **A build you do not audit.** The gate audits the build in
   `POSTURE_AUDIT_FLAGS`. A route that exists only in another build is not in
   the manifest. Keep the flags the same as your image build. The `build`

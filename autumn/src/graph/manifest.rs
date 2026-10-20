@@ -43,9 +43,6 @@ pub const LIMITS: &[&str] = &[
      and a model whose name matches a common type is linked wherever that name appears.",
     "Raw SQL is matched by identifier, and only inside string literals that contain a SQL \
      keyword; SQL assembled at runtime from fragments is invisible.",
-    "The served-surface census does not yet reach the OpenAPI JSON and Swagger routes an app \
-     enables with `.openapi(...)`, nor a worker replica\'s own probe and actuator mounts: those \
-     are served but appear in no section.",
     "A router mounted with `merge`/`nest` is opaque: its endpoints cannot be enumerated at all, \
      so `completeness.opaque_mounted_routers` counts them rather than naming them. The \
      `AUTUMN_DUMP_GRAPH` count covers the routers the *builder* declares; a router the \
@@ -62,9 +59,29 @@ pub const LIMITS: &[&str] = &[
      followed by a bare `posts.filter(…)` in the body names no candidate and produces no edge. \
      Write the table module (`posts::table`) or the model in the handler to be linked.",
     "A route's access is its declared HTTP method (safe methods read, everything else writes); a \
-     job's is whether its tokens carry mutation evidence. Either way it is the declared intent, \
+     job's is set per edge: a write when the edge's symbol names a mutating SQL statement, or when \
+     the job calls `.update`/`.create`/`.delete`/`.insert` on a repository parameter, or when \
+     mutation evidence names no symbol (then every edge). Either way it is the declared intent, \
      not an executed statement.",
+    "The served graph is process-global: the first application built in a process installs it, \
+     and every later application in that process (an embedded host, a test) serves the first \
+     application's `/actuator/graph`. One application per process is the supported shape.",
+    "Node ids come from `module_path!()`. A binary that links two versions of one crate gives \
+     both versions the same ids, so one node replaces the other and their edges merge.",
 ];
+
+/// Whether a schedule is a fixed delay such as `15m`, `1h30m` or `1h 30m`.
+///
+/// A delay is a few letters-and-digits words. A cron expression has five or
+/// more fields, or a symbol such as `*`, `/` or `(`.
+fn is_fixed_delay(schedule: &str) -> bool {
+    schedule.split_whitespace().count() < 5
+        && schedule
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+        && schedule.chars().any(|c| c.is_ascii_alphabetic())
+        && schedule.chars().any(|c| c.is_ascii_digit())
+}
 
 // ── Node facts ───────────────────────────────────────────────────────
 
@@ -181,7 +198,15 @@ impl GraphNode {
             (_, _, Some(r), _) => format!("{} over {}", self.name, r.model),
             (.., Some(j)) => j.schedule.as_ref().map_or_else(
                 || self.name.clone(),
-                |s| format!("{} (every {s})", self.name),
+                // Only a fixed delay reads as "every". Each part of a delay is
+                // a number with a unit (`15m`, `1h 30m`); a cron field is not.
+                |s| {
+                    if is_fixed_delay(s) {
+                        format!("{} (every {s})", self.name)
+                    } else {
+                        format!("{} ({s})", self.name)
+                    }
+                },
             ),
             _ => self.name.clone(),
         }
@@ -241,6 +266,25 @@ pub struct Completeness {
     /// cannot quietly under-report the served surface.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmodelled_mounted_routes: Vec<String>,
+    /// Plugin mounts the app declared with `declare_plugin_routes`, sorted.
+    ///
+    /// These have no `#[route]` node, but their auth is known, so they are
+    /// listed here with it and not as a bare name in
+    /// [`Self::unmodelled_mounted_routes`]. A change from gated to public with
+    /// the same method and path then changes the document. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_mounts: Vec<DeclaredMount>,
+}
+
+/// A declared plugin mount with its known auth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredMount {
+    /// Uppercase HTTP method.
+    pub method: String,
+    /// Full mounted path.
+    pub path: String,
+    /// The auth the plugin declared for the mount.
+    pub auth: RouteAuth,
 }
 
 /// The application's architecture, as its macros declare it.
@@ -348,6 +392,16 @@ impl ArchitectureGraph {
                 let _ = writeln!(out, "  {id}");
             }
         }
+        if !c.declared_mounts.is_empty() {
+            let _ = writeln!(
+                out,
+                "\nDeclared plugin mounts ({}):",
+                c.declared_mounts.len()
+            );
+            for m in &c.declared_mounts {
+                let _ = writeln!(out, "  {} {} (auth {})", m.method, m.path, m.auth.label());
+            }
+        }
         if !c.unmodelled_mounted_routes.is_empty() {
             let _ = writeln!(
                 out,
@@ -389,24 +443,45 @@ fn job_id(module_path: &str, handler: &str) -> String {
     format!("job:{module_path}::{handler}")
 }
 
-/// A `file:line` location string, with a dependency's registry path shortened.
+/// A `file:line` location string, with a dependency's checkout path shortened.
 ///
 /// `file!()` for an element declared in a non-path dependency is the absolute
-/// checkout path — `/home/<user>/.cargo/registry/src/index.crates.io-<hash>/
-/// plugin-0.1.0/src/routes.rs`. Left whole it puts the build machine's username
-/// and layout into a document served over HTTP, and makes the committed graph
-/// differ between two developers for reasons that have nothing to do with the
-/// app. The crate-relative tail is the part that identifies anything.
+/// checkout path. A registry crate is
+/// `/home/<user>/.cargo/registry/src/index.crates.io-<hash>/plugin-0.1.0/src/routes.rs`.
+/// A git crate is `/home/<user>/.cargo/git/checkouts/<name>-<hash>/<rev>/src/lib.rs`.
+/// Left whole it puts the build machine's username and layout into a document
+/// served over HTTP, and makes the committed graph differ between two
+/// developers for reasons that have nothing to do with the app. The
+/// crate-relative tail is the part that identifies anything. For git, the
+/// `-<hash>` suffix and the `<rev>` are dropped too: the rev changes at every
+/// dependency update.
 fn location(file: &str, line: u32) -> String {
     // Separators first: on Windows `file!()` yields backslashes, so a graph
     // committed from Linux would otherwise read as drift on every node, and the
     // registry shortening below would not match at all.
     let file = file.replace('\\', "/");
-    let normalized = file
-        .split_once("/registry/src/")
-        .and_then(|(_, tail)| tail.split_once('/'))
-        .map_or(file.as_str(), |(_, crate_relative)| crate_relative);
+    let normalized = shorten_dependency_path(&file);
     format!("{normalized}:{line}")
+}
+
+/// The crate-relative tail of a registry or git checkout path.
+///
+/// A path in neither layout is returned whole.
+fn shorten_dependency_path(file: &str) -> String {
+    if let Some((_, tail)) = file.split_once("/registry/src/")
+        && let Some((_, crate_relative)) = tail.split_once('/')
+    {
+        return crate_relative.to_owned();
+    }
+    if let Some((_, tail)) = file.split_once("/git/checkouts/") {
+        let mut parts = tail.splitn(3, '/');
+        if let (Some(dir), Some(_rev), Some(rest)) = (parts.next(), parts.next(), parts.next()) {
+            // `<name>-<hash>`: the hash is the last dash-separated part.
+            let name = dir.rsplit_once('-').map_or(dir, |(name, _)| name);
+            return format!("{name}/{rest}");
+        }
+    }
+    file.to_owned()
 }
 
 /// The access a declared HTTP method states.
@@ -487,7 +562,7 @@ struct Candidates<'a> {
 fn resolve_edges(
     from: &str,
     candidates: Candidates<'_>,
-    access: Access,
+    access: impl Fn(&str) -> Access,
     index: &BTreeMap<String, BTreeSet<String>>,
     sql_tables: &BTreeMap<String, BTreeSet<String>>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
@@ -512,19 +587,31 @@ fn resolve_edges(
             };
             for target in targets {
                 let key = (from.to_owned(), target.clone());
-                let candidate = GraphEdge {
+                let mut candidate = GraphEdge {
                     from: from.to_owned(),
                     to: target.clone(),
-                    access,
+                    access: access(symbol),
                     provenance,
                     symbol: (*symbol).to_owned(),
                 };
-                match edges.get(&key) {
+                match edges.get_mut(&key) {
                     // A signature edge outranks a body edge for the same pair:
                     // an extractor is a stronger statement than a name in the
-                    // body, and the report should say the stronger one.
-                    Some(existing) if existing.provenance <= candidate.provenance => {}
-                    _ => {
+                    // body, and the report should say the stronger one. The
+                    // access still merges: a write through any symbol is a
+                    // write to the target.
+                    Some(existing) if existing.provenance <= candidate.provenance => {
+                        if candidate.access == Access::Write {
+                            existing.access = Access::Write;
+                        }
+                    }
+                    Some(existing) => {
+                        if existing.access == Access::Write {
+                            candidate.access = Access::Write;
+                        }
+                        *existing = candidate;
+                    }
+                    None => {
                         edges.insert(key, candidate);
                     }
                 }
@@ -581,6 +668,7 @@ pub fn build(
             opaque_mounted_routers,
             unmounted_routes: unmounted,
             unmodelled_mounted_routes: surface.unmodelled,
+            declared_mounts: surface.declared,
         },
         nodes: nodes.into_values().collect(),
         edges: edges.into_values().collect(),
@@ -650,29 +738,42 @@ fn add_repository_nodes(
         // and at the same strength: `#[votable]` and `#[commentable]` put their
         // generated methods on this repository, so a route holding it reaches
         // those edge tables too — without ever naming them.
-        let relation_tables: Vec<&str> = models
+        //
+        // The repository carries its resolved table, so the model is picked by
+        // (name, table). Name alone also picked up another crate's model of the
+        // same name (#2520). Only a repository that overrides the table finds
+        // no such pair; it falls back to the name, so no edge is lost.
+        let exact = models
             .iter()
-            .filter(|m| m.model == repo.model)
-            .flat_map(|m| m.relations.iter().copied())
+            .any(|m| m.model == repo.model && m.table == repo.table);
+        let own: Vec<&ModelGraphDescriptor> = models
+            .iter()
+            .filter(|m| m.model == repo.model && (!exact || m.table == repo.table))
             .collect();
-        for name in std::iter::once(repo.model).chain(relation_tables) {
-            for target in index
-                .get(name)
-                .into_iter()
-                .flatten()
-                .filter(|t| t.starts_with("model:"))
-            {
-                edges.insert(
-                    (id.clone(), target.clone()),
-                    GraphEdge {
-                        from: id.clone(),
-                        to: target.clone(),
-                        access: Access::ReadWrite,
-                        provenance: Provenance::Declaration,
-                        symbol: String::new(),
-                    },
-                );
-            }
+        let mut targets: BTreeSet<String> = own.iter().map(|m| model_id(m.model_path)).collect();
+        // A relation table is a table name, not a model name: it resolves
+        // through the index to whichever model maps that table.
+        for relation in own.iter().flat_map(|m| m.relations.iter().copied()) {
+            targets.extend(
+                index
+                    .get(relation)
+                    .into_iter()
+                    .flatten()
+                    .filter(|t| t.starts_with("model:"))
+                    .cloned(),
+            );
+        }
+        for target in &targets {
+            edges.insert(
+                (id.clone(), target.clone()),
+                GraphEdge {
+                    from: id.clone(),
+                    to: target.clone(),
+                    access: Access::ReadWrite,
+                    provenance: Provenance::Declaration,
+                    symbol: String::new(),
+                },
+            );
         }
     }
 }
@@ -768,7 +869,7 @@ fn add_route_nodes(
                 body: route.body_symbols,
                 sql: route.sql_symbols,
             },
-            access,
+            |_| access,
             index,
             sql_tables,
             edges,
@@ -779,6 +880,31 @@ fn add_route_nodes(
         unmounted,
         matched: matched_mounted,
     }
+}
+
+/// The symbols a job writes through.
+///
+/// Two sources. The macro names the symbols of each mutating SQL statement.
+/// A receiver of `.create`, `.delete`, `.insert` or `.update` counts only when
+/// it is a parameter whose type resolves to a declared repository. The macro
+/// cannot know repositories, so a bare `.update` is no evidence here: it would
+/// also match `HashMap::insert`.
+fn job_write_symbols<'a>(
+    job: &'a JobGraphDescriptor,
+    index: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<&'a str> {
+    let mut writes: BTreeSet<&str> = job.mutating_symbols.iter().copied().collect();
+    for receiver in job.dot_mutation_receivers {
+        for (param, ty) in job.signature_bindings {
+            let is_repository = index
+                .get(*ty)
+                .is_some_and(|ids| ids.iter().any(|id| id.starts_with("repository:")));
+            if param == receiver && is_repository {
+                writes.insert(ty);
+            }
+        }
+    }
+    writes
 }
 
 /// One node per `#[job]`/`#[scheduled]`/`#[task]`, with its resolved edges.
@@ -812,11 +938,7 @@ fn add_job_nodes(
                 }),
             },
         );
-        let access = if job.mutating {
-            Access::Write
-        } else {
-            Access::Read
-        };
+        let writes = job_write_symbols(job, index);
         resolve_edges(
             &id,
             Candidates {
@@ -824,7 +946,13 @@ fn add_job_nodes(
                 body: job.body_symbols,
                 sql: job.sql_symbols,
             },
-            access,
+            |symbol| {
+                if job.mutating || writes.contains(symbol) {
+                    Access::Write
+                } else {
+                    Access::Read
+                }
+            },
             index,
             sql_tables,
             edges,
@@ -836,8 +964,11 @@ fn add_job_nodes(
 struct MountedSurface {
     /// Mounted routes attributed to a repository auto-API.
     generated: usize,
-    /// Mounted routes no declaration and no auto-API accounts for.
+    /// Mounted routes no declaration and no auto-API accounts for, and whose
+    /// auth is unknown.
     unmodelled: Vec<String>,
+    /// Declared plugin mounts: no node, but a known auth.
+    declared: Vec<DeclaredMount>,
 }
 
 /// One node per mounted route a `#[repository(api = "...")]` generated.
@@ -854,6 +985,7 @@ fn add_auto_api_nodes(
     // routes touching a table would miss its entire REST surface.
     let mut generated_routes = 0usize;
     let mut unmodelled: BTreeSet<String> = BTreeSet::new();
+    let mut declared: BTreeMap<(String, String), RouteAuth> = BTreeMap::new();
     for route in mounted {
         if matched_mounted.contains(&(route.method.clone(), route.path.clone())) {
             continue;
@@ -864,23 +996,26 @@ fn add_auto_api_nodes(
         // inside `.scoped("/v1", …)` no longer starts with the declared prefix
         // and was dropped, and a hand-written route under an API prefix was
         // claimed as generated (Codex round 5).
-        let owner = route.repository_api.as_ref().and_then(|api| {
+        let owner = route.repository_api.as_ref().and_then(|identity| {
             repositories
                 .iter()
-                .filter(|repo| repo.api == api)
+                .filter(|repo| repo.api == identity.api && repo.model == identity.model)
                 // Ties break on node id, so the answer never depends on link
-                // order. They are not impossible, though: two repositories CAN
-                // declare the same raw `api = "..."` prefix as long as their
-                // generated routes are mounted under different `.scoped(...)`
-                // prefixes, because then the effective paths do not collide and
-                // the router has nothing to refuse. In that case this picks the
-                // lexicographically first and can attribute a CRUD route to the
-                // wrong model. Carrying a repository-specific identity rather
-                // than the prefix alone is the fix — see #2520.
+                // order. The route carries the prefix and the model name, so
+                // two repositories that share a prefix but sit over different
+                // models are told apart (#2520). Only two repositories with the
+                // same prefix AND the same model name can still tie.
                 .min_by_key(|repo| repository_id(repo.module_path, repo.repository))
         });
         let Some(repo) = owner else {
-            unmodelled.insert(format!("{} {}", route.method, route.path));
+            if route.auth_declared {
+                declared.insert(
+                    (route.method.clone(), route.path.clone()),
+                    route.auth.clone(),
+                );
+            } else {
+                unmodelled.insert(format!("{} {}", route.method, route.path));
+            }
             continue;
         };
         generated_routes += 1;
@@ -923,6 +1058,10 @@ fn add_auto_api_nodes(
     MountedSurface {
         generated: generated_routes,
         unmodelled: unmodelled.into_iter().collect(),
+        declared: declared
+            .into_iter()
+            .map(|((method, path), auth)| DeclaredMount { method, path, auth })
+            .collect(),
     }
 }
 
@@ -991,6 +1130,7 @@ pub fn parse_manifest_dump(stdout: &str) -> Option<ArchitectureGraph> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::RepositoryApiOwner;
 
     fn model(name: &'static str, path: &'static str, table: &'static str) -> ModelGraphDescriptor {
         ModelGraphDescriptor {
@@ -1068,9 +1208,12 @@ mod tests {
             module_path: "app::jobs",
             schedule: "",
             mutating: false,
+            mutating_symbols: &[],
             file: "src/jobs.rs",
             line: 40,
             signature_symbols: &[],
+            signature_bindings: &[],
+            dot_mutation_receivers: &[],
             body_symbols,
             sql_symbols: &[],
         }
@@ -1088,15 +1231,36 @@ mod tests {
                 ..RouteAuth::default()
             },
             repository_api: None,
+            auth_declared: false,
         }
     }
 
     /// A mounted route a `#[repository(api = ...)]` generated, carrying the
     /// declared ownership the real `Route` does.
     fn mounted_by_repository(method: &str, path: &str, api: &str) -> MountedRoute {
+        mounted_by_model(method, path, api, "Post")
+    }
+
+    fn mounted_by_model(method: &str, path: &str, api: &str, model: &str) -> MountedRoute {
         MountedRoute {
-            repository_api: Some(api.to_owned()),
+            repository_api: Some(RepositoryApiOwner {
+                api: api.to_owned(),
+                model: model.to_owned(),
+            }),
             ..mounted(method, path, "auto")
+        }
+    }
+
+    /// A plugin mount the app declared, so its auth is known.
+    fn declared_mount(method: &str, path: &str, public: bool) -> MountedRoute {
+        MountedRoute {
+            auth: RouteAuth {
+                secured: !public,
+                public,
+                ..RouteAuth::default()
+            },
+            auth_declared: true,
+            ..mounted(method, path, "plugin")
         }
     }
 
@@ -1445,6 +1609,156 @@ mod tests {
             &[writer],
         );
         assert_eq!(graph.edges[0].access, Access::Write);
+    }
+
+    fn edge_access(graph: &ArchitectureGraph, to_suffix: &str) -> Access {
+        graph
+            .edges
+            .iter()
+            .find(|e| e.to.ends_with(to_suffix) && e.provenance != Provenance::Declaration)
+            .unwrap_or_else(|| panic!("no edge to {to_suffix}: {:?}", graph.edges))
+            .access
+    }
+
+    #[test]
+    fn a_job_that_reads_one_table_and_writes_another_has_two_accesses() {
+        // #2520 item 11: loading `users`, then inserting into `audit_events`.
+        let mut writer = job("audit", JobKind::Job, &["audit_events", "users"]);
+        writer.mutating_symbols = &["audit_events"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("User", "app::models::User", "users"),
+                model("AuditEvent", "app::models::AuditEvent", "audit_events"),
+            ],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "AuditEvent"), Access::Write);
+        assert_eq!(edge_access(&graph, "User"), Access::Read);
+    }
+
+    #[test]
+    fn unattributed_mutation_evidence_still_writes_every_edge() {
+        let mut writer = job("audit", JobKind::Job, &["audit_events", "users"]);
+        writer.mutating = true;
+        writer.mutating_symbols = &["audit_events"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("User", "app::models::User", "users"),
+                model("AuditEvent", "app::models::AuditEvent", "audit_events"),
+            ],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "AuditEvent"), Access::Write);
+        assert_eq!(edge_access(&graph, "User"), Access::Write);
+    }
+
+    #[test]
+    fn a_write_through_one_symbol_beats_a_read_through_another_for_one_target() {
+        // `Post` (a read) and `posts` (a write) reach the same model node.
+        let mut writer = job("rank", JobKind::Job, &["Post", "posts"]);
+        writer.mutating_symbols = &["posts"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "Post"), Access::Write);
+    }
+
+    fn repo_job(
+        bindings: &'static [(&'static str, &'static str)],
+        receivers: &'static [&'static str],
+    ) -> JobGraphDescriptor {
+        JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository"],
+            signature_bindings: bindings,
+            dot_mutation_receivers: receivers,
+            ..job("edit", JobKind::Job, &[])
+        }
+    }
+
+    fn post_graph(job: JobGraphDescriptor) -> ArchitectureGraph {
+        build(
+            &[],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
+            &[job],
+        )
+    }
+
+    #[test]
+    fn a_dot_call_on_a_repository_parameter_is_a_write() {
+        // #2520 item 8: `repo.update(id, &patch)`.
+        let graph = post_graph(repo_job(&[("repo", "PgPostRepository")], &["repo"]));
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Write);
+    }
+
+    #[test]
+    fn a_repository_parameter_with_no_dot_mutation_stays_a_read() {
+        let graph = post_graph(repo_job(&[("repo", "PgPostRepository")], &[]));
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Read);
+    }
+
+    #[test]
+    fn a_dot_call_on_a_name_that_is_not_a_repository_parameter_is_a_read() {
+        // `HashMap::insert`: `cache` is a local, not a parameter.
+        let unbound = post_graph(repo_job(&[("repo", "PgPostRepository")], &["cache"]));
+        assert_eq!(edge_access(&unbound, "PostRepository"), Access::Read);
+        // A parameter whose type is no declared repository.
+        let other = JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository", "Cache"],
+            signature_bindings: &[("repo", "PgPostRepository"), ("cache", "Cache")],
+            dot_mutation_receivers: &["cache"],
+            ..job("edit", JobKind::Job, &[])
+        };
+        assert_eq!(
+            edge_access(&post_graph(other), "PostRepository"),
+            Access::Read
+        );
+    }
+
+    #[test]
+    fn a_repository_receiver_makes_only_its_own_repository_a_write() {
+        let both = JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository", "PgUserRepository"],
+            signature_bindings: &[("posts", "PgPostRepository"), ("users", "PgUserRepository")],
+            dot_mutation_receivers: &["posts"],
+            ..job("edit", JobKind::Job, &[])
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("Post", "app::models::Post", "posts"),
+                model("User", "app::models::User", "users"),
+            ],
+            &[
+                repository("PostRepository", "PgPostRepository", "Post", "posts"),
+                repository("UserRepository", "PgUserRepository", "User", "users"),
+            ],
+            &[both],
+        );
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Write);
+        assert_eq!(edge_access(&graph, "UserRepository"), Access::Read);
     }
 
     #[test]
@@ -1829,5 +2143,231 @@ mod tests {
         assert!(summary.contains("Post (table posts)"), "{summary}");
         assert!(summary.contains("PostRepository over Post"), "{summary}");
         assert!(summary.contains("Limits of this derivation"), "{summary}");
+    }
+
+    // ── #2520 follow-ups ─────────────────────────────────────────────
+
+    fn plugin_post() -> ModelGraphDescriptor {
+        ModelGraphDescriptor {
+            model_path: "plugin::models::Post",
+            table: "plugin_posts",
+            relations: &["plugin_votes"],
+            ..model("Post", "plugin::models::Post", "plugin_posts")
+        }
+    }
+
+    #[test]
+    fn a_repository_edge_requires_the_model_name_and_table_to_match() {
+        let mut app_post = model("Post", "app::models::Post", "posts");
+        app_post.relations = &["votes"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                app_post,
+                plugin_post(),
+                model("Vote", "app::models::Vote", "votes"),
+                model("PluginVote", "plugin::models::PluginVote", "plugin_votes"),
+            ],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
+            &[],
+        );
+        let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["model:app::models::Post", "model:app::models::Vote"],
+            "the other crate's Post and its relations must not be claimed"
+        );
+    }
+
+    #[test]
+    fn a_repository_over_an_overridden_table_still_finds_its_model_by_name() {
+        // No model matches (name, table) when the repository overrides the
+        // table. Dropping the edge would lose recall, so fall back to the name.
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "archive",
+            )],
+            &[],
+        );
+        assert_eq!(graph.edges.len(), 1, "{:?}", graph.edges);
+    }
+
+    #[test]
+    fn a_git_checkout_path_is_shortened_to_its_crate_relative_tail() {
+        assert_eq!(
+            location(
+                "/home/someone/.cargo/git/checkouts/plug-1a2b3c4d5e6f7a8b/9f8e7d6/src/lib.rs",
+                4
+            ),
+            "plug/src/lib.rs:4"
+        );
+        assert_eq!(
+            location(
+                r"C:\Users\dev\.cargo\git\checkouts\plug-1a2b3c4d5e6f7a8b\9f8e7d6\crates\x\src\lib.rs",
+                4
+            ),
+            "plug/crates/x/src/lib.rs:4"
+        );
+    }
+
+    #[test]
+    fn the_same_prefix_under_two_models_keeps_each_route_with_its_own_repository() {
+        let mut other = repository_with_api(
+            "ArticleRepository",
+            "PgArticleRepository",
+            "Article",
+            "articles",
+            "/api/items",
+        );
+        other.module_path = "app::other";
+        let graph = build(
+            &[
+                mounted_by_model("GET", "/a/api/items", "/api/items", "Post"),
+                mounted_by_model("GET", "/b/api/items", "/api/items", "Article"),
+            ],
+            0,
+            &[],
+            &[
+                model("Post", "app::models::Post", "posts"),
+                model("Article", "app::models::Article", "articles"),
+            ],
+            &[
+                repository_with_api(
+                    "PostRepository",
+                    "PgPostRepository",
+                    "Post",
+                    "posts",
+                    "/api/items",
+                ),
+                other,
+            ],
+            &[],
+        );
+        let owner_of = |path: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|n| n.route.as_ref().is_some_and(|r| r.path == path))
+                .and_then(|n| n.route.as_ref()?.generated_by.clone())
+        };
+        assert_eq!(owner_of("/a/api/items").as_deref(), Some("PostRepository"));
+        assert_eq!(
+            owner_of("/b/api/items").as_deref(),
+            Some("ArticleRepository")
+        );
+    }
+
+    #[test]
+    fn the_limits_name_the_process_global_graph_and_duplicate_versions() {
+        let graph = build(&[], 0, &[], &[], &[], &[]);
+        assert!(
+            graph.limits.iter().any(|l| l.contains("first application")),
+            "{:?}",
+            graph.limits
+        );
+        assert!(
+            graph.limits.iter().any(|l| l.contains("two versions")),
+            "{:?}",
+            graph.limits
+        );
+    }
+
+    #[test]
+    fn a_declared_plugin_mount_keeps_its_auth_in_a_structured_entry() {
+        let graph = build(
+            &[
+                declared_mount("GET", "/admin/plugins", false),
+                mounted("GET", "/health", "probe"),
+            ],
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let c = &graph.completeness;
+        assert_eq!(c.declared_mounts.len(), 1, "{:?}", c.declared_mounts);
+        assert_eq!(c.declared_mounts[0].method, "GET");
+        assert_eq!(c.declared_mounts[0].path, "/admin/plugins");
+        assert!(c.declared_mounts[0].auth.secured);
+        assert_eq!(
+            c.unmodelled_mounted_routes,
+            vec!["GET /health"],
+            "a mount with known auth is not also a name-only string"
+        );
+    }
+
+    #[test]
+    fn flipping_a_declared_mounts_auth_changes_the_document() {
+        let secured = build(&[declared_mount("GET", "/p", false)], 0, &[], &[], &[], &[]);
+        let public = build(&[declared_mount("GET", "/p", true)], 0, &[], &[], &[], &[]);
+        assert_ne!(secured.completeness, public.completeness);
+    }
+
+    #[test]
+    fn declared_mounts_are_omitted_when_there_are_none_and_sorted_otherwise() {
+        let none = build(&[], 0, &[], &[], &[], &[]);
+        assert!(!none.to_json().contains("declared_mounts"));
+        let graph = build(
+            &[
+                declared_mount("POST", "/z", false),
+                declared_mount("GET", "/a", false),
+            ],
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let paths: Vec<&str> = graph
+            .completeness
+            .declared_mounts
+            .iter()
+            .map(|m| m.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["/a", "/z"]);
+        assert_eq!(graph.schema_version, 1);
+        assert!(graph.summary().contains("GET /a"), "{}", graph.summary());
+    }
+
+    #[test]
+    fn a_cron_schedule_is_not_labelled_as_every() {
+        let node = |schedule: &str| GraphNode {
+            id: "job:x".to_owned(),
+            kind: NodeKind::ScheduledTask,
+            name: "digest".to_owned(),
+            module: String::new(),
+            location: String::new(),
+            route: None,
+            model: None,
+            repository: None,
+            job: Some(JobFacts {
+                kind: JobKind::Scheduled,
+                schedule: Some(schedule.to_owned()),
+            }),
+        };
+        assert_eq!(node("15m").label(), "digest (every 15m)");
+        assert_eq!(node("1h 30m").label(), "digest (every 1h 30m)");
+        assert_eq!(node("1h30m").label(), "digest (every 1h30m)");
+        assert_eq!(node("1 h").label(), "digest (every 1 h)");
+        assert_eq!(node("0 0 1 1 1").label(), "digest (0 0 1 1 1)");
+        assert_eq!(
+            node("0 3 * * * (America/New_York)").label(),
+            "digest (0 3 * * * (America/New_York))"
+        );
     }
 }

@@ -110,6 +110,11 @@ pub enum EdgePlan {
     Build,
 }
 
+/// The env var selecting the app binary's static-build mode. The first mode
+/// `AppBuilder::run` checks, so no other mode ever needs to clear it before
+/// setting its own.
+pub const BUILD_STATIC_ENV: &str = "AUTUMN_BUILD_STATIC";
+
 /// Tells the static renderer that an empty route set is not an error. Read by
 /// `autumn-web`'s static build.
 const STATIC_ALLOW_EMPTY_ENV: &str = "AUTUMN_BUILD_STATIC_ALLOW_EMPTY";
@@ -681,7 +686,7 @@ pub fn run(
     eprintln!("\nRunning static renderer...\n");
 
     let mut cmd = Command::new(&binary);
-    cmd.env("AUTUMN_BUILD_STATIC", "1");
+    cmd.env(BUILD_STATIC_ENV, "1");
     if static_render_allows_empty(plan) {
         cmd.env(STATIC_ALLOW_EMPTY_ENV, "1");
     } else {

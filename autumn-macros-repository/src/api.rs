@@ -18,6 +18,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Ident;
 
+use autumn_macros_support::cascade::CASCADE_LEVELS;
+
 use crate::repository::{McpExpose, RepoConfig, to_snake_case};
 
 /// What `repository_macro` must hand to the API emitter.
@@ -120,6 +122,17 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
     let mcp_delete_op = mcp_for("DELETE");
 
     let has_policy = config.policy_type.is_some();
+
+    // `grant = X`: each generated MCP tool is governed by grant X. The three
+    // writes also assert, at compile time, that X allows writing the model.
+    let authority = |route: &str, op_enabled: bool, writes: bool| {
+        governed_route(config, inputs, &prefix, route, op_enabled, writes)
+    };
+    let (list_authority, list_authority_items) = authority("list", mcp_list_op, false);
+    let (get_authority, get_authority_items) = authority("get", mcp_get_op, false);
+    let (create_authority, create_authority_items) = authority("create", mcp_create_op, true);
+    let (update_authority, update_authority_items) = authority("update", mcp_update_op, true);
+    let (delete_authority, delete_authority_items) = authority("delete", mcp_delete_op, true);
 
     // #1237: the generated JSON list endpoint paginates by default instead
     // of streaming the whole table via `find_all()`. Offset pagination
@@ -890,6 +903,12 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
         #policy_type_assertion
         #scope_type_assertion
 
+        #list_authority_items
+        #get_authority_items
+        #create_authority_items
+        #update_authority_items
+        #delete_authority_items
+
         #vis async fn #list_fn(
             #list_session_state_args
             #list_pager_arg
@@ -939,6 +958,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                     ),
                     register_schemas: ::core::option::Option::Some(#list_schema_fn),
                     mcp_tool: #mcp_list_op,
+                    agent_authority: #list_authority,
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -997,6 +1017,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                         }
                     ),
                     mcp_tool: #mcp_get_op,
+                    agent_authority: #get_authority,
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -1055,6 +1076,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                         }
                     ),
                     mcp_tool: #mcp_create_op,
+                    agent_authority: #create_authority,
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -1115,6 +1137,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                         }
                     ),
                     mcp_tool: #mcp_update_op,
+                    agent_authority: #update_authority,
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -1156,6 +1179,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                     path_params: &["id"],
                     success_status: 204,
                     mcp_tool: #mcp_delete_op,
+                    agent_authority: #delete_authority,
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -1201,4 +1225,112 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
             format!("{}/{}", #api_path, ::autumn_web::paths::encode_path_segment(id))
         }
     }
+}
+
+/// The authority a generated MCP tool carries under `grant = X`, and the items
+/// that define it. Without a grant, or for a route that is not an MCP tool,
+/// the authority is `None` and no item is emitted.
+fn governed_route(
+    config: &RepoConfig,
+    inputs: &ApiInputs<'_>,
+    prefix: &str,
+    route: &str,
+    op_enabled: bool,
+    writes: bool,
+) -> (TokenStream, TokenStream) {
+    let Some(grant) = config.grant.as_ref().filter(|_| op_enabled) else {
+        return (quote! { ::core::option::Option::None }, quote! {});
+    };
+    let pg_name = inputs.pg_name;
+    let vis = inputs.vis;
+    let action = format!("{prefix}_api_{route}");
+    let authority = format_ident!("__AUTUMN_AGENT_AUTHORITY_{prefix}_api_{route}");
+    let model = quote! { #pg_name::__AUTUMN_MODEL_IDENT };
+    let effects = if writes {
+        quote! {
+            ::autumn_web::agent_authority::Effect {
+                kind: ::autumn_web::agent_authority::EffectKind::Write,
+                subject: #model,
+                location: ::core::concat!(::core::file!(), ":", ::core::line!()),
+                provenance: ::autumn_web::agent_authority::EffectProvenance::TypeResolved,
+            }
+        }
+    } else {
+        quote! {}
+    };
+    // One assertion serves the create, update and delete tools: they write
+    // the same model, so three copies would repeat one error.
+    let assertion = if route == "create" {
+        let message = format!(
+            "agent authority: the generated create, update and delete tools of this repository \
+             write its model, which grant `{}` does not allow.\n\nAdd the model to the \
+             grant's `writes: [...]`, or drop `grant = ...` from the repository. See \
+             docs/guide/agent-authority.md.",
+            path_text(grant),
+        );
+        quote! {
+            const _: () = ::core::assert!(#grant.allows_write(#model), #message);
+        }
+    } else {
+        quote! {}
+    };
+    // A delete also writes the models its `dependent(...)` cascade names.
+    let too_deep = format!(
+        "agent authority: the generated delete tool of this repository starts a `dependent(...)` \
+         cascade that is deeper than {} levels, or that loops.\n\nGrant `{}` cannot cover \
+         what Autumn cannot list. Make a leg `restrict`, or drop `grant = ...` from the \
+         repository. See docs/guide/agent-authority.md.",
+        CASCADE_LEVELS,
+        path_text(grant),
+    );
+    let cascade_assertion = if route == "delete" {
+        let message = format!(
+            "agent authority: the generated delete tool of this repository also writes the \
+             models its `dependent(...)` cascade names, and grant `{}` does not allow all of \
+             them.\n\nAdd every dependent model to the grant's `writes: [...]`, make the \
+             association `restrict`, or drop `grant = ...` from the repository. See \
+             docs/guide/agent-authority.md.",
+            path_text(grant),
+        );
+        quote! {
+            const _: () = ::core::assert!(
+                #grant.allows_writes_all(#pg_name::__AUTUMN_CASCADE_3.models),
+                #message
+            );
+            const _: () = ::core::assert!(!#pg_name::__AUTUMN_CASCADE_3.more, #too_deep);
+        }
+    } else {
+        quote! {}
+    };
+    let items = quote! {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals, dead_code)]
+        #vis static #authority: ::autumn_web::agent_authority::AgentAuthority =
+            ::autumn_web::agent_authority::AgentAuthority {
+                action: #action,
+                module_path: ::core::module_path!(),
+                location: ::core::concat!(::core::file!(), ":", ::core::line!()),
+                grant: &#grant,
+                effects: &[#effects],
+                asserted_effect_free_sites: 0,
+                asserted_effect_free: &[],
+            };
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::agent_authority::AgentAuthorityDescriptor(&#authority)
+        }
+
+        #assertion
+
+        #cascade_assertion
+    };
+    (quote! { ::core::option::Option::Some(&#authority) }, items)
+}
+
+fn path_text(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
 }

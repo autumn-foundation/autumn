@@ -87,7 +87,8 @@ async fn main() {
         // App migrations (todos table) + framework migrations (api_tokens table).
         .migrations(MIGRATIONS)
         .migrations(API_TOKEN_MIGRATIONS)
-        // HTML routes (session-auth) + open token-issuance endpoint.
+        // HTML routes + open token-issuance endpoint. All are `#[public]`: this
+        // demo has no login.
         .routes(routes![
             routes::todos::index,
             routes::todos::list,
@@ -110,7 +111,8 @@ async fn main() {
         // (rather than a merged raw router) keeps these routes in the route
         // registry, so their `#[api_doc(mcp)]` tags project them as MCP tools
         // while `RequireApiToken` still guards every call — agent or HTTP.
-        .scoped(
+        // `scoped_guarded` tells `routes audit` that this layer is the guard.
+        .scoped_guarded(
             "/api",
             RequireApiToken::new(Arc::new(deferred.clone())),
             routes![

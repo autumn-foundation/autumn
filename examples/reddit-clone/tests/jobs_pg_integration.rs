@@ -21,7 +21,7 @@ use autumn_web::AppState;
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use reddit_clone::jobs::{UserOnboardingArgs, user_onboarding};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -105,8 +105,8 @@ async fn pg_job_enqueue_participates_in_transaction() {
     let (_container, pool) = start_postgres().await;
     let mut conn = pool.get().await.expect("get connection");
 
-    diesel::sql_query(CREATE_AUTUMN_JOBS)
-        .execute(&mut *conn)
+    // The migration holds several statements, so it needs the simple protocol.
+    conn.batch_execute(CREATE_AUTUMN_JOBS)
         .await
         .expect("create autumn_jobs");
     diesel::sql_query(CREATE_USERS_TABLE)
@@ -171,8 +171,8 @@ async fn user_onboarding_enqueue_run_ack_cycle() {
     let (_container, pool) = start_postgres().await;
     let mut conn = pool.get().await.expect("get connection");
 
-    diesel::sql_query(CREATE_AUTUMN_JOBS)
-        .execute(&mut *conn)
+    // The migration holds several statements, so it needs the simple protocol.
+    conn.batch_execute(CREATE_AUTUMN_JOBS)
         .await
         .expect("create autumn_jobs");
     diesel::sql_query(CREATE_USERS_TABLE)

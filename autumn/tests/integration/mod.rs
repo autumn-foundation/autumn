@@ -155,6 +155,8 @@ mod failure_capsule_end_to_end;
 mod failure_capsule_overhead;
 #[cfg(all(feature = "reporting", feature = "db", not(feature = "sqlite")))]
 mod failure_capsule_replay;
+#[cfg(all(feature = "reporting", feature = "http-client", feature = "cache-moka"))]
+mod failure_capsule_url_userinfo;
 mod fake_generators;
 mod fault_injection;
 mod feature_flags_integration;
@@ -229,6 +231,8 @@ mod mcp_endpoint;
 mod mcp_modern;
 #[cfg(feature = "mcp")]
 mod mcp_plugin;
+#[cfg(feature = "mcp")]
+mod mcp_progressive;
 #[cfg(all(feature = "db", feature = "mcp"))]
 mod mcp_repository;
 #[cfg(feature = "mcp")]

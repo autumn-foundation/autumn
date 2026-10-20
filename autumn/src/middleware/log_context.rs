@@ -108,7 +108,13 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let request_id = req.extensions().get::<RequestId>().map(ToString::to_string);
+        // The `RequestId` itself (a few bytes, no heap): the context renders it
+        // to text only for a reader, and most requests have none.
+        let request_id = req.extensions().get::<RequestId>().cloned();
+        let agent_call = req
+            .extensions()
+            .get::<crate::agent_authority::AgentInvocation>()
+            .is_some();
 
         // Open an always-on request span carrying the well-known correlation
         // fields. They are declared up front (Empty) so `set_user_id` /
@@ -129,7 +135,7 @@ where
         // Attach the request span so `set_user_id` / `set_tenant_id` record onto
         // it directly, rather than whatever child span happens to be current.
         let ctx =
-            LogContext::with_filter(request_id, Arc::clone(&self.filter)).with_span(span.clone());
+            LogContext::for_request(request_id, Arc::clone(&self.filter)).with_span(span.clone());
         #[cfg(feature = "telemetry-otlp")]
         record_trace_ids(&span, &ctx);
         let body_ctx = ctx.clone();
@@ -161,7 +167,14 @@ where
             ctx,
             async move {
                 let response = inner.await?;
-                let (parts, body) = response.into_parts();
+                let (mut parts, body) = response.into_parts();
+                // An MCP tool call reads the principal off the response: the
+                // scope is gone once this future ends.
+                if agent_call && let Some(actor) = crate::current::Current::scoped_actor() {
+                    parts
+                        .extensions
+                        .insert(crate::agent_authority::AgentActor(actor));
+                }
                 // Capture the request's *resolved* actor scope (the auth layer has
                 // published the principal by now) and re-establish it on every
                 // streamed frame, so a lazy/SSE body's writes stay attributed to
@@ -258,6 +271,27 @@ mod tests {
 
     fn filter() -> Arc<ParameterFilter> {
         Arc::new(ParameterFilter::default())
+    }
+
+    /// `MakeWriter` collecting a `fmt` layer's output, so a test can assert on
+    /// the rendered span fields.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    struct BufGuard(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for BufGuard {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = BufGuard;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufGuard(Arc::clone(&self.0))
+        }
     }
 
     #[tokio::test]
@@ -554,25 +588,6 @@ mod tests {
         // Regression guard: `set_user_id` must record onto the request span, not
         // whatever child span is current — otherwise the field is silently
         // dropped from log output when set from inside e.g. a DB-query span.
-        #[derive(Clone)]
-        struct BufWriter(Arc<Mutex<Vec<u8>>>);
-        struct BufGuard(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for BufGuard {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
-            type Writer = BufGuard;
-            fn make_writer(&'a self) -> Self::Writer {
-                BufGuard(Arc::clone(&self.0))
-            }
-        }
-
         let buf = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -645,5 +660,82 @@ mod tests {
         let body_id = String::from_utf8(body.to_vec()).unwrap();
         assert_eq!(body_id, header_id);
         assert!(!body_id.is_empty());
+    }
+
+    /// The span's `request_id` field, the context's text and the header are
+    /// one id. The layer seeds the context with the `RequestId` itself and the
+    /// span records it through its `Display` (unquoted in text output, as the
+    /// copied `String` was); the context renders the same text when read.
+    /// Covers a minted id and a trusted proxy's id in mixed case.
+    #[test]
+    fn span_field_context_and_header_carry_the_same_request_id() {
+        let open = crate::security::config::TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        };
+        let trusting = RequestIdLayer::default()
+            .with_inbound_trust(Arc::new(crate::security::ProxyResolver::from_config(&open)));
+        let sent = "0F8FAD5B-d9cb-469F-A165-70867728950E";
+        for (layer, inbound) in [(RequestIdLayer::default(), None), (trusting, Some(sent))] {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(BufWriter(Arc::clone(&buf))),
+            );
+
+            let (header_id, body_id) = with_default(subscriber, || {
+                let app = Router::new()
+                    .route(
+                        "/",
+                        get(|| async {
+                            tracing::info!("handled");
+                            context::current_request_id().unwrap_or_default()
+                        }),
+                    )
+                    .layer(LogContextLayer::new(filter()))
+                    .layer(layer);
+                let mut builder = Request::builder().uri("/");
+                if let Some(inbound) = inbound {
+                    builder = builder.header("x-request-id", inbound);
+                }
+                let mut request = builder.body(Body::empty()).unwrap();
+                let peer: std::net::SocketAddr = "10.1.2.3:4000".parse().unwrap();
+                request
+                    .extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer));
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let response = app.oneshot(request).await.unwrap();
+                    let header_id = response
+                        .headers()
+                        .get("x-request-id")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned();
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    (header_id, String::from_utf8(body.to_vec()).unwrap())
+                })
+            });
+
+            if let Some(inbound) = inbound {
+                assert_eq!(header_id, inbound, "a trusted proxy's id is kept as sent");
+            }
+            assert_eq!(body_id, header_id);
+            let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            assert!(out.contains(&format!("request_id={header_id}")), "{out}");
+            assert!(
+                !out.contains(&format!("request_id=\"{header_id}\"")),
+                "{out}"
+            );
+        }
     }
 }

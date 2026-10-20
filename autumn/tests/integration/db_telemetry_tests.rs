@@ -184,6 +184,12 @@ mod db_telemetry_tests {
                     found_sleep,
                     "Expected a metrics entry for GET /sleep-default"
                 );
+                // The exact key `Db`'s drop records: method, route template and
+                // verb, composed without an intermediate `String`.
+                assert!(
+                    queries.get("GET /sleep-default SELECT").is_some(),
+                    "expected the exact Db key `GET /sleep-default SELECT`, got {queries}"
+                );
             });
     }
 

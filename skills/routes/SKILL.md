@@ -106,6 +106,11 @@ Mark a deliberately-unauthenticated handler with the new `#[public]` attribute
 (mirrors `#[secured]`) to classify it as `public` and clear it from the
 `unclassified` set.
 
+A layer can be the guard, such as `RequireApiToken`. Mount that group with
+`AppBuilder::scoped_guarded`, not `scoped` (issue #2468). Its routes are then
+`gated` with `provenance: "declared"`. Do not use `#[public]` on them. The
+audit cannot check that the layer authenticates.
+
 An unclassified-route diagnostic now names the offending handler's `file:line`
 (from `file!()`/`line!()`) alongside its module, e.g. `POST /widgets (handler
 `create_widget` [myapp::widgets] at src/routes/widgets.rs:12)`, so it can be
@@ -127,7 +132,7 @@ The audit builds the dev profile with default features unless told otherwise.
 A route behind `#[cfg(not(debug_assertions))]` or a feature is only in the
 manifest when the audit builds it, so audit the build you deploy:
 `autumn routes audit --release` (issue #2472). The
-manifest (schema v5) records the build in a top-level `build` object, and
+manifest (schema v5 and later) records the build in a top-level `build` object, and
 `routes posture diff` reports `build_changed` as a widening when two manifests
 come from different builds.
 
@@ -160,10 +165,12 @@ security header no longer emitted. Narrowing and neutral changes annotate and
 never block, a security header's *value* changing is reported but never
 blocked, and a handler rename or a moved file produces no finding at all.
 
-A widening is acknowledged with one pull-request comment carrying the digest
-the report prints — `/ack-posture <digest> <reason>` — which stays valid across
-unrelated pushes and stops matching the moment something new widens. That is
-also the only escape hatch for a false positive: nothing disables the gate.
+A widening is acknowledged with one pull-request comment carrying the marker
+the report prints — `/ack-posture <digest> ceiling=<posture> <reason>`. It
+means "no wider than this": it stays valid across unrelated pushes and
+narrowing, and stops matching when something new widens or a constraint is
+removed. A bare digest means "exactly this". The marker is also the only
+escape hatch for a false positive. Nothing disables the gate.
 
 `autumn new` scaffolds `.github/workflows/posture-gate.yml`; existing apps
 adopt it with `autumn upgrade --apply`. See `docs/guide/posture-gate.md`.

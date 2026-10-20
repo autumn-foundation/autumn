@@ -286,6 +286,48 @@ middleware resolved for the request — so two tenants that pick the same
 comes from the framework's own resolution rather than from the request header,
 so a genuine retry from the same tenant still replays.
 
+### Bearer-token clients
+
+Token clients — service integrations, agents, MCP clients — usually have no
+session, so the key scopes them by their bearer credential instead:
+
+| The request carries | The key is scoped by |
+| --- | --- |
+| A token [`RequireApiToken`](authentication.md) verified | The token's principal id |
+| An `Authorization` header and no cookie-backed session | A SHA-256 digest of the header |
+| A cookie-backed session | The session (a raw `Authorization` header does not change the key) |
+
+Two token clients that send the same key and body therefore get their own runs,
+and each one's retry replays its own response.
+
+- **Mount `RequireApiToken` with `AppBuilder::layer` when you can.** The key
+  then carries the principal, not the token, so an agent that refreshes its
+  token between attempts still replays. `RequireApiToken` registered this way
+  no longer forces the app into fail-closed replay; a retry replays instead of
+  answering `409`.
+- **A route that checks the token in the handler** is scoped by the raw header.
+  A retry with a different header — a refreshed token, or none — is a new
+  caller to the cache and runs the handler again.
+
+Wrapping `RequireApiToken` in a `ServiceBuilder` stack, or mounting it on a
+`.scoped(...)` group or a merged router, still fails closed with `409` on a
+cache hit, as any opaque layer does.
+
+### Opting a route out
+
+A route that dedupes by its own key — a durable workflow route that keys its
+run by `Idempotency-Key` and the caller's scope, for example — gains nothing
+from a second cache in front of it. Turn the layer off for that route:
+
+```rust,ignore
+#[post("/orders", idempotent = false)]
+async fn place_order(/* ... */) -> impl IntoResponse { /* ... */ }
+```
+
+The layer is not mounted on that route at all: it neither stores nor replays,
+and the handler runs on every request. A hand-built `Route` gets the same with
+`idempotency: RouteIdempotency::Off`.
+
 Manually constructed `Route` values passed to `AppBuilder::routes()` or
 `AppBuilder::scoped()` are also treated as unknown by default. Autumn records
 the first successful mutation, but cache hits fail closed with `409 Conflict`

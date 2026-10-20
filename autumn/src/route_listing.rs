@@ -364,6 +364,10 @@ pub struct RouteInfo {
     /// (`#[authorize]`), carried for `Gated` routes.
     #[serde(default, skip_serializing_if = "is_false")]
     pub policy: bool,
+    /// The route is `Gated` only because its group uses
+    /// `AppBuilder::scoped_guarded`. The guard is declared, not proven.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub layer_guarded: bool,
     /// Module path of the handler (from `module_path!()`), used to name a
     /// route in audit diagnostics. `None` for routes without a known module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,7 +425,7 @@ const fn is_false(b: &bool) -> bool {
 impl RouteInfo {
     /// Construct a framework-owned `GET` route entry. Framework routes are
     /// pre-classified and exempt from the audit gate.
-    fn framework_get(path: String, handler: &str) -> Self {
+    pub(crate) fn framework_get(path: String, handler: &str) -> Self {
         Self::framework_route("GET", path, handler)
     }
 
@@ -437,6 +441,24 @@ impl RouteInfo {
             ..Self::default()
         }
     }
+}
+
+/// Classify a route in a scoped group. Only an app route with no other
+/// classification takes the group's declared layer guard.
+fn classify_in_group(
+    group: &ScopedGroup,
+    route: &Route,
+) -> (RouteClassification, Vec<String>, Vec<String>, bool, bool) {
+    let (mut classification, roles, scopes, policy) =
+        classify(&group.source, &route.api_doc, route.repository.as_ref());
+    // A plugin cannot vouch for its own routes.
+    let layer_guarded = group.layer_guarded
+        && group.source == RouteSource::User
+        && classification == RouteClassification::Unclassified;
+    if layer_guarded {
+        classification = RouteClassification::Gated;
+    }
+    (classification, roles, scopes, policy, layer_guarded)
 }
 
 /// Derive a route's security classification (and carried posture) from its
@@ -667,6 +689,7 @@ pub fn collect_route_infos(
             roles,
             scopes,
             policy,
+            layer_guarded: false,
             module: module_of(&route.api_doc),
             location: source_location_of(&route.api_doc),
             authorize_bindings,
@@ -681,8 +704,8 @@ pub fn collect_route_infos(
             let full_path = join_scope_path(&group.prefix, route.path);
             let (api_version, status, sunset_opt_out) =
                 resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
-            let (classification, roles, scopes, policy) =
-                classify(&group.source, &route.api_doc, route.repository.as_ref());
+            let (classification, roles, scopes, policy, layer_guarded) =
+                classify_in_group(group, route);
             let pools = pools_of(&route.api_doc, route.repository.as_ref());
             infos.push(RouteInfo {
                 method: route.method.to_string(),
@@ -697,6 +720,7 @@ pub fn collect_route_infos(
                 roles,
                 scopes,
                 policy,
+                layer_guarded,
                 module: module_of(&route.api_doc),
                 location: source_location_of(&route.api_doc),
                 authorize_bindings: authorize_bindings_of(&group.source, &route.api_doc),
@@ -710,12 +734,11 @@ pub fn collect_route_infos(
     Ok(infos)
 }
 
-/// Append framework-internal routes (probes, actuator, htmx assets).
+/// Append the routes a worker replica serves: the probes and the actuator.
 ///
-/// Paths are taken from `config` so custom probe/actuator prefix settings
-/// are reflected accurately.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn append_framework_routes(
+/// This matches `router::try_build_probe_only_router`. It adds no htmx asset,
+/// docs UI, static route or dev route.
+pub(crate) fn append_probe_and_actuator_routes(
     infos: &mut Vec<RouteInfo>,
     config: &crate::config::AutumnConfig,
 ) {
@@ -776,6 +799,27 @@ pub(crate) fn append_framework_routes(
             "actuator",
         ));
     }
+}
+
+/// Append framework-internal routes (probes, actuator, assets, dev routes).
+///
+/// Paths are taken from `config` so custom probe/actuator prefix settings
+/// are reflected accurately. Dev routes follow the process environment.
+pub(crate) fn append_framework_routes(
+    infos: &mut Vec<RouteInfo>,
+    config: &crate::config::AutumnConfig,
+) {
+    append_framework_routes_with_env(infos, config, &crate::config::OsEnv);
+}
+
+/// [`append_framework_routes`] with an explicit environment for the dev gate.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn append_framework_routes_with_env(
+    infos: &mut Vec<RouteInfo>,
+    config: &crate::config::AutumnConfig,
+    env: &dyn crate::config::Env,
+) {
+    append_probe_and_actuator_routes(infos, config);
 
     #[cfg(feature = "htmx")]
     for asset in crate::htmx::framework_scripts() {
@@ -792,6 +836,20 @@ pub(crate) fn append_framework_routes(
         ));
         infos.push(RouteInfo::framework_get(asset.url().to_owned(), handler));
     }
+
+    // Flash and widget stylesheets: mounted whenever their feature is on.
+    #[cfg(feature = "flash")]
+    infos.push(RouteInfo::framework_get(
+        crate::flash::FLASH_CSS_PATH.to_owned(),
+        "flash_css",
+    ));
+    #[cfg(feature = "maud")]
+    infos.push(RouteInfo::framework_get(
+        crate::ui::WIDGETS_CSS_PATH.to_owned(),
+        "widgets_css",
+    ));
+
+    append_dev_reload_routes_with_env(infos, env);
 
     #[cfg(feature = "mail")]
     if config
@@ -898,15 +956,18 @@ pub(crate) fn append_openapi_routes(
     ));
     if let Some(ui_path) = &openapi.swagger_ui_path {
         infos.push(RouteInfo::framework_get(ui_path.clone(), "swagger_ui"));
+        for asset in crate::openapi::swagger_ui_asset_paths(ui_path) {
+            infos.push(RouteInfo::framework_get(asset, "swagger_ui_asset"));
+        }
     }
 }
 
 /// Append dev live-reload routes (`/__autumn/live-reload`, `/__autumn/live-reload.js`).
 ///
-/// Routes are only appended when the Autumn dev server is active
-/// (`AUTUMN_DEV=1` and `AUTUMN_ENV != production`).
-pub(crate) fn append_dev_reload_routes(infos: &mut Vec<RouteInfo>) {
-    if crate::middleware::dev::is_enabled_with_env(&crate::config::OsEnv) {
+/// Routes are only appended when the dev server sets the live-reload
+/// variables, the same gate the router uses.
+fn append_dev_reload_routes_with_env(infos: &mut Vec<RouteInfo>, env: &dyn crate::config::Env) {
+    if crate::middleware::dev::is_enabled_with_env(env) {
         for (path, handler) in [
             (crate::middleware::dev::LIVE_RELOAD_PATH, "dev_live_reload"),
             (
@@ -1100,6 +1161,7 @@ mod tests {
             prefix: "/api".to_owned(),
             routes: vec![make_route(Method::GET, "/posts", "api_list_posts")],
             source: RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
@@ -1114,6 +1176,7 @@ mod tests {
             prefix: "/api".to_owned(),
             routes: vec![make_route(Method::GET, "/", "api_root")],
             source: RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
@@ -1143,6 +1206,7 @@ mod tests {
             prefix: "/admin".to_owned(),
             routes: vec![make_route(Method::GET, "/users", "admin_users")],
             source: RouteSource::Plugin("admin".to_owned()),
+            layer_guarded: false,
             apply_layer: Box::new(|r| r),
         };
         let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
@@ -1295,6 +1359,88 @@ mod tests {
         let route = make_route_with(Method::POST, "/widgets", "create_widget", public_doc);
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
         assert_eq!(infos[0].classification, RouteClassification::Public);
+    }
+
+    /// Group helper for the layer-guard tests (#2468).
+    fn group_of(layer_guarded: bool, routes: Vec<Route>) -> ScopedGroup {
+        ScopedGroup {
+            prefix: "/api".to_owned(),
+            routes,
+            source: RouteSource::User,
+            layer_guarded,
+            apply_layer: Box::new(|r| r),
+        }
+    }
+
+    /// An unclassified route in a layer-guarded group is `Gated` and flagged
+    /// as declared. The macros cannot see the layer.
+    #[test]
+    fn layer_guarded_group_gates_an_unclassified_route() {
+        let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
+        let infos = collect_route_infos(&[], &[], &[group_of(true, vec![route])], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Gated);
+        assert!(infos[0].layer_guarded);
+        assert!(infos[0].roles.is_empty() && !infos[0].policy);
+    }
+
+    /// Without the declaration, the same route still fails the audit.
+    #[test]
+    fn plain_scoped_group_stays_unclassified() {
+        let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
+        let infos = collect_route_infos(&[], &[], &[group_of(false, vec![route])], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Unclassified);
+        assert!(!infos[0].layer_guarded);
+    }
+
+    /// An explicit `#[public]` wins over the group. The manifest must not hide it.
+    #[test]
+    fn layer_guard_does_not_override_public() {
+        let doc = crate::openapi::ApiDoc {
+            public: true,
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::GET, "/todos", "list", doc);
+        let infos = collect_route_infos(&[], &[], &[group_of(true, vec![route])], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Public);
+        assert!(!infos[0].layer_guarded);
+    }
+
+    /// A plugin cannot declare a guard for its own routes.
+    #[test]
+    fn layer_guard_is_ignored_for_plugin_groups() {
+        let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
+        let mut group = group_of(true, vec![route]);
+        group.source = RouteSource::Plugin("x".to_owned());
+        let infos = collect_route_infos(&[], &[], &[group], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Unclassified);
+        assert!(!infos[0].layer_guarded);
+    }
+
+    /// The wire contract with `autumn routes audit`: `true` is sent, `false` is not.
+    #[test]
+    fn layer_guarded_serialises_only_when_true() {
+        let route = make_route_with(Method::GET, "/todos", "list", dummy_api_doc());
+        let mut infos = collect_route_infos(&[], &[], &[group_of(true, vec![route])], &[]).unwrap();
+        let json = serde_json::to_string(&infos[0]).unwrap();
+        assert!(json.contains(r#""layer_guarded":true"#), "{json}");
+        infos[0].layer_guarded = false;
+        let json = serde_json::to_string(&infos[0]).unwrap();
+        assert!(!json.contains("layer_guarded"), "{json}");
+    }
+
+    /// A handler guard is proven. It keeps its stronger claim.
+    #[test]
+    fn layer_guard_does_not_weaken_a_handler_guard() {
+        let doc = crate::openapi::ApiDoc {
+            secured: true,
+            required_roles: &["admin"],
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::GET, "/todos", "list", doc);
+        let infos = collect_route_infos(&[], &[], &[group_of(true, vec![route])], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Gated);
+        assert_eq!(infos[0].roles, vec!["admin"]);
+        assert!(!infos[0].layer_guarded);
     }
 
     /// End-to-end through `collect_route_infos`: a policy-protected repository
@@ -2131,6 +2277,12 @@ mod tests {
             paths.contains(&"/swagger-ui"),
             "swagger ui path missing: {paths:?}"
         );
+        for asset in crate::openapi::swagger_ui_asset_paths("/swagger-ui") {
+            assert!(
+                paths.contains(&asset.as_str()),
+                "swagger ui asset missing: {asset} in {paths:?}"
+            );
+        }
         for info in &infos {
             assert_eq!(info.source, RouteSource::Framework);
             assert_eq!(info.method, "GET");
@@ -2183,18 +2335,101 @@ mod tests {
 
     #[test]
     fn append_dev_reload_routes_empty_when_dev_disabled() {
-        // In the test environment AUTUMN_DEV is not set, so this should be a no-op.
-        let guard = std::env::var("AUTUMN_DEV");
-        if guard.is_ok() {
-            // Skip: dev mode is active in this test process.
-            return;
-        }
+        let env = crate::config::MockEnv::new();
         let mut infos = Vec::new();
-        append_dev_reload_routes(&mut infos);
+        append_dev_reload_routes_with_env(&mut infos, &env);
+        assert!(infos.is_empty(), "expected no dev routes without dev env");
+    }
+
+    fn dev_env() -> crate::config::MockEnv {
+        crate::config::MockEnv::new()
+            .with("AUTUMN_DEV_RELOAD", "1")
+            .with("AUTUMN_DEV_RELOAD_STATE", "state.json")
+    }
+
+    /// Framework routes list the dev live-reload paths under the router's
+    /// gate, so `autumn routes` and the graph both see them (#2520 item 7).
+    #[test]
+    fn append_framework_routes_lists_dev_reload_when_dev_env_is_set() {
+        let config = AutumnConfig::default();
+        let mut infos = Vec::new();
+        append_framework_routes_with_env(&mut infos, &config, &dev_env());
+        for path in [
+            crate::middleware::dev::LIVE_RELOAD_PATH,
+            crate::middleware::dev::LIVE_RELOAD_SCRIPT_PATH,
+        ] {
+            assert_eq!(infos.iter().filter(|i| i.path == path).count(), 1, "{path}");
+        }
+        let mut quiet = Vec::new();
+        append_framework_routes_with_env(&mut quiet, &config, &crate::config::MockEnv::new());
         assert!(
-            infos.is_empty(),
-            "expected no dev routes when AUTUMN_DEV unset"
+            !quiet
+                .iter()
+                .any(|i| i.path == crate::middleware::dev::LIVE_RELOAD_PATH)
         );
+    }
+
+    #[cfg(feature = "flash")]
+    #[test]
+    fn append_framework_routes_lists_flash_css() {
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &AutumnConfig::default());
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|i| i.path == crate::flash::FLASH_CSS_PATH)
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn append_framework_routes_lists_widgets_css() {
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &AutumnConfig::default());
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|i| i.path == crate::ui::WIDGETS_CSS_PATH)
+                .count(),
+            1
+        );
+    }
+
+    /// The widget runtime script comes from `framework_scripts`; it must be
+    /// listed once, not once there and once as a separate asset entry.
+    #[cfg(feature = "htmx")]
+    #[test]
+    fn append_framework_routes_lists_widgets_js_once() {
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &AutumnConfig::default());
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|i| i.path == crate::htmx::AUTUMN_WIDGETS_JS_PATH)
+                .count(),
+            1
+        );
+    }
+
+    /// A worker mounts the probes and the actuator only (#2520 item 2).
+    #[test]
+    fn append_probe_and_actuator_routes_lists_only_those() {
+        let config = AutumnConfig::default();
+        let mut infos = Vec::new();
+        append_probe_and_actuator_routes(&mut infos, &config);
+        let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&config.health.path.as_str()), "{paths:?}");
+        assert!(
+            paths.iter().any(|p| p.starts_with(&config.actuator.prefix)),
+            "{paths:?}"
+        );
+        assert!(
+            infos.iter().all(|i| !i.path.starts_with("/static/")),
+            "no asset or static routes: {paths:?}"
+        );
+        assert!(!paths.contains(&"/static/{*path}"), "{paths:?}");
     }
 
     // ── SecurityDump::from_config (declared-vs-runtime honesty) ─────────────

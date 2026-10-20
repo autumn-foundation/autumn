@@ -825,10 +825,14 @@ pub fn run_pending_sqlite(
 /// A fleet (ADR 0019) migrates each database as it opens, which across
 /// thousands of tenant databases would print thousands of lines; the caller
 /// logs one summary through `tracing` instead. Same lock, same atomicity.
+///
+/// `guard` first gets the applied versions, under the same write lock. An
+/// error from `guard` stops the run before a migration is applied.
 #[cfg(feature = "sqlite")]
-pub(crate) fn run_pending_sqlite_quiet(
+pub(crate) fn run_pending_sqlite_guarded(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+    guard: impl FnOnce(&[String]) -> Result<(), String>,
 ) -> Result<MigrationResult, MigrationError> {
     if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
         return Err(err);
@@ -840,6 +844,13 @@ pub(crate) fn run_pending_sqlite_quiet(
         ))
     })?;
     let applied = with_sqlite_migration_lock(&mut conn, |conn| {
+        let recorded: Vec<String> = conn
+            .applied_migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        guard(&recorded).map_err(MigrationError::Migration)?;
         conn.run_pending_migrations(migrations)
             .map(|applied| applied.iter().map(|m| format!("{m}")).collect::<Vec<_>>())
             .map_err(|e| MigrationError::Migration(e.to_string()))
@@ -3484,7 +3495,7 @@ where
 /// [`pending_shard_framework_migrations`] (the status path) cannot disagree about
 /// what a shard needs. Adding a shard-required set means adding it here.
 #[cfg(feature = "db")]
-const fn shard_framework_migration_sets() -> [&'static EmbeddedMigrations; 3] {
+pub(crate) const fn shard_framework_migration_sets() -> [&'static EmbeddedMigrations; 3] {
     [
         &crate::version_history::VERSION_HISTORY_MIGRATIONS,
         &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
@@ -4488,6 +4499,35 @@ mod tests {
             "nothing is applied twice: {:?}",
             second.applied
         );
+    }
+
+    /// A history table the guarded path cannot read stops the run before
+    /// the guard sees anything, and nothing is applied.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_guarded_sqlite_run_stops_on_an_unreadable_history() {
+        use diesel::{Connection as _, RunQueryDsl as _};
+
+        let (migrations_dir, url) = sqlite_scratch("guarded-history");
+        let path = url.trim_start_matches("sqlite://");
+        let mut conn = diesel::SqliteConnection::establish(path).expect("scratch database");
+        diesel::sql_query("CREATE TABLE __diesel_schema_migrations (other INTEGER)")
+            .execute(&mut conn)
+            .expect("a history table without a version column");
+        drop(conn);
+
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("empty app set");
+        let result = run_pending_sqlite_guarded(
+            &url,
+            DisambiguatedMigrations::new(&app, &HashMap::new()),
+            |_| panic!("the guard runs only on a readable history"),
+        );
+        match result {
+            Err(MigrationError::Migration(detail)) => {
+                assert!(detail.contains("version"), "{detail}");
+            }
+            other => panic!("expected a migration error, got {other:?}"),
+        }
     }
 
     /// Rollback plans and reverts under the identities the apply path

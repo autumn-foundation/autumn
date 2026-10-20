@@ -40,6 +40,7 @@ pub struct IssueTokenRequest {
 /// securely.** In production, protect this endpoint with session auth or an
 /// admin guard; it is left open here for demonstration clarity.
 #[post("/api/tokens")]
+#[public]
 pub async fn issue_token(
     State(state): State<AppState>,
     body: Json<IssueTokenRequest>,
@@ -175,6 +176,7 @@ pub struct Summary {
 /// response. A client that forbids both (`Accept: text/html;q=0,
 /// application/json;q=0`) gets `406 Not Acceptable`.
 #[get("/todos/summary")]
+#[public]
 pub async fn summary(negotiate: Negotiate, mut db: Db) -> AutumnResult<impl IntoResponse> {
     let all = Todo::all(&mut db).await?;
     let total = all.len() as i64;

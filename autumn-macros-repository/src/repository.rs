@@ -58,6 +58,9 @@ fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> syn::Result<Vec<
     Ok(cols)
 }
 
+use autumn_macros_support::cascade::{
+    CASCADE_LEVELS, CascadeLeg, any_const, cascade_level, level_name,
+};
 use autumn_macros_support::naming::infer_table_name;
 
 pub(crate) fn to_snake_case(name: &str) -> String {
@@ -123,6 +126,24 @@ fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result
     Ok(output)
 }
 
+/// [`generate_topic_format`] for a site that only *borrows* the topic.
+///
+/// A topic with no `{` is emitted as its own `&'static str` literal rather than
+/// `ToString::to_string(literal)`, so publishing on a static topic (the default:
+/// the table name) no longer allocates a fresh copy of it per broadcast; any
+/// other topic is `generate_topic_format`'s owned `String`. The two arms have
+/// different types, so splice this only where the topic is read by reference
+/// (`&__topic`, `__prev != __topic`, a `format!` argument) — never into a
+/// `String`-typed slot (`Option<String>` previous topics, the `(String, String)`
+/// delete tuples, a `Value::String` context entry).
+fn generate_topic_ref(topic: &str, record_ident: &TokenStream) -> syn::Result<TokenStream> {
+    if topic.contains('{') {
+        generate_topic_format(topic, record_ident)
+    } else {
+        Ok(quote! { #topic })
+    }
+}
+
 /// Which of the generated CRUD routes the `mcp` key opts in as MCP tools.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum McpExpose {
@@ -177,6 +198,9 @@ pub(crate) struct RepoConfig {
     /// Expose the generated CRUD routes as MCP tools (`mcp` / `mcp = "read"`).
     /// `None` = not opted in. Requires `api = "/path"`.
     pub(crate) mcp_expose: Option<McpExpose>,
+    /// The `authority_grant!` that governs the generated MCP tools
+    /// (`grant = Path`). Requires `mcp`.
+    pub(crate) grant: Option<syn::Path>,
     pub(crate) policy_type: Option<Ident>,
     pub(crate) scope_type: Option<Ident>,
     pub(crate) cursor_key: Option<String>,
@@ -552,6 +576,75 @@ fn dependent_child_repositories(config: &RepoConfig) -> Vec<(syn::Path, bool)> {
     children.into_iter().map(|(_, p, r)| (p, r)).collect()
 }
 
+/// The `__AUTUMN_CASCADE_{k}` consts: the models a delete also writes, at each
+/// depth.
+///
+/// A `dependent(..)` clause is authoritative when present, as it is at run
+/// time. A `restrict` leg writes nothing. A `destroy` leg runs the child's own
+/// cascade. A repository that cascades into itself adds nothing. Each level
+/// reads only the level below it, so a cascade that loops is no const cycle.
+fn cascade_levels(config: &RepoConfig, pg_name: &Ident) -> TokenStream {
+    let level_consts = |any: TokenStream, expr_of: &dyn Fn(usize) -> TokenStream| {
+        let levels = (0..CASCADE_LEVELS).map(|k| {
+            let name = level_name(k);
+            let expr = expr_of(k);
+            quote! {
+                #[doc(hidden)]
+                pub const #name: ::autumn_web::agent_authority::CascadeLevel = #expr;
+            }
+        });
+        quote! {
+            #[doc(hidden)]
+            pub const __AUTUMN_CASCADE_ANY: bool = #any;
+            #(#levels)*
+        }
+    };
+    if config.dependents.is_empty() {
+        let model = &config.model_name;
+        // The inherent consts of `#[model]` win over the trait defaults.
+        let any = quote! {{
+            use ::autumn_web::repository::AutumnDependents as _;
+            #model::DEPENDENT_CASCADE_ANY
+        }};
+        return level_consts(any, &|k| {
+            let name = format_ident!("DEPENDENT_CASCADE_{}", k);
+            quote! {{
+                use ::autumn_web::repository::AutumnDependents as _;
+                #model::#name
+            }}
+        });
+    }
+    let mut legs: Vec<CascadeLeg> = Vec::new();
+    for dep in config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action != DependentAction::Restrict)
+    {
+        let child = &dep.child_repo;
+        // Only the bare name is proven to be this repository. A qualified path
+        // can name another repository with the same type name, and a macro
+        // cannot resolve paths. Keeping that leg can only refuse a governed
+        // delete. Skipping it could hide a model.
+        if child.is_ident(pg_name) {
+            continue;
+        }
+        let rendered = quote!(#child).to_string();
+        let destroy = dep.action == DependentAction::Destroy;
+        // One child can appear in several clauses. The runtime runs each, so
+        // the child's own cascade counts if any clause destroys.
+        if let Some(seen) = legs.iter_mut().find(|l| l.child.to_string() == rendered) {
+            seen.destroy |= destroy;
+            continue;
+        }
+        legs.push(CascadeLeg {
+            model: quote! { #child::__AUTUMN_MODEL_IDENT },
+            child: quote! { #child },
+            destroy,
+        });
+    }
+    level_consts(any_const(&legs), &|k| cascade_level(&legs, k))
+}
+
 /// Write methods that run the `dependent(...)` cascade.
 const CASCADING_WRITES: &[&str] = &["delete_by_id", "delete_many"];
 
@@ -807,6 +900,7 @@ fn generate_coherence_items(
     // type name. The guess is wrong for the supported escape hatch where they
     // differ — `#[repository(Comment)] trait ModerationRepository` — and a wrong
     // model means the cascade intersects nothing and the audit reports clean.
+    let cascade_consts = cascade_levels(config, pg_name);
     let published_model = quote! {
         impl #pg_name {
             /// The model this repository writes, for the cache-coherence
@@ -827,6 +921,8 @@ fn generate_coherence_items(
             /// const context so the authority assertion works across crates.
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str = #model_ident;
+
+            #cascade_consts
         }
     };
 
@@ -855,6 +951,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut commit_hooks = false;
     let mut api_path: Option<String> = None;
     let mut mcp_expose: Option<McpExpose> = None;
+    let mut grant: Option<syn::Path> = None;
     let mut mcp_span: Option<proc_macro2::Span> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
@@ -990,6 +1087,12 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             } else {
                 mcp_expose = Some(McpExpose::All);
             }
+            Ok(())
+        } else if meta.path.is_ident("grant") {
+            if grant.is_some() {
+                return Err(meta.error("duplicate `grant` key: a repository has one grant"));
+            }
+            grant = Some(meta.value()?.parse()?);
             Ok(())
         } else if meta.path.is_ident("policy") {
             let value: Ident = meta.value()?.parse()?;
@@ -1301,6 +1404,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "commit_hooks = true requires hooks = Type",
         ));
     }
+    if let Some(path) = &grant
+        && mcp_expose.is_none()
+    {
+        return Err(syn::Error::new_spanned(
+            path,
+            "grant requires mcp: a grant governs the generated MCP tools, and no `mcp` key \
+             exposes any",
+        ));
+    }
     if mcp_expose.is_some() && api_path.is_none() {
         return Err(syn::Error::new(
             mcp_span.unwrap_or_else(proc_macro2::Span::call_site),
@@ -1552,6 +1664,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         commit_hooks,
         api_path,
         mcp_expose,
+        grant,
         policy_type,
         scope_type,
         cursor_key,
@@ -2190,16 +2303,28 @@ fn vh_insert_ts(
     // overridable by a `before_*` hook). Non-hooked repos have no `ctx`, so they
     // read the ambient current actor directly. Both fall back to the canonical
     // `SYSTEM_ACTOR` when no actor is in scope.
-    let actor_ts = if with_ctx {
+    //
+    // The resolved actor is only ever read as `&str` (`VersionHistoryWrite.actor`,
+    // `LedgerAppend.actor`), so it is borrowed rather than owned: straight out of
+    // `ctx` on the hooked path (the same borrow `__vh_request_id` already holds
+    // across the awaits below), out of a local holding the ambient actor on the
+    // non-hooked one, and the `&'static` `SYSTEM_ACTOR` otherwise. That saves a
+    // `String` per versioned write — the `ctx.actor` copy, or the
+    // `SYSTEM_ACTOR.to_string()` fallback.
+    let actor_bind_ts = if with_ctx {
         quote! {
-            ctx.actor
-                .clone()
-                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+            let __vh_actor: &str = ctx
+                .actor
+                .as_deref()
+                .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR);
         }
     } else {
         quote! {
-            ::autumn_web::current::Current::actor()
-                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+            let __vh_actor_scoped: ::core::option::Option<::std::string::String> =
+                ::autumn_web::current::Current::actor();
+            let __vh_actor: &str = __vh_actor_scoped
+                .as_deref()
+                .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR);
         }
     };
     let request_id_ts = if with_ctx {
@@ -2282,7 +2407,7 @@ fn vh_insert_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_tenant_id()
             };
-            let __vh_actor: ::std::string::String = #actor_ts;
+            #actor_bind_ts
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
             // The statement itself — both backend arms, all seven binds — lives
             // in `autumn_web::version_history` rather than here. It is fully
@@ -2296,7 +2421,7 @@ fn vh_insert_ts(
                     tenant_id: __vh_tenant_id,
                     record_id: __vh_record_id,
                     op: #op_variant,
-                    actor: __vh_actor.as_str(),
+                    actor: __vh_actor,
                     request_id: __vh_request_id,
                     changes_json: __vh_changes_str.as_str(),
                 },
@@ -2507,7 +2632,8 @@ fn ledger_append_ts(
                     tenant_id: __lg_tenant_id,
                     record_id: __lg_record_id,
                     op: #op_variant,
-                    actor: __vh_actor.as_str(),
+                    // `vh_insert_ts`'s borrowed `&str` actor binding.
+                    actor: __vh_actor,
                     request_id: __vh_request_id,
                     snapshot: __lg_snapshot,
                     valid_from: __lg_valid_from,
@@ -10735,7 +10861,9 @@ fn emit_crud_bodies_hooked(
     };
 
     let (broadcast_create, broadcast_update, broadcast_delete) = if config.broadcasts {
-        let base_topic_expr = match generate_topic_format(
+        // Every use of this topic below is a `let __topic = ...;` read only by
+        // reference, so a static topic stays its `&'static str` literal.
+        let base_topic_expr = match generate_topic_ref(
             config
                 .broadcast_topic
                 .as_deref()
@@ -10762,6 +10890,9 @@ fn emit_crud_bodies_hooked(
             .unwrap_or(&default_container);
         let model_prefix = to_snake_case(&config.model_name.to_string());
 
+        // `container_expr` is a macro-time string, so the create swap id is
+        // spliced as its `&'static str` literal: `publish_oob` only borrows it,
+        // and a `.to_string()` here was one more allocation per broadcast create.
         let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
             if let Some(ref render_path) = config.broadcast_render {
                 let extract_id = quote! {
@@ -10770,7 +10901,7 @@ fn emit_crud_bodies_hooked(
                 };
                 (
                     quote! { #render_path(__record_ref) },
-                    quote! { #container_expr.to_string() },
+                    quote! { #container_expr },
                     quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
                     extract_id.clone(),
                     extract_id,
@@ -10779,7 +10910,7 @@ fn emit_crud_bodies_hooked(
                 let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
                 (
                     quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
-                    quote! { #container_expr.to_string() },
+                    quote! { #container_expr },
                     quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
                     dom_id.clone(),
                     dom_id,
@@ -10792,11 +10923,11 @@ fn emit_crud_bodies_hooked(
                 if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                     let __topic = #topic_expr;
                     let __fragment = #render_expr;
-                    let __create_id = #create_swap_id;
+                    let __create_id: &str = #create_swap_id;
                     let __create_swap = #create_swap_strategy;
                     if let ::core::result::Result::Err(__err) = __channels
                         .broadcast()
-                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        .publish_oob(&__topic, __create_id, &__create_swap, &__fragment)
                     {
                         ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                     }
@@ -14245,10 +14376,11 @@ fn emit_dependent_cascade(
             quote! {
                 {
                     let __broadcast_rec: &#model_name = &__record;
-                    let __del_topic: ::std::string::String =
-                        ::std::string::ToString::to_string(&#topic_expr);
-                    let __del_id: ::std::string::String =
-                        ::std::string::ToString::to_string(&#dom_id_expr);
+                    // Both expressions already yield an owned `String`;
+                    // `ToString::to_string(&..)` around them only copied it
+                    // again, per destroyed child row.
+                    let __del_topic: ::std::string::String = #topic_expr;
+                    let __del_id: ::std::string::String = #dom_id_expr;
                     __ret_broadcasts.push((__del_topic, __del_id));
                 }
             }
@@ -20263,19 +20395,42 @@ fn emit_write_bodies(
             }
         };
 
-        let topic_expr_outer = if config.tenant_scoped {
-            quote! {
-                ::std::format!(
-                    "tenant:{}:{}",
-                    ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
-                        &__record_ref.tenant_id
-                    ),
-                    #base_topic_expr_outer
-                )
+        // Borrow-only twin of `base_topic_expr_outer` for the `let __topic = ...;`
+        // publish sites, where a static topic stays a `&'static str` rather than
+        // being re-owned per broadcast. The `String`-typed slots
+        // (`__autumn_prev_topic`, the delete tuples, the delete_many pre-fetch
+        // vec) keep the owned `topic_expr_outer`.
+        let base_topic_ref_outer = match generate_topic_ref(
+            config
+                .broadcast_topic
+                .as_deref()
+                .unwrap_or(&config.table_name),
+            &quote! { __record_ref },
+        ) {
+            Ok(expr) => expr,
+            Err(err) => {
+                let compile_err = err.to_compile_error();
+                return Err(quote! { #compile_err });
             }
-        } else {
-            base_topic_expr_outer
         };
+
+        let scope_topic_to_tenant = |base_topic: TokenStream| {
+            if config.tenant_scoped {
+                quote! {
+                    ::std::format!(
+                        "tenant:{}:{}",
+                        ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                            &__record_ref.tenant_id
+                        ),
+                        #base_topic
+                    )
+                }
+            } else {
+                base_topic
+            }
+        };
+        let topic_expr_outer = scope_topic_to_tenant(base_topic_expr_outer);
+        let topic_ref_outer = scope_topic_to_tenant(base_topic_ref_outer);
 
         let model_prefix_outer = to_snake_case(&config.model_name.to_string());
         let default_container_outer = format!("{}-list", config.table_name);
@@ -20284,6 +20439,9 @@ fn emit_write_bodies(
             .as_deref()
             .unwrap_or(&default_container_outer);
 
+        // As in the commit-hook runner, the create swap id is the container's
+        // `&'static str` literal: `publish_oob` only borrows it. (The update
+        // path's `(String, OobSwap)` target tuple still owns its copy.)
         let (render_expr_outer, create_swap_id_outer, create_swap_outer, update_id_outer) =
             if let Some(ref render_path) = config.broadcast_render {
                 let extract_id = quote! {
@@ -20300,7 +20458,7 @@ fn emit_write_bodies(
                 };
                 (
                     quote! { #render_path(__record_ref) },
-                    quote! { #container_expr_outer.to_string() },
+                    quote! { #container_expr_outer },
                     quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
                     extract_id,
                 )
@@ -20311,7 +20469,7 @@ fn emit_write_bodies(
                             __record_ref
                         )
                     },
-                    quote! { #container_expr_outer.to_string() },
+                    quote! { #container_expr_outer },
                     quote! {
                         <#model_name as ::autumn_web::live::LiveFragment>::insert_swap()
                     },
@@ -20369,13 +20527,13 @@ fn emit_write_bodies(
                 if let ::core::option::Option::Some(__channels) =
                     ::autumn_web::__private::get_global_channels()
                 {
-                    let __topic = #topic_expr_outer;
+                    let __topic = #topic_ref_outer;
                     let __fragment = #render_expr_outer;
-                    let __create_id = #create_swap_id_outer;
+                    let __create_id: &str = #create_swap_id_outer;
                     let __create_swap = #create_swap_outer;
                     if let ::core::result::Result::Err(__err) = __channels
                         .broadcast()
-                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        .publish_oob(&__topic, __create_id, &__create_swap, &__fragment)
                     {
                         ::autumn_web::reexports::tracing::warn!(
                             error = %__err,
@@ -20427,7 +20585,7 @@ fn emit_write_bodies(
                     if let ::core::option::Option::Some(__channels) =
                         ::autumn_web::__private::get_global_channels()
                     {
-                        let __topic = #topic_expr_outer;
+                        let __topic = #topic_ref_outer;
                         let __fragment = #render_expr_outer;
                         let __id = #update_id_outer;
 
@@ -20510,7 +20668,7 @@ fn emit_write_bodies(
                     if let ::core::option::Option::Some(__channels) =
                         ::autumn_web::__private::get_global_channels()
                     {
-                        let __topic = #topic_expr_outer;
+                        let __topic = #topic_ref_outer;
                         let __fragment = #render_expr_outer;
                         let __id = #update_id_outer;
                         if let ::core::result::Result::Err(__err) = __channels
@@ -20638,7 +20796,7 @@ fn emit_write_bodies(
                     {
                         for __autumn_record in __autumn_result_vec {
                             let __record_ref = __autumn_record;
-                            let __topic = #topic_expr_outer;
+                            let __topic = #topic_ref_outer;
                             let __fragment = #render_expr_outer;
                             let __id = #update_id_outer;
                             if let ::core::result::Result::Err(__err) = __channels
@@ -23247,6 +23405,211 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_publishes_the_models_its_delete_writes() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        for level in 0..4 {
+            assert!(
+                generated.contains(&format!("const __AUTUMN_CASCADE_{level}")),
+                "{generated}"
+            );
+            assert!(
+                generated.contains(&format!("Post :: DEPENDENT_CASCADE_{level}")),
+                "with no `dependent(..)` clause the model's own levels are used: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependent_clause_names_its_child_models() {
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgLikeRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgAuditRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_MODEL_IDENT"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "destroy runs the child's own cascade: {generated}"
+        );
+        assert!(
+            generated.contains("PgLikeRepository :: __AUTUMN_MODEL_IDENT"),
+            "nullify writes the child: {generated}"
+        );
+        assert!(
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE"),
+            "{generated}"
+        );
+        assert!(
+            !generated.contains("PgAuditRepository :: __AUTUMN_MODEL_IDENT"),
+            "restrict writes nothing: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_later_destroy_clause_keeps_the_childs_own_cascade() {
+        // `nullify` first, `destroy` second, one child. The runtime runs both,
+        // so the child's own cascade must be listed.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgCommentRepository, fk = "editor_id", on_delete = destroy)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_path_is_never_taken_for_the_repository_itself() {
+        // `plugin::PgCommentRepository` can be another repository with the same
+        // name. A macro cannot resolve paths, so it keeps the leg: a missed
+        // model would be a hole, a kept leg only refuses a governed delete.
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                dependent(plugin::PgCommentRepository, fk = "parent_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("plugin :: PgCommentRepository :: __AUTUMN_MODEL_IDENT"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("plugin :: PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn a_repository_that_cascades_into_itself_does_not_name_itself() {
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                dependent(PgCommentRepository, fk = "parent_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_grant() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp, grant = crate::grants::PostEditor"#
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let grant = config.grant.expect("grant is parsed");
+        assert_eq!(
+            quote! { #grant }.to_string(),
+            "crate :: grants :: PostEditor"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_grant_without_mcp() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", grant = PostEditor"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("a grant with no MCP tools governs nothing and must be rejected");
+        };
+        assert!(err.to_string().contains("mcp"), "{err}");
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_a_duplicate_grant() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp, grant = A, grant = B"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("two grants must be rejected");
+        };
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn a_granted_repository_governs_every_mcp_tool_it_generates() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp, grant = PostEditor },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated
+                .matches("agent_authority : :: core :: option :: Option :: Some (&")
+                .count(),
+            5,
+            "list/get/create/update/delete each carry the authority"
+        );
+        assert_eq!(
+            generated.matches("AgentAuthorityDescriptor").count(),
+            5,
+            "each authority is registered for the manifest"
+        );
+        assert_eq!(
+            generated.matches("PostEditor . allows_write (").count(),
+            1,
+            "the writes are const-checked against the grant, once"
+        );
+        assert!(
+            generated
+                .contains("PostEditor . allows_write (PgPostRepository :: __AUTUMN_MODEL_IDENT)"),
+            "the write subject is the model ident: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches(
+                    "PostEditor . allows_writes_all (PgPostRepository :: __AUTUMN_CASCADE_3 . models)"
+                )
+                .count(),
+            1,
+            "the delete tool is checked against its cascade"
+        );
+    }
+
+    #[test]
+    fn a_granted_read_only_repository_has_no_write_assertion() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp = "read", grant = PostEditor },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(generated.matches("AgentAuthorityDescriptor").count(), 2);
+        assert_eq!(generated.matches("allows_write").count(), 0);
+    }
+
+    #[test]
+    fn an_ungranted_repository_emits_no_authority() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(generated.matches("AgentAuthority").count(), 0);
+    }
+
+    #[test]
     fn repository_macro_mcp_flags_all_five_crud_api_docs() {
         let generated = repository_macro(
             quote! { Post, api = "/api/posts", mcp },
@@ -23608,9 +23971,56 @@ mod tests {
             "hooked versioned save_many must record history for each inserted record before moving chunk results: {section}"
         );
         assert!(
-            section.contains("ctx . actor . clone"),
+            section.contains("ctx . actor . as_deref ()"),
             "hooked versioned save_many history should use the per-record MutationContext: {section}"
         );
+    }
+
+    /// The version-history actor is only read as `&str`, so both the hooked
+    /// (`ctx.actor`) and non-hooked (`Current::actor()`) paths borrow it and
+    /// fall back to the `&'static` `SYSTEM_ACTOR` — no per-write `String`.
+    #[test]
+    fn versioned_history_actor_is_borrowed_not_reallocated() {
+        for (args, actor_source) in [
+            (
+                quote! { Post, versioned = true },
+                "let __vh_actor_scoped : :: core :: option :: Option < :: std :: string :: String > = :: autumn_web :: current :: Current :: actor () ;",
+            ),
+            (
+                quote! { Post, hooks = PostHooks, versioned = true },
+                "let __vh_actor : & str = ctx . actor . as_deref ()",
+            ),
+        ] {
+            let generated =
+                repository_macro(args, quote! { pub trait PostRepository {} }).to_string();
+            assert!(generated.contains("append_version_history"), "{generated}");
+            assert!(
+                !generated.contains("SYSTEM_ACTOR . to_string ()"),
+                "the SYSTEM_ACTOR fallback must stay a &'static str: {generated}"
+            );
+            assert!(
+                !generated.contains("ctx . actor . clone ()"),
+                "the hooked actor must be borrowed from ctx: {generated}"
+            );
+            assert!(
+                !generated.contains("__vh_actor . as_str ()"),
+                "the actor binding is already a &str: {generated}"
+            );
+            assert!(
+                generated.contains(
+                    ". unwrap_or (:: autumn_web :: version_history :: VersionEntry :: SYSTEM_ACTOR) ;"
+                ),
+                "the actor must still fall back to SYSTEM_ACTOR: {generated}"
+            );
+            assert!(
+                generated.contains("actor : __vh_actor ,"),
+                "the version-history write must take the borrowed actor: {generated}"
+            );
+            assert!(
+                generated.contains(actor_source),
+                "the actor must be read from `{actor_source}`: {generated}"
+            );
+        }
     }
 
     #[test]
@@ -25167,6 +25577,138 @@ mod tests {
         );
     }
 
+    /// The cascade's topic and dom id expressions already yield owned
+    /// `String`s, so the accumulated `(topic, dom_id)` pair takes them as-is
+    /// instead of copying each through `ToString::to_string(&..)` per row.
+    #[test]
+    fn repository_macro_dependent_destroy_broadcast_does_not_recopy_topic_or_dom_id() {
+        let generated = repository_macro(
+            quote! { Comment, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("__ret_broadcasts . push"),
+            "{destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("ToString :: to_string (&"),
+            "the cascade must not copy an already-owned topic / dom id: {destroy_arm}"
+        );
+        // The pushed values themselves are unchanged: the static topic and the
+        // model's own `LiveFragment::dom_id`.
+        assert!(
+            destroy_arm.contains(
+                "let __del_topic : :: std :: string :: String = :: std :: string :: ToString :: to_string (\"comments\") ;"
+            ),
+            "{destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains(
+                "let __del_id : :: std :: string :: String = < Comment as :: autumn_web :: live :: LiveFragment > :: dom_id (__broadcast_rec) ;"
+            ),
+            "{destroy_arm}"
+        );
+    }
+
+    /// A static broadcast topic and the create container are spliced as
+    /// `&'static str` literals at the publish sites that only borrow them,
+    /// rather than re-owned per publish — on both the inline (`--live`) path
+    /// and the commit-hook runner.
+    #[test]
+    fn repository_macro_broadcast_static_topic_and_container_are_borrowed() {
+        for args in [
+            quote! { Post, broadcasts = true },
+            quote! { Post, hooks = PostHooks, commit_hooks = true, broadcasts = true },
+        ] {
+            let generated =
+                repository_macro(args, quote! { pub trait PostRepository {} }).to_string();
+            assert!(
+                generated.contains("let __topic = \"posts\" ;"),
+                "a static topic must be borrowed at the publish site: {generated}"
+            );
+            assert!(
+                !generated.contains(
+                    "let __topic = :: std :: string :: ToString :: to_string (\"posts\")"
+                ),
+                "a static topic must not be re-owned per publish: {generated}"
+            );
+            assert!(
+                generated.contains("let __create_id : & str = \"posts-list\" ;")
+                    && !generated.contains("\"posts-list\" . to_string ()"),
+                "the create container must be a borrowed literal: {generated}"
+            );
+            assert!(
+                generated.contains("publish_oob (& __topic , __create_id ,"),
+                "the create publish must pass the borrowed container id: {generated}"
+            );
+        }
+    }
+
+    /// A tenant-scoped static topic still formats as `tenant:{id}:{topic}`; only
+    /// the inner topic argument is now the literal rather than a fresh `String`.
+    #[test]
+    fn repository_macro_broadcast_tenant_scoped_static_topic_formats_the_literal() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, broadcasts = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("\"tenant:{}:{}\""),
+            "a tenant-scoped topic keeps its tenant prefix: {generated}"
+        );
+        assert!(
+            generated.contains("__record_ref . tenant_id) , \"posts\")"),
+            "the static base topic is a format! argument literal: {generated}"
+        );
+    }
+
+    /// `generate_topic_ref` only diverges from `generate_topic_format` for a
+    /// topic without `{`: that one becomes its own literal. Placeholder topics
+    /// and an unclosed `{` keep the owned expression, byte-for-byte.
+    #[test]
+    fn generate_topic_ref_borrows_only_static_topics() {
+        let record = quote! { __record_ref };
+        assert_eq!(
+            generate_topic_ref("posts", &record)
+                .expect("static topic")
+                .to_string(),
+            "\"posts\""
+        );
+        assert_eq!(
+            generate_topic_format("posts", &record)
+                .expect("static topic")
+                .to_string(),
+            ":: std :: string :: ToString :: to_string (\"posts\")",
+            "the owned form, still used by String-typed slots, is unchanged"
+        );
+        // A `}` alone is not a placeholder: the literal is the same bytes the
+        // owned form copies.
+        assert_eq!(
+            generate_topic_ref("a}b", &record)
+                .expect("static topic")
+                .to_string(),
+            "\"a}b\""
+        );
+        for topic in ["feed:{category}", "a{b", "{tenant}:{category}"] {
+            assert_eq!(
+                generate_topic_ref(topic, &record)
+                    .expect("valid topic")
+                    .to_string(),
+                generate_topic_format(topic, &record)
+                    .expect("valid topic")
+                    .to_string(),
+                "`{topic}` must keep the owned expression"
+            );
+        }
+        assert!(
+            generate_topic_ref("{}", &record).is_err(),
+            "an empty placeholder is still rejected"
+        );
+    }
+
     #[test]
     fn repository_generates_typed_list_method() {
         // #1126: `list()` is generated alongside `page()` and delegates
@@ -26514,7 +27056,7 @@ mod tests {
             "tenant_id : __vh_tenant_id",
             "record_id : __vh_record_id",
             "op : :: autumn_web :: version_history :: VersionOp :: Insert",
-            "actor : __vh_actor . as_str ()",
+            "actor : __vh_actor ,",
             "request_id : __vh_request_id",
             "changes_json : __vh_changes_str . as_str ()",
         ] {
@@ -29325,7 +29867,9 @@ mod tests {
             ("plain", quote! { Post }, 81_000),
             ("soft_delete", quote! { Post, soft_delete }, 89_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
-            ("api", quote! { Post, api = "/posts" }, 95_000),
+            // Raised from 95_000 (#2451): each repository publishes its
+            // cascade consts. Understood and intended.
+            ("api", quote! { Post, api = "/posts" }, 96_000),
             ("searchable", quote! { Post, searchable }, 98_000),
             ("versioned", quote! { Post, versioned = true }, 128_000),
             // Raised from 201_000 (#2490): `ledger_as_of_at`/`ledger_diff_at`

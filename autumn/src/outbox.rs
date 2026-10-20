@@ -711,9 +711,13 @@ impl Outbox {
         let changed = diesel::sql_query(sql(REQUEUE_SQL))
             .bind::<BigInt, _>(to_millis(self.state.clock().now()))
             .bind::<Text, _>(id)
-            .execute(conn)
+            .execute(&mut *conn)
             .await
             .map_err(|error| sql_error("outbox requeue", &error))?;
+        if changed > 0 {
+            #[cfg(feature = "sqlite")]
+            mark_fleet_outbox(conn).await?;
+        }
         Ok(changed > 0)
     }
 }
@@ -743,10 +747,20 @@ async fn insert_message(
         .bind::<Text, _>(payload.to_string())
         .bind::<BigInt, _>(now)
         .bind::<BigInt, _>(now)
-        .execute(conn)
+        .execute(&mut *conn)
         .await
         .map_err(|error| sql_error("outbox write", &error))?;
+    #[cfg(feature = "sqlite")]
+    mark_fleet_outbox(conn).await?;
     Ok(id)
+}
+
+/// Mark this connection's fleet database as holding outbox rows, in
+/// the caller's transaction (issue 3234). A no-op on any other database.
+#[cfg(feature = "sqlite")]
+async fn mark_fleet_outbox(conn: &mut RuntimeConnection) -> AutumnResult<()> {
+    crate::db::fleet_sweeper::mark_connection(conn, crate::db::fleet_sweeper::PendingKind::Outbox)
+        .await
 }
 
 // ── Inbox ────────────────────────────────────────────────────────────────────
@@ -1050,6 +1064,74 @@ async fn drain_until(
 /// pool, or the first shard when there is no app pool.
 fn mail_pool(state: &AppState) -> Option<Pool<RuntimeConnection>> {
     relay_pools(state).ok()?.into_iter().next()
+}
+
+/// Relay the outbox of one fleet database for the fleet sweeper (issue 3234):
+/// send up to `max` ready messages, then purge old rows. In a tenant fleet,
+/// `tenant` is the database's tenant, and handlers run in its scope.
+///
+/// # Errors
+///
+/// Returns an error when the relay is not installed, or a claim or the purge
+/// fails.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn relay_fleet_database(
+    state: &AppState,
+    pool: &Pool<RuntimeConnection>,
+    max: usize,
+    shutdown: &CancellationToken,
+    tenant: Option<String>,
+) -> AutumnResult<usize> {
+    let relay = state
+        .extension::<OutboxRelay>()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("outbox relay is not installed"))?;
+    ensure_schema(pool).await?;
+    let drain = drain_pool(state, &relay, pool, max, Some(shutdown));
+    let handled = match tenant {
+        Some(tenant) => {
+            crate::tenancy::CURRENT_TENANT
+                .scope(Some(tenant), drain)
+                .await?
+        }
+        None => drain.await?,
+    };
+    let retention = duration_millis(Duration::from_millis(relay.config.retention_ms));
+    let outbox_cutoff = to_millis(state.clock().now()).saturating_sub(retention);
+    let inbox_cutoff = to_millis(crate::time::ambient_now()).saturating_sub(retention);
+    purge_pool(pool, outbox_cutoff, inbox_cutoff).await?;
+    Ok(handled)
+}
+
+/// Whether a database holds outbox messages that are neither sent nor dead.
+/// `false` when it has no outbox table.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn has_pending(conn: &mut RuntimeConnection) -> AutumnResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Pending {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let table: Pending = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'autumn_outbox'",
+    )
+    .get_result(&mut *conn)
+    .await
+    .map_err(|error| sql_error("outbox probe", &error))?;
+    if table.n == 0 {
+        return Ok(false);
+    }
+    let pending: Pending = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM (SELECT 1 FROM autumn_outbox \
+         WHERE dispatched_at IS NULL AND dead_at IS NULL LIMIT 1)",
+    )
+    .get_result(&mut *conn)
+    .await
+    .map_err(|error| sql_error("outbox probe", &error))?;
+    Ok(pending.n > 0)
 }
 
 /// The pools the relay drains: the app pool, if any, and the primary pool of

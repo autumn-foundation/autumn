@@ -526,8 +526,10 @@ fn origin_matches_request_with_identity(
         return false;
     }
 
-    // Prefer the resolver-validated scheme; fall back to header reads.
-    let resolved_scheme: Option<String> = identity.map_or_else(
+    // Prefer the resolver-validated scheme; fall back to header reads. Borrowed
+    // either way: the comparison below ignores ASCII case, so neither a copy of
+    // the identity's scheme nor a lower-cased copy of the header is needed.
+    let resolved_scheme: Option<&str> = identity.map_or_else(
         || {
             headers
                 .get("x-forwarded-proto")
@@ -535,10 +537,10 @@ fn origin_matches_request_with_identity(
                 .map(|s| {
                     // Multiple `X-Forwarded-Proto` values chained by intermediaries;
                     // the leftmost (client-facing) is the one that matters.
-                    s.split(',').next().unwrap_or(s).trim().to_ascii_lowercase()
+                    s.split(',').next().unwrap_or(s).trim()
                 })
         },
-        |id| id.scheme.clone(),
+        |id| id.scheme.as_deref(),
     );
 
     if let Some(scheme) = resolved_scheme {
@@ -1421,6 +1423,57 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// The forwarded scheme is compared ignoring ASCII case, so a proxy
+    /// that spells it `HTTPS` still matches an `https://` Origin.
+    #[tokio::test]
+    async fn origin_scheme_match_via_uppercase_forwarded_proto() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://app.example")
+                    .header("host", "app.example")
+                    .header("x-forwarded-proto", "HTTPS")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Ignoring case must not blur the scheme itself: an upper-cased,
+    /// chained `X-Forwarded-Proto` whose leftmost value is `HTTPS` still
+    /// rejects an `http://` Origin.
+    #[tokio::test]
+    async fn origin_scheme_mismatch_via_uppercase_chained_forwarded_proto_is_rejected() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "http://app.example")
+                    .header("host", "app.example")
+                    .header("x-forwarded-proto", " HTTPS , http")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "leftmost forwarded scheme differs from the Origin's"
+        );
+    }
+
     /// When the proxy surfaces a different `X-Forwarded-Host`, that's
     /// the host the browser saw — Origin must match the forwarded host,
     /// not the internal `Host` header from the proxy.
@@ -1722,5 +1775,86 @@ mod tests {
             StatusCode::METHOD_NOT_ALLOWED,
             "resolver-validated host mismatch must reject the override"
         );
+    }
+
+    #[tokio::test]
+    async fn resolved_identity_scheme_is_compared_case_insensitively() {
+        let app = layered_router();
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/items/1")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", "https://app.example")
+            .header("host", "internal.cluster.local")
+            .body(Body::from("_method=DELETE"))
+            .unwrap();
+
+        req.extensions_mut().insert(ResolvedClientIdentity {
+            addr: None,
+            host: Some("app.example".to_owned()),
+            scheme: Some("HTTPS".to_owned()),
+        });
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Pins the scheme half of `origin_matches_request_with_identity`, which
+    /// compares borrowed values rather than lower-cased copies: the leftmost
+    /// trimmed `X-Forwarded-Proto` (or the identity's scheme) must equal the
+    /// Origin's scheme ignoring ASCII case, and no scheme signal at all falls
+    /// back to the host-only match.
+    #[test]
+    fn origin_scheme_comparison_matrix() {
+        let mut base = http::HeaderMap::new();
+        base.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("app.example"),
+        );
+
+        // No identity stamp: the scheme comes from the raw header.
+        for (proto, origin, expected) in [
+            (Some("https"), "https://app.example", true),
+            (Some("HTTPS"), "https://app.example", true),
+            (Some(" Https , http"), "https://app.example", true),
+            (Some("https"), "HTTP://app.example", false),
+            (Some("http, https"), "https://app.example", false),
+            (None, "http://app.example", true),
+        ] {
+            let mut h = base.clone();
+            if let Some(proto) = proto {
+                h.insert(
+                    "x-forwarded-proto",
+                    http::HeaderValue::from_str(proto).unwrap(),
+                );
+            }
+            assert_eq!(
+                origin_matches_request_with_identity(origin, &h, None),
+                expected,
+                "x-forwarded-proto {proto:?} vs origin {origin}"
+            );
+        }
+
+        // Identity stamp present: its scheme is used exclusively, so a raw
+        // `X-Forwarded-Proto` that disagrees with it is ignored.
+        let mut with_raw_proto = base.clone();
+        with_raw_proto.insert("x-forwarded-proto", http::HeaderValue::from_static("http"));
+        for (scheme, origin, expected) in [
+            (Some("https"), "https://app.example", true),
+            (Some("HTTPS"), "https://app.example", true),
+            (Some("http"), "https://app.example", false),
+            (None, "https://app.example", true),
+        ] {
+            let identity = ResolvedClientIdentity {
+                addr: None,
+                host: Some("app.example".to_owned()),
+                scheme: scheme.map(str::to_owned),
+            };
+            assert_eq!(
+                origin_matches_request_with_identity(origin, &with_raw_proto, Some(&identity)),
+                expected,
+                "identity scheme {scheme:?} vs origin {origin}"
+            );
+        }
     }
 }

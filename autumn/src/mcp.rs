@@ -46,6 +46,11 @@
 //! `tools/call` returns a task handle and the tool runs in the background.
 //! The client polls `tasks/get`. See the `tasks` submodule.
 //!
+//! A large app can send a short catalog. `#[api_doc(mcp, core)]` marks a core
+//! tool, and [`McpCatalog::Progressive`](crate::mcp::McpCatalog::Progressive)
+//! lists only the core tools plus
+//! `search_tools` and `call_tool`. See the `catalog` submodule.
+//!
 //! The endpoint is dual-era. A request with the protocol version in
 //! `params._meta` uses revision `2026-07-28`. Other requests use the legacy
 //! `initialize` flow. See the `modern` submodule.
@@ -73,9 +78,11 @@ use crate::sse::{Event, Sse};
 
 use crate::openapi::{ApiDoc, schema_entry_to_value};
 
+mod catalog;
 mod modern;
 mod tasks;
 
+pub use catalog::McpCatalog;
 pub use tasks::McpTaskConfig;
 
 /// Protocol version advertised when a client requests an unsupported one (or
@@ -164,6 +171,12 @@ pub struct McpRuntime {
     /// Settings for task tools (MCP Tasks extension). Set via
     /// [`AppBuilder::mcp_tasks`](crate::app::AppBuilder::mcp_tasks).
     pub(crate) tasks: McpTaskConfig,
+    /// The server instructions. Set via
+    /// [`AppBuilder::mcp_instructions`](crate::app::AppBuilder::mcp_instructions).
+    pub(crate) instructions: Option<String>,
+    /// How `tools/list` presents the catalog. Set via
+    /// [`AppBuilder::mcp_catalog`](crate::app::AppBuilder::mcp_catalog).
+    pub(crate) catalog: McpCatalog,
 }
 
 impl McpRuntime {
@@ -175,6 +188,8 @@ impl McpRuntime {
             expose_all: false,
             endpoint_layer: None,
             tasks: McpTaskConfig::default(),
+            instructions: None,
+            catalog: McpCatalog::Full,
         }
     }
 }
@@ -211,6 +226,10 @@ struct McpTool {
     /// ungoverned tool. Drives the invocation's audit record and the
     /// reversibility-derived `destructiveHint`.
     agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
+    /// True for a core tool (`#[api_doc(mcp, core)]`).
+    core: bool,
+    /// The route's `OpenAPI` tags. `search_tools` matches them.
+    tags: Vec<String>,
 }
 
 impl McpTool {
@@ -223,6 +242,9 @@ impl McpTool {
         }
         obj.insert("inputSchema".into(), self.input_schema.clone());
         obj.insert("annotations".into(), self.annotations.clone());
+        if self.core {
+            obj.insert("_meta".into(), json!({ catalog::ALWAYS_LOAD: true }));
+        }
         Value::Object(obj)
     }
 }
@@ -264,6 +286,10 @@ pub(crate) struct McpWiring {
     pub session_cookie: String,
     /// Settings for task tools.
     pub tasks: McpTaskConfig,
+    /// The author's server instructions, if any.
+    pub instructions: Option<String>,
+    /// How `tools/list` presents the catalog.
+    pub catalog: McpCatalog,
 }
 
 /// The shared MCP server state attached to the endpoint handler. Holds the
@@ -316,6 +342,17 @@ pub struct McpServer {
     has_task_tools: bool,
     server_name: String,
     server_version: String,
+    /// The server instructions: the author's text and the catalog guidance.
+    instructions: Option<String>,
+    /// How `tools/list` presents the catalog.
+    catalog: McpCatalog,
+    /// The `search_tools` and `call_tool` entries. Empty in the full catalog.
+    meta_tools: Vec<Value>,
+    /// The searchable words of each tool, in catalog order. Empty in the
+    /// full catalog.
+    search_index: Vec<catalog::ToolWords>,
+    /// Enforces each grant's `rate` cap. Per process.
+    rate_limiter: crate::agent_authority::rate::RateLimiter,
 }
 
 impl McpServer {
@@ -807,9 +844,18 @@ pub fn derive_tools(
                 && !doc.mcp_stream,
             task: doc.mcp_task,
             agent_authority: doc.agent_authority,
+            core: doc.mcp_core,
+            tags: doc.tags.iter().map(|tag| (*tag).to_owned()).collect(),
         });
     }
     tools
+}
+
+/// Remove each tool that has a meta-tool name, in progressive mode only.
+/// The router calls it before the server and the AEO documents read the
+/// tools.
+pub(crate) fn drop_reserved_tools(tools: Vec<McpToolInfo>, mode: McpCatalog) -> Vec<McpToolInfo> {
+    catalog::drop_reserved(tools, mode)
 }
 
 /// Public, transport-agnostic description of a derived tool. Returned by
@@ -831,6 +877,8 @@ pub struct McpToolInfo {
     empty_body: bool,
     task: bool,
     agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
+    core: bool,
+    tags: Vec<String>,
 }
 
 impl McpToolInfo {
@@ -885,6 +933,12 @@ impl McpToolInfo {
         self.task
     }
 
+    /// Whether this is a core tool (`#[api_doc(mcp, core)]`).
+    #[must_use]
+    pub const fn is_core(&self) -> bool {
+        self.core
+    }
+
     /// The build-time authority envelope proved for the handler behind this
     /// tool by `#[agent_operable(grant = ...)]` (issue #1691), or `None` for an
     /// **ungoverned** tool — one exposed to agents with no grant declared.
@@ -904,7 +958,10 @@ impl McpServer {
     /// router-supplied [`McpWiring`] (CORS, trusted hosts, tenant/CSRF headers).
     #[must_use]
     pub(crate) fn new(tools: Vec<McpToolInfo>, dispatch: axum::Router, wiring: McpWiring) -> Self {
-        let tools: Vec<McpTool> = tools
+        let progressive = wiring.catalog == McpCatalog::Progressive;
+        // The router already removed a tool with a meta-tool name. A direct
+        // caller of this function gets the same filter.
+        let tools: Vec<McpTool> = catalog::drop_reserved(tools, wiring.catalog)
             .into_iter()
             .map(|t| McpTool {
                 name: t.name,
@@ -920,8 +977,15 @@ impl McpServer {
                 empty_body: t.empty_body,
                 task: t.task,
                 agent_authority: t.agent_authority,
+                core: t.core,
+                tags: t.tags,
             })
             .collect();
+        let (meta_tools, search_index) = if progressive {
+            (catalog::meta_descriptors(&tools), catalog::index(&tools))
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let has_task_tools = tools.iter().any(|t| t.task);
         let by_name = tools
             .iter()
@@ -944,6 +1008,11 @@ impl McpServer {
             has_task_tools,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            instructions: catalog::instructions(wiring.instructions.as_deref(), wiring.catalog),
+            catalog: wiring.catalog,
+            meta_tools,
+            search_index,
+            rate_limiter: crate::agent_authority::rate::RateLimiter::default(),
         }
     }
 }
@@ -1546,6 +1615,9 @@ fn discover_result(server: &McpServer) -> Value {
         "supportedVersions": modern::VERSIONS,
         "capabilities": server.capabilities(),
     });
+    if let Some(text) = &server.instructions {
+        result["instructions"] = json!(text);
+    }
     modern::add_cache_hints(&mut result);
     result
 }
@@ -1557,18 +1629,38 @@ fn initialize_result(server: &McpServer, params: &Value) -> Value {
         Some(requested) if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) => requested,
         _ => DEFAULT_PROTOCOL_VERSION,
     };
-    json!({
+    let mut result = json!({
         "protocolVersion": protocol,
         "capabilities": server.capabilities(),
         "serverInfo": {
             "name": server.server_name,
             "version": server.server_version,
         },
-    })
+    });
+    if let Some(text) = &server.instructions {
+        result["instructions"] = json!(text);
+    }
+    result
 }
 
+/// The `tools/list` result. The full catalog lists every tool. The
+/// progressive catalog lists the meta-tools, then the core tools.
 fn tools_list_result(server: &McpServer) -> Value {
-    let tools: Vec<Value> = server.tools.iter().map(McpTool::descriptor).collect();
+    let tools: Vec<Value> = match server.catalog {
+        McpCatalog::Progressive => server
+            .meta_tools
+            .iter()
+            .cloned()
+            .chain(
+                server
+                    .tools
+                    .iter()
+                    .filter(|t| t.core)
+                    .map(McpTool::descriptor),
+            )
+            .collect(),
+        McpCatalog::Full => server.tools.iter().map(McpTool::descriptor).collect(),
+    };
     json!({ "tools": tools })
 }
 
@@ -1722,6 +1814,71 @@ const MAX_ARGUMENT_NAMES_BYTES: usize = 512;
 /// audit row that cannot name who acted is still a row that must be greppable.
 const ANONYMOUS_AGENT: &str = "agent:anonymous";
 
+/// Admit a call. It must be inside the `rate` cap. Its attempt record must be
+/// writable, unless the action is provably reversible. A refusal becomes the
+/// tool error text.
+async fn admit_call(server: &McpServer, tool: &McpTool, audit: &AgentAudit) -> Result<(), String> {
+    if let Err(refusal) = check_rate_cap(server, tool) {
+        audit.record_refusal(&server.state, &refusal).await;
+        return Err(refusal);
+    }
+    // The last thing before the action runs: if this record cannot be written
+    // and the action is not provably reversible, it does not run.
+    audit
+        .record_attempt(&server.state)
+        .await
+        .map_err(str::to_owned)
+}
+
+/// Refuse a call that is over its grant's declared `rate` cap. A cap that
+/// cannot be read refuses every call: it must never mean "no cap".
+fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
+    let Some(grant) = tool.agent_authority.map(|a| a.grant) else {
+        return Ok(());
+    };
+    let Some(rate) = grant.rate else {
+        return Ok(());
+    };
+    let Some(cap) = crate::agent_authority::rate::parse_rate(rate) else {
+        return Err(format!(
+            "rate cap `{rate}` for grant {} cannot be read; the call is refused",
+            grant.name
+        ));
+    };
+    server
+        .rate_limiter
+        .check(grant.name, grant.location, cap, server.state.clock().now())
+        .map_err(|wait| {
+            format!(
+                "rate cap {rate} for grant {} exceeded; retry in {wait}s",
+                grant.name
+            )
+        })
+}
+
+/// Longest actor id an audit row keeps.
+const MAX_ACTOR_LEN: usize = 128;
+
+/// An actor id fit for an audit row: letters, digits and plain id punctuation
+/// only, capped in length.
+///
+/// An allowlist, because line separators, zero-width marks and bidirectional
+/// marks are not control characters, and a list of them is never complete.
+fn clean_actor(actor: &str) -> Option<String> {
+    let clean: String = actor
+        .chars()
+        .filter(|c| {
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '_' | '.' | ':' | '@' | '+' | '/' | '=' | '#' | '~' | ' '
+                )
+        })
+        .take(MAX_ACTOR_LEN)
+        .collect();
+    (!clean.trim().is_empty()).then_some(clean)
+}
+
 /// The tool error returned when a non-reversible action cannot be recorded.
 const UNAUDITABLE_REFUSAL: &str =
     "audit attempt record could not be written; refusing a non-reversible action";
@@ -1765,7 +1922,16 @@ struct AgentAudit {
 impl AgentAudit {
     /// Resolve the invocation's audit context from the tool's compile-time
     /// authority and the call's *shape*.
-    fn new(server: &McpServer, tool: &McpTool, arguments: &Value, ctx: &ReplayContext<'_>) -> Self {
+    ///
+    /// `via_call_tool` is true for a call that `call_tool` wrapped. The
+    /// record names the inner tool and adds `via = "call_tool"`.
+    fn new(
+        server: &McpServer,
+        tool: &McpTool,
+        arguments: &Value,
+        ctx: &ReplayContext<'_>,
+        via_call_tool: bool,
+    ) -> Self {
         let authority = tool.agent_authority;
         let grant = authority.map(|a| a.grant.name);
         let reversibility = authority.map(|a| a.grant.reversibility);
@@ -1789,6 +1955,9 @@ impl AgentAudit {
             shared.insert("effects".to_owned(), render_effects(authority.effects));
         }
         shared.insert("argument_names".to_owned(), argument_names(tool, arguments));
+        if via_call_tool {
+            shared.insert("via".to_owned(), catalog::CALL_TOOL.to_owned());
+        }
 
         Self {
             tool: tool.name.clone(),
@@ -1800,6 +1969,7 @@ impl AgentAudit {
             // the auth layer on the request scope, so a `secure_mcp` app names
             // its caller and an open one falls back rather than recording "".
             actor: crate::current::Current::scoped_actor()
+                .and_then(|actor| clean_actor(&actor))
                 .unwrap_or_else(|| ANONYMOUS_AGENT.to_owned()),
             ip: ctx.peer.map(|peer| peer.ip()),
             shared,
@@ -1823,6 +1993,18 @@ impl AgentAudit {
     /// unknown marker is that we do not get to assume.
     fn refuse_when_unauditable(&self) -> bool {
         self.reversibility != Some(crate::agent_authority::Reversibility::Reversible)
+    }
+
+    /// Name the principal the route's own auth layer resolved. Only the rows
+    /// written after dispatch carry it. The envelope's own actor, when it
+    /// resolved one, wins.
+    fn adopt_actor(&mut self, actor: Option<&str>) {
+        if self.actor != ANONYMOUS_AGENT {
+            return;
+        }
+        if let Some(clean) = actor.and_then(clean_actor) {
+            self.actor = clean;
+        }
     }
 
     /// Build one of this invocation's events.
@@ -2429,12 +2611,18 @@ struct Dispatched {
     /// replayed onto the outer HTTP response so a tool call sends what the
     /// equivalent direct call would have.
     replayed: Vec<(HeaderName, HeaderValue)>,
+    /// The principal the route's own auth layer resolved, if any.
+    actor: Option<String>,
 }
 
 impl Dispatched {
     fn inspect(response: &Response) -> Self {
         let headers = response.headers();
         Self {
+            actor: response
+                .extensions()
+                .get::<crate::agent_authority::AgentActor>()
+                .map(|actor| actor.0.clone()),
             status: response.status(),
             request_id: headers
                 .get("x-request-id")
@@ -2496,14 +2684,11 @@ async fn serve_tools_call(
         }
         json_response(&message)
     };
-    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    // `inputSchema` is always an object; reject a non-object `arguments`
-    // (null/string/array) rather than coercing it to `{}` and dispatching.
-    let arguments = match params.get("arguments") {
-        None => json!({}),
-        Some(value) if value.is_object() => value.clone(),
-        Some(_) => return json_response(&error(id, -32602, "`arguments` must be a JSON object")),
+    let (params, arguments, via_call_tool) = match prepare_call(server, &id, params, reply) {
+        PreparedCall::Run(params, arguments, via_call_tool) => (params, arguments, via_call_tool),
+        PreparedCall::Done(response) => return response,
     };
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
 
     let Some(&idx) = server.by_name.get(name) else {
         return json_response(&error(id, -32602, &format!("unknown tool: {name}")));
@@ -2523,12 +2708,10 @@ async fn serve_tools_call(
 
     // Agent-authority envelope (#1691). Resolved before dispatch so the
     // correlation id exists ahead of anything that can go wrong.
-    let audit = AgentAudit::new(server, tool, &arguments, ctx);
+    let mut audit = AgentAudit::new(server, tool, &arguments, ctx, via_call_tool);
 
-    // The last thing before the action runs: if this record cannot be written
-    // and the action is not provably reversible, it does not run.
-    if let Err(refusal) = audit.record_attempt(&server.state).await {
-        return reply(success(id, tool_error(refusal)));
+    if let Err(refusal) = admit_call(server, tool, &audit).await {
+        return reply(success(id, tool_error(&refusal)));
     }
 
     // MCP Tasks extension: give a task handle to a client that declared the
@@ -2566,7 +2749,9 @@ async fn serve_tools_call(
         request_id,
         is_event_stream,
         replayed,
+        actor,
     } = Dispatched::inspect(&response);
+    audit.adopt_actor(actor.as_deref());
     let client_accepts_sse = ctx
         .headers
         .get(header::ACCEPT)
@@ -2621,6 +2806,72 @@ async fn serve_tools_call(
         )
         .await;
     resp
+}
+
+/// A `tools/call` after the meta-tool step and the argument check.
+enum PreparedCall {
+    /// Run the call: its parameters, its `arguments` object, and whether
+    /// `call_tool` wrapped it.
+    Run(Value, Value, bool),
+    /// End the call with this response.
+    Done(Response),
+}
+
+/// Serve the meta-tools of the progressive catalog, then check the
+/// `arguments` of the call to run.
+///
+/// `search_tools` gets its answer here. `call_tool` gives the parameters of
+/// the inner call, which then takes the same path as a direct call.
+fn prepare_call(
+    server: &McpServer,
+    id: &Value,
+    params: Value,
+    reply: impl Fn(Value) -> Response,
+) -> PreparedCall {
+    let invalid =
+        |message: &str| PreparedCall::Done(json_response(&error(id.clone(), -32602, message)));
+    let (params, via_call_tool) = match params.get("name").and_then(Value::as_str) {
+        Some(catalog::SEARCH_TOOL) if server.catalog == McpCatalog::Progressive => {
+            return match search_tools(server, &params) {
+                Ok(result) => PreparedCall::Done(reply(success(id.clone(), result))),
+                Err(message) => invalid(&message),
+            };
+        }
+        Some(catalog::CALL_TOOL) if server.catalog == McpCatalog::Progressive => {
+            match catalog::unwrap_call(&params) {
+                Ok(inner) => (inner, true),
+                Err(message) => return invalid(&message),
+            }
+        }
+        _ => (params, false),
+    };
+    match call_arguments(&params) {
+        Ok(arguments) => PreparedCall::Run(params, arguments, via_call_tool),
+        Err(message) => invalid(message),
+    }
+}
+
+/// The `arguments` object of a `tools/call`. Absent arguments are `{}`.
+///
+/// `inputSchema` is always an object. A non-object `arguments` (null,
+/// string, array) is an error, not a value to coerce to `{}`.
+fn call_arguments(params: &Value) -> Result<Value, &'static str> {
+    match params.get("arguments") {
+        None => Ok(json!({})),
+        Some(value) if value.is_object() => Ok(value.clone()),
+        Some(_) => Err("`arguments` must be a JSON object"),
+    }
+}
+
+/// Serve a `search_tools` call. Returns the tool result, or the reason that
+/// the arguments are not valid.
+fn search_tools(server: &McpServer, params: &Value) -> Result<Value, String> {
+    let arguments = call_arguments(params)?;
+    let args = catalog::parse_search(&arguments)?;
+    let found = catalog::search(&server.tools, &server.search_index, &args);
+    let mut result = tool_ok(&found.to_string());
+    result["structuredContent"] = found;
+    Ok(result)
 }
 
 /// Add a `working` task to the store. Returns its ID and `CreateTaskResult`,
@@ -2741,8 +2992,10 @@ async fn run_task(
         status,
         request_id,
         is_event_stream,
+        actor,
         ..
     } = Dispatched::inspect(&response);
+    outcome.audit.adopt_actor(actor.as_deref());
     // A task has no HTTP response to carry `Set-Cookie` or `Server-Timing`.
     outcome.status = Some(status);
     outcome.request_id = request_id;
@@ -4451,6 +4704,26 @@ mod tests {
     }
 
     #[test]
+    fn an_actor_id_keeps_only_id_characters_and_is_capped() {
+        assert_eq!(clean_actor("user-42").as_deref(), Some("user-42"));
+        assert_eq!(clean_actor("a\nb\r\u{0}c").as_deref(), Some("abc"));
+        assert_eq!(clean_actor("\n"), None);
+        assert_eq!(
+            clean_actor("ad\u{202E}min\u{200B}").as_deref(),
+            Some("admin")
+        );
+        // Line separators and soft or joining marks are not control characters.
+        assert_eq!(clean_actor("a\u{2028}b\u{2029}c").as_deref(), Some("abc"));
+        assert_eq!(clean_actor("a\u{2060}b\u{00AD}c").as_deref(), Some("abc"));
+        // Ordinary ids keep their punctuation.
+        assert_eq!(
+            clean_actor("agent:key_1.x@example.com").as_deref(),
+            Some("agent:key_1.x@example.com")
+        );
+        assert_eq!(clean_actor(&"x".repeat(500)).map(|a| a.len()), Some(128));
+    }
+
+    #[test]
     fn encode_query_arg_renders_the_extractor_dialect() {
         let mut pairs = QueryPairs::new();
         encode_query_arg("page", &json!(2), 1, &mut pairs).expect("scalar");
@@ -4717,6 +4990,8 @@ mod tests {
             empty_body: false,
             task: false,
             agent_authority: None,
+            core: false,
+            tags: Vec::new(),
         }
     }
 
@@ -5070,6 +5345,8 @@ mod tests {
                 state: crate::AppState::for_test(),
                 session_cookie: "autumn.sid".to_owned(),
                 tasks: McpTaskConfig::default(),
+                instructions: None,
+                catalog: McpCatalog::Full,
             },
         )
     }

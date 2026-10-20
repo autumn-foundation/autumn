@@ -48,6 +48,7 @@ pub const WIDGETS_CSS_PATH: &str = "/static/css/autumn-widgets.css";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn widgets_css_bundles_tokens_and_components() {
@@ -100,5 +101,176 @@ mod tests {
                 "widget emits .{class} but WIDGETS_COMPONENT_CSS has no rule for it"
             );
         }
+    }
+
+    /// Wayfinder audit (keyboard walkthrough, tier 1): four widget rules
+    /// set `outline: none` and signalled focus with `border-color` +
+    /// `box-shadow` only. Forced-colors mode (Windows High Contrast) strips
+    /// `box-shadow`, so keyboard users lost the focus indicator (WCAG 2.4.7).
+    /// A transparent outline is repainted in the system focus colour under
+    /// forced-colors and is invisible otherwise — but only on the `:focus`
+    /// state: on the base selector every unfocused field would be outlined
+    /// too, and focus would be indistinguishable.
+    #[test]
+    fn widget_focus_states_keep_an_outline_and_base_rules_have_none() {
+        assert!(
+            !WIDGETS_COMPONENT_CSS.contains("outline: none"),
+            "`outline: none` leaves no focus indicator under forced-colors mode"
+        );
+        for selector in [
+            ".autumn-field__input:focus {",
+            ".autumn-submit:focus {",
+            ".autumn-search__input:focus {",
+            ".autumn-autocomplete__input:focus {",
+        ] {
+            let start = WIDGETS_COMPONENT_CSS
+                .find(selector)
+                .unwrap_or_else(|| panic!("missing `{selector}` rule"));
+            let end = WIDGETS_COMPONENT_CSS[start..].find('}').unwrap() + start;
+            assert!(
+                WIDGETS_COMPONENT_CSS[start..end].contains("outline: 2px solid transparent;"),
+                "`{selector}` must declare a transparent outline"
+            );
+        }
+        assert_eq!(
+            WIDGETS_COMPONENT_CSS
+                .matches("outline: 2px solid transparent;")
+                .count(),
+            4,
+            "the transparent outline belongs on the four :focus rules only"
+        );
+    }
+    /// `#rrggbb` -> WCAG relative luminance.
+    fn luminance(hex: &str) -> f64 {
+        let channel = |i: usize| {
+            let c = f64::from(u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap()) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.0722_f64.mul_add(
+            channel(2),
+            0.7152_f64.mul_add(channel(1), 0.2126 * channel(0)),
+        )
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Resolve `#hex` / `var(--x)` / `var(--x, #hex)` against the shipped
+    /// tokens, the way a browser does: the token wins, the fallback only
+    /// applies when the token is undefined.
+    fn resolve(value: &str) -> String {
+        let value = value.trim();
+        if let Some(args) = value
+            .strip_prefix("color-mix(in srgb,")
+            .and_then(|v| v.strip_suffix(')'))
+        {
+            // `<color> <pct>%, <color>`
+            let (first, second) = args.split_once("%,").unwrap();
+            let (a, pct) = first.trim().rsplit_once(' ').unwrap();
+            let weight = pct.parse::<u32>().unwrap();
+            let (a, b) = (resolve(a), resolve(second));
+            let channel =
+                |h: &str, i: usize| u32::from_str_radix(&h[1 + i * 2..3 + i * 2], 16).unwrap();
+            let mixed = (0..3).fold(String::from("#"), |mut out, i| {
+                let c = (channel(&a, i) * weight + channel(&b, i) * (100 - weight) + 50) / 100;
+                write!(out, "{c:02x}").unwrap();
+                out
+            });
+            return mixed;
+        }
+        let Some(inner) = value.strip_prefix("var(").and_then(|v| v.strip_suffix(')')) else {
+            return value.to_owned();
+        };
+        let (name, fallback) = inner
+            .split_once(',')
+            .map_or((inner, None), |(n, f)| (n, Some(f)));
+        let tokens = crate::ui::tokens::TOKENS_CSS;
+        let def = format!("{}:", name.trim());
+        tokens
+            .find(&def)
+            .map(|at| {
+                let rest = &tokens[at + def.len()..];
+                rest[..rest.find(';').unwrap()].trim().to_owned()
+            })
+            .or_else(|| fallback.map(resolve))
+            .unwrap_or_else(|| panic!("`{name}` is neither a token nor has a fallback"))
+    }
+
+    fn declared(selector: &str, prop: &str) -> String {
+        let at = WIDGETS_COMPONENT_CSS
+            .find(&format!("{selector} {{"))
+            .unwrap_or_else(|| panic!("missing `{selector}` rule"));
+        let body = &WIDGETS_COMPONENT_CSS[at..];
+        let body = &body[..body.find('}').unwrap()];
+        let line = body
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(&format!("{prop}:")))
+            .next_back()
+            .unwrap_or_else(|| panic!("`{selector}` has no `{prop}`"));
+        resolve(line.trim_end_matches(';'))
+    }
+
+    /// Status chips keep their light tint under dark themes (the Midnight
+    /// story re-themes `--text` but not `--*-light`), so their foreground must
+    /// not be derived from `--text`: mixing toward a light `--text` would
+    /// lighten it against a light chip (2.3:1 on Midnight).
+    #[test]
+    fn status_chip_text_is_independent_of_the_theme_foreground() {
+        for selector in [
+            ".badge--success",
+            ".badge--warning",
+            ".alert-success",
+            ".alert-warning",
+        ] {
+            let at = WIDGETS_COMPONENT_CSS
+                .find(&format!("{selector} {{"))
+                .unwrap();
+            let body = &WIDGETS_COMPONENT_CSS[at..];
+            let body = &body[..body.find('}').unwrap()];
+            assert!(!body.contains("var(--text"), "{selector} reads --text");
+        }
+    }
+
+    /// Wayfinder audit (contrast, tier 1): computed text/background pairs of
+    /// the status chips and the wizard step number against the shipped
+    /// tokens. WCAG 1.4.3 needs 4.5:1 for normal-size text. Baseline before
+    /// the fix: badge/alert-success 3.58, badge/alert-warning 3.07,
+    /// badge/alert-error 3.95, job-status__success 3.77, upcoming wizard
+    /// step number 3.90 (8 failing pairs).
+    #[test]
+    fn widget_text_meets_aa_contrast_against_its_own_background() {
+        let surface = "var(--surface)";
+        let mut failures = Vec::new();
+        for (selector, bg) in [
+            (".badge--success", "background"),
+            (".badge--warning", "background"),
+            (".badge--danger", "background"),
+            (".alert-success", "background"),
+            (".alert-warning", "background"),
+            (".alert-error", "background"),
+            (".autumn-job-status__success", ""),
+            (".autumn-job-status__error", ""),
+            (
+                ".wizard-step--upcoming .wizard-step__number",
+                "background-color",
+            ),
+        ] {
+            let bg = if bg.is_empty() {
+                resolve(surface)
+            } else {
+                declared(selector, bg)
+            };
+            let ratio = contrast(&declared(selector, "color"), &bg);
+            if ratio < 4.5 {
+                failures.push(format!("{selector}: {ratio:.2}:1"));
+            }
+        }
+        assert!(failures.is_empty(), "below 4.5:1 — {failures:?}");
     }
 }

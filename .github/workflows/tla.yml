@@ -1,0 +1,58 @@
+name: TLA+ specs
+
+# Runs TLC on every check in verification/tla/checks.txt: the correct
+# protocols must hold and reach their witnesses, and each seeded bug must give
+# a counterexample. See verification/README.md, "TLA+ specs".
+#
+# This is not a required check yet. A red run shows a broken spec, but it does
+# not block a merge. `cargo test -p autumn-protocol-models` (in ci.yml) checks
+# that checks.txt keeps up with the Stateright models, with no Java.
+
+on:
+  pull_request:
+    paths:
+      - "verification/tla/**"
+      - "scripts/verify-tla.sh"
+      - ".github/workflows/tla.yml"
+  push:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "verification/tla/**"
+      - "scripts/verify-tla.sh"
+      - ".github/workflows/tla.yml"
+  schedule:
+    # Mondays 05:37 UTC.
+    - cron: "37 5 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TLA_VERSION: v1.7.4
+  TLA_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+
+jobs:
+  tlc:
+    name: TLA+ specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # The runner image ships a JDK; TLC needs Java 11 or newer.
+      - name: Install TLC
+        run: |
+          java -version
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL --retry 4 -o "$jar" \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_VERSION}/tla2tools.jar"
+          echo "${TLA_SHA256}  ${jar}" | sha256sum --check --strict
+          echo "TLA2TOOLS_JAR=$jar" >> "$GITHUB_ENV"
+
+      - name: Check specs
+        run: ./scripts/verify-tla.sh

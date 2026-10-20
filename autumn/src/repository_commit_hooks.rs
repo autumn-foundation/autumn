@@ -580,14 +580,24 @@ where
         .bind::<diesel::sql_types::Text, _>(hook_name)
         .bind::<diesel::sql_types::Text, _>(context)
         .bind::<diesel::sql_types::Text, _>(record)
-        .execute(conn)
+        .execute(&mut *conn)
         .await
-        .map(|_| ())
         .map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "repository commit hook enqueue failed: {error}"
             ))
-        })
+        })?;
+    #[cfg(feature = "sqlite")]
+    mark_fleet_hooks(conn).await?;
+    Ok(())
+}
+
+/// Mark this connection's fleet database as holding commit hooks, in
+/// the caller's transaction (issue 3234). A no-op on any other database.
+#[cfg(feature = "sqlite")]
+async fn mark_fleet_hooks(conn: &mut crate::db::RuntimeConnection) -> AutumnResult<()> {
+    crate::db::fleet_sweeper::mark_connection(conn, crate::db::fleet_sweeper::PendingKind::Hooks)
+        .await
 }
 
 /// Insert a generated repository commit hook row in a staged state.
@@ -630,14 +640,16 @@ where
         .bind::<diesel::sql_types::Text, _>(context)
         .bind::<diesel::sql_types::Text, _>(record)
         .bind::<diesel::sql_types::Text, _>(owner.clone())
-        .execute(conn)
+        .execute(&mut *conn)
         .await
-        .map(|_| (id, owner))
         .map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "repository commit hook staging failed: {error}"
             ))
-        })
+        })?;
+    #[cfg(feature = "sqlite")]
+    mark_fleet_hooks(conn).await?;
+    Ok((id, owner))
 }
 
 /// Insert multiple generated repository commit hook rows in a staged state in a single query.
@@ -749,6 +761,8 @@ where
                         ))
                     })?;
             }
+            #[cfg(feature = "sqlite")]
+    mark_fleet_hooks(conn).await?;
             Ok(results)
         }},
     }
@@ -843,6 +857,8 @@ where
                         ))
                     })?;
             }
+            #[cfg(feature = "sqlite")]
+    mark_fleet_hooks(conn).await?;
             Ok(())
         }},
     }
@@ -1991,12 +2007,15 @@ where
 /// scope) → ack/nack, one row at a time. Mirrors the Postgres
 /// `drain_ready_repository_commit_hooks` shape.
 #[cfg(feature = "sqlite")]
+///
+/// Returns how many hooks ran (succeeded or failed).
 pub async fn sqlite_drain_ready_repository_commit_hooks(
     pool: &RtPool,
     worker_id: &str,
     max_rows: usize,
     stop: &CancellationToken,
-) {
+) -> usize {
+    let mut ran = 0;
     for _ in 0..max_rows {
         // The row in flight settles; no new row starts once `stop` fires.
         if stop.is_cancelled() {
@@ -2005,6 +2024,7 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
         let Some(row) = sqlite_claim_next_repository_commit_hook(pool, worker_id).await else {
             break;
         };
+        ran += 1;
 
         let heartbeat_shutdown = CancellationToken::new();
         let heartbeat_task = tokio::spawn(heartbeat_repository_commit_hook_claim(
@@ -2081,6 +2101,65 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
                 "repository commit hook heartbeat task failed"
             );
         }
+    }
+    ran
+}
+
+/// The channels a fleet sweep runs hooks with.
+#[cfg(all(feature = "sqlite", feature = "ws"))]
+pub type SweepChannels = crate::channels::Channels;
+/// The channels a fleet sweep runs hooks with.
+#[cfg(all(feature = "sqlite", not(feature = "ws")))]
+pub type SweepChannels = Channels;
+
+/// Drain the commit hooks of one fleet database for the fleet sweeper: recover
+/// stale claims, then run up to `max_rows` ready hooks. Returns how many ran.
+#[cfg(feature = "sqlite")]
+pub async fn sweep_fleet_database_hooks(
+    pool: &RtPool,
+    channels: Option<SweepChannels>,
+    max_rows: usize,
+    stop: &CancellationToken,
+) -> usize {
+    register_inventory_repository_commit_hook_runners();
+    let worker_id = repository_commit_hook_worker_id();
+    recover_stale_repository_commit_hooks(pool, &worker_id).await;
+    let drain = sqlite_drain_ready_repository_commit_hooks(pool, &worker_id, max_rows, stop);
+    #[cfg(feature = "ws")]
+    if let Some(channels) = channels {
+        return CURRENT_CHANNELS.scope(channels, drain).await;
+    }
+    #[cfg(not(feature = "ws"))]
+    let _ = channels;
+    drain.await
+}
+
+/// Whether a fleet database holds commit hooks that have not finished:
+/// queued, running, or staged. `false` when it has no hook table.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+#[cfg(feature = "sqlite")]
+pub async fn has_pending_hooks(conn: &mut crate::db::RuntimeConnection) -> AutumnResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Pending {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let found = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM (SELECT 1 FROM autumn_repository_commit_hooks \
+         WHERE status IN ('enqueued', 'running', 'pending_after_hook', 'after_hook_succeeded') \
+         LIMIT 1)",
+    )
+    .get_result::<Pending>(conn)
+    .await;
+    match found {
+        Ok(pending) => Ok(pending.n > 0),
+        Err(error) if is_missing_hook_table_error(&error) => Ok(false),
+        Err(error) => Err(AutumnError::internal_server_error_msg(format!(
+            "repository commit hook probe failed: {error}"
+        ))),
     }
 }
 

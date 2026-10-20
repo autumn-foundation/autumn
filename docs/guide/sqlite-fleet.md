@@ -37,6 +37,10 @@ pool_size = 2                   # connections per open database
 idle_close_secs = 300           # close a database idle this long
 # create_on_demand = false      # default: false for tenants, true for slots
 # restore_missing = false       # see "Replication" below
+
+# [database.fleet.ownership]    # see "Failover: slot ownership" below
+# owner = "host-a"
+# slots = ["0-8191"]
 ```
 
 The control database must live outside `root`: otherwise a tenant or slot
@@ -133,6 +137,80 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
 
+## Operating the fleet
+
+`autumn fleet` runs these operations from the command line. Use it when the
+app is stopped and when it runs. It reads `[database.fleet]` the same way the
+app does. `restore` also reads `[replication]`. The sources are
+`autumn.toml`, the `[profile.<p>]` overlay, `.env.<profile>` and `AUTUMN_*`
+overrides. Run it from the app directory. `--profile <p>` selects a profile.
+
+The fleet API is in the SQLite build only. Install that build of the CLI:
+
+```shell
+cargo install autumn-cli --no-default-features --features sqlite
+```
+
+| Command | Does |
+| --- | --- |
+| `autumn fleet list [--open] [--json]` | name, size and path of each database; `--open` adds the identity row, the latest applied app migration and the number of pending app migrations |
+| `autumn fleet migrate [--concurrency N] [--key K]` | apply `migrations/` and the framework tables to every database, or to one |
+| `autumn fleet backup <key> <dest>` | copy one database with `VACUUM INTO`; `dest` must not exist |
+| `autumn fleet delete <key> --force` | remove one database and its sidecars |
+| `autumn fleet restore <key> [--timestamp T] --force` | rebuild one database from its replica; `--timestamp` sets a point in time |
+
+```shell
+autumn fleet list --open
+autumn fleet migrate --concurrency 4
+autumn fleet backup tenant:acme /backups/acme.db
+autumn fleet delete tenant:acme --force
+autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+```
+
+- A key is a name as `autumn fleet list` prints it: `tenant:<id>` or
+  `slot:<nnnnn>`. `tenant/<id>` and `slot/<n>` are also accepted.
+- No command creates the fleet root. Each command stops when
+  `database.fleet.root` does not exist, so a wrong directory does not give an
+  empty fleet. For a new volume, create the root directory first.
+- Only `restore` creates a database file. The other commands do not.
+- Like boot, each command validates `[database]` first and stops when the
+  control database resolves inside the fleet root.
+- `list --open` reads each file and changes no data. It exits non-zero when
+  it cannot read a file.
+- `migrate` reads the app's `migrations/` directory. It does not apply plugin
+  migrations. For those, run the app once with `AUTUMN_MIGRATE=1`. If an app
+  migration has the same version as a framework migration, `migrate` stops:
+  only boot can record that pair correctly. `migrate` also stops when a
+  database records a migration that is not in `migrations/` or the framework
+  sets (a plugin migration, for example). It checks each database again
+  inside the migration's write lock, so a file replaced after the first check
+  is not migrated. After you add a plugin, run the app once
+  with `AUTUMN_MIGRATE=1` before you use `fleet migrate`: until then, no
+  database records the plugin's migrations, so `migrate` cannot see them.
+- A failure on one database does not stop the others. `migrate` lists each
+  failure and exits non-zero.
+- With `[replication]` on, a migration of a database that the app has open
+  can make the replicator start a new generation. `AUTUMN_MIGRATE=1` does the
+  same.
+- `backup` never replaces or follows a file at `dest`. On Unix, only its
+  owner can read the copy, and `backup` stops when another user could change
+  a directory on the way to `dest`: each one must belong to root or to you,
+  and must not be writable by others unless it has the sticky bit (as `/tmp`
+  has). On Windows, the copy gets the ACL of the `dest`
+  directory: put backups in a directory that only you can read.
+- `delete` and `restore` destroy data, so they need `--force` on every
+  profile. When another process has the file open (an app that serves the
+  tenant), they stop with "open in another process" and change nothing. Wait
+  until the app closes the database (`idle_close_secs`), or stop the app.
+- `restore` verifies the replica chain before it replaces the file, as
+  `autumn db replica restore` does.
+- `delete` does not remove the replica. With `restore_missing = true`, the app
+  restores a deleted database on the next request for it.
+- On Windows, another process can open the database while `delete` or
+  `restore` removes files (see [Limits](#limits)). The command then
+  stops with "open in another process" or "created ... during the restore".
+  The replica keeps the data. Stop the app, then run the command again.
+
 ## Migrations
 
 Every fleet database gets the app's migrations and the shard framework tables
@@ -144,7 +222,8 @@ Every fleet database gets the app's migrations and the shard framework tables
   migrations (`database.auto_migrate`, `auto_migrate_in_production`).
 - Otherwise opening one with pending migrations answers `503` until you run
   the app once with `AUTUMN_MIGRATE=1`, which migrates the control database
-  and then every fleet database.
+  and then every fleet database. `autumn fleet migrate` migrates the fleet
+  databases only (see [Operating the fleet](#operating-the-fleet)).
 
 Each database's run is one `BEGIN IMMEDIATE` transaction: atomic, and safe
 when two processes race. During a rollout the fleet is mixed, so write
@@ -168,6 +247,51 @@ migrations expand-then-contract.
 - Metrics label every fleet database `shard=fleet`; the database name goes on
   spans and logs only, so a tenant fleet cannot explode metric cardinality.
 
+## Background work: the sweeper
+
+Outbox rows, commit hooks and derivation backfills work on fleet databases.
+A database does not have to be open for its work to run: the fleet sweeper
+visits it.
+
+```rust
+#[post("/orders/{id}")]
+async fn place(mut db: ShardedDb, outbox: Outbox, Path(id): Path<i64>) -> AutumnResult<()> {
+    autumn_web::db::scoped_transaction(&mut *db, |conn| async move {
+        outbox.write(conn, &format!("order:{id}"), "order.placed", &id).await?;
+        Ok(())
+    }.scope_boxed()).await
+}
+```
+
+- The write also adds a row for the database to `_autumn_fleet_pending` on
+  the control database, in the same transaction. A commit-hook enqueue does
+  the same. If the control database cannot take the row, the write fails.
+- A worker process (`role = "worker"` or `"combined"`) reads that table each
+  second. It opens each listed database, sends its outbox, drains its hooks
+  and runs its derivation backfill. Then it closes the database again, if
+  nobody else used it.
+- The sweeper never opens a database past `max_open`. With no room, it waits
+  for the next pass. It never closes a database that a request holds, and
+  it never restores a deleted database from its replica.
+- An outbox handler for a tenant fleet runs in the tenant's scope
+  (`CURRENT_TENANT`), so a `tenant_scoped` repository finds that tenant.
+- A `web` process does not open databases for the sweeper. It drains the
+  hooks of the databases it has open. A worker sends their outbox.
+- A new or changed `#[derivation]` is backfilled in every database: the
+  first worker pass after the deploy marks each file. When a database opens
+  first, it runs up to 8 backfill batches before its first request, and the
+  sweeper does the rest. During a rolling deploy, only the new binary runs
+  backfills. After a rollback to older derivations, run a `resweep`.
+- Write outbox rows in a transaction. Do not enqueue on a fleet database
+  while you hold a write transaction on the control database: the row on the
+  control database then cannot be written, and the write fails.
+
+`/actuator/health` reports `fleet:sweeper`: `backlog` (databases with work),
+`oldest_pending_secs`, and `last_pass` (`visited`, `cleared`, `deferred`,
+`failed`, `handled`). A `backlog` that grows, or an old
+`oldest_pending_secs`, means the sweeper cannot keep up: a handler fails, the
+fleet is full, or no worker process runs.
+
 ## Replication: object storage between volumes
 
 A cloud host attaches one volume. The volume can't be the unit of
@@ -185,10 +309,9 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
 - `fleet.restore(&key, at)` rebuilds one database, point in time included;
 - `restore_missing = true` restores a database whose file is missing before
   opening it. A host with an empty volume takes over a tenant or a slot range
-  by serving it.
-
-**Only turn on `restore_missing` for keys the previous owner has stopped
-writing**, or the two copies diverge. Ownership fencing is on the roadmap.
+  by serving it. Turn on [slot ownership](#failover-slot-ownership) with it:
+  without ownership, nothing stops the previous owner, and the two copies
+  diverge. Boot logs a warning for `restore_missing` without ownership.
 
 **Processes can share a replicated fleet root.** Only one process replicates a
 database. It holds the lock file `<db>.replicator.lock`. The other processes
@@ -201,18 +324,118 @@ file systems.
 replicating, the number this process does not own (`unowned`), the worst lag
 and which database has it.
 
+## Failover: slot ownership
+
+With `[database.fleet.ownership]`, a host serves only the slot ranges that it
+owns. Each claim of a range gets an **epoch**. An epoch is a number that only
+increases. The epoch fences the old owner:
+
+- the old owner stops opening the range's databases;
+- its replicator stops;
+- a restore never selects its data instead of the new owner's data.
+
+```toml
+[database.fleet]
+restore_missing = true
+
+[database.fleet.ownership]
+owner = "host-a"     # one id per volume
+slots = ["0-8191"]   # default: every slot, as one range
+lease_secs = 30      # default; 3 to 3600
+```
+
+The overrides are `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER`, `..._SLOTS`
+(comma-separated) and `..._LEASE_SECS`. The processes on one volume (a `web`
+and a `worker` role) use the same `owner` and the same `slots`. A tenant fleet
+uses the slot of the tenant id, so the same ranges work in both modes and in
+the [cell router](cell-isolation.md).
+
+### How it works
+
+| Step | Rule |
+| --- | --- |
+| Claim | At boot, before the first request. If the range is free, or each lease on it ended, the host gets a new epoch. If the host already has the same range, it keeps its epoch. A live lease on any slot of the range refuses the claim, also a lease of the same owner on a range of another shape. |
+| Renew | Every `lease_secs / 3`. If the row has another owner or epoch, the host loses the range. |
+| Serve | `open` checks the slot first. If the host does not own the slot, `open` returns `421 Misdirected Request` and does not touch the disk. So `restore_missing` runs only for an owned key. |
+| Lose | The host closes every open database of the range. The close does not wait for workers, but it waits for connections that are in use. The sweeper and the fan-outs skip the range. |
+| Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after it sent its last renew. This is before the lease in the table ends. |
+| Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. A replicator reads the epochs at the destination at each new generation and every 60 s. If it finds a newer epoch, it stops, and the host loses the range. |
+| Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped. The next owner can then claim them at once. In all other cases, the leases end on their own. |
+
+The ownership table is `_autumn_fleet_slot_owners` on the control database.
+All hosts of the fleet must use the same table. The control database is a
+local SQLite file, so the built-in table fences only the processes of one
+host. For hosts on different machines, implement `SlotOwnershipStore` (in
+`autumn_web::db::fleet_ownership`) on a store that all hosts reach. Then
+start a `FleetOwnership` with `DatabaseFleet::start_ownership` (it takes the
+volume lock, then claims), and start `DatabaseFleet::spawn_ownership` before
+the first request.
+
+### The failover procedure
+
+1. Give every host the same `[replication]` destination and the same
+   ownership table. Set `restore_missing = true` and a unique `owner` per
+   volume.
+2. **Planned move.** Stop the old host. It releases its ranges at shutdown.
+   Start the new host with the same `slots`. It claims the ranges at once and
+   restores each database on its first request.
+3. **Unplanned failover.** The old host stopped, or the network isolates it.
+   Start the new host with the same `slots`. The new host claims the ranges
+   when the old lease ends: after at most `lease_secs`, plus one renew
+   interval and the clock skew. Then it serves at a new epoch.
+4. If the old host is still alive, it stops serving when its local lease
+   ends, and returns `421`. When it can reach the table again, its renew
+   fails. It claims the range again only when the new owner lets it go, at a
+   newer epoch.
+5. **Fail back.** When the old host gets a range back, its files on disk are
+   older than the replica. Each file records the epoch it was last opened
+   under. On the first open at the newer epoch, the host compares that epoch
+   with the newest epoch at the replica. If the replica's is newer, the host
+   restores the file from the replica before it serves it. Without
+   `[replication]` there is nothing to compare with: give the old host an
+   empty volume.
+6. **Move part of a range.** Change `slots` on the owner, for example from
+   `"0-8191"` to `"0-4095"`, and restart it. A clean shutdown releases the
+   old range, so the owner claims `"0-4095"` at once at a new epoch. Another
+   host can then claim `"4096-8191"`. If the old range was not released, each
+   claim waits until its lease ends.
+
+`/actuator/health` reports `fleet:ownership`. The details are the `owner`,
+the `held` ranges with their epoch and whether the host serves them now, and
+the ranges that are `waiting`, `lost` or `failed`. The status is `Down` when
+the last claim or renew could not reach the table, or when a held range
+stopped serving because a renew did not come back in time.
+
+### Clocks
+
+The lease in the table uses the wall clock of the host that writes it. The
+holder stops on its own monotonic clock, `lease_secs / 3` before the lease
+ends. The clock skew between hosts plus the longest request must be less
+than `lease_secs / 3` (10 s by default). Otherwise two hosts can serve one
+slot for a short time. The epoch still protects the replicas: a restore
+selects the newest epoch, and the old replicator stops.
+
+If the old owner accepts writes after the new owner claims the range, those
+writes are lost. They are in the old epoch's generation, and no restore
+selects that generation.
+
+Do not restore the control database to an earlier time while ownership is
+on. If its epoch counter goes back, the next claim after a fence still goes
+above the epoch that the replicator found.
+
 ## Limits
 
-- The outbox relay, derivation backfill, shard-local jobs and the job
-  dashboard work on the control database, not on fleet databases. Enqueue
-  through the control database.
-- Each open database runs its own commit-hook worker, in every process role
-  (`web` included: a `worker` process does not open fleet databases). Hooks
-  queued in a database drain while it is open, and resume on its next open.
+- Shard-local jobs and the job dashboard work on the control database, not
+  on fleet databases.
+- Each open database runs its own commit-hook worker, in every process role.
   Before a database closes (idle, `max_open`, shutdown), its worker
   finishes the hook it runs and acks it, for up to 10 seconds. A hook that
-  does not finish in that time can run again after the next open. Hooks stay
+  does not finish in that time can run again later. Hooks stay
   at-least-once: write them to be idempotent.
+- An outbox row written outside a transaction commits before the sweeper's
+  row. If that row cannot be written, the call returns an error for a
+  committed message: do not retry it. The next open of the database writes
+  the row.
 - A replicated database takes a fresh base snapshot each time it reopens.
   Size `max_open` so busy tenants stay open.
 - A deleted database's replica stays in object storage until you remove it.

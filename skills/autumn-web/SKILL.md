@@ -2984,13 +2984,40 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - With `[replication]` on, each open database ships its WAL under
   `fleet/tenant/<id>` / `fleet/slot/<n>` (health `replication:fleet`);
   `restore_missing = true` serves a missing database from its replica on a
-  fresh volume — only once the old host stopped writing. A replicated fleet
-  root is served by one process (one replicator per database).
+  fresh volume. A replicated fleet root is served by one process (one
+  replicator per database).
+- Failover: turn on `[database.fleet.ownership]` (`owner` unique per volume,
+  `slots = ["0-8191"]`, `lease_secs = 30`) with `restore_missing`. A host
+  serves only the slot ranges it claims; an unowned slot is `421`
+  (`FleetError::NotOwner`), and `restore_missing` runs only for an owned key.
+  Each claim gets an epoch: a restore selects the newest epoch, and an old
+  owner's replicator stops. A host that gets a range back restores files
+  older than the replica before it serves them. Health: `fleet:ownership`. The built-in table is
+  on the control database, so it fences the processes of one host only;
+  hosts on different machines implement `SlotOwnershipStore`
+  (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
+  `docs/guide/sqlite-fleet.md`.
 - The control database lives outside `root` (validation refuses it inside).
-- Outbox rows and derivation backfill stay on the control database.
-- Tests: `TestApp::new().with_db(control).with_fleet(fleet)`.
+- Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
+  databases, also closed ones (issue #3234). Write outbox rows in a
+  transaction on the tenant connection: the write records the database in
+  `_autumn_fleet_pending` on the control database. A worker-role process
+  (the fleet sweeper) opens each listed database, never past `max_open`,
+  does the work, then closes it. Outbox handlers of a tenant fleet run in
+  the tenant's scope. Health: `fleet:sweeper` (`backlog`,
+  `oldest_pending_secs`). Do not enqueue on a fleet database inside a
+  control-database write transaction: the write fails.
+- Tests: `TestApp::new().with_db(control).with_fleet(fleet)`; call
+  `FleetSweeper::install(client.state())` (`autumn_web::db::fleet_sweeper`)
+  before the first request, then `sweep_once()` to run a pass.
+- Out of band (stopped or live app), with the `sqlite` CLI build:
+  `autumn fleet list --open`, `migrate [--key K]`, `backup <key> <dest>`,
+  `delete <key> --force`, `restore <key> [--timestamp T] --force`. Keys are
+  `tenant:<id>` / `slot:<nnnnn>`. A file another process has open is refused
+  ("open in another process"). `migrate` reads `migrations/` only: plugin
+  sets need `AUTUMN_MIGRATE=1`. Run it from the app directory.
 
-See `docs/guide/sqlite-fleet.md`.
+See `docs/guide/sqlite-fleet.md` ("Operating the fleet").
 
 ## Cell and shuffle-shard isolation (issue #3072)
 
@@ -3488,6 +3515,7 @@ autumn db backup --keep 7        # dump control DB + shards to ./backups/<profil
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
 autumn db replica restore --force        # SQLite tier: rebuild from the continuous replica; --timestamp <RFC3339> for PITR, --overwrite to replace an existing file  # (0.7.0)
 autumn db replica status --json          # replica generation, segments, and current replication lag; db replica verify proves it restorable  # (0.7.0)
+autumn fleet list --open                 # SQLite fleet (sqlite CLI build): every tenant/slot database; migrate | backup <key> <dest> | delete <key> --force | restore <key> [--timestamp T] --force
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
 autumn db scrub --sample users=1% --seed 42            # scrub AND subset in one pass: 1% of users plus every row they relate to, reproducibly
 autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
@@ -3535,6 +3563,7 @@ autumn graph show                # the application architecture graph the macros
 autumn graph touches posts       # which routes and jobs reach a model, table, or repository — transitively, so a handler that only takes `PgPostRepository` is included
 autumn graph impact Post         # what a change to a model would affect: the repositories over it, and every route and job reaching it directly or through one
 autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
+# `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
@@ -3622,10 +3651,15 @@ For the scaffold half, five more things (issue #1593):
   team's — a `Dockerfile` with their own base image — `autumn upgrade --accept
   <path>` records it in the manifest's `pinned` list so `--check` can go green
   again. Removing a line from that list brings the file back.
-- **Inside a Cargo workspace, member crates are not offered `clippy.toml`,
-  `rustfmt.toml`, `rust-toolchain.toml` or a CI workflow.** Those resolve from
-  the nearest ancestor, so a crate-local copy *shadows* the workspace's rather
-  than adding to it, and GitHub never runs a workflow from a subdirectory.
+- **A workspace member gets its root files at the root (issue #2469).**
+  `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are planned at the
+  workspace root, and `ci.yml` and `posture-gate.yml` at the git root, as
+  `../` paths in the report and in `.autumn/scaffold.toml`. The workflows name
+  the member. A root file that exists already is a `conflict`: use
+  `--accept ../<file>` to leave it. A member copy of a Cargo file is a
+  `conflict` too, because it shadows the root copy: tell the user to delete
+  it. With no git repository, nothing is planned. If the workspace root is
+  below the git root, only the Cargo files are planned.
 
 `--to` selects which codemods run; the scaffold half always reconciles to the
 release the CLI itself ships templates for — downgrades and historical

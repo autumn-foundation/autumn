@@ -608,7 +608,12 @@ fn sanitize_for_log(name: &str) -> String {
 }
 
 /// Sorted, deduplicated label pairs identifying one series of an instrument.
-type SeriesKey = Box<[(Box<str>, Box<str>)]>;
+///
+/// `String`s rather than `Box<str>`s so the map is probed with a handle's own
+/// labels: `Box<[T]>: Borrow<[T]>` lets `&[(String, String)]` look a series up
+/// without building an owned key, so a label set already seen costs a lookup
+/// and only a new one is copied in.
+type SeriesKey = Box<[(String, String)]>;
 
 /// A single registered instrument: its identity, its help text, and every
 /// series recorded through it.
@@ -664,25 +669,27 @@ impl Instrument {
 
     /// Apply `update` to the series `labels` identifies, creating it if needed.
     ///
+    /// `labels` is a handle's canonical label set (see [`insert_label`]), so
+    /// the only canonicalization left is the cap, which is a prefix: the
+    /// series map is probed with a borrowed slice and nothing is allocated
+    /// unless the label set is new.
+    ///
     /// No lock is held while `update` runs, and the no-label case touches no
     /// lock at all.
     fn record(&self, labels: &[(String, String)], update: impl FnOnce(&Series)) {
-        if labels.is_empty() {
-            self.record_unlabeled(update);
-            return;
-        }
         // ONE snapshot for both capped decisions below. Reading the label cap
         // and the series cap separately could straddle a `set_limits` and
         // admit a series that neither configuration would have produced — and
         // a retained series is never evicted, so it would stay wrong forever.
         let limits = limits();
-        let key = self.canonical_key(labels, limits.max_labels_per_series);
+        let key = self.capped_key(labels, limits.max_labels_per_series);
         if key.is_empty() {
-            // Every label was rejected; the sample still belongs somewhere.
+            // No labels, or every label was rejected as it was attached; the
+            // sample still belongs somewhere.
             self.record_unlabeled(update);
             return;
         }
-        if let Some(series) = self.series_for(&key, limits.max_series_per_metric) {
+        if let Some(series) = self.series_for(key, limits.max_series_per_metric) {
             update(&series);
         }
     }
@@ -700,7 +707,7 @@ impl Instrument {
 
     /// Look up (or register) the series for `key`, honouring the cardinality
     /// cap. Returns `None` when the cap dropped this label set.
-    fn series_for(&self, key: &SeriesKey, cap: usize) -> Option<Arc<Series>> {
+    fn series_for(&self, key: &[(String, String)], cap: usize) -> Option<Arc<Series>> {
         // `cap` comes from the caller's single snapshot and is reused for both
         // halves of the check-then-register: re-reading it would let a
         // concurrent `set_limits` admit the label set under the read lock and
@@ -728,7 +735,10 @@ impl Instrument {
                 self.note_dropped(cap);
                 return None;
             }
-            series.insert(key.clone(), Arc::clone(&fresh));
+            // The only allocation on the record path: a label set seen for the
+            // first time is copied in once and probed by borrow ever after.
+            let owned: SeriesKey = key.into();
+            series.insert(owned, Arc::clone(&fresh));
         }
         Some(fresh)
     }
@@ -750,33 +760,20 @@ impl Instrument {
         }
     }
 
-    /// Canonicalize a handle's pending labels into a series key: invalid,
-    /// reserved and over-long names dropped, duplicates resolved first-wins,
-    /// values sanitized, sorted by key, then cut to
-    /// [`max_labels_per_series`].
-    fn canonical_key(&self, labels: &[(String, String)], cap: usize) -> SeriesKey {
-        let mut kept: Vec<(Box<str>, Box<str>)> = Vec::with_capacity(labels.len());
-        for (key, value) in labels {
-            if !is_acceptable_label_name(key) {
-                self.warn_labels("invalid, reserved or over-long label name");
-                continue;
-            }
-            if kept.iter().any(|(existing, _)| **existing == **key) {
-                self.warn_labels("duplicate label name");
-                continue;
-            }
-            kept.push((key.as_str().into(), sanitize_label_value(value)));
-        }
-        // Sort *before* cutting to the cap. Truncating in insertion order would
-        // make the surviving subset — and therefore the identity of the series
-        // — depend on the order `with_label` happened to be called in, so the
-        // same ten labels applied in two orders would land in two series.
-        kept.sort_by(|(a, _), (b, _)| a.cmp(b));
-        if kept.len() > cap {
-            kept.truncate(cap);
+    /// Cut a handle's canonical label set to [`max_labels_per_series`].
+    ///
+    /// The set is already sorted, so the cut is a prefix — the
+    /// lexicographically smallest names — and needs no copy. Sorting *before*
+    /// cutting is what keeps the surviving subset (and therefore the series'
+    /// identity) independent of the order `with_label` happened to be called
+    /// in; [`insert_label`] does that as each label arrives.
+    fn capped_key<'a>(&self, labels: &'a [(String, String)], cap: usize) -> &'a [(String, String)] {
+        if labels.len() > cap {
             self.warn_labels("too many labels");
+            &labels[..cap]
+        } else {
+            labels
         }
-        kept.into_boxed_slice()
     }
 
     /// Warn at most once that this instrument was handed unusable labels.
@@ -816,10 +813,7 @@ impl Instrument {
             series
                 .iter()
                 .map(|(key, value)| {
-                    let labels = key
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect();
+                    let labels = key.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     (labels, Arc::clone(value))
                 })
                 .collect()
@@ -1014,19 +1008,11 @@ fn is_forbidden_control(c: char) -> bool {
 }
 
 /// Canonicalize a label value: control characters removed, then truncated to
-/// [`MAX_LABEL_VALUE_LEN`] characters.
-fn sanitize_label_value(value: &str) -> Box<str> {
-    // A string of at most `MAX_LABEL_VALUE_LEN` bytes holds at most that many
-    // characters, so the common case walks the string once and copies it once.
-    if value.len() <= MAX_LABEL_VALUE_LEN && !value.contains(is_forbidden_control) {
-        return value.into();
-    }
-    sanitized_chars(value, MAX_LABEL_VALUE_LEN).into_boxed_str()
-}
-
-/// [`sanitize_label_value`] for a value the caller already owns, reusing the
-/// allocation when nothing needs changing.
+/// [`MAX_LABEL_VALUE_LEN`] characters, reusing the caller's allocation when
+/// nothing needs changing.
 fn sanitize_owned_label_value(value: String) -> String {
+    // A string of at most `MAX_LABEL_VALUE_LEN` bytes holds at most that many
+    // characters, so the common case walks the string once and keeps it.
     if value.len() <= MAX_LABEL_VALUE_LEN && !value.contains(is_forbidden_control) {
         return value;
     }
@@ -1052,6 +1038,30 @@ fn sanitized_chars(text: &str, limit: usize) -> String {
         .collect()
 }
 
+/// Attach one label to a handle's label set, keeping the set canonical: sorted
+/// by key, deduplicated first-wins, invalid, reserved and over-long names
+/// dropped, values sanitized.
+///
+/// Doing this as each label arrives, rather than on every record, is what lets
+/// [`Instrument::record`] probe the series map with the handle's own labels:
+/// they already are the key, so a label set the instrument has seen before is
+/// found without copying a single string.
+fn insert_label(
+    instrument: &Instrument,
+    labels: &mut Vec<(String, String)>,
+    key: &str,
+    value: String,
+) {
+    if !is_acceptable_label_name(key) {
+        instrument.warn_labels("invalid, reserved or over-long label name");
+        return;
+    }
+    match labels.binary_search_by(|(existing, _)| existing.as_str().cmp(key)) {
+        Ok(_) => instrument.warn_labels("duplicate label name"),
+        Err(at) => labels.insert(at, (key.to_owned(), sanitize_owned_label_value(value))),
+    }
+}
+
 /// Whether `name` may be used as a label key on an app metric.
 fn is_acceptable_label_name(name: &str) -> bool {
     name.len() <= MAX_LABEL_NAME_LEN
@@ -1059,6 +1069,9 @@ fn is_acceptable_label_name(name: &str) -> bool {
         && !name.starts_with("__")
         && !RESERVED_LABEL_NAMES.contains(&name)
 }
+
+/// Rejection reason for a name over [`MAX_METRIC_NAME_LEN`].
+const NAME_TOO_LONG: &str = "longer than the metric name cap";
 
 /// Whether `name` may be registered as an app metric.
 ///
@@ -1069,7 +1082,7 @@ fn registration_rejection(name: &str) -> Option<&'static str> {
         // Checked before the grammar so a pathological name is not scanned in
         // full. Rejected, never truncated: two names sharing a 128-byte prefix
         // would otherwise silently become one family.
-        return Some("longer than the metric name cap");
+        return Some(NAME_TOO_LONG);
     }
     if !crate::actuator::is_valid_metric_name(name) {
         return Some("not a valid Prometheus metric name");
@@ -1179,8 +1192,10 @@ enum Registration {
 /// an unusable name, a collision with another instrument's family names, a
 /// kind that contradicts an existing registration, or an exhausted registry.
 fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
-    if let Some(reason) = registration_rejection(name) {
-        REGISTRY.warn_once(name, reason);
+    // The one check that must precede the probe below: hashing a pathological
+    // name in full is exactly what the length cap exists to prevent.
+    if name.len() > MAX_METRIC_NAME_LEN {
+        REGISTRY.warn_once(name, NAME_TOO_LONG);
         return None;
     }
 
@@ -1197,10 +1212,19 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
             .instruments
             .read()
             .unwrap_or_else(PoisonError::into_inner);
+        // The registry interns accepted names: nothing reaches it without
+        // passing `registration_rejection`, so a hit needs no re-validation,
+        // and the grammar walk and reserved-name scan run on first sight of a
+        // name rather than on every `counter(..)` call.
         if let Some(existing) = registered.get(name) {
             let existing = Arc::clone(existing);
             drop(registered);
             return matching_kind(existing, kind);
+        }
+        if let Some(reason) = registration_rejection(name) {
+            drop(registered);
+            REGISTRY.warn_once(name, reason);
+            return None;
         }
         if registered.len() >= instrument_cap {
             drop(registered);
@@ -1625,17 +1649,18 @@ pub struct Counter {
 impl Counter {
     /// Attach a label to the series this handle records into.
     ///
-    /// Label keys are canonicalized (sorted, deduplicated first-wins); an
-    /// invalid or reserved key drops that label, never the sample. Values are
-    /// stripped of control characters and truncated to
-    /// [`MAX_LABEL_VALUE_LEN`] characters here, so an over-long value is never
-    /// carried around whole.
+    /// Label keys are canonicalized as they are attached (sorted,
+    /// deduplicated first-wins); an invalid or reserved key drops that label,
+    /// never the sample. Values are stripped of control characters and
+    /// truncated to [`MAX_LABEL_VALUE_LEN`] characters here, so an over-long
+    /// value is never carried around whole. Once its series exists (the first
+    /// sample for a label set registers it), a handle that is kept and reused
+    /// records without allocating: its labels already are the series key.
     ///
     /// An inert handle (one whose name was rejected) skips the work entirely.
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
-        if self.instrument.is_some() {
-            self.labels
-                .push((key.to_owned(), sanitize_owned_label_value(value.into())));
+        if let Some(instrument) = self.instrument.as_deref() {
+            insert_label(instrument, &mut self.labels, key, value.into());
         }
         self
     }
@@ -1667,9 +1692,8 @@ impl Gauge {
     ///
     /// Canonicalized exactly like [`Counter::with_label`].
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
-        if self.instrument.is_some() {
-            self.labels
-                .push((key.to_owned(), sanitize_owned_label_value(value.into())));
+        if let Some(instrument) = self.instrument.as_deref() {
+            insert_label(instrument, &mut self.labels, key, value.into());
         }
         self
     }
@@ -1744,9 +1768,8 @@ impl Histogram {
     ///
     /// Canonicalized exactly like [`Counter::with_label`].
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
-        if self.instrument.is_some() {
-            self.labels
-                .push((key.to_owned(), sanitize_owned_label_value(value.into())));
+        if let Some(instrument) = self.instrument.as_deref() {
+            insert_label(instrument, &mut self.labels, key, value.into());
         }
         self
     }
@@ -2209,6 +2232,135 @@ mod tests {
             Some("paid")
         );
         assert_eq!(series.labels.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_label_key_keeps_the_first_value_across_other_labels() {
+        // The duplicate arrives after a label that sorts between the two, so
+        // first-wins must hold by key, not by adjacency in the label set.
+        let name = unique_name("facade_label_dup_interleaved");
+        counter(&name)
+            .with_label("status", "paid")
+            .with_label("currency", "eur")
+            .with_label("status", "refunded")
+            .increment(1);
+
+        let instrument = expect_instrument(&name);
+        let series = only_series(&instrument);
+        assert_eq!(
+            series.labels.get("status").map(String::as_str),
+            Some("paid")
+        );
+        assert_eq!(
+            series.labels.get("currency").map(String::as_str),
+            Some("eur")
+        );
+        assert_eq!(series.labels.len(), 2);
+    }
+
+    #[test]
+    fn a_held_handle_and_per_call_handles_share_one_series() {
+        // A held handle probes the series map with its own labels; a fresh
+        // handle built in another order must find the very same series.
+        let name = unique_name("facade_held_shared");
+        let held = counter(&name)
+            .with_label("status", "paid")
+            .with_label("region", "eu");
+        held.increment(1);
+        counter(&name)
+            .with_label("region", "eu")
+            .with_label("status", "paid")
+            .increment(1);
+        let sent = held.clone();
+        std::thread::spawn(move || sent.increment(1))
+            .join()
+            .expect("recording thread panicked");
+        held.increment(1);
+
+        let instrument = expect_instrument(&name);
+        assert_eq!(
+            instrument.series.len(),
+            1,
+            "a held handle must not split from per-call handles: {:?}",
+            instrument.series
+        );
+        assert_eq!(counter_value(only_series(&instrument)), 4);
+    }
+
+    #[test]
+    fn gauge_and_histogram_labels_canonicalize_like_counter_labels() {
+        // `Gauge::with_label` and `Histogram::with_label` share the counter's
+        // canonicalization: order-independent, first-wins, invalid names
+        // dropped. Two handles built in different orders land in one series.
+        let gauge_name = unique_name("facade_gauge_labels");
+        gauge(&gauge_name)
+            .with_label("pool", "primary")
+            .with_label("region", "eu")
+            .with_label("pool", "replica")
+            .set(3_u32);
+        gauge(&gauge_name)
+            .with_label("region", "eu")
+            .with_label("not-a-valid-name", "x")
+            .with_label("pool", "primary")
+            .increment(2_u32);
+        let instrument = expect_instrument(&gauge_name);
+        let series = only_series(&instrument);
+        assert!((gauge_value(series) - 5.0).abs() < f64::EPSILON);
+        assert_eq!(
+            series.labels.get("pool").map(String::as_str),
+            Some("primary")
+        );
+        assert_eq!(series.labels.len(), 2);
+
+        let histogram_name = unique_name("facade_histogram_labels");
+        histogram(&histogram_name)
+            .with_label("route", "/upload")
+            .with_label("method", "POST")
+            .record(1_u32);
+        timer(&histogram_name)
+            .with_label("method", "POST")
+            .with_label("route", "/upload")
+            .record(Duration::from_secs(2));
+        let instrument = expect_instrument(&histogram_name);
+        let (count, sum, _) = histogram_parts(only_series(&instrument));
+        assert_eq!(count, 2, "both handles record into one series");
+        assert!((sum - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_held_handle_applies_the_label_cap_in_force_when_it_records() {
+        // The cap is a property of the configuration at record time, not of
+        // the moment the handle was built: a handle built under one cap and
+        // recorded under another must follow the one in force.
+        let name = unique_name("facade_held_cap_raised");
+        let mut handle = counter(&name);
+        for i in 0..DEFAULT_MAX_LABELS_PER_SERIES + 2 {
+            handle = handle.with_label(&format!("k{i:02}"), "v");
+        }
+        {
+            let _limits = LimitsGuard::pinned();
+            handle.increment(1);
+        }
+        {
+            let _limits = LimitsGuard::raised_to(Limits {
+                max_labels_per_series: DEFAULT_MAX_LABELS_PER_SERIES + 4,
+                ..Limits::default()
+            });
+            handle.increment(1);
+        }
+
+        let instrument = expect_instrument(&name);
+        let mut widths: Vec<usize> = instrument.series.iter().map(|s| s.labels.len()).collect();
+        widths.sort_unstable();
+        assert_eq!(
+            widths,
+            vec![
+                DEFAULT_MAX_LABELS_PER_SERIES,
+                DEFAULT_MAX_LABELS_PER_SERIES + 2
+            ],
+            "one sample under each cap: {:?}",
+            instrument.series
+        );
     }
 
     #[test]

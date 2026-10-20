@@ -172,6 +172,7 @@ fn fleet(dir: &FsPath, mode: FleetMode, create_on_demand: bool) -> DatabaseFleet
         create_on_demand: Some(create_on_demand),
         idle_close_secs: 0,
         restore_missing: false,
+        ownership: None,
     })
     .migrations("app", MIGRATIONS)
     .migrations(

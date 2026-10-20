@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use super::ack::{ACK_PHRASE, Acknowledgment, short};
+use super::ack::{ACK_PHRASE, Acknowledgment, CEILING_KEY, short};
 use super::diff::{Finding, Severity};
 
 /// HTML marker the workflow greps for so it can *update* its comment instead of
@@ -27,8 +27,10 @@ pub const MAX_ROWS: usize = 25;
 #[derive(Debug)]
 pub struct Report<'a> {
     pub findings: &'a [Finding],
-    /// Digest of the widening subset; the number the acknowledgment carries.
+    /// Digest of the widening findings. A bare marker carries it.
     pub ack_digest: String,
+    /// What follows the phrase in the line a reviewer pastes.
+    pub marker: String,
     /// Posture digest of the head manifest (what a release would record).
     pub head_posture_digest: String,
     /// The acknowledgment that unblocked this run, when one did.
@@ -152,12 +154,27 @@ pub fn markdown(report: &Report<'_>) -> String {
     if !widening.is_empty() && report.acknowledged.is_none() {
         let _ = write!(
             out,
-            "To acknowledge these exact changes, comment on this pull request with:\n\n\
-             ```\n{ACK_PHRASE} {}\n```\n\n\
-             The digest names this set of widenings: unrelated pushes keep it valid, and a \
-             *new* widening needs a new acknowledgment.\n\n",
-            short(&report.ack_digest)
+            "To acknowledge these changes, comment on this pull request with:\n\n\
+             ```\n{ACK_PHRASE} {}\n```\n\n",
+            report.marker
         );
+        if report.marker.contains(CEILING_KEY) {
+            let _ = write!(
+                out,
+                "This comment approves these findings. It also approves any narrower posture \
+                 on these routes. Unrelated pushes keep it valid. A new widening, or a wider \
+                 route, needs a new comment.\n\n\
+                 For an exact match, use this line instead. Any later change asks again:\n\n\
+                 ```\n{ACK_PHRASE} {}\n```\n\n",
+                short(&report.ack_digest)
+            );
+        } else {
+            let _ = write!(
+                out,
+                "The digest names this set of widenings. Unrelated pushes keep it valid. A new \
+                 widening needs a new acknowledgment.\n\n"
+            );
+        }
     }
 
     let _ = write!(
@@ -284,7 +301,7 @@ pub fn text(report: &Report<'_>) -> String {
                 let _ = writeln!(
                     out,
                     "blocked: acknowledge with `{ACK_PHRASE} {}`",
-                    short(&report.ack_digest)
+                    report.marker
                 );
             }
         }
@@ -307,8 +324,7 @@ pub fn json(report: &Report<'_>) -> String {
         ack_digest: report.ack_digest.clone(),
         // Only meaningful when something is actually waiting to be
         // acknowledged; on a clean run it would be the digest of the empty set.
-        ack_phrase: (counts.widening > 0)
-            .then(|| format!("{ACK_PHRASE} {}", short(&report.ack_digest))),
+        ack_phrase: (counts.widening > 0).then(|| format!("{ACK_PHRASE} {}", report.marker)),
         head_posture_digest: &report.head_posture_digest,
         acknowledged_by_digest: report.acknowledged.as_ref().map(|a| a.digest.as_str()),
         acknowledgment_reason: report
@@ -355,6 +371,7 @@ mod tests {
         Report {
             findings,
             ack_digest: "0123456789abcdef0123".to_owned(),
+            marker: short("0123456789abcdef0123"),
             head_posture_digest: "deadbeef".to_owned(),
             acknowledged,
             bootstrap: false,
@@ -408,6 +425,7 @@ mod tests {
         let ack = Acknowledgment {
             digest: short("0123456789abcdef0123"),
             reason: Some("launch week".to_owned()),
+            ceiling: None,
         };
         let md = markdown(&report(&findings, Some(ack)));
         assert!(md.to_lowercase().contains("acknowledged"), "{md}");
@@ -561,5 +579,20 @@ mod tests {
         assert!(out.contains("/admin"), "{out}");
         assert!(out.to_lowercase().contains("widening"), "{out}");
         assert_eq!(text(&report(&[], None)), "", "silence when nothing changed");
+    }
+
+    #[test]
+    fn the_report_prints_the_marker_it_was_given() {
+        let findings = vec![finding(
+            "classification_downgraded",
+            Severity::Widening,
+            "/admin/users",
+        )];
+        let mut r = report(&findings, None);
+        r.marker = "0123456789abcdef ceiling=GET|%2Fa".to_owned();
+        let line = format!("{ACK_PHRASE} {}", r.marker);
+        assert!(markdown(&r).contains(&line));
+        assert!(text(&r).contains(&line));
+        assert!(json(&r).contains("ceiling=GET|%2Fa"));
     }
 }

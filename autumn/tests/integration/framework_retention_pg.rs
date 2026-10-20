@@ -245,6 +245,8 @@ fn config_with_windows() -> AutumnConfig {
     // The job-tracking window competes with this knob; keep it wide so the
     // policy window is the bound under test.
     config.jobs.tracking.ttl_secs = 365 * 86_400;
+    // Both jobs datasets are swept only on the Postgres jobs backend.
+    "postgres".clone_into(&mut config.jobs.backend);
     config
 }
 
@@ -943,6 +945,10 @@ async fn a_failing_dataset_is_reported_without_aborting_the_run() {
         .find(|r| r.dataset == "job_history")
         .expect("reported");
     assert!(job_history.error.is_some(), "{job_history:?}");
+    assert_eq!(
+        job_history.eligible_rows, None,
+        "the pass failed before the count: {job_history:?}"
+    );
     assert!(
         job_history.truncated,
         "a failed pass certainly did not drain the table: {job_history:?}"

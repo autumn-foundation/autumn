@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "build": {
     "profile": "release",
     "features": [],
@@ -172,6 +172,28 @@
           "path": "/startup",
           "method": "GET",
           "name": "startup",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/css/autumn-flash.css",
+          "method": "GET",
+          "name": "flash_css",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/css/autumn-widgets.css",
+          "method": "GET",
+          "name": "widgets_css",
           "classification": "framework",
           "roles": [],
           "scopes": [],
@@ -433,6 +455,16 @@
         },
         {
           "path": "/startup",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/css/autumn-flash.css",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/css/autumn-widgets.css",
           "method": "GET",
           "mtls_required": false
         },

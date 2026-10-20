@@ -537,10 +537,15 @@ where
         req.extensions_mut()
             .insert(SubmitFormField(self.settings.field_name.clone()));
 
-        let clean = crate::security::path::clean_path(req.uri().path());
-        let path = clean.as_str();
-        let is_exempt = crate::security::path::is_exempt_path(path, &self.settings.exempt_paths);
-        let is_guarded = !is_exempt && is_mutating_method(req.method());
+        // Only a mutating request is guarded, and only a configured exemption
+        // (matched on the normalized path, so dot-segments cannot reach one)
+        // lifts the guard. A GET, or any request when no exemptions are
+        // configured (the default), skips building the normalized copy.
+        let is_guarded = is_mutating_method(req.method())
+            && (self.settings.exempt_paths.is_empty() || {
+                let clean = crate::security::path::clean_path(req.uri().path());
+                !crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths)
+            });
 
         // Every GET (and every exempt/non-mutating request) takes this branch:
         // nothing below needs `self.inner` cloned into an owned value, so
@@ -1255,6 +1260,55 @@ mod tests {
         count.store(0, Ordering::SeqCst);
         submit("/webhooks/stripe-admin", "tok-adjacent").await;
         submit("/webhooks/stripe-admin", "tok-adjacent").await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// The exemption check only runs when exemptions are configured, but when
+    /// it runs it still matches the normalized path: a percent-encoded
+    /// dot-segment cannot climb out of an exempt prefix to a guarded route.
+    #[tokio::test]
+    async fn dot_segments_cannot_reach_an_exempt_prefix() {
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let layer = SubmitTokenLayer::new(store, &default_config()).with_exempt_path("/api/");
+        let app = Router::new()
+            .fallback(move || {
+                let count = count_inner.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    "ok"
+                }
+            })
+            .layer(layer);
+
+        let submit = |uri: &'static str, token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .body(Body::from(format!("_submit_token={token}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Inside the exempt prefix: not guarded, so both submits run.
+        submit("/api/items", "tok-exempt").await;
+        submit("/api/items", "tok-exempt").await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        // `/api/%2e%2e/submit` normalizes to `/submit`, which is not exempt, so
+        // the replayed token does not re-run the handler.
+        count.store(0, Ordering::SeqCst);
+        submit("/api/%2e%2e/submit", "tok-dot").await;
+        submit("/api/%2e%2e/submit", "tok-dot").await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 

@@ -1275,6 +1275,14 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `idem.recovery_point(&mut db)` on retry. Another body with the same key
   gets `422`.
 - `IdempotencyTx` methods are no-ops without a key or with another backend.
+- Scope: session, resolved tenant, and for token clients the bearer
+  principal. Mount `RequireApiToken` with `AppBuilder::layer` so the key uses
+  the verified principal (a rotated token still replays, and retries replay
+  instead of `409`). Without it and without a session, the key uses a digest
+  of the raw `Authorization` header. Fine for agent / MCP token APIs.
+- `#[post("/x", idempotent = false)]` (`RouteIdempotency::Off`) keeps the
+  layer off a route that dedupes by its own key, e.g. a durable workflow
+  route.
 - Custom store: implement the async `IdempotencyStore` trait (`get`, `set`
   returning whether it stored, `try_lock(key, owner, ttl)`,
   `unlock(key, owner)`, and optionally `renew_lock(key, owner, ttl)`; each
@@ -1339,9 +1347,10 @@ double-submits and replays.
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
 | `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived). Get the document out with `autumn openapi export` — no boot, no database (#802) |
-| `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)`, `mcp_tasks(config)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()/mcp_task()` toggle exposure per route (plugin fluent opt-in); `mcp_tasks` sets task-tool limits |
+| `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)`, `mcp_tasks(config)`, `mcp_instructions(text)`, `mcp_catalog(catalog)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()/mcp_task()/mcp_core()` toggle exposure per route (plugin fluent opt-in); `mcp_tasks` sets task-tool limits; `mcp_instructions` sets the server instructions; `mcp_catalog(McpCatalog::Progressive)` lists core tools plus `search_tools` and `call_tool` |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
+| `scoped_guarded(prefix, layer, routes)` | Scoped group whose `layer` is the auth guard, such as `RequireApiToken` (trunk-dev, #2468). `routes audit` lists its unclassified routes as `gated` with `provenance: "declared"`. The audit cannot check the claim. Do not use it with a layer that does not authenticate. A plugin cannot use it for its own routes |
 | `layer(...)`, `has_layer<T>()`, `get_layer_types()` | Tower middleware |
 | `merge(router)`, `nest(path, router)` | Raw Axum composition |
 | `declare_plugin_routes(...)` | Plugin route declarations |

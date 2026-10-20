@@ -18,6 +18,7 @@ use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
+use autumn_macros_support::cascade::{CASCADE_LEVELS, CascadeLeg, any_const, cascade_level};
 use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
 use autumn_macros_support::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
@@ -2245,6 +2246,7 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
         });
     }
 
+    let dependent_models = emit_dependent_models(model_ident, &deps);
     quote! {
         impl #model_ident {
             /// Runtime dependent-cascade specs consulted by the parent
@@ -2260,7 +2262,49 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
                 ];
                 __AUTUMN_DEPENDENTS
             }
+            #dependent_models
         }
+    }
+}
+
+/// The inherent `DEPENDENT_CASCADE_{k}` consts: the models a delete of
+/// `model_ident` also writes, at each depth. A `restrict` leg writes nothing. A
+/// `destroy` leg also runs the child's own cascade. A model that cascades into
+/// itself adds nothing new. Each level reads only the level below it, so a
+/// cascade that loops cannot make the consts depend on each other.
+fn emit_dependent_models(model_ident: &syn::Ident, deps: &[&Association]) -> TokenStream {
+    let legs: Vec<CascadeLeg> = deps
+        .iter()
+        .filter_map(|assoc| {
+            let action = assoc.dependent.expect("filtered to Some by the caller");
+            if action == DependentAction::Restrict || assoc.target == *model_ident {
+                return None;
+            }
+            let target = assoc.target.to_string();
+            let child_repo = format_ident!("Pg{}Repository", assoc.target);
+            Some(CascadeLeg {
+                model: quote! { #target },
+                child: quote! { #child_repo },
+                destroy: action == DependentAction::Destroy,
+            })
+        })
+        .collect();
+    if legs.is_empty() {
+        return quote! {};
+    }
+    let levels = (0..CASCADE_LEVELS).map(|k| {
+        let name = format_ident!("DEPENDENT_CASCADE_{}", k);
+        let level = cascade_level(&legs, k);
+        quote! {
+            #[doc(hidden)]
+            pub const #name: ::autumn_web::agent_authority::CascadeLevel = #level;
+        }
+    });
+    let any = any_const(&legs);
+    quote! {
+        #[doc(hidden)]
+        pub const DEPENDENT_CASCADE_ANY: bool = #any;
+        #(#levels)*
     }
 }
 
@@ -7694,13 +7738,19 @@ fn emit_state_machine_on_conn(
                         "{}:{}:{}:{}:{}",
                         #model_str, #field_str, __record_id, #from, #to,
                     );
-                    let __effect = ::autumn_web::TransitionEffect {
-                        model: ::std::string::String::from(#model_str),
-                        field: ::std::string::String::from(#field_str),
-                        record_id: __record_id,
-                        from_state: ::std::string::String::from(#from),
-                        to_state: ::std::string::String::from(#to),
-                        idempotency_key: __idempotency_key,
+                    // The borrowed twin of `TransitionEffect`: `enqueue_on_conn`
+                    // only serializes its args, and the twin serializes to the
+                    // identical JSON, so the job still receives a
+                    // `TransitionEffect` — without first copying the literal
+                    // model/field/state names into owned `String`s for
+                    // `serde_json::to_value` to copy again.
+                    let __effect = ::autumn_web::__private::TransitionEffectRef {
+                        model: #model_str,
+                        field: #field_str,
+                        record_id: &__record_id,
+                        from_state: #from,
+                        to_state: #to,
+                        idempotency_key: &__idempotency_key,
                     };
                     ::autumn_web::job::enqueue_on_conn(
                         <#job>::NAME,
@@ -13925,6 +13975,94 @@ mod tests {
     }
 
     #[test]
+    fn a_model_publishes_every_model_its_delete_writes() {
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            #[has_many(Like, dependent = nullify)]
+            #[has_many(Audit, dependent = restrict)]
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        for level in 0..4 {
+            assert!(
+                generated.contains(&format!("const DEPENDENT_CASCADE_{level}")),
+                "expected level {level}: {generated}"
+            );
+        }
+        assert!(generated.contains("\"Comment\""), "{generated}");
+        assert!(
+            generated.contains("\"Like\""),
+            "nullify writes the child: {generated}"
+        );
+        assert!(
+            !generated.contains("\"Audit\""),
+            "restrict only probes and writes nothing: {generated}"
+        );
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "a destroy child cascades into its own dependents: {generated}"
+        );
+        assert!(
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE"),
+            "nullify runs no cascade of its own: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_self_referencing_dependent_adds_no_cycle() {
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            struct Comment {
+                #[id]
+                id: i64,
+                body: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        assert!(
+            !generated.contains("DEPENDENT_CASCADE"),
+            "a model that cascades only into itself publishes nothing: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_level_never_reads_its_own_level_of_another_type() {
+        // Level k reads level k - 1 only, so a cascade that loops through two
+        // models is no const cycle.
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            struct Post {
+                #[id]
+                id: i64,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        let level_three = generated
+            .split("const DEPENDENT_CASCADE_3")
+            .nth(1)
+            .expect("level 3");
+        assert!(level_three.contains("__AUTUMN_CASCADE_2"), "{level_three}");
+        assert!(!level_three.contains("__AUTUMN_CASCADE_3"), "{level_three}");
+    }
+
+    #[test]
+    fn a_model_without_dependents_emits_no_cascade_levels() {
+        let item: TokenStream = quote! {
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        assert!(!generated.contains("DEPENDENT_CASCADE"), "{generated}");
+    }
+
+    #[test]
     fn model_emits_dependents_impl_for_declared_cascade() {
         // The `#[model]` expansion must generate the runtime `AutumnDependents`
         // dispatch (an inherent `dependents()` returning `RuntimeDependentSpec`s
@@ -19139,6 +19277,54 @@ mod tests {
             generated.contains("enqueue_on_conn")
                 && generated.contains("< SendShippedEmailJob > :: NAME"),
             "the effect must enqueue the named job on the connection: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_commit_enqueues_the_borrowed_effect_payload() {
+        // The enqueued args are only serialized, so the effect is built as the
+        // borrowed `TransitionEffectRef` twin (same JSON as `TransitionEffect`):
+        // the macro-time names go in as literals and the per-call record id and
+        // idempotency key are borrowed, instead of four `String::from` copies.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains(":: autumn_web :: __private :: TransitionEffectRef {"),
+            "the effect payload must be the borrowed twin: {generated}"
+        );
+        for field in [
+            "model : \"Order\" ,",
+            "field : \"status\" ,",
+            "record_id : & __record_id ,",
+            "from_state : \"processing\" ,",
+            "to_state : \"shipped\" ,",
+            "idempotency_key : & __idempotency_key ,",
+        ] {
+            assert!(
+                generated.contains(field),
+                "the effect payload must carry `{field}`: {generated}"
+            );
+        }
+        assert!(
+            !generated.contains("from_state : :: std :: string :: String :: from"),
+            "the literal state names must not be copied into owned Strings: {generated}"
+        );
+        assert!(
+            !generated.contains(":: autumn_web :: TransitionEffect {"),
+            "the owned payload must no longer be built: {generated}"
         );
     }
 

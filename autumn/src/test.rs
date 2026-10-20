@@ -1043,6 +1043,32 @@ impl TestApp {
         self
     }
 
+    /// Set the MCP server instructions, mirroring
+    /// [`AppBuilder::mcp_instructions`](crate::app::AppBuilder::mcp_instructions).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_instructions(mut self, text: impl Into<String>) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .instructions = Some(text.into());
+        self
+    }
+
+    /// Select the MCP tool catalog, mirroring
+    /// [`AppBuilder::mcp_catalog`](crate::app::AppBuilder::mcp_catalog).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_catalog(mut self, catalog: crate::mcp::McpCatalog) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .catalog = catalog;
+        self
+    }
+
     /// Merge a router into the internal application state.
     ///
     /// This is useful when testing modular route definitions without building
@@ -1073,6 +1099,7 @@ impl TestApp {
             prefix: prefix.to_owned(),
             routes,
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
