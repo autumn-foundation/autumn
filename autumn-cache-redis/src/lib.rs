@@ -41,8 +41,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_web::cache::{
-    Cache, CacheFuture, FillEpoch, FillLockStatus, InvalidationError, RawCacheBytes, jittered_ttl,
-    record_invalidation_failure,
+    Cache, CacheBackendError, CacheFuture, FillEpoch, FillLockStatus, InvalidationError,
+    RawCacheBytes, jittered_ttl, record_invalidation_failure,
 };
 use redis::AsyncCommands as _;
 use redis::aio::ConnectionManager;
@@ -330,18 +330,35 @@ impl RedisCache {
     }
 
     fn redis_get(&self, key: &str) -> Option<Vec<u8>> {
+        self.try_redis_get(key).ok().flatten()
+    }
+
+    /// `GET`, with the Redis error kept.
+    fn try_redis_get(&self, key: &str) -> Result<Option<Vec<u8>>, redis::RedisError> {
         let prefixed = self.prefixed(key);
         let mut conn = self.manager.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(async move { conn.get(&prefixed).await.ok().flatten() })
+                .block_on(async move { conn.get::<_, Option<Vec<u8>>>(&prefixed).await })
         })
     }
 
     fn redis_set(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
+        // The error is dropped: `Cache::insert_raw_bytes` cannot return it.
+        // `Cache::try_insert_raw_bytes` can.
+        let _ = self.try_redis_set(key, bytes, ttl);
+    }
+
+    /// `SET` or `PSETEX`, with the failure kept.
+    fn try_redis_set(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), CacheBackendError> {
         if is_reserved_key(key) {
             warn!(key, "RedisCache: refused a write to a reserved epoch key");
-            return;
+            return Err(CacheBackendError::new("the key is reserved"));
         }
         let prefixed = self.prefixed(key);
         let mut conn = self.manager.clone();
@@ -349,17 +366,18 @@ impl RedisCache {
             tokio::runtime::Handle::current().block_on(async move {
                 if let Some(ttl) = ttl {
                     let millis = ttl_millis_for_redis(ttl);
-                    let _: Result<(), _> = redis::cmd("PSETEX")
+                    redis::cmd("PSETEX")
                         .arg(&prefixed)
                         .arg(millis)
                         .arg(bytes)
-                        .query_async(&mut conn)
-                        .await;
+                        .query_async::<()>(&mut conn)
+                        .await
                 } else {
-                    let _: Result<(), _> = conn.set(&prefixed, bytes).await;
+                    conn.set::<_, _, ()>(&prefixed, bytes).await
                 }
-            });
-        });
+            })
+        })
+        .map_err(|error| CacheBackendError::new(error.to_string()))
     }
 
     /// Delete every key matching `pattern`, walking the keyspace with `SCAN`
@@ -547,6 +565,33 @@ impl Cache for RedisCache {
     fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
         self.redis_set(key, bytes, ttl);
         debug!(key, "RedisCache: inserted via insert_raw_bytes");
+    }
+
+    /// As [`Cache::get_value`], but a Redis error is an error, not a miss.
+    fn try_get_value(
+        &self,
+        key: &str,
+    ) -> Result<Option<Arc<dyn Any + Send + Sync>>, CacheBackendError> {
+        self.try_redis_get(key)
+            .map(|found| {
+                found.map(|bytes| Arc::new(RawCacheBytes(bytes)) as Arc<dyn Any + Send + Sync>)
+            })
+            .map_err(|error| CacheBackendError::new(error.to_string()))
+    }
+
+    /// As [`Cache::insert_raw_bytes`], but a failed write is an error.
+    fn try_insert_raw_bytes(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), CacheBackendError> {
+        self.try_redis_set(key, bytes, ttl)
+    }
+
+    /// As [`Cache::invalidate`], but the final error is returned, not counted.
+    fn try_invalidate(&self, key: &str) -> Result<(), InvalidationError> {
+        block_on(self.delete_key(key))
     }
 
     /// `RedisCache` keeps a shared fill epoch per namespace.
@@ -1408,6 +1453,32 @@ mod tests {
         // Invalidate
         autumn_web::cache::Cache::invalidate(&cache, "hello");
         assert!(cache.get_value("hello").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_try_methods_round_trip_and_report_outage() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let cache = RedisCache::connect(&url, "test").await.unwrap();
+
+        cache
+            .try_insert_raw_bytes("k", b"1".to_vec(), None)
+            .unwrap();
+        assert!(cache.try_get_value("k").unwrap().is_some());
+        assert!(cache.try_get_value("absent").unwrap().is_none());
+        cache.try_invalidate("k").unwrap();
+        assert!(cache.try_get_value("k").unwrap().is_none());
+
+        // An outage is an error, not a miss.
+        container.stop().await.unwrap();
+        assert!(cache.try_get_value("k").is_err());
+        assert!(
+            cache
+                .try_insert_raw_bytes("k", b"1".to_vec(), None)
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

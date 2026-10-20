@@ -304,6 +304,30 @@ impl InvalidationError {
     }
 }
 
+/// A backend read or write that did not complete.
+///
+/// Returned by [`Cache::try_get_value`] and [`Cache::try_insert_raw_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("cache backend failed: {reason}")]
+pub struct CacheBackendError {
+    reason: String,
+}
+
+impl CacheBackendError {
+    /// Make an error with the backend's `reason`.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// The backend error, as text.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 /// Invalidations that failed after all retries, in this process.
 static INVALIDATION_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -497,6 +521,54 @@ pub trait Cache: Send + Sync + 'static {
             self.invalidate(key);
             Ok(())
         })
+    }
+
+    /// Read a value, and report a backend failure.
+    ///
+    /// [`get_value`](Cache::get_value) answers `None` for both a miss and an
+    /// outage. This method keeps them apart. The default calls `get_value` and
+    /// cannot fail. A backend that does I/O overrides it.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheBackendError`] when the backend could not answer.
+    fn try_get_value(
+        &self,
+        key: &str,
+    ) -> Result<Option<Arc<dyn Any + Send + Sync>>, CacheBackendError> {
+        Ok(self.get_value(key))
+    }
+
+    /// Store pre-serialized bytes, and report a backend failure.
+    ///
+    /// The default calls [`insert_raw_bytes`](Cache::insert_raw_bytes) and
+    /// returns `Ok`. A backend that does I/O overrides it.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheBackendError`] when the write did not land.
+    fn try_insert_raw_bytes(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), CacheBackendError> {
+        self.insert_raw_bytes(key, bytes, ttl);
+        Ok(())
+    }
+
+    /// Remove a key, and report a failure. Blocks like
+    /// [`invalidate`](Cache::invalidate). Prefer
+    /// [`invalidate_async`](Cache::invalidate_async) in async code.
+    ///
+    /// The default calls `invalidate` and returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidationError`] when the key could not be removed.
+    fn try_invalidate(&self, key: &str) -> Result<(), InvalidationError> {
+        self.invalidate(key);
+        Ok(())
     }
 
     /// Whether this backend is the framework's failure-capsule wrapper.
@@ -710,6 +782,72 @@ where
     if let Some(bytes) = bytes {
         cache.insert_raw_bytes(key, bytes, ttl);
     }
+}
+
+/// [`get_cached`], with a backend failure kept apart from a miss.
+///
+/// A value that cannot be decoded is a miss, as in [`get_cached`]. A failed
+/// read is recorded as a miss in a failure capsule.
+///
+/// # Errors
+///
+/// [`CacheBackendError`] when the backend could not answer.
+pub fn try_get_cached<V>(cache: &dyn Cache, key: &str) -> Result<Option<V>, CacheBackendError>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    match replayed_cache_get::<V>(key) {
+        ReplayedRead::NoTape => {}
+        ReplayedRead::Miss => return Ok(None),
+        ReplayedRead::Hit(value) => return Ok(Some(value)),
+    }
+    let read = {
+        #[cfg(feature = "reporting")]
+        let _helper = HelperCall::enter();
+        cache.try_get_value(key)
+    };
+    let value = match read {
+        Ok(found) => found.and_then(|arc| {
+            if let Some(value) = arc.downcast_ref::<V>() {
+                return Some(value.clone());
+            }
+            arc.downcast_ref::<RawCacheBytes>()
+                .and_then(|raw| serde_json::from_slice::<V>(&raw.0).ok())
+        }),
+        Err(error) => {
+            record_cache_get::<V>(key, None);
+            return Err(error);
+        }
+    };
+    record_cache_get(key, value.as_ref());
+    Ok(value)
+}
+
+/// [`insert_cached`], with a backend failure reported.
+///
+/// # Errors
+///
+/// [`CacheBackendError`] when the value cannot be serialized, or the backend
+/// did not store it.
+pub fn try_insert_cached<V>(
+    cache: &dyn Cache,
+    key: &str,
+    value: V,
+    ttl: Option<std::time::Duration>,
+) -> Result<(), CacheBackendError>
+where
+    V: Clone + serde::Serialize + Send + Sync + 'static,
+{
+    let bytes = serde_json::to_vec(&value).map_err(|error| {
+        CacheBackendError::new(format!("the value cannot be serialized: {error}"))
+    })?;
+    if record_or_replay_cache_insert(key, Some(&bytes), ttl) {
+        return Ok(());
+    }
+    #[cfg(feature = "reporting")]
+    let _helper = HelperCall::enter();
+    cache.insert_value(key, Arc::new(value));
+    cache.try_insert_raw_bytes(key, bytes, ttl)
 }
 
 /// Like [`insert_cached`], but store only if the shared epoch did not change.
@@ -1210,6 +1348,58 @@ impl Cache for CapsuleSeamCache {
             return;
         }
         self.0.insert_value(key, value);
+    }
+
+    fn try_get_value(
+        &self,
+        key: &str,
+    ) -> Result<Option<Arc<dyn Any + Send + Sync>>, CacheBackendError> {
+        let direct = !HELPER_CALL.with(std::cell::Cell::get);
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            if direct {
+                tape.cache_direct_get(key);
+            }
+            return Ok(None);
+        }
+        if replay_blocked() {
+            return Ok(None);
+        }
+        if direct && let Some(scope) = crate::capsule::current_scope() {
+            scope.note(DIRECT_READ_NOTE);
+            scope.mark_truncated();
+        }
+        self.0.try_get_value(key)
+    }
+
+    fn try_insert_raw_bytes(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), CacheBackendError> {
+        if Self::direct_write_blocked(key) {
+            return Ok(());
+        }
+        self.0.try_insert_raw_bytes(key, bytes, ttl)
+    }
+
+    fn try_invalidate(&self, key: &str) -> Result<(), InvalidationError> {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            return tape.cache_invalidate(key);
+        }
+        if replay_blocked() {
+            return Ok(());
+        }
+        let slot = Self::reserve();
+        let result = self.0.try_invalidate(key);
+        Self::fill(
+            slot,
+            crate::capsule::CacheEffect::Invalidate {
+                key: key.to_owned(),
+                error: recorded_error(&result),
+            },
+        );
+        result
     }
 
     fn invalidate(&self, key: &str) {
@@ -1930,6 +2120,90 @@ mod tests {
                 .push(key.to_owned());
         }
         fn clear(&self) {}
+    }
+
+    #[test]
+    fn default_try_methods_delegate_and_succeed() {
+        let backend = MinimalBackend {
+            invalidated: std::sync::Mutex::new(Vec::new()),
+        };
+        assert!(matches!(backend.try_get_value("k"), Ok(None)));
+        assert!(backend.try_insert_raw_bytes("k", vec![1], None).is_ok());
+        backend
+            .try_invalidate("k")
+            .expect("the default cannot fail");
+        assert_eq!(
+            *backend
+                .invalidated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ["k"],
+            "the default try_invalidate must reach invalidate"
+        );
+    }
+
+    /// Fails every acknowledged operation.
+    struct DownBackend;
+
+    impl Cache for DownBackend {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+        fn invalidate(&self, _key: &str) {}
+        fn clear(&self) {}
+        fn try_get_value(
+            &self,
+            _key: &str,
+        ) -> Result<Option<Arc<dyn Any + Send + Sync>>, CacheBackendError> {
+            Err(CacheBackendError::new("down"))
+        }
+        fn try_insert_raw_bytes(
+            &self,
+            _key: &str,
+            _bytes: Vec<u8>,
+            _ttl: Option<Duration>,
+        ) -> Result<(), CacheBackendError> {
+            Err(CacheBackendError::new("down"))
+        }
+        fn try_invalidate(&self, _key: &str) -> Result<(), InvalidationError> {
+            Err(InvalidationError::new(1, "down"))
+        }
+    }
+
+    /// The capsule seam must pass a backend failure through, and must not mark
+    /// a helper call as a direct one.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_capsule_seam_passes_try_failures_through() {
+        let cache = with_capsule_seam(Arc::new(DownBackend));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                assert!(try_insert_cached(cache.as_ref(), "k", 1_i64, None).is_err());
+                assert!(try_get_cached::<i64>(cache.as_ref(), "k").is_err());
+                assert!(cache.try_invalidate("k").is_err());
+            },
+        ));
+        let _ = scope.effects_snapshot();
+        assert!(!scope.is_truncated(), "helper calls are recorded");
+    }
+
+    #[test]
+    fn try_cached_helpers_report_backend_failure() {
+        let err = try_insert_cached(&DownBackend, "k", 1_i64, None).expect_err("write failed");
+        assert_eq!(err.reason(), "down");
+        let err = try_get_cached::<i64>(&DownBackend, "k").expect_err("read failed");
+        assert_eq!(err.reason(), "down");
+    }
+
+    #[test]
+    fn try_cached_helpers_round_trip_in_process() {
+        let cache = MokaCache::new(8, None);
+        try_insert_cached(&cache, "k", 7_i64, None).expect("stored");
+        assert_eq!(try_get_cached::<i64>(&cache, "k").expect("read"), Some(7));
+        assert_eq!(try_get_cached::<i64>(&cache, "gone").expect("read"), None);
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
