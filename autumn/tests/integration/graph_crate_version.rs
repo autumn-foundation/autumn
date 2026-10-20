@@ -1,7 +1,7 @@
 //! The graph macros record the declaring crate's version (#2520 item 14).
 //!
 //! The manifest adds the version to a node id when two versions of one crate
-//! give the same id. Every element in this binary comes from one package.
+//! give the same id. All crates in this workspace have the same version.
 use autumn_web::graph::{
     JobGraphDescriptor, ModelGraphDescriptor, RepositoryGraphDescriptor, RouteGraphDescriptor,
 };

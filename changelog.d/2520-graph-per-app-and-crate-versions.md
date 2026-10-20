@@ -2,7 +2,8 @@
 
 - **Breaking:** `autumn_web::graph::served()` takes the app's `&AppState` and
   returns an `Arc` ([migration guide](docs/migrations/next.md)). Each
-  application now serves its own graph at `/actuator/graph`.
+  application now serves its own graph at `/actuator/graph`. The graph
+  descriptor types have a new `crate_version` field.
 
 ### Fixed
 

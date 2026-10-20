@@ -6,8 +6,9 @@ use quote::quote;
 /// The declaring crate's version, as a `&'static str` expression.
 ///
 /// Expands at the macro call site, so Cargo gives the version of the crate
-/// that holds the element. Outside Cargo it is `""`. The graph adds it to a
-/// node id when two versions of one crate give the same id (#2520 item 14).
+/// that holds the element. Outside Cargo it is `""`. A node id ends in
+/// `@<version>` when two versions of one crate give the same id (#2520 item
+/// 14).
 #[must_use]
 pub fn crate_version() -> TokenStream {
     quote! {

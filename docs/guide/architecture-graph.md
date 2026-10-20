@@ -104,14 +104,14 @@ its auth requirement, and the table each one touches — a map of exactly where 
 attacker would look first. It is available when `actuator.sensitive = true`
 (the default in dev), and absent in production unless you opt in.
 
-Each application serves its own graph. The framework keeps the graph in the
-app's `AppState` when it builds the router. Two applications in one process (an
-embedded host, a test) each serve their own paths and auth. Read it in code
-with `autumn_web::graph::served(&state)`.
+Each application serves its own graph. When `AppBuilder` builds the router, it
+keeps the graph in the app's `AppState`. Two such applications in one process
+(an embedded host, say) each serve their own paths and auth. Read the graph in
+code with `autumn_web::graph::served(&state)`.
 
-An application that never built its router answers `503` with an
-explanation rather than `404`, so "this app published no graph" reads
-differently from "this build has no such endpoint".
+A state with no installed graph gets `503` from `/actuator/graph`, with an
+explanation, not `404`. Then "this app published no graph" reads differently
+from "this build has no such endpoint". A `TestApp` installs no graph.
 
 A **worker** (`AUTUMN_ROLE=worker`) serves the probe-only router and mounts no
 application route, so its graph reports every declared route as
@@ -220,10 +220,11 @@ read as more than it is:
 * **Duplicate crate versions.** Node ids come from `module_path!()`. If a binary
   links two versions of one crate, each id they share ends in `@<version>`, for
   example `model:plugin::models::Post@1.2.0`. Other ids do not change. A query
-  by model path (`plugin::models::Post`) finds every version. A mounted route
-  names only its module and handler, so the route node of each version takes
-  the mounts of both. Two copies of one version (from two sources) still share
-  one node.
+  by model path (`plugin::models::Post`) or by the id with no version finds
+  every version. A mounted route records only its module and handler, so the
+  route node of each version shows the mounts of both versions. An auto-API
+  route links to the repository of each version. Two copies of one version
+  (from two sources) still share one node.
 * **Name-only matching.** It applies only where no qualified identity exists. A
   repository edge uses the model name and table. An auto-API route is matched to
   its repository by prefix and model name. If two repositories share both, the

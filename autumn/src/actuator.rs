@@ -4813,12 +4813,12 @@ fn derivation_report(
 /// route, its auth requirement, and which table each one touches -- a map of
 /// exactly where an attacker would look first, so it is not a public surface.
 ///
-/// The graph is read from the state, so each application serves its own
-/// (#2520 item 17).
+/// The handler reads the graph from the state. Each application serves its
+/// own graph (#2520 item 17).
 ///
-/// A state with no installed graph answers `503` with an explanation, not
-/// `404`. Then an operator can tell "this process has not published one"
-/// from "this build has no such endpoint".
+/// The endpoint answers `503`, not `404`, when the state has no graph. An
+/// operator can then tell "this app published no graph" from "this build has
+/// no such endpoint".
 pub(crate) async fn graph_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> axum::response::Response {
@@ -4827,7 +4827,8 @@ pub(crate) async fn graph_endpoint<S: ProvideActuatorState + Send + Sync + 'stat
 
 /// Render the `/actuator/graph` response for a given installed graph.
 ///
-/// Split from the handler so the two branches are testable without a state.
+/// This function is separate from the handler. Tests use it to examine the
+/// two branches.
 fn graph_response(graph: Option<bytes::Bytes>) -> axum::response::Response {
     graph.map_or_else(
         || {
@@ -7976,7 +7977,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a process with no graph must say so rather than 404, which would read as \
+            "an app with no graph must say so rather than 404, which would read as \
              'this build has no such endpoint'"
         );
     }

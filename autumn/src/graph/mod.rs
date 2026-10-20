@@ -62,10 +62,10 @@ use manifest::ArchitectureGraph;
 
 /// The graph one application serves, and the bytes `/actuator/graph` sends.
 ///
-/// Kept in the application's `AppState` extensions, not in a process global.
-/// The graph holds per-application data (mounted paths, auth, completeness),
-/// so two applications in one process must not share it (#2520 item 17).
-/// The JSON is serialized once, at install.
+/// The application's `AppState` extensions keep this value. A process global
+/// does not. The graph holds data of one application (mounted paths, auth,
+/// completeness), so two applications in one process must not share it
+/// (#2520 item 17). `install` serializes the JSON one time.
 struct ServedGraph {
     graph: Arc<ArchitectureGraph>,
     json: Bytes,
@@ -122,8 +122,8 @@ pub struct RouteGraphDescriptor {
     /// Whether the handler was declared with `#[static_get]`.
     pub static_route: bool,
     /// Version of the crate that declared this element (`CARGO_PKG_VERSION`),
-    /// or `""` outside Cargo. A node id carries it only when two versions of
-    /// one crate give the same id (#2520 item 14).
+    /// or `""` outside Cargo. A node id ends in `@<version>` only when two
+    /// versions of one crate give the same id (#2520 item 14).
     pub crate_version: &'static str,
     /// `file!()` of the handler.
     pub file: &'static str,
@@ -165,8 +165,8 @@ pub struct ModelGraphDescriptor {
     /// Module path the model was declared in.
     pub module_path: &'static str,
     /// Version of the crate that declared this element (`CARGO_PKG_VERSION`),
-    /// or `""` outside Cargo. A node id carries it only when two versions of
-    /// one crate give the same id (#2520 item 14).
+    /// or `""` outside Cargo. A node id ends in `@<version>` only when two
+    /// versions of one crate give the same id (#2520 item 14).
     pub crate_version: &'static str,
     /// `file!()` of the declaration.
     pub file: &'static str,
@@ -195,8 +195,8 @@ pub struct RepositoryGraphDescriptor {
     /// Module path the repository was declared in.
     pub module_path: &'static str,
     /// Version of the crate that declared this element (`CARGO_PKG_VERSION`),
-    /// or `""` outside Cargo. A node id carries it only when two versions of
-    /// one crate give the same id (#2520 item 14).
+    /// or `""` outside Cargo. A node id ends in `@<version>` only when two
+    /// versions of one crate give the same id (#2520 item 14).
     pub crate_version: &'static str,
     /// `file!()` of the declaration.
     pub file: &'static str,
@@ -249,8 +249,8 @@ pub struct JobGraphDescriptor {
     /// [`Self::mutating`] is true.
     pub mutating_symbols: &'static [&'static str],
     /// Version of the crate that declared this element (`CARGO_PKG_VERSION`),
-    /// or `""` outside Cargo. A node id carries it only when two versions of
-    /// one crate give the same id (#2520 item 14).
+    /// or `""` outside Cargo. A node id ends in `@<version>` only when two
+    /// versions of one crate give the same id (#2520 item 14).
     pub crate_version: &'static str,
     /// `file!()` of the handler.
     pub file: &'static str,

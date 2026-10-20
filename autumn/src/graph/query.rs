@@ -62,14 +62,10 @@ pub fn resolve_all<'g>(graph: &'g ArchitectureGraph, name: &str) -> Vec<&'g Grap
         graph.nodes.iter().filter(|n| f(n)).collect()
     };
     let tiers: [Vec<&'g GraphNode>; 6] = [
-        all(&|n: &GraphNode| n.id == name),
-        // A model path names every version of the model: an id can end in
-        // `@<version>` (#2520 item 14).
-        all(&|n: &GraphNode| {
-            n.id.strip_prefix("model:")
-                .map(|path| path.split_once('@').map_or(path, |(path, _)| path))
-                == Some(name)
-        }),
+        // An id with no version names every version of the node: an id can
+        // end in `@<version>` (#2520 item 14).
+        all(&|n: &GraphNode| n.id == name || n.base_id() == name),
+        all(&|n: &GraphNode| n.base_id().strip_prefix("model:") == Some(name)),
         all(&|n: &GraphNode| n.kind == NodeKind::Model && n.name == name),
         all(&|n: &GraphNode| {
             n.model
@@ -443,6 +439,11 @@ mod tests {
             ]
         );
         assert_eq!(resolve_all(&g, "model:app::models::Post@2.0.0").len(), 1);
+        assert_eq!(
+            resolve_all(&g, "model:app::models::Post").len(),
+            2,
+            "an id written before the versions appeared names both"
+        );
     }
 
     #[test]
