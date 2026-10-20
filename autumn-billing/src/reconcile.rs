@@ -251,21 +251,24 @@ impl Ctx<'_> {
     ///
     /// A provider that cannot look the subscription up leaves the event to the
     /// ranking. A failed lookup is returned, so the webhook is retried.
+    ///
+    /// Also returns the row that the tie found. It is the true previous state
+    /// for the hooks, because the caller read before the other webhook wrote.
     async fn write_subscription(
         &self,
         customer: &Customer,
         snapshot: &SubscriptionSnapshot,
         status: SubscriptionStatus,
         occurred_at: DateTime<Utc>,
-    ) -> Result<StoreWrite<Subscription>, BillingError> {
+    ) -> Result<(StoreWrite<Subscription>, Option<Subscription>), BillingError> {
         let store = self.service.store();
         let upsert = self.subscription_upsert(customer, snapshot, status, occurred_at);
         let written = store
             .upsert_subscription(upsert.clone().with_tie_check())
             .await?;
-        if !written.is_tie() {
-            return Ok(written);
-        }
+        let StoreWrite::Tie(tied) = written else {
+            return Ok((written, None));
+        };
         let live = self
             .service
             .provider()
@@ -277,7 +280,7 @@ impl Ctx<'_> {
                 .with_authoritative(),
             None => upsert,
         };
-        store.upsert_subscription(retry).await
+        Ok((store.upsert_subscription(retry).await?, Some(tied)))
     }
 
     async fn subscription(
@@ -291,9 +294,10 @@ impl Ctx<'_> {
         let previous = store
             .subscription_by_provider_id(&snapshot.provider_subscription_id)
             .await?;
-        let written = self
+        let (written, tied) = self
             .write_subscription(&customer, snapshot, status, occurred_at)
             .await?;
+        let previous = tied.or(previous);
         // Every outcome has a stored row. This call is idempotent. A
         // redelivery therefore links what the first delivery missed.
         let stored = written.as_inner();

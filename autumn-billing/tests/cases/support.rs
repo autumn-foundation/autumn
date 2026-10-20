@@ -835,6 +835,30 @@ pub fn harness_dyn(
     }
 }
 
+/// Like [`harness_dyn`] with recording `hooks`.
+pub fn harness_dyn_hooks(
+    billing: BillingConfig,
+    hooks: Arc<dyn BillingHooks>,
+    store: Arc<dyn BillingStore>,
+    provider: Arc<FakeProvider>,
+    customize: impl FnOnce(TestApp) -> TestApp,
+) -> DynHarness {
+    let app = TestApp::new().config(autumn_config(&billing)).plugin(
+        BillingPlugin::new()
+            .config(billing)
+            .plans(&catalog())
+            .provider(provider.clone())
+            .store(store.clone())
+            .hooks(hooks),
+    );
+    let client = customize(app).build();
+    DynHarness {
+        client,
+        store,
+        provider,
+    }
+}
+
 // ── Test-gap round helpers ────────────────────────────────────────────────
 
 /// Poll `check` every 25 ms until it is `true`, for at most `timeout` of

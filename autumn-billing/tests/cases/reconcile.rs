@@ -17,8 +17,8 @@ use serde_json::json;
 
 use super::support::{
     self, FailingStore, FakeParser, FakeProvider, Harness, PRO_PRICE, RecordingHooks, apply_event,
-    at, checkout_kind, event, harness, harness_dyn, harness_with_hooks, notification_kinds,
-    notification_routes, notifications_for, post_webhook,
+    at, checkout_kind, event, harness, harness_dyn, harness_dyn_hooks, harness_with_hooks,
+    notification_kinds, notification_routes, notifications_for, post_webhook,
 };
 
 const USER: &str = "42";
@@ -259,13 +259,21 @@ async fn same_second_pause_ends_paused_in_either_delivery_order() {
 /// Models the other webhook's write landing between this event's read of the
 /// row and its write: `racer` runs before the first `upsert_subscription`.
 async fn race_harness(live: SubscriptionStatus, racer: SubscriptionStatus) -> Harness {
+    race_harness_with_hooks(live, racer, RecordingHooks::new()).await
+}
+
+async fn race_harness_with_hooks(
+    live: SubscriptionStatus,
+    racer: SubscriptionStatus,
+    hooks: Arc<RecordingHooks>,
+) -> Harness {
     let inner = MemoryBillingStore::shared();
     let store = FailingStore::wrap(inner.clone());
     let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
     provider.script_live_subscription(
         SubscriptionSnapshot::new("sub_1", "cus_1", live).with_price(PRO_PRICE),
     );
-    let h = harness_dyn(support::config(), store.clone(), provider, |app| {
+    let h = harness_dyn_hooks(support::config(), hooks, store.clone(), provider, |app| {
         app.with_clock(TickingClock::starting_at(support::base_time()))
     });
     inner
@@ -309,6 +317,17 @@ async fn a_racing_same_second_event_for_a_new_subscription_ends_at_the_providers
         .unwrap();
     assert_eq!(subscription(&h).await.status, Active);
     assert_eq!(h.provider.fetch_calls(), 1);
+}
+
+#[tokio::test]
+async fn the_hook_gets_the_row_the_tie_replaced_as_its_previous_state() {
+    use SubscriptionStatus::{Active, PastDue};
+    let hooks = RecordingHooks::new();
+    let h = race_harness_with_hooks(Active, PastDue, hooks.clone()).await;
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(hooks.calls(), vec!["subscription_changed:active:past_due"]);
 }
 
 #[tokio::test]
