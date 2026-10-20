@@ -824,9 +824,9 @@ fn ci_job<'a>(ci: &'a str, name: &str) -> &'a str {
     &body[..end]
 }
 
-/// `deploy_e2e` builds its own image on top of everything the Docker sweep
-/// already pulled and built, and ran the runner out of disk (#2547). It must
-/// run in its own job, on a fresh disk, and the aggregate gate must wait for it.
+/// `deploy_e2e` builds its own image on top of the sweep's images. This filled
+/// the runner disk (#2547). It must run in its own job on a fresh disk. The
+/// aggregate gate must wait for that job.
 #[test]
 fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
     let root = workspace_root();
@@ -834,7 +834,7 @@ fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
     let sweep = ci_job(&ci, "test-docker");
     assert!(
         !sweep.contains("--test deploy_e2e"),
-        "`test-docker` must not run deploy_e2e: its disk is already spent (#2547)"
+        "`test-docker` must not run deploy_e2e: its disk is already full (#2547)"
     );
     let job = ci_job(&ci, "test-docker-deploy");
     assert!(
@@ -846,8 +846,8 @@ fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
         "`test-docker-deploy` must reclaim disk and report it"
     );
     assert!(
-        job.contains("openssh-client"),
-        "`test-docker-deploy` must install the ssh client"
+        job.contains("openssh-client") && job.contains("ci-docker-hub-mirror.sh"),
+        "`test-docker-deploy` must install the ssh client and use the Docker Hub mirror"
     );
     let gate = ci_job(&ci, "test-gate");
     assert!(

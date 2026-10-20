@@ -64,7 +64,7 @@ release time.
 
 ## CI test sharding
 
-`.github/workflows/ci.yml` runs the suite as four sibling job families rather
+`.github/workflows/ci.yml` runs the suite as five sibling job families rather
 than one job per OS. Which one a test lands in follows from how it is written,
 so it is usually automatic:
 
@@ -74,6 +74,7 @@ so it is usually automatic:
 | `trybuild` | Linux | `compile_fail::*` only, split into four shards |
 | `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
+| `test-docker-deploy` | Linux | `deploy_e2e` alone, on a fresh disk (#2547) |
 
 Only `test` runs on all three OSes. `trybuild` and `test-features` are Linux
 only: a trybuild golden is pinned to the rustc *version*, not the OS (the same
