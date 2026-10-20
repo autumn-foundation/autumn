@@ -12,8 +12,8 @@
 //!
 //! Per `CLAUDE.md`, a test gets its own binary when it (a) has process-wide side
 //! effects or (b) is targeted independently in CI. This one spawns privileged
-//! containers and is run as its own `--test deploy_e2e` slice in the Docker CI
-//! step, so it lives in `tests/deploy_e2e.rs` with a `[[test]]` entry and is NOT
+//! containers and runs as its own `--test deploy_e2e` slice in the `Test (Docker deploy)`
+//! CI job, so it lives in `tests/deploy_e2e.rs` with a `[[test]]` entry and is NOT
 //! declared in `tests/integration/mod.rs`.
 //!
 //! ## What is real vs simulated/deferred (honest annotations)
@@ -815,8 +815,8 @@ fn deploy_e2e_full_lifecycle() {
 /// invocation in `KamalProxyController`) holds without the fixture papering over
 /// the mismatch.
 ///
-/// Runs as part of the default Docker CI `--ignored` sweep (same as the sibling
-/// `deploy_e2e_full_lifecycle`): the "Run Docker-dependent tests" job executes
+/// Runs in the `Test (Docker deploy)` CI job, with the sibling
+/// `deploy_e2e_full_lifecycle`. The job runs
 /// `cargo test -p autumn-cli --test deploy_e2e -- --ignored`, which picks this up
 /// automatically. Run it locally the same way:
 /// ```text

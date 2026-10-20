@@ -805,6 +805,57 @@ fn container_test_jobs_pre_pull_their_images() {
     );
 }
 
+/// Body of the top-level job `name` in ci.yml, up to the next job.
+fn ci_job<'a>(ci: &'a str, name: &str) -> &'a str {
+    let head = format!("\n  {name}:\n");
+    let start = ci
+        .find(&head)
+        .unwrap_or_else(|| panic!("ci.yml must define job `{name}`"));
+    let body = &ci[start + head.len()..];
+    let end = body
+        .lines()
+        .scan(0, |off, l| {
+            let at = *off;
+            *off += l.len() + 1;
+            Some((at, l))
+        })
+        .find(|(_, l)| l.starts_with("  ") && !l.starts_with("   ") && l.trim_end().ends_with(':'))
+        .map_or(body.len(), |(at, _)| at);
+    &body[..end]
+}
+
+/// `deploy_e2e` builds its own image on top of everything the Docker sweep
+/// already pulled and built, and ran the runner out of disk (#2547). It must
+/// run in its own job, on a fresh disk, and the aggregate gate must wait for it.
+#[test]
+fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
+    let root = workspace_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let sweep = ci_job(&ci, "test-docker");
+    assert!(
+        !sweep.contains("--test deploy_e2e"),
+        "`test-docker` must not run deploy_e2e: its disk is already spent (#2547)"
+    );
+    let job = ci_job(&ci, "test-docker-deploy");
+    assert!(
+        job.contains("cargo test -p autumn-cli --test deploy_e2e -- --ignored"),
+        "`test-docker-deploy` must run the deploy_e2e suite"
+    );
+    assert!(
+        job.contains("Free disk space") && job.contains("df -h"),
+        "`test-docker-deploy` must reclaim disk and report it"
+    );
+    assert!(
+        job.contains("openssh-client"),
+        "`test-docker-deploy` must install the ssh client"
+    );
+    let gate = ci_job(&ci, "test-gate");
+    assert!(
+        gate.contains("test-docker-deploy"),
+        "`test-gate` must need `test-docker-deploy`"
+    );
+}
+
 #[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();

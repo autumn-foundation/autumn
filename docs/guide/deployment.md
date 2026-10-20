@@ -1733,8 +1733,8 @@ systemd + kamal-proxy — nothing is mocked:
   Hetzner-specific provisioning is isolated in the workflow so another provider
   can be swapped in without touching the script. The in-container half of the
   pam_systemd socket check runs as part of the standard
-  `cargo test -p autumn-cli --test deploy_e2e -- --ignored` Docker sweep (no
-  separate feature needed).
+  `cargo test -p autumn-cli --test deploy_e2e -- --ignored` CI job
+  (`Test (Docker deploy)`). No separate feature is needed.
 
 ---
 
