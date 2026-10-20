@@ -4462,7 +4462,7 @@ async fn stamp_lockout(db: &mut Db, id: i64, threshold: i32) -> AutumnResult<boo
             .filter({table}::locked_at.is_null()),
     )
     .set({table}::locked_at.eq(Some(chrono::Utc::now().naive_utc())))
-    .execute(&mut *db)
+    .execute(&mut **db)
     .await
     .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
     Ok(locked_rows > 0)
