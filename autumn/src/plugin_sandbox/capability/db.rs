@@ -365,6 +365,14 @@ pub(super) fn validate(call: &CapabilityCall) -> Result<(), CallResult> {
 /// `db-delete` it, and the log names it for the operator.
 fn check_stored_rows<'a>(rows: impl IntoIterator<Item = &'a PluginRow>) -> Result<(), String> {
     for row in rows {
+        if let Some(column) = row
+            .keys()
+            .find(|column| RESERVED_COLUMNS.contains(&column.as_str()))
+        {
+            return Err(format!(
+                "the store returned the host's column {column:?}, which a plugin may not write"
+            ));
+        }
         let id = match row.get(ID_COLUMN) {
             Some(super::PluginValue::Text(id)) if check_row_id(id).is_ok() => Some(id.as_str()),
             _ => None,

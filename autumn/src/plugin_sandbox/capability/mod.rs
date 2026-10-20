@@ -824,14 +824,16 @@ impl CapabilityCall {
 
     /// Bytes a reply to this call may take, at its worst.
     ///
-    /// Zero for a read: a reply that does not fit fails only the guest's own
-    /// request, and nothing has changed. A call that changes state reserves
-    /// room first. Only an outbound reply can be large; headers count at the
-    /// JSON worst case of six bytes per byte.
+    /// A read and an outbound call can have a large reply. A write answers with
+    /// `done` or an id. Headers count at the JSON worst case of six bytes per
+    /// byte. The host refuses a call that has no room, so the guest gets a
+    /// denial it can read, not a failed request.
     #[must_use]
     pub const fn reply_reserve(&self) -> usize {
         match self {
-            Self::KvGet { .. } | Self::DbGet { .. } | Self::DbQuery { .. } => 0,
+            Self::KvGet { .. } | Self::DbGet { .. } | Self::DbQuery { .. } => {
+                MAX_RESULT_BYTES + 4096
+            }
             Self::HttpFetch { .. } => {
                 MAX_RESULT_BYTES + outbound::MAX_RESPONSE_HEADER_BYTES * 6 + 4096
             }
@@ -1858,10 +1860,11 @@ path = "/shop/panel"
     #[test]
     fn a_stored_row_the_host_would_not_have_accepted_is_not_served() {
         let bad_name = row(&[("row_id", "r1"), ("Bad-Name", "x")]);
+        let host_column = row(&[("row_id", "r1"), (db::TENANT_COLUMN, "alpha")]);
         let too_wide: PluginRow = (0..=MAX_ROW_COLUMNS)
             .map(|index| (format!("c{index}"), PluginValue::Int(1)))
             .collect();
-        for stored in [bad_name, too_wide] {
+        for stored in [bad_name, host_column, too_wide] {
             let mut runtime = rogue_db("r1", vec![stored]);
             assert_eq!(
                 runtime.dispatch(&db_get()).denial(),
@@ -2073,13 +2076,23 @@ path = "/shop/panel"
         assert!(fixture.http.seen().is_empty(), "the POST ran");
         let fits = fixture.runtime.dispatch_within(&post, reserve);
         assert_ne!(fits.denial(), Some(DenialReason::QuotaExceeded), "{fits:?}");
-        // A read reserves nothing.
+        // A read reserves room too.
         let get = CapabilityCall::KvGet {
             id: 2,
             key: "cart".to_owned(),
         };
-        assert_eq!(get.reply_reserve(), 0);
-        assert!(fixture.runtime.dispatch_within(&get, 0).denial().is_none());
+        let read = get.reply_reserve();
+        assert_eq!(
+            fixture.runtime.dispatch_within(&get, read - 1).denial(),
+            Some(DenialReason::QuotaExceeded)
+        );
+        assert!(
+            fixture
+                .runtime
+                .dispatch_within(&get, read)
+                .denial()
+                .is_none()
+        );
     }
 
     #[test]

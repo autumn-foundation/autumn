@@ -8109,15 +8109,31 @@ hosts = ["api.example.com"]
     }
 
     #[test]
-    fn a_read_is_served_on_a_small_fuel_budget() {
-        let (mut state, _) = outbound_state(0);
-        let read = crate::plugin_sandbox::CapabilityCall::KvGet {
+    fn a_get_is_denied_not_failed_when_the_fuel_cannot_price_its_reply() {
+        let read = || crate::plugin_sandbox::CapabilityCall::HttpFetch {
             id: 1,
-            key: "cart".to_owned(),
+            method: "GET".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
         };
-        state.service(&read, 10);
-        let queued =
-            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned();
-        assert!(!queued.contains("not room"), "{queued}");
+        let queued = |state: &HostState| {
+            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned()
+        };
+        let (mut state, _) = outbound_state(0);
+        state.service(&read(), 10);
+        assert!(state.answer.is_none(), "the request must go on");
+        assert!(
+            queued(&state).contains("quota-exceeded"),
+            "{}",
+            queued(&state)
+        );
+        let (mut state, _) = outbound_state(0);
+        state.service(&read(), 1_000_000);
+        assert!(
+            !queued(&state).contains("quota-exceeded"),
+            "{}",
+            queued(&state)
+        );
     }
 }
