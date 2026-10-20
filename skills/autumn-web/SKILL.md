@@ -2984,8 +2984,18 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - With `[replication]` on, each open database ships its WAL under
   `fleet/tenant/<id>` / `fleet/slot/<n>` (health `replication:fleet`);
   `restore_missing = true` serves a missing database from its replica on a
-  fresh volume — only once the old host stopped writing. A replicated fleet
-  root is served by one process (one replicator per database).
+  fresh volume. A replicated fleet root is served by one process (one
+  replicator per database).
+- Failover: turn on `[database.fleet.ownership]` (`owner` unique per volume,
+  `slots = ["0-8191"]`, `lease_secs = 30`) with `restore_missing`. A host
+  serves only the slot ranges it claims; an unowned slot is `421`
+  (`FleetError::NotOwner`), and `restore_missing` runs only for an owned key.
+  Each claim gets an epoch: a restore selects the newest epoch, and an old
+  owner's replicator stops. Health: `fleet:ownership`. The built-in table is
+  on the control database, so it fences the processes of one host only;
+  hosts on different machines implement `SlotOwnershipStore`
+  (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
+  `docs/guide/sqlite-fleet.md`.
 - The control database lives outside `root` (validation refuses it inside).
 - Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
   databases, also closed ones (issue #3234). Write outbox rows in a
