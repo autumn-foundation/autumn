@@ -4571,9 +4571,9 @@ pub async fn login(
                 }};
 
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    // Account crosses the threshold. `current_locked_at` is a stale
-                    // read, so the helper re-checks the row at the DB. Propagate
-                    // errors: a failed write leaves the account unlocked.
+                    // The account reaches the threshold. `current_locked_at` is an
+                    // old read, so the helper checks the row again in the database.
+                    // Propagate errors: a failed write leaves the account unlocked.
                     let newly_locked =
                         stamp_lockout(&mut db, {snake_name}.id, lockout_cfg.threshold).await?;
 
@@ -5633,7 +5633,7 @@ pub async fn reauth(
                     1i32
                 }};
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    // Same guarded stamp as `login` (#2500, #2531). No telemetry here.
+                    // Same guarded stamp as `login` (#2500, #2531). This path does not log.
                     stamp_lockout(&mut db, {snake_name}.id, lockout_cfg.threshold).await?;
                 }}
                 session.remove("reauth_pw_ok").await;
@@ -18203,13 +18203,15 @@ mod tests {
             .find("locked_at.eq(Some(")
             .expect("helper must stamp locked_at");
         assert_eq!(routes.matches("locked_at.eq(Some(").count(), 1, "{routes}");
-        let preceding = &routes[stamp_at.saturating_sub(500)..stamp_at];
+        let preceding = routes
+            .get(stamp_at.saturating_sub(500)..stamp_at)
+            .unwrap_or_default();
         assert!(
             preceding.contains("failed_attempts.ge(threshold)")
                 && preceding.contains("locked_at.is_null()"),
             "stamp must be guarded by failed_attempts and locked_at IS NULL: {routes}"
         );
-        let following = &routes[stamp_at..stamp_at + 120];
+        let following = routes.get(stamp_at..stamp_at + 120).unwrap_or_default();
         assert!(
             following.contains("chrono::Utc::now().naive_utc()"),
             "stamp must read the clock inside the helper, at write time: {routes}"

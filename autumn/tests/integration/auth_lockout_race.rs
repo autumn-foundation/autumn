@@ -153,8 +153,8 @@ async fn stamp_lock_unconditional(conn: &mut AsyncPgConnection, id: i64) -> u64 
 /// The **fixed** lock-stamp write: re-checks `failed_attempts` and
 /// `locked_at` at the database, at write time, instead of trusting the
 /// in-memory value read at the top of the request. Mirrors the
-/// `.filter({table}::failed_attempts.ge(lockout_cfg.threshold)).filter({table}::locked_at.is_null())`
-/// guard added to `autumn-cli/src/generate/auth.rs`.
+/// `.filter({table}::failed_attempts.ge(threshold)).filter({table}::locked_at.is_null())`
+/// guard in the generated `stamp_lockout` helper (`autumn-cli/src/generate/auth.rs`).
 async fn stamp_lock_guarded(conn: &mut AsyncPgConnection, id: i64, threshold: i32) -> u64 {
     diesel::sql_query(
         "UPDATE lockout_accounts SET locked_at = now() \
