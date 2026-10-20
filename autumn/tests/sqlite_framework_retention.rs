@@ -179,7 +179,7 @@ fn state_with(pool: &SqlitePool, config: AutumnConfig) -> AppState {
     state
 }
 
-fn options(dataset: Option<&'static str>, dry_run: bool) -> RetentionRunOptions<'static> {
+const fn options(dataset: Option<&'static str>, dry_run: bool) -> RetentionRunOptions<'static> {
     RetentionRunOptions { dry_run, dataset }
 }
 
