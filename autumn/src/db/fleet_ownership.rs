@@ -747,9 +747,9 @@ pub struct FleetOwnership {
     held: RwLock<Vec<Held>>,
     last: Mutex<RefreshReport>,
     changed: Notify,
-    /// The newest epoch a replicator saw at the destination. Claims go
-    /// above it.
-    fence_floor: std::sync::atomic::AtomicU64,
+    /// Per range of `ranges`: the newest epoch a replicator saw at the
+    /// destination for a slot in it. Claims of the range go above it.
+    fence_floors: Vec<std::sync::atomic::AtomicU64>,
 }
 
 impl fmt::Debug for FleetOwnership {
@@ -790,6 +790,10 @@ impl FleetOwnership {
         if let Some(pair) = sorted.windows(2).find(|pair| pair[0].overlaps(pair[1])) {
             return Err(OwnershipError::Overlap(pair[0], pair[1]));
         }
+        let fence_floors = ranges
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         Ok(Self {
             store,
             owner,
@@ -798,7 +802,7 @@ impl FleetOwnership {
             held: RwLock::new(Vec::new()),
             last: Mutex::new(RefreshReport::default()),
             changed: Notify::new(),
-            fence_floor: std::sync::atomic::AtomicU64::new(0),
+            fence_floors,
         })
     }
 
@@ -830,7 +834,7 @@ impl FleetOwnership {
     /// before the first open, then every [`renew_interval`](Self::renew_interval).
     pub async fn refresh(&self) -> RefreshReport {
         let mut report = RefreshReport::default();
-        for &range in &self.ranges {
+        for (&range, floor) in self.ranges.iter().zip(&self.fence_floors) {
             let held = self.held_epoch(range);
             // Sent before the call: the local lease must not outlive the
             // store's.
@@ -838,14 +842,14 @@ impl FleetOwnership {
             let result = if let Some(epoch) = held {
                 self.store.renew(range, &self.owner, epoch, self.ttl).await
             } else {
-                let floor = self.fence_floor.load(std::sync::atomic::Ordering::Acquire);
+                let floor = floor.load(std::sync::atomic::Ordering::Acquire);
                 self.store.claim(range, &self.owner, self.ttl, floor).await
             };
             match result {
-                // A replicator saw a newer epoch while the call ran.
+                // A replicator saw a newer epoch in this range while the
+                // call ran.
                 Ok(grant)
-                    if grant.epoch.get()
-                        < self.fence_floor.load(std::sync::atomic::Ordering::Acquire) =>
+                    if grant.epoch.get() < floor.load(std::sync::atomic::Ordering::Acquire) =>
                 {
                     tracing::warn!(range = %range, epoch = %grant.epoch, "fleet slot range fenced while the store call ran");
                     self.drop_range(range);
@@ -933,8 +937,11 @@ impl FleetOwnership {
     /// `newer` (a replicator saw `newer` at the destination). Returns whether
     /// a range was dropped.
     pub fn lose(&self, slot: u16, newer: FencingToken) -> bool {
-        self.fence_floor
-            .fetch_max(newer.get(), std::sync::atomic::Ordering::AcqRel);
+        for (range, floor) in self.ranges.iter().zip(&self.fence_floors) {
+            if range.contains(slot) {
+                floor.fetch_max(newer.get(), std::sync::atomic::Ordering::AcqRel);
+            }
+        }
         let range = self
             .read_held()
             .iter()
@@ -1629,6 +1636,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fence_on_one_range_leaves_the_others_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = clock_at(1_000_000);
+        let shared = Arc::new(store(dir.path(), &clock).await);
+        let a =
+            FleetOwnership::new(shared, owner("a"), vec![range(0, 9), range(10, 19)], TTL).unwrap();
+        assert_eq!(a.refresh().await.claimed.len(), 2);
+        assert!(a.lose(3, token(9)));
+        let report = a.refresh().await;
+        assert_eq!(report.renewed, vec![range(10, 19)]);
+        assert!(report.lost.is_empty());
+        assert_eq!(report.claimed, vec![(range(0, 9), token(10))]);
+        assert_eq!(a.epoch_for(15), Some(token(2)));
+    }
+
+    #[tokio::test]
     async fn a_renewal_that_returns_after_a_fence_does_not_bring_the_range_back() {
         let dir = tempfile::tempdir().unwrap();
         let clock = clock_at(1_000_000);
@@ -2111,6 +2134,33 @@ mod tests {
             assert_eq!(bodies(&db_a).await, vec!["a1", "b1", "a3"]);
             drop(db_a);
             a.fleet.close_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_new_database_is_not_restored_over_its_unshipped_writes() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            // A web and a worker process of owner "a" on one volume.
+            let web = host_on(dir.path(), "vol", "a", &clock, vec![SlotRange::ALL]).await;
+            let worker = host_on(dir.path(), "vol", "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&web.fleet);
+            let db = web.fleet.open(&key).await.unwrap();
+            exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db, "INSERT INTO notes VALUES ('shipped')")
+                .await
+                .unwrap();
+            tick(&web.replication).await;
+            exec(&db, "INSERT INTO notes VALUES ('not shipped yet')")
+                .await
+                .unwrap();
+            // The replica holds this epoch's generation, not a newer owner's.
+            let other = worker.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&other).await, vec!["shipped", "not shipped yet"]);
+            drop((db, other));
+            web.fleet.close_all().await;
+            worker.fleet.close_all().await;
         }
 
         #[tokio::test]

@@ -1816,6 +1816,18 @@ impl DatabaseFleet {
                 detail: format!("create task failed: {e}"),
             })??
         };
+        // A new file is current: record its epoch before anyone serves it.
+        if created && let Some(epoch) = epoch {
+            let (stamp_path, stamp_name) = (path.clone(), name.clone());
+            crate::time::spawn_blocking(move || {
+                write_epoch_stamp(&stamp_path, &stamp_name, epoch.get())
+            })
+            .await
+            .map_err(|e| FleetError::Unavailable {
+                name: name.clone(),
+                detail: format!("epoch stamp task failed: {e}"),
+            })??;
+        }
         let url = Self::url_of(&path);
         let pool = crate::db::build_sqlite_pool_with(
             &url,
@@ -1965,7 +1977,10 @@ impl DatabaseFleet {
                         name: name.clone(),
                         detail: format!("could not read the replica's epochs: {detail}"),
                     })?;
-            if let Some(newest) = newest.filter(|newest| *newest > stamp) {
+            // Newer than the file, and another owner's: an epoch belongs to
+            // one owner, so the replica's generation of `epoch` is this
+            // host's own.
+            if let Some(newest) = newest.filter(|newest| *newest > stamp && *newest != epoch) {
                 tracing::warn!(
                     database = %name,
                     stamp,
