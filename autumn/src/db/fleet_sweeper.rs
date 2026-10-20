@@ -1752,13 +1752,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (index, clock) = ticking_index(tmp.path(), 1_000_000).await;
         let budget = 2;
-        // The closed database has the oldest work.
-        index.mark("slot:00009", PendingKind::Outbox).await.unwrap();
         let open: BTreeSet<String> = (1..=5).map(|n| format!("slot:{n:05}")).collect();
         for key in &open {
-            clock.advance(Duration::from_millis(1));
             index.mark(key, PendingKind::Outbox).await.unwrap();
+            clock.advance(Duration::from_millis(1));
         }
+        // The closed database has the newest work.
+        index.mark("slot:00009", PendingKind::Outbox).await.unwrap();
         // Each busy database makes progress and keeps work: it is requeued.
         let bound = open.len().div_ceil(budget) + 1;
         let mut visited_on = None;
