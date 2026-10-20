@@ -22,6 +22,9 @@
 //! construction inside the loop. `feed::escape` self cost is 79.6M Ir of
 //! 267.7M (29.8%) at `--iterations 1000`.
 //!
+//! After escaping straight into the output buffer (`escape_into`), same
+//! method: 197,727 instructions, 196 allocations and 61.0 KB per iteration.
+//!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing: it is a workload to point a profiler at.
 //!
