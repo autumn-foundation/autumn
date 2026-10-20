@@ -66,6 +66,10 @@ const FINAL_SHIP_MAX_TICKS: usize = 64;
 /// Longest a closing non-owner waits for the owner to hand over the lock.
 const CLAIM_WAIT: Duration = Duration::from_secs(2);
 
+/// Longest a reopen under a new epoch waits for a tick to free the parked
+/// replicator. After it, the open is refused and the caller retries.
+const REUSE_WAIT: Duration = Duration::from_secs(2);
+
 /// Pause between claim attempts at close.
 const CLAIM_POLL: Duration = Duration::from_millis(25);
 
@@ -99,6 +103,10 @@ struct ActiveReplica {
     /// Set when a newer ownership epoch writes to the replica (issue #3233).
     /// Such a replica ships nothing more, not even at close.
     fenced: AtomicBool,
+    /// The replicator's epoch, 0 for none. Written under the replicator
+    /// lock; read without it, so a reopen under the same epoch does not wait
+    /// for a tick in destination I/O.
+    epoch: AtomicU64,
     status: Arc<ReplicationStatus>,
     registered_at: DateTime<Utc>,
 }
@@ -698,14 +706,35 @@ impl FleetLifecycle for FleetReplication {
         // two replicators on one file would both checkpoint it.
         let epoch = db.epoch().map(crate::lock::FencingToken::get);
         let parked = self.parked().remove(db.key());
-        if let Some(parked) = parked {
-            // A new epoch starts a new generation; a fenced replica cannot
-            // be reused. The flag is read under the replicator lock, which a
-            // tick holds while it sets it.
-            if let Some(mut replicator) = lock_replicator(&parked, &|| None)
-                && !parked.fenced.load(Ordering::Acquire)
-            {
+        // A fenced replica cannot be reused.
+        if let Some(parked) = parked
+            && !parked.fenced.load(Ordering::Acquire)
+        {
+            if parked.epoch.load(Ordering::Acquire) == epoch.unwrap_or(0) {
+                // Nothing to change, so no wait for a tick in destination
+                // I/O. A fence that lands now names a newer epoch, and that
+                // also drops this host's range.
+                self.active().insert(db.key().clone(), parked);
+                return Ok(());
+            }
+            // A new epoch starts a new generation. The flag is read under
+            // the replicator lock, which a tick holds while it sets it. The
+            // tick may be in destination I/O: wait only so long.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real time: the wait bounds blocking I/O"
+            )]
+            let limit = std::time::Instant::now() + REUSE_WAIT;
+            let Some(mut replicator) = lock_replicator(&parked, &|| Some(limit)) else {
+                self.parked().insert(db.key().clone(), parked);
+                return Err(
+                    "the replicator of this database is busy shipping its backlog; retry"
+                        .to_owned(),
+                );
+            };
+            if !parked.fenced.load(Ordering::Acquire) {
                 replicator.set_epoch(epoch);
+                parked.epoch.store(epoch.unwrap_or(0), Ordering::Release);
                 drop(replicator);
                 self.active().insert(db.key().clone(), Arc::clone(&parked));
                 return Ok(());
@@ -730,6 +759,7 @@ impl FleetLifecycle for FleetReplication {
             lock_error: Mutex::new(None),
             retired: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
+            epoch: AtomicU64::new(epoch.unwrap_or(0)),
             path: db.path().to_path_buf(),
             status,
             registered_at: self.clock.now(),
@@ -1662,6 +1692,63 @@ mod tests {
         drop(db);
         fleet.close(&key).await;
         key
+    }
+
+    /// Hold the replicator lock of `replica` on another thread, as a tick
+    /// in destination I/O does, until the returned sender drops.
+    fn hold_replicator(replica: Arc<ActiveReplica>) -> std::sync::mpsc::Sender<()> {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _guard = replica.replicator.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        release_tx
+    }
+
+    #[tokio::test]
+    async fn a_reopen_under_the_same_epoch_does_not_wait_for_a_busy_replicator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        let replica = replication.parked().get(&key).cloned().unwrap();
+        let release = hold_replicator(Arc::clone(&replica));
+        let opened = tokio::time::timeout(Duration::from_secs(10), fleet.open(&key)).await;
+        drop(release);
+        assert!(opened.expect("the open does not wait for the tick").is_ok());
+        let active = replication.active().get(&key).cloned().unwrap();
+        assert!(
+            Arc::ptr_eq(&active, &replica),
+            "the parked replicator is reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reopen_under_a_new_epoch_waits_for_a_busy_replicator_only_so_long() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        let replica = replication.parked().get(&key).cloned().unwrap();
+        // The database closed under epoch 7; it reopens with no epoch.
+        replica.epoch.store(7, Ordering::Release);
+        let release = hold_replicator(Arc::clone(&replica));
+        let opened = tokio::time::timeout(Duration::from_secs(10), fleet.open(&key)).await;
+        drop(release);
+        assert!(
+            matches!(opened, Ok(Err(FleetError::Unavailable { .. }))),
+            "the open is refused, so the caller retries"
+        );
+        assert!(
+            replication.parked().contains_key(&key),
+            "the replicator stays parked and keeps shipping"
+        );
+        // Free again: the open takes the parked replicator.
+        fleet.open(&key).await.unwrap();
+        let active = replication.active().get(&key).cloned().unwrap();
+        assert!(Arc::ptr_eq(&active, &replica));
+        assert_eq!(replica.epoch.load(Ordering::Acquire), 0);
     }
 
     fn recover_after(flaky: &Arc<Flaky>, delay: Duration) {

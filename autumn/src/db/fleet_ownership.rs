@@ -1413,6 +1413,9 @@ mod tests {
     struct Scripted {
         inner: SqlSlotOwnership,
         hang: std::sync::atomic::AtomicBool,
+        /// Renewals run on another task, a second late: dropping the call
+        /// does not stop them, as with work handed to `spawn_blocking`.
+        slow: std::sync::atomic::AtomicBool,
         /// Runs once, before the next renew reaches the store.
         before_renew: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// Runs once, after the next claim reached the store.
@@ -1424,6 +1427,7 @@ mod tests {
             Self {
                 inner,
                 hang: std::sync::atomic::AtomicBool::new(false),
+                slow: std::sync::atomic::AtomicBool::new(false),
                 before_renew: Mutex::new(None),
                 after_claim: Mutex::new(None),
             }
@@ -1466,6 +1470,15 @@ mod tests {
                 let step = self.before_renew.lock().unwrap().take();
                 if let Some(step) = step {
                     step();
+                }
+                if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+                    let (inner, owner) = (self.inner.clone(), owner.clone());
+                    return tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        inner.renew(range, &owner, epoch, ttl).await
+                    })
+                    .await
+                    .unwrap();
                 }
                 self.inner.renew(range, owner, epoch, ttl).await
             })
@@ -1911,7 +1924,8 @@ mod tests {
             tokio::time::sleep(TTL).await;
             assert_eq!(ownership.epoch_for(7), None);
             stop.cancel();
-            tokio::time::timeout(Duration::from_secs(5), handle)
+            // It gives the call a renew interval, then stops.
+            tokio::time::timeout(ownership.renew_interval() * 2, handle)
                 .await
                 .expect("the loop ends at shutdown")
                 .unwrap();
@@ -1920,6 +1934,42 @@ mod tests {
                 .await
                 .expect("the release ends at shutdown");
             assert!(!released);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_lets_a_running_renewal_finish_before_the_release() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let scripted = Arc::new(Scripted::new(store(dir.path(), &clock).await));
+            let (fleet, _replication, _) = plain(dir.path(), "vol");
+            let ownership = Arc::new(
+                FleetOwnership::new(scripted.clone(), owner("a"), vec![SlotRange::ALL], TTL)
+                    .unwrap(),
+            );
+            fleet.start_ownership(Arc::clone(&ownership)).await.unwrap();
+            scripted
+                .slow
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let stop = tokio_util::sync::CancellationToken::new();
+            let handle = fleet.spawn_ownership(stop.clone());
+            // The loop's renewal is running when shutdown starts.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stop.cancel();
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("the loop ends at shutdown")
+                .unwrap();
+            assert!(fleet.release_ownership().await);
+            // No renewal lands after the release: another host claims.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let b = FleetOwnership::new(
+                Arc::new(store(dir.path(), &clock).await),
+                owner("b"),
+                vec![SlotRange::ALL],
+                TTL,
+            )
+            .unwrap();
+            assert_eq!(b.refresh().await.claimed.len(), 1);
         }
 
         #[tokio::test]

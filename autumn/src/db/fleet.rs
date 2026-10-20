@@ -1267,6 +1267,7 @@ impl DatabaseFleet {
                 let _ = fleet.fence_unowned();
                 let refresh = ownership.refresh();
                 tokio::pin!(refresh);
+                let mut stopping = false;
                 loop {
                     let lapse = ownership.next_lapse();
                     tokio::select! {
@@ -1274,9 +1275,20 @@ impl DatabaseFleet {
                         () = sleep_until_some(lapse) => {
                             let _ = fleet.fence_unowned();
                         }
-                        // A hung store must not hold shutdown.
-                        () = shutdown.cancelled() => return,
+                        () = shutdown.cancelled() => {
+                            stopping = true;
+                            break;
+                        }
                     }
+                }
+                if stopping {
+                    // A store may finish a call it was sent even when the
+                    // call is dropped, and a renewal that lands after the
+                    // release extends the lease again. So let it finish
+                    // first, within a renew interval: a hung store must not
+                    // hold shutdown.
+                    let _ = tokio::time::timeout(ownership.renew_interval(), &mut refresh).await;
+                    return;
                 }
                 let _ = fleet.fence_unowned();
                 let wake = ownership.next_wake();
