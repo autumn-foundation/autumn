@@ -1011,7 +1011,7 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
             Node::Map(entries) => visitor.visit_map(NodeMap {
                 entries: entries.iter(),
                 value: None,
-                key: String::new(),
+                key: "",
             }),
             // An all-digit key (`counts[2024]=5`) parses as a position, because
             // the tree is built before the target type is known. Serving a
@@ -1217,7 +1217,7 @@ impl<'de> SeqAccess<'de> for PairElements<'_> {
 struct NodeMap<'a> {
     entries: std::collections::btree_map::Iter<'a, String, Node>,
     value: Option<&'a Node>,
-    key: String,
+    key: &'a str,
 }
 
 impl<'de> MapAccess<'de> for NodeMap<'_> {
@@ -1231,7 +1231,7 @@ impl<'de> MapAccess<'de> for NodeMap<'_> {
             return Ok(None);
         };
         self.value = Some(node);
-        self.key = key.clone();
+        self.key = key;
         seed.deserialize(ValueDeserializer { value: key }).map(Some)
     }
 
@@ -1245,7 +1245,7 @@ impl<'de> MapAccess<'de> for NodeMap<'_> {
         // Tag the failure with the field it came from, so a caller sees
         // `filter.limit: invalid value …` rather than a bare parse error.
         seed.deserialize(NodeDeserializer { node })
-            .map_err(|err| err.with_segment(sanitize_key(&self.key)))
+            .map_err(|err| err.with_segment(sanitize_key(self.key)))
     }
 
     fn size_hint(&self) -> Option<usize> {
