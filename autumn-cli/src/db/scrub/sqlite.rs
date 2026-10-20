@@ -112,7 +112,8 @@ fn connect(label: &str, url: &str) -> Result<SqliteConnection, ScrubError> {
 /// The SQL expression that identifies a row: its primary key, else `rowid`.
 ///
 /// A rowid table can hold several rows with a `NULL` non-integer key. Those fall
-/// back to `rowid`, or they would share one seed and one token.
+/// back to `rowid`, or they would share one seed and one token. Both branches
+/// carry a prefix, so a real key such as `rowid:1` cannot equal a fallback key.
 pub(super) fn row_key_expr(table: &Table, facts: &DatabaseFacts) -> String {
     let mut keys: Vec<&str> = table.primary_key.iter().map(String::as_str).collect();
     if keys.is_empty() {
@@ -142,7 +143,7 @@ pub(super) fn row_key_expr(table: &Table, facts: &DatabaseFacts) -> String {
         .map(|key| format!("{} IS NULL", quote_ident(key)))
         .collect::<Vec<_>>()
         .join(" OR ");
-    format!("CASE WHEN {any_null} THEN 'rowid:' || rowid ELSE {key} END")
+    format!("CASE WHEN {any_null} THEN 'rowid:' || rowid ELSE 'key:' || {key} END")
 }
 
 /// The per-row, per-column token every replacement derives from. The column
@@ -892,6 +893,11 @@ fn apply(
             drift = drift_entries(facts, &now.facts);
             return Err(Failure::Db(diesel::result::Error::RollbackTransaction));
         }
+        // The pass-1 check ran before this lock. Run it again on the locked file.
+        let side_effects = purge_side_effects(conn, facts, purges).map_err(Failure::Refused)?;
+        if !side_effects.is_empty() {
+            return Err(Failure::Refused(cascade_refusal(&side_effects)));
+        }
         let violations_before = foreign_key_violations(conn)?;
 
         let mut emptied: BTreeMap<&str, usize> = BTreeMap::new();
@@ -1034,6 +1040,17 @@ fn purge_side_effects(
     Ok(found)
 }
 
+fn cascade_refusal(side_effects: &[String]) -> ScrubError {
+    ScrubError::UnsupportedOnSqlite {
+        what: "[framework] purge",
+        detail: format!(
+            "a foreign key action would also change: {}. Drop the action, or \
+             empty those tables first.",
+            side_effects.join(", ")
+        ),
+    }
+}
+
 /// Name what changed between two probes.
 fn drift_entries(before: &DatabaseFacts, after: &DatabaseFacts) -> Vec<String> {
     let mut drift = super::schema_drift(
@@ -1108,14 +1125,7 @@ pub(super) fn classify_and_apply(
         // A purge that cascades would change tables the plan never classified.
         let side_effects = purge_side_effects(&mut conn, &facts, &purges)?;
         if !side_effects.is_empty() {
-            return Err(ScrubError::UnsupportedOnSqlite {
-                what: "[framework] purge",
-                detail: format!(
-                    "a foreign key action would also change: {}. Drop the action, or \
-                     empty those tables first.",
-                    side_effects.join(", ")
-                ),
-            });
+            return Err(cascade_refusal(&side_effects));
         }
         // The emptying pass runs after every rewrite, so a delete trigger on a
         // purged table can write fresh rows into a table already scrubbed.
@@ -1453,6 +1463,10 @@ mod tests {
             key.starts_with("CASE WHEN \"a\" IS NULL OR \"b\" IS NULL THEN 'rowid:' || rowid"),
             "{key}"
         );
+        assert!(
+            key.contains("ELSE 'key:' || "),
+            "both branches are prefixed: {key}"
+        );
     }
 
     #[test]
@@ -1593,5 +1607,44 @@ mod tests {
             .get_result(&mut conn)
             .expect("read");
         assert_eq!(kept.v, "keep@me.example", "nothing was written");
+    }
+
+    #[test]
+    fn a_cascade_added_after_the_plan_is_refused_under_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        let url = format!("sqlite://{}", path.display());
+        let mut conn = SqliteConnection::establish(&path.to_string_lossy()).expect("open");
+        conn.batch_execute(
+            "CREATE TABLE autumn_sync_rows (id INTEGER PRIMARY KEY, payload TEXT); \
+             INSERT INTO autumn_sync_rows (payload) VALUES ('x'); \
+             CREATE TABLE refs (id INTEGER PRIMARY KEY, \
+                 sync_id INTEGER REFERENCES autumn_sync_rows(id) ON DELETE CASCADE); \
+             INSERT INTO refs (sync_id) VALUES (1);",
+        )
+        .expect("seed");
+        let config = super::super::ScrubConfig::default();
+        let facts = probe(&mut conn, &config).expect("probe").facts;
+        let purges = vec![(
+            "autumn_sync_rows".to_owned(),
+            "DELETE FROM \"autumn_sync_rows\"".to_owned(),
+        )];
+        // `apply` is the locked path. It must refuse without a pass-1 check.
+        let result = apply(
+            "control",
+            &url,
+            &ScrubPlan::default(),
+            &purges,
+            &facts,
+            &config,
+        );
+        assert!(
+            matches!(&result, Err(ScrubError::UnsupportedOnSqlite { detail, .. }) if detail.contains("refs -> autumn_sync_rows")),
+            "{result:?}"
+        );
+        let left: CountRow = sql_query("SELECT count(*) AS n FROM refs")
+            .get_result(&mut conn)
+            .expect("count");
+        assert_eq!(left.n, 1, "nothing was deleted");
     }
 }
