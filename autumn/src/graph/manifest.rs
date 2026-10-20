@@ -888,14 +888,14 @@ fn add_repository_nodes(
         };
         let named: Vec<&ModelGraphDescriptor> =
             models.iter().filter(|m| m.model == repo.model).collect();
+        // A model of the repository's crate in another version is dropped,
+        // also when that version moved it to another module. A model of
+        // another crate stays.
+        let has_mine = named.iter().any(|m| mine(m));
         let named: Vec<&ModelGraphDescriptor> = named
-            .iter()
-            .copied()
+            .into_iter()
             .filter(|m| {
-                mine(m)
-                    || !named
-                        .iter()
-                        .any(|other| other.model_path == m.model_path && mine(other))
+                !has_mine || mine(m) || crate_root(m.module_path) != crate_root(repo.module_path)
             })
             .collect();
         let exact = named.iter().any(|m| m.table == repo.table);
@@ -2598,6 +2598,47 @@ mod tests {
                 "repository:plugin::repositories::PostRepository@2.0.0",
             ]
         );
+    }
+
+    /// The other version moved the model to another module. It is still the
+    /// other version of the repository's own crate, so it gets no edge.
+    #[test]
+    fn a_moved_model_of_the_other_version_is_not_linked() {
+        let moved = ModelGraphDescriptor {
+            model_path: "plugin::model::Post",
+            module_path: "plugin::model",
+            ..post_at("2.0.0")
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[post_at("1.0.0"), moved],
+            &[repository_at("1.0.0")],
+            &[],
+        );
+        let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(targets, vec!["model:plugin::models::Post"]);
+    }
+
+    /// A model of another crate is not a version of the repository's crate,
+    /// so it keeps its edge.
+    #[test]
+    fn a_model_of_another_crate_keeps_its_edge() {
+        let app_post = ModelGraphDescriptor {
+            crate_version: "9.0.0",
+            module_path: "app::models",
+            ..model("Post", "app::models::Post", "plugin_posts")
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[post_at("1.0.0"), app_post],
+            &[repository_at("1.0.0")],
+            &[],
+        );
+        assert_eq!(graph.edges.len(), 2, "{:?}", graph.edges);
     }
 
     /// The version narrows the candidates before the table does. Else a table
