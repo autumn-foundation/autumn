@@ -29866,7 +29866,10 @@ mod tests {
             // Raised from 80_000 (#2364): each write descriptor gained a
             // `cascades_into` field, and each repository one name const.
             // Understood and intended: about 400 bytes.
-            ("plain", quote! { Post }, 81_000),
+            // Raised from 81_000 (#2520): the graph descriptor gained a
+            // `crate_version` field, an `option_env!` match of about 170
+            // bytes. Understood and intended.
+            ("plain", quote! { Post }, 82_000),
             ("soft_delete", quote! { Post, soft_delete }, 89_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
             // Raised from 95_000 (#2451): each repository publishes its
