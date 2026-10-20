@@ -13649,7 +13649,7 @@ async fn start_fleet_ownership(
     let report = fleet
         .start_ownership(Arc::clone(&ownership))
         .await
-        .map_err(|_| "the fleet already has ownership".to_owned())?;
+        .map_err(|e| e.to_string())?;
     tracing::info!(
         owner = %ownership.owner(),
         claimed = report.claimed.len(),

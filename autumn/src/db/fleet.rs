@@ -1081,30 +1081,39 @@ impl DatabaseFleet {
     /// [`refresh`](super::fleet_ownership::FleetOwnership::refresh):
     /// [`start_ownership`](Self::start_ownership) does both in that order.
     ///
-    /// The process also takes a shared OS lock on the root, so that
+    /// The process first takes a shared OS lock on the root, so that
     /// [`release_ownership`](Self::release_ownership) knows when it is the
-    /// last process on the volume.
+    /// last process on the volume. Without it, the process it replaces could
+    /// see itself as the last one and release the epoch this one serves.
     ///
     /// # Errors
     ///
-    /// The ownership that is already installed, when called twice.
+    /// [`FleetError::Io`] when the volume lock cannot be taken, or when
+    /// ownership is already installed.
     pub fn install_ownership(
         &self,
         ownership: Arc<super::fleet_ownership::FleetOwnership>,
-    ) -> Result<(), Arc<super::fleet_ownership::FleetOwnership>> {
-        self.inner.ownership.set(ownership)?;
-        match VolumeLock::shared(self.root()) {
-            Ok(lock) => {
-                *self
-                    .inner
-                    .volume_lock
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lock);
-            }
-            Err(error) => {
-                tracing::warn!(%error, "fleet ownership: no volume lock; ranges lapse instead of being released");
-            }
+    ) -> Result<(), FleetError> {
+        let installed = || FleetError::Io {
+            op: "install fleet ownership",
+            detail: "the fleet already has ownership".to_owned(),
+        };
+        if self.inner.ownership.get().is_some() {
+            return Err(installed());
         }
+        let lock = VolumeLock::shared(self.root()).map_err(|error| FleetError::Io {
+            op: "lock the fleet volume",
+            detail: error.to_string(),
+        })?;
+        self.inner
+            .ownership
+            .set(ownership)
+            .map_err(|_| installed())?;
+        *self
+            .inner
+            .volume_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lock);
         self.wire_fence_hook();
         Ok(())
     }
@@ -1118,12 +1127,12 @@ impl DatabaseFleet {
     ///
     /// # Errors
     ///
-    /// The ownership that is already installed, when called twice.
+    /// As [`install_ownership`](Self::install_ownership); nothing is claimed
+    /// then.
     pub async fn start_ownership(
         &self,
         ownership: Arc<super::fleet_ownership::FleetOwnership>,
-    ) -> Result<super::fleet_ownership::RefreshReport, Arc<super::fleet_ownership::FleetOwnership>>
-    {
+    ) -> Result<super::fleet_ownership::RefreshReport, FleetError> {
         self.install_ownership(Arc::clone(&ownership))?;
         Ok(ownership.refresh().await)
     }

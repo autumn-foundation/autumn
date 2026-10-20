@@ -2070,6 +2070,26 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn ownership_does_not_start_without_the_volume_lock() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let (fleet, _replication, _) = plain(dir.path(), "vol");
+            // The lock directory cannot be made: a file has its name.
+            let root = dir.path().join("vol");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(crate::fleet_layout::RESERVED_DIR), b"").unwrap();
+            let shared = Arc::new(store(dir.path(), &clock).await);
+            let ownership = Arc::new(
+                FleetOwnership::new(shared.clone(), owner("a"), vec![SlotRange::ALL], TTL).unwrap(),
+            );
+            assert!(fleet.start_ownership(Arc::clone(&ownership)).await.is_err());
+            assert!(fleet.ownership().is_none());
+            // Nothing was claimed: a process that cannot hold the lock could
+            // have its epoch released by the one it replaces.
+            assert!(shared.rows().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
         async fn only_the_last_process_on_a_volume_releases() {
             let dir = tempfile::tempdir().unwrap();
             let clock = clock_at(1_000_000);
