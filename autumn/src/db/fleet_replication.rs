@@ -385,6 +385,20 @@ impl FleetReplication {
         replica_root(&self.settings.root, key)
     }
 
+    /// The newest ownership epoch any host recorded at the replica of `key`
+    /// (issue #3233). `None` when no generation recorded one. Blocking: one
+    /// list at the destination.
+    pub(crate) fn newest_epoch(&self, key: &FleetDbKey) -> Result<Option<u64>, String> {
+        let root = self.root_for(key);
+        Ok(self
+            .destination
+            .list(&crate::replication::segment::epochs_prefix(&root))
+            .map_err(|error| error.to_string())?
+            .iter()
+            .filter_map(|marker| crate::replication::segment::parse_epoch_marker_key(&root, marker))
+            .max())
+    }
+
     fn active(&self) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<ActiveReplica>>> {
         self.active.lock().unwrap_or_else(PoisonError::into_inner)
     }

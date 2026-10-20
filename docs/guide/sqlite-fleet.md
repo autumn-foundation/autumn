@@ -385,8 +385,16 @@ the first request.
    interval and the clock skew. Then it serves at a new epoch.
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
-   fails. It does not serve the range again.
-5. **Move part of a range.** Change `slots` on the owner, for example from
+   fails. It claims the range again only when the new owner lets it go, at a
+   newer epoch.
+5. **Fail back.** When the old host gets a range back, its files on disk are
+   older than the replica. Each file records the epoch it was last opened
+   under. On the first open at the newer epoch, the host compares that epoch
+   with the newest epoch at the replica. If the replica's is newer, the host
+   restores the file from the replica before it serves it. Without
+   `[replication]` there is nothing to compare with: give the old host an
+   empty volume.
+6. **Move part of a range.** Change `slots` on the owner, for example from
    `"0-8191"` to `"0-4095"`, and restart it. A clean shutdown releases the
    old range, so the owner claims `"0-4095"` at once at a new epoch. Another
    host can then claim `"4096-8191"`. If the old range was not released, each

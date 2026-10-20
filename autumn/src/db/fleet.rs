@@ -104,6 +104,10 @@ pub const WORKER_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The table that records which database a file is.
 const IDENTITY_TABLE: &str = "_autumn_fleet_identity";
 
+/// One row: the newest ownership epoch the file was opened under (issue
+/// #3233). A file stamped below the replica's newest epoch is stale.
+const EPOCH_TABLE: &str = "_autumn_fleet_epoch";
+
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Why a fleet operation failed.
@@ -1785,6 +1789,9 @@ impl DatabaseFleet {
         if !existed && restore {
             existed = self.restore_missing(&key, &path).await?;
         }
+        if existed && let Some(epoch) = epoch {
+            self.check_epoch_stamp(&key, &path, epoch).await?;
+        }
         // Whether this open published the file (another process may have won
         // the race to create it; then we open theirs).
         let created = if existed {
@@ -1913,6 +1920,68 @@ impl DatabaseFleet {
             .map_err(|detail| FleetError::Unavailable { name, detail })?;
         }
         Ok(applied)
+    }
+
+    /// Before an open under `epoch` (issue #3233). A host that gets a range
+    /// back after another host held it still has its own, older file. The
+    /// file records the epoch it was last opened under; when the replica
+    /// holds a newer one, the file is replaced from the replica. Then the
+    /// file records `epoch`.
+    async fn check_epoch_stamp(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+        epoch: crate::lock::FencingToken,
+    ) -> Result<(), FleetError> {
+        let (fleet, key, path) = (self.clone(), key.clone(), path.to_path_buf());
+        let name = key.name();
+        crate::time::spawn_blocking(move || {
+            fleet.check_epoch_stamp_blocking(&key, &path, epoch.get())
+        })
+        .await
+        .map_err(|e| FleetError::Unavailable {
+            name,
+            detail: format!("epoch check task failed: {e}"),
+        })?
+    }
+
+    fn check_epoch_stamp_blocking(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+        epoch: u64,
+    ) -> Result<(), FleetError> {
+        let name = key.name();
+        let stamp = read_epoch_stamp(path, &name)?;
+        if stamp >= epoch {
+            return Ok(());
+        }
+        // No replica: nothing newer to compare with.
+        if let Some(replication) = self.replication() {
+            let newest =
+                replication
+                    .newest_epoch(key)
+                    .map_err(|detail| FleetError::Unavailable {
+                        name: name.clone(),
+                        detail: format!("could not read the replica's epochs: {detail}"),
+                    })?;
+            if let Some(newest) = newest.filter(|newest| *newest > stamp) {
+                tracing::warn!(
+                    database = %name,
+                    stamp,
+                    newest,
+                    epoch,
+                    "fleet database on disk is older than its replica: another host owned it \
+                     meanwhile; it is restored from the replica"
+                );
+                for hook in self.hooks() {
+                    hook.release(key);
+                }
+                check_contained(self.root(), path)?;
+                restore_in_place(self.root(), replication, key, None, path)?;
+            }
+        }
+        write_epoch_stamp(path, &name, epoch)
     }
 
     /// Ask the lifecycle hooks to produce a missing file (a restore).
@@ -2963,6 +3032,67 @@ async fn check_identity(pool: &Pool<RuntimeConnection>, name: &str) -> Result<()
             found: found.name,
         });
     }
+    Ok(())
+}
+
+/// The epoch `path` was last opened under, 0 for none. Blocking.
+fn read_epoch_stamp(path: &Path, name: &str) -> Result<u64, FleetError> {
+    use diesel::{OptionalExtension as _, RunQueryDsl as _};
+
+    #[derive(diesel::QueryableByName)]
+    struct Stamp {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        epoch: i64,
+    }
+
+    let unavailable = |detail: String| FleetError::Unavailable {
+        name: name.to_owned(),
+        detail,
+    };
+    let mut conn = crate::db::establish_sqlite_migration_connection(&existing_only_url(path))
+        .map_err(|e| unavailable(e.to_string()))?;
+    let exists = diesel::sql_query(format!(
+        "SELECT 0 AS epoch FROM sqlite_master WHERE type = 'table' AND name = '{EPOCH_TABLE}'"
+    ))
+    .get_result::<Stamp>(&mut conn)
+    .optional()
+    .map_err(|e| unavailable(e.to_string()))?
+    .is_some();
+    if !exists {
+        return Ok(0);
+    }
+    let stamp = diesel::sql_query(format!("SELECT epoch FROM {EPOCH_TABLE} WHERE id = 1"))
+        .get_result::<Stamp>(&mut conn)
+        .optional()
+        .map_err(|e| unavailable(e.to_string()))?;
+    Ok(stamp.map_or(0, |s| u64::try_from(s.epoch).unwrap_or(0)))
+}
+
+/// Record that `path` is opened under `epoch`. Never lowers it. Blocking.
+fn write_epoch_stamp(path: &Path, name: &str, epoch: u64) -> Result<(), FleetError> {
+    use diesel::RunQueryDsl as _;
+    use diesel::connection::SimpleConnection as _;
+
+    let unavailable = |detail: String| FleetError::Unavailable {
+        name: name.to_owned(),
+        detail,
+    };
+    let epoch = i64::try_from(epoch).map_err(|e| unavailable(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(&existing_only_url(path))
+        .map_err(|e| unavailable(e.to_string()))?;
+    conn.batch_execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {EPOCH_TABLE} (\
+             id INTEGER PRIMARY KEY CHECK (id = 1), \
+             epoch INTEGER NOT NULL)"
+    ))
+    .map_err(|e| unavailable(e.to_string()))?;
+    diesel::sql_query(format!(
+        "INSERT INTO {EPOCH_TABLE} (id, epoch) VALUES (1, ?) \
+         ON CONFLICT (id) DO UPDATE SET epoch = max(epoch, excluded.epoch)"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(epoch)
+    .execute(&mut conn)
+    .map_err(|e| unavailable(e.to_string()))?;
     Ok(())
 }
 

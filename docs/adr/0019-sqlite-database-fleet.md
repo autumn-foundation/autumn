@@ -293,6 +293,11 @@ and the replication path both check it.
   it: `FleetError::NotOwner`, `421`. So `restore_missing` runs only for an
   owned key. Each `FleetDatabase` carries its epoch. After an open, the fleet
   reads the epoch again; a database of another epoch is fenced, not served.
+- **Stale files.** Each file records the newest epoch it was opened under
+  (`_autumn_fleet_epoch`). A host can get a range back after another host
+  held it. Its files on disk are then older than the replica. So an open under
+  a newer epoch than the file's lists `<root>/epochs/`. If the replica holds a
+  newer epoch than the file, the file is restored from the replica first.
 - **Lose.** A lost range closes its open databases without a worker settle.
   The close still waits for connections in use. The sweeper and the fan-outs
   skip slots this host does not own.

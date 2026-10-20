@@ -2064,6 +2064,56 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_host_that_gets_its_range_back_serves_the_newer_owners_data() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db_a, "INSERT INTO notes VALUES ('a1')")
+                .await
+                .unwrap();
+            tick(&a.replication).await;
+            drop(db_a);
+            a.fleet.close(&key).await;
+
+            // A cannot renew. B takes over from the replica and writes.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            let db_b = b.fleet.open(&key).await.unwrap();
+            exec(&db_b, "INSERT INTO notes VALUES ('b1')")
+                .await
+                .unwrap();
+            tick(&b.replication).await;
+            drop(db_b);
+            b.fleet.close_all().await;
+            assert!(b.fleet.release_ownership().await);
+
+            // A gets the range back. Its file on disk is older than B's
+            // generation, so it serves B's data, not its own.
+            assert_eq!(
+                a.ownership.refresh().await.claimed,
+                vec![(SlotRange::ALL, token(3))]
+            );
+            let db_a = a.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_a).await, vec!["a1", "b1"]);
+            exec(&db_a, "INSERT INTO notes VALUES ('a3')")
+                .await
+                .unwrap();
+            drop(db_a);
+            a.fleet.close(&key).await;
+            // Under the same epoch, its own file is current.
+            let db_a = a.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_a).await, vec!["a1", "b1", "a3"]);
+            drop(db_a);
+            a.fleet.close_all().await;
+        }
+
+        #[tokio::test]
         async fn a_fenced_replicator_stops_and_restore_takes_the_newest_epoch() {
             let dir = tempfile::tempdir().unwrap();
             let clock = clock_at(1_000_000);

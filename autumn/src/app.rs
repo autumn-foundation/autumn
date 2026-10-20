@@ -6408,6 +6408,11 @@ impl AppBuilder {
                     "shutdown: SQLite fleet databases did not all close within the shutdown \
                      budget; a replicated fleet's last frames may not be offsite"
                 );
+                // Renewals stop, so the ranges lapse. No release: a database
+                // may still be open.
+                if let Some(ownership) = ownership {
+                    drop(ownership.abandon());
+                }
             }
         }
 
@@ -13592,6 +13597,14 @@ impl FleetOwnershipRuntime {
             tracing::info!("shutdown: fleet slot ranges released");
         }
     }
+
+    /// Stop renewing without a release: the fleet did not close within the
+    /// shutdown budget, so databases may still be open. The ranges lapse.
+    /// The loop ends within a renew interval; the caller need not wait.
+    fn abandon(self) -> tokio::task::JoinHandle<()> {
+        self.stop.cancel();
+        self.handle
+    }
 }
 
 /// Claim this host's slot ranges and install them on the fleet (issue #3233):
@@ -15659,6 +15672,40 @@ mod fleet_boot_tests {
             rows[0].lease_expires_ms <= state.clock().now().timestamp_millis(),
             "released at shutdown"
         );
+    }
+
+    /// The fleet did not close within the shutdown budget: renewals stop, but
+    /// nothing is released while databases may still be open.
+    #[tokio::test]
+    async fn a_fleet_that_did_not_close_stops_renewing_without_a_release() {
+        use crate::db::fleet_ownership::{SlotOwnershipStore as _, SqlSlotOwnership};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut config, _fleet, state) = booted(tmp.path());
+        if let Some(fleet_config) = config.database.fleet.as_mut() {
+            fleet_config.ownership = Some(crate::config::FleetOwnershipConfig {
+                owner: "host-a".to_owned(),
+                slots: vec![crate::config::SlotSpec::Range("0-16383".to_owned())],
+                lease_secs: 30,
+            });
+        }
+        state.insert_extension(config);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let runtime = start_fleet_runtime(&state, shutdown.clone(), None)
+            .await
+            .expect("the app has a fleet");
+        let renewals = runtime.ownership.expect("ownership runs").abandon();
+        tokio::time::timeout(std::time::Duration::from_secs(5), renewals)
+            .await
+            .expect("the renew loop stops")
+            .unwrap();
+        let store = SqlSlotOwnership::new(state.pool().cloned().unwrap(), state.clock_arc());
+        let rows = store.rows().await.unwrap();
+        assert!(
+            rows[0].lease_expires_ms > state.clock().now().timestamp_millis(),
+            "not released: the leases lapse"
+        );
+        shutdown.cancel();
+        runtime.maintenance.await.unwrap();
     }
 
     /// `[replication]` on a fleet app: the fleet replicates next to the control

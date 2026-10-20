@@ -6,7 +6,8 @@
   does not own answers `421` (`FleetError::NotOwner`), and `restore_missing`
   runs only for an owned key. Each replica generation records its epoch: a
   restore takes the newest epoch, and a replicator that sees a newer epoch
-  stops. `/actuator/health` reports `fleet:ownership`. New:
+  stops. A host that gets a range back restores a file that is older than
+  the replica before it serves it. `/actuator/health` reports `fleet:ownership`. New:
   `autumn_web::db::fleet_ownership`, `DatabaseFleet::install_ownership`,
   `DatabaseFleet::start_ownership`, `DatabaseFleet::spawn_ownership`, `DatabaseFleet::release_ownership`,
   `DatabaseFleet::owns`,
