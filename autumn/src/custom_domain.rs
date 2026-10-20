@@ -678,13 +678,40 @@ pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
     fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, io::Result<()>>;
     /// Delete one record. Deleting an absent record succeeds.
     fn delete<'a>(&'a self, hostname: &'a str) -> StoreFuture<'a, io::Result<()>>;
+
+    /// The global attempt ledger: the instant of each recent ACME order.
+    ///
+    /// The ledger does not depend on any domain record, so an order for a
+    /// domain that was offboarded still counts after a restart. Called once at
+    /// boot. The default is empty: a store that does not override it loses
+    /// offboarded orders on restart.
+    fn load_attempts(&self) -> StoreFuture<'_, io::Result<Vec<i64>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Add an order at `at_unix` to the ledger. Drop entries older than the
+    /// global window at `now_unix`. The default does nothing.
+    fn append_attempt(&self, at_unix: i64, now_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        let _ = (at_unix, now_unix);
+        Box::pin(async { Ok(()) })
+    }
 }
+
+/// Ledger entries still inside the global window at `now_unix`.
+fn prune_ledger(ledger: &mut Vec<i64>, now_unix: i64) {
+    let cutoff = now_unix.saturating_sub(GLOBAL_WINDOW_SECS);
+    ledger.retain(|at| *at > cutoff);
+}
+
+/// Ledger file name. Its extension is not `json`, so `load_all` skips it.
+const LEDGER_FILE: &str = "attempts.ledger";
 
 /// In-memory [`CustomDomainStore`], for tests and for a deployment that
 /// re-registers its domains from the app's own database at boot.
 #[derive(Debug, Default)]
 pub struct MemoryCustomDomainStore {
     records: RwLock<HashMap<String, CustomDomain>>,
+    ledger: RwLock<Vec<i64>>,
 }
 
 impl MemoryCustomDomainStore {
@@ -720,6 +747,20 @@ impl CustomDomainStore for MemoryCustomDomainStore {
             Ok(())
         })
     }
+
+    fn load_attempts(&self) -> StoreFuture<'_, io::Result<Vec<i64>>> {
+        Box::pin(async move { Ok(read_lock(&self.ledger).clone()) })
+    }
+
+    fn append_attempt(&self, at_unix: i64, now_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        Box::pin(async move {
+            let mut ledger = write_lock(&self.ledger);
+            prune_ledger(&mut ledger, now_unix);
+            ledger.push(at_unix);
+            drop(ledger);
+            Ok(())
+        })
+    }
 }
 
 /// Filesystem [`CustomDomainStore`]: one `0600` JSON file per domain under a
@@ -731,13 +772,18 @@ impl CustomDomainStore for MemoryCustomDomainStore {
 #[derive(Debug, Clone)]
 pub struct FsCustomDomainStore {
     dir: PathBuf,
+    /// Serialises ledger read-modify-write cycles.
+    ledger_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FsCustomDomainStore {
     /// A store rooted at `dir`.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            ledger_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// The file holding `hostname`'s record.
@@ -813,6 +859,43 @@ impl CustomDomainStore for FsCustomDomainStore {
                 Err(e) => Err(e),
             }
         })
+    }
+
+    fn load_attempts(&self) -> StoreFuture<'_, io::Result<Vec<i64>>> {
+        Box::pin(async move { read_ledger(&self.dir.join(LEDGER_FILE)).await })
+    }
+
+    fn append_attempt(&self, at_unix: i64, now_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        let dir = self.dir.clone();
+        let path = self.dir.join(LEDGER_FILE);
+        let lock = Arc::clone(&self.ledger_lock);
+        Box::pin(async move {
+            let _guard = lock.lock().await;
+            let mut ledger = read_ledger(&path).await?;
+            prune_ledger(&mut ledger, now_unix);
+            ledger.push(at_unix);
+            let bytes = serde_json::to_vec(&ledger)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            crate::fs_atomic::blocking(move || {
+                crate::fs_atomic::ensure_owner_only_dir(&dir)?;
+                crate::fs_atomic::write_owner_only(&path, &bytes)
+            })
+            .await
+        })
+    }
+}
+
+/// Read the ledger file. A missing or corrupt file reads as empty: the next
+/// write replaces it, and a lost ledger only narrows the budget to the
+/// surviving domain records.
+async fn read_ledger(path: &std::path::Path) -> io::Result<Vec<i64>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(path = %path.display(), "ignoring an unreadable attempt ledger: {e}");
+            Vec::new()
+        })),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
     }
 }
 
@@ -1091,6 +1174,24 @@ impl CustomDomainRegistry {
     /// Propagates the store's read error.
     pub async fn stored_records(&self) -> io::Result<Vec<CustomDomain>> {
         self.store.load_all().await
+    }
+
+    /// Every order in the store's global attempt ledger.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's read error.
+    pub async fn load_global_attempts(&self) -> io::Result<Vec<i64>> {
+        self.store.load_attempts().await
+    }
+
+    /// Add an order at `now_unix` to the store's global attempt ledger.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_global_attempt(&self, now_unix: i64) -> io::Result<()> {
+        self.store.append_attempt(now_unix, now_unix).await
     }
 
     /// Give a record stored before ownership tokens a token, and send it back
@@ -2132,6 +2233,30 @@ impl IssuanceLimiter {
         drop(state);
     }
 
+    /// Seed the global window from the persisted attempt ledger.
+    ///
+    /// The ledger also holds orders for domains that were offboarded, which no
+    /// domain record can show. It overlaps what [`Self::hydrate`] adds, so it
+    /// raises the global count at each instant to the ledger count and never
+    /// past it. Call it after `hydrate`. Calling it twice is harmless.
+    pub fn hydrate_global(&self, attempts: impl IntoIterator<Item = i64>, now_unix: i64) {
+        let oldest = now_unix.saturating_sub(GLOBAL_WINDOW_SECS);
+        let mut persisted: HashMap<i64, usize> = HashMap::new();
+        for at in attempts {
+            if at > oldest {
+                *persisted.entry(at).or_default() += 1;
+            }
+        }
+        let mut state = write_lock(&self.attempts);
+        for (at, want) in persisted {
+            let have = state.global.iter().filter(|known| **known == at).count();
+            state
+                .global
+                .extend(std::iter::repeat_n(at, want.saturating_sub(have)));
+        }
+        drop(state);
+    }
+
     /// Drop a domain's attempt history — called when it is offboarded, so a
     /// re-registration of the same hostname is not charged for the old one.
     pub fn forget(&self, hostname: &str) {
@@ -2788,6 +2913,82 @@ mod tests {
         assert!(store.load_all().await.unwrap().is_empty());
         // Deleting again is not an error.
         store.delete("app.clientco.com").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_memory_ledger_keeps_recent_attempts_and_prunes_old_ones() {
+        let store = MemoryCustomDomainStore::new();
+        store.append_attempt(1000, 1000).await.unwrap();
+        store.append_attempt(1000, 1000).await.unwrap();
+        // The next write is past the global window: the first two go.
+        let later = 1000 + GLOBAL_WINDOW_SECS + 1;
+        store.append_attempt(later, later).await.unwrap();
+        assert_eq!(store.load_attempts().await.unwrap(), vec![later]);
+    }
+
+    #[tokio::test]
+    async fn the_filesystem_ledger_survives_a_new_store_and_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        assert!(store.load_attempts().await.unwrap().is_empty());
+        store.append_attempt(1000, 1000).await.unwrap();
+        store.append_attempt(1000, 1001).await.unwrap();
+
+        let reopened = FsCustomDomainStore::new(dir.path());
+        assert_eq!(reopened.load_attempts().await.unwrap(), vec![1000, 1000]);
+
+        let later = 1000 + GLOBAL_WINDOW_SECS + 1;
+        reopened.append_attempt(later, later).await.unwrap();
+        assert_eq!(reopened.load_attempts().await.unwrap(), vec![later]);
+    }
+
+    #[tokio::test]
+    async fn the_ledger_file_is_not_read_as_a_domain_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        store.append_attempt(1000, 1000).await.unwrap();
+        assert!(store.load_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_filesystem_ledger_reads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        store.append_attempt(1000, 1000).await.unwrap();
+        std::fs::write(dir.path().join(LEDGER_FILE), b"not json").unwrap();
+        assert!(store.load_attempts().await.unwrap().is_empty());
+        // The next write repairs it.
+        store.append_attempt(2000, 2000).await.unwrap();
+        assert_eq!(store.load_attempts().await.unwrap(), vec![2000]);
+    }
+
+    #[test]
+    fn hydrating_the_global_ledger_is_idempotent_and_never_double_counts() {
+        let limiter = IssuanceLimiter::new(5, 2, 300, 3600);
+        // One order is already known from a domain record.
+        limiter.hydrate([("a.test".to_owned(), 1000)], 1100);
+        // The ledger lists that order again, and one for an offboarded domain.
+        limiter.hydrate_global([1000, 1010], 1100);
+        limiter.hydrate_global([1000, 1010], 1100);
+        assert!(matches!(
+            limiter.check("c.test", 1100),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+        // Exactly two hits: one expires, one stays.
+        assert_eq!(
+            limiter.check("c.test", 1000 + GLOBAL_WINDOW_SECS + 1),
+            IssuanceDecision::Allow
+        );
+    }
+
+    #[test]
+    fn hydrating_the_global_ledger_ignores_attempts_outside_the_window() {
+        let limiter = IssuanceLimiter::new(5, 1, 300, 3600);
+        limiter.hydrate_global([1000], 1000 + GLOBAL_WINDOW_SECS + 1);
+        assert_eq!(
+            limiter.check("a.test", 1000 + GLOBAL_WINDOW_SECS + 1),
+            IssuanceDecision::Allow
+        );
     }
 
     #[tokio::test]

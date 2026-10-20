@@ -573,7 +573,7 @@ impl CustomDomainTask {
         // Warm the cache before the first tick so a restart serves stored
         // certificates on the first handshake instead of after an order.
         self.warm_all().await;
-        self.hydrate_limiter(crate::custom_domain::now_unix());
+        self.hydrate_limiter(crate::custom_domain::now_unix()).await;
         loop {
             // The tick is inside the `select!`: a pass over a thousand domains
             // is long, and shutdown must not wait for it.
@@ -1098,7 +1098,7 @@ impl CustomDomainTask {
     /// record, so a restart does not hand the shared ACME account a fresh
     /// quota. Called once before the first pass of [`Self::run`]; safe to call
     /// again.
-    pub fn hydrate_limiter(&self, now_unix: i64) {
+    pub async fn hydrate_limiter(&self, now_unix: i64) {
         self.limiter.hydrate(
             self.registry.list().into_iter().flat_map(|d| {
                 let hostname = d.hostname;
@@ -1108,6 +1108,15 @@ impl CustomDomainTask {
             }),
             now_unix,
         );
+        // The ledger also holds orders for offboarded domains.
+        match self.registry.load_global_attempts().await {
+            Ok(ledger) => self.limiter.hydrate_global(ledger, now_unix),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not read the custom-domain attempt ledger; orders for offboarded domains \
+                 do not count against the budget"
+            ),
+        }
     }
 
     /// Is there issuance budget for `hostname`? A refusal defers the domain
@@ -1149,6 +1158,14 @@ impl CustomDomainTask {
         token: Option<&str>,
         now_unix: i64,
     ) {
+        if let Err(e) = self.registry.record_global_attempt(now_unix).await {
+            tracing::warn!(
+                hostname,
+                error = %e,
+                "could not persist the global attempt ledger; the order will not count after an \
+                 offboarding and a restart"
+            );
+        }
         if let Err(e) = self
             .registry
             .record_attempt_for_registration(hostname, tenant, token, now_unix)
