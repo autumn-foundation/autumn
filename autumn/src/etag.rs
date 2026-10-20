@@ -2134,6 +2134,19 @@ mod tests {
         assert!(fresh_when(&headers, etag).is_fresh());
     }
 
+    /// Characterization for the Echo clone class: `sha256_hex` renders its
+    /// digest through this file's own `hex_lower`, one of six byte-identical
+    /// copies across the crate. Pinned against the well-known SHA-256("hello")
+    /// test vector before `hex_lower` is replaced by the `hex` crate (already
+    /// a dependency) at its call site.
+    #[test]
+    fn sha256_hex_is_pinned_hex() {
+        assert_eq!(
+            sha256_hex(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
     #[tokio::test]
     async fn etag_layer_multi_value_handler_etag_never_304s() {
         let status = layer_status(r#""a", "b""#, &[r#""a""#]).await;

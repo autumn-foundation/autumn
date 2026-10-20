@@ -2954,4 +2954,16 @@ mod tests {
 
         assert!(!is_missing_hook_table_error(&unrelated));
     }
+
+    /// Characterization for the Echo clone class: `repository_commit_hook_id`
+    /// renders its digest through this file's own `hex_lower`, one of six
+    /// byte-identical copies across the crate. Pinned before `hex_lower` is
+    /// replaced by the `hex` crate (already a dependency) at its call site.
+    #[test]
+    fn repository_commit_hook_id_is_pinned_hex() {
+        assert_eq!(
+            repository_commit_hook_id(Some("order-42"), None, "handler", "hook", "record-1"),
+            "idempotent:b8fceec62ab6e24e8d96034789e38d8fe64c5e3f593675d5704ac980b6944ebf",
+        );
+    }
 }

@@ -1606,6 +1606,18 @@ mod tests {
         assert_ne!(count_def().definition_hash(), sum_def().definition_hash());
     }
 
+    /// Characterization for the Echo clone class: `definition_hash` renders
+    /// its digest through this file's own `hex_lower`, one of six
+    /// byte-identical copies across the crate. Pinned before `hex_lower` is
+    /// replaced by the `hex` crate (already a dependency) at its call site.
+    #[test]
+    fn definition_hash_is_pinned_hex() {
+        assert_eq!(
+            count_def().definition_hash(),
+            "ec7890d9c13320917bd7ed3fddc72dafa9e7bd265dd598014bc4236895b53875"
+        );
+    }
+
     #[test]
     fn the_definition_hash_tracks_every_part_of_the_lowered_shape() {
         let base = count_def().definition_hash();

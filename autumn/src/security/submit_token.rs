@@ -2390,4 +2390,16 @@ mod tests {
         );
         assert_eq!(count.load(Ordering::SeqCst), 0, "the handler did not run");
     }
+
+    /// Characterization for the Echo clone class: `storage_key` renders its
+    /// digest through this file's own `hex_lower`, one of six byte-identical
+    /// copies across the crate. Pinned before `hex_lower` is replaced by the
+    /// `hex` crate (already a dependency) at its call site.
+    #[test]
+    fn storage_key_is_pinned_hex() {
+        assert_eq!(
+            storage_key("token-abc"),
+            "submit:2a8a128a33f0f4cec8eb049c91fc3242d32de4ca2384fa3e7a3770b7ab952d1b"
+        );
+    }
 }

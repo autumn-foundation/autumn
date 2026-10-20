@@ -3902,4 +3902,19 @@ mod tests {
         assert_eq!(retry.status(), StatusCode::CONFLICT);
         assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
+
+    /// Characterization for the Echo clone class: `build_storage_key` and
+    /// `principal_scope_digest` render their digests through this file's own
+    /// `hex_lower`, one of six byte-identical copies across the crate (this
+    /// file's test module carries a seventh, test-local copy). Pinned before
+    /// every copy is replaced by the `hex` crate (already a dependency,
+    /// already used this way in ~20 other places in this crate) at its call
+    /// site.
+    #[test]
+    fn build_storage_key_is_pinned_hex() {
+        assert_eq!(
+            build_storage_key("pay-once", "POST", "/payments", None, None, None),
+            "v2:e776147e12affe592b79542ee766f4171dc7b7a7e50cf234424fc32fa0b3d1ce",
+        );
+    }
 }
