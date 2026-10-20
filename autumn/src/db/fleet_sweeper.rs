@@ -1168,15 +1168,21 @@ impl FleetSweeper {
                 .max(1);
             rows.extend(inner.index.due(None, limit).await?);
         }
-        let grace = chrono::Duration::from_std(inner.options.hook_grace)
-            .unwrap_or_else(|_| chrono::Duration::zero());
-        Ok(pick(
-            rows,
-            &open,
+        let owned = |name: &str| {
+            inner
+                .fleet
+                .key_for_name(name)
+                .map_or(true, |key| inner.fleet.owns(&key))
+        };
+        let plan = PassPlan {
+            open: &open,
             relay,
-            inner.state.clock().now() - grace,
-            inner.options.max_databases_per_pass,
-        ))
+            hooks_before: hooks_cutoff(inner.state.clock().now(), inner.options.hook_grace),
+            budget: inner.options.max_databases_per_pass,
+            room: inner.fleet.max_open().saturating_sub(open.len()),
+            owned: &owned,
+        };
+        Ok(plan.pick(rows))
     }
 
     async fn visit(&self, name: String) -> Visit {
@@ -1375,44 +1381,53 @@ impl FleetSweeper {
     }
 }
 
-/// The databases one pass visits, at most `budget`. The row due first goes
-/// first, then the oldest row (issue 3350). An open database goes first only
-/// on a tie: its visit opens nothing. A worker leaves hook rows written after
-/// `hooks_before` alone in a closed database. A web process takes only hook
-/// rows.
-fn pick(
-    mut rows: Vec<Due>,
-    open: &BTreeSet<String>,
+/// What one pass may take.
+struct PassPlan<'a> {
+    open: &'a BTreeSet<String>,
     relay: bool,
     hooks_before: DateTime<Utc>,
     budget: usize,
-) -> Vec<String> {
-    rows.sort_by(|a, b| {
-        a.visit_after
-            .cmp(&b.visit_after)
-            .then(a.entry.since.cmp(&b.entry.since))
-            .then(
-                open.contains(&b.entry.key)
-                    .cmp(&open.contains(&a.entry.key)),
-            )
-            .then_with(|| a.entry.key.cmp(&b.entry.key))
-            .then(a.entry.kind.cmp(&b.entry.kind))
-    });
-    let mut chosen: Vec<String> = Vec::new();
-    for Due { entry, .. } in rows {
-        let hooks = entry.kind == PendingKind::Hooks;
-        let young_hooks = hooks && entry.since > hooks_before;
-        let wanted = if relay {
-            !young_hooks || open.contains(&entry.key)
-        } else {
-            hooks
-        };
-        if wanted && !chosen.contains(&entry.key) {
-            chosen.push(entry.key);
+    room: usize,
+    owned: &'a dyn Fn(&str) -> bool,
+}
+
+impl PassPlan<'_> {
+    fn pick(&self, mut rows: Vec<Due>) -> Vec<String> {
+        let (_, _) = (self.room, self.owned);
+        let open = self.open;
+        rows.sort_by(|a, b| {
+            a.visit_after
+                .cmp(&b.visit_after)
+                .then(a.entry.since.cmp(&b.entry.since))
+                .then(
+                    open.contains(&b.entry.key)
+                        .cmp(&open.contains(&a.entry.key)),
+                )
+                .then_with(|| a.entry.key.cmp(&b.entry.key))
+                .then(a.entry.kind.cmp(&b.entry.kind))
+        });
+        let mut chosen: Vec<String> = Vec::new();
+        for Due { entry, .. } in rows {
+            let hooks = entry.kind == PendingKind::Hooks;
+            let young_hooks = hooks && entry.since > self.hooks_before;
+            let wanted = if self.relay {
+                !young_hooks || open.contains(&entry.key)
+            } else {
+                hooks
+            };
+            if wanted && !chosen.contains(&entry.key) {
+                chosen.push(entry.key);
+            }
         }
+        chosen.truncate(self.budget.max(1));
+        chosen
     }
-    chosen.truncate(budget.max(1));
-    chosen
+}
+
+/// A worker leaves the hook rows written after this time alone in a closed
+/// database.
+fn hooks_cutoff(now: DateTime<Utc>, grace: Duration) -> DateTime<Utc> {
+    now - chrono::Duration::from_std(grace).unwrap_or_else(|_| chrono::Duration::zero())
 }
 
 // ── Health ──────────────────────────────────────────────────────────────────
@@ -1513,6 +1528,28 @@ mod tests {
         let index = FleetPendingIndex::new(control(dir), Arc::new(clock.clone()));
         index.ensure_schema().await.unwrap();
         (index, clock)
+    }
+
+    fn plan<'a>(open: &'a BTreeSet<String>, budget: usize, room: usize) -> PassPlan<'a> {
+        PassPlan {
+            open,
+            relay: true,
+            hooks_before: DateTime::<Utc>::MAX_UTC,
+            budget,
+            room,
+            owned: &|_| true,
+        }
+    }
+
+    fn due_row(key: &str, since: i64, visit_after: i64) -> Due {
+        Due {
+            entry: PendingEntry {
+                key: key.to_owned(),
+                kind: PendingKind::Outbox,
+                since: from_millis(since),
+            },
+            visit_after,
+        }
     }
 
     /// The rows one pass reads: of the open databases, then the oldest.
@@ -1765,7 +1802,7 @@ mod tests {
         for pass in 1..=bound {
             clock.advance(Duration::from_millis(10));
             let rows = pass_rows(&index, &open, budget).await;
-            let chosen = pick(rows, &open, true, clock.now(), budget);
+            let chosen = plan(&open, budget, budget).pick(rows);
             assert_eq!(chosen.len(), budget, "pass {pass} uses its budget");
             if chosen.iter().any(|key| key == "slot:00009") {
                 visited_on = Some(pass);
@@ -1807,22 +1844,91 @@ mod tests {
 
     #[test]
     fn an_open_database_goes_first_only_on_a_tie() {
-        let row = |key: &str, since: i64, visit_after: i64| Due {
-            entry: PendingEntry {
-                key: key.to_owned(),
-                kind: PendingKind::Outbox,
-                since: from_millis(since),
-            },
-            visit_after,
-        };
         let open = BTreeSet::from(["slot:00002".to_owned()]);
-        let at = from_millis(1_000);
-        // The open rows come first, as `candidates` reads them first.
-        let earlier_closed = vec![row("slot:00002", 10, 50), row("slot:00009", 10, 40)];
-        assert_eq!(pick(earlier_closed, &open, true, at, 1), vec!["slot:00009"]);
-        let older_closed = vec![row("slot:00002", 20, 40), row("slot:00009", 10, 40)];
-        assert_eq!(pick(older_closed, &open, true, at, 1), vec!["slot:00009"]);
-        let tie = vec![row("slot:00009", 10, 40), row("slot:00002", 10, 40)];
-        assert_eq!(pick(tie, &open, true, at, 1), vec!["slot:00002"]);
+        let one = plan(&open, 1, 1);
+        // In the first two cases the open row comes first, because
+        // `candidates` reads open rows first.
+        let earlier_closed = vec![due_row("slot:00002", 10, 50), due_row("slot:00009", 10, 40)];
+        assert_eq!(one.pick(earlier_closed), vec!["slot:00009"]);
+        let older_closed = vec![due_row("slot:00002", 20, 40), due_row("slot:00009", 10, 40)];
+        assert_eq!(one.pick(older_closed), vec!["slot:00009"]);
+        // The tie puts the open row last, so only the tie rule moves it up.
+        let tie = vec![due_row("slot:00009", 10, 40), due_row("slot:00002", 10, 40)];
+        assert_eq!(one.pick(tie), vec!["slot:00002"]);
+    }
+
+    #[test]
+    fn a_full_fleet_gives_the_pass_to_the_open_databases() {
+        let open = BTreeSet::from(["slot:00005".to_owned()]);
+        let rows = || {
+            vec![
+                due_row("slot:00001", 1, 1),
+                due_row("slot:00002", 2, 2),
+                due_row("slot:00003", 3, 3),
+                due_row("slot:00005", 5, 5),
+            ]
+        };
+        // A closed database waits when the fleet has no room for it.
+        assert_eq!(plan(&open, 2, 0).pick(rows()), vec!["slot:00005"]);
+        assert_eq!(
+            plan(&open, 3, 1).pick(rows()),
+            vec!["slot:00005", "slot:00001"]
+        );
+    }
+
+    #[test]
+    fn half_of_each_pass_goes_to_the_open_databases() {
+        // A deploy marks many closed databases for a backfill, before the
+        // new work of an open one.
+        let open = BTreeSet::from(["slot:00099".to_owned()]);
+        let mut rows: Vec<Due> = (1..=20)
+            .map(|n| due_row(&format!("slot:{n:05}"), n, n))
+            .collect();
+        rows.push(due_row("slot:00099", 50, 50));
+        assert_eq!(
+            plan(&open, 4, 100).pick(rows),
+            vec!["slot:00099", "slot:00001", "slot:00002", "slot:00003"]
+        );
+    }
+
+    #[test]
+    fn a_row_of_a_database_another_host_owns_takes_no_place() {
+        let open = BTreeSet::new();
+        let rows = vec![due_row("slot:00001", 1, 1), due_row("slot:00002", 2, 2)];
+        let not_one = |name: &str| name != "slot:00001";
+        let plan = PassPlan {
+            owned: &not_one,
+            ..plan(&open, 1, 1)
+        };
+        assert_eq!(plan.pick(rows), vec!["slot:00002"]);
+    }
+
+    #[tokio::test]
+    async fn a_mark_from_a_clock_that_is_ahead_is_due_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worker = index(tmp.path(), 10_000).await;
+        let web = FleetPendingIndex::new(
+            worker.control.clone(),
+            Arc::new(crate::time::FixedClock::at(from_millis(70_000))),
+        );
+        web.mark("slot:00001", PendingKind::Outbox).await.unwrap();
+        assert_eq!(worker.due(None, 10).await.unwrap().len(), 1);
+        let keys = ["slot:00001".to_owned()];
+        assert_eq!(worker.due(Some(&keys), 0).await.unwrap().len(), 1);
+        // A backoff still hides the row.
+        web.defer("slot:00001").await.unwrap();
+        assert!(worker.due(None, 10).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_very_long_hook_grace_does_not_panic() {
+        let now = from_millis(10_000);
+        assert_eq!(
+            hooks_cutoff(now, Duration::from_secs(5)),
+            from_millis(5_000)
+        );
+        let huge = Duration::from_secs(u64::from(u32::MAX) * 3_600);
+        assert_eq!(hooks_cutoff(now, huge), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(hooks_cutoff(now, Duration::MAX), DateTime::<Utc>::MIN_UTC);
     }
 }

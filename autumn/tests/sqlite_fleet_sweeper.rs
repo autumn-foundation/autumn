@@ -8,6 +8,8 @@
 //! - Rows of a deleted or unknown database are dropped.
 //! - The sweeper never opens past `max_open` and never closes a leased
 //!   database.
+//! - Busy open databases do not take every pass from a closed one, and a
+//!   full fleet still relays its open ones (issue 3350).
 //!
 //! Run:
 //!
@@ -686,7 +688,8 @@ async fn a_busy_database_takes_its_turn_again_after_its_budget() {
     assert!(pending(&sweeper).await.is_empty());
 }
 
-// Issue 3350: busy open databases must not take every pass.
+// Issue 3350: when open databases went first, busy open databases took
+// every pass.
 #[tokio::test]
 async fn a_closed_database_is_visited_when_more_busy_databases_are_open_than_a_pass_visits() {
     let tmp = tempfile::tempdir().unwrap();
@@ -702,14 +705,15 @@ async fn a_closed_database_is_visited_when_more_busy_databases_are_open_than_a_p
         },
     )
     .await;
-    assert_eq!(post(&client, "quiet", "/orders/100").await, 200);
-    fleet.close(&key(&fleet, "quiet")).await;
     let busy = ["busy-a", "busy-b", "busy-c"];
     for tenant in busy {
         for id in 1..=5 {
             assert_eq!(post(&client, tenant, &format!("/orders/{id}")).await, 200);
         }
     }
+    // The closed database has the newest work.
+    assert_eq!(post(&client, "quiet", "/orders/100").await, 200);
+    fleet.close(&key(&fleet, "quiet")).await;
     let quiet_relayed = |state: &AppState| {
         relayed(state)
             .iter()
@@ -717,7 +721,8 @@ async fn a_closed_database_is_visited_when_more_busy_databases_are_open_than_a_p
     };
 
     // Each pass relays one message per database: the busy ones keep work.
-    let bound = busy.len().div_ceil(budget) + 1;
+    // Half of each pass goes to open databases, the rest in turn to all.
+    let bound = busy.len().div_ceil(budget - budget / 2) + 1;
     for pass in 1..=bound {
         let report = sweeper.sweep_once().await;
         assert_eq!(report.visited, budget, "pass {pass}: {report:?}");
@@ -726,6 +731,43 @@ async fn a_closed_database_is_visited_when_more_busy_databases_are_open_than_a_p
         }
     }
     panic!("the closed database waited more than {bound} passes");
+}
+
+#[tokio::test]
+async fn a_full_fleet_still_relays_the_open_databases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 3);
+    let client = app(tmp.path(), fleet.clone());
+    let sweeper = install_with(
+        &client,
+        FleetSweeperOptions {
+            max_databases_per_pass: 2,
+            ..FleetSweeperOptions::default()
+        },
+    )
+    .await;
+    // The closed databases have the oldest work.
+    for tenant in ["quiet-1", "quiet-2"] {
+        assert_eq!(post(&client, tenant, "/orders/1").await, 200);
+        fleet.close(&key(&fleet, tenant)).await;
+    }
+    for tenant in ["busy-a", "busy-b", "busy-c"] {
+        assert_eq!(post(&client, tenant, "/orders/2").await, 200);
+    }
+    assert_eq!(fleet.stats().open, 3, "the fleet is full");
+
+    let report = sweeper.sweep_once().await;
+    assert_eq!(
+        (report.visited, report.deferred),
+        (2, 0),
+        "no closed database fits: {report:?}"
+    );
+    sweeper.sweep_once().await;
+    assert_eq!(
+        relayed(client.state()).len(),
+        3,
+        "each open database relays"
+    );
 }
 
 #[tokio::test]
