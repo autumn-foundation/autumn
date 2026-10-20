@@ -102,6 +102,12 @@ ignore = [
     # default. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), or whenever the MSRV floor rises far enough
     # to take an aws-sdk-s3 that resolves a fixed `lru`.
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — webpki-roots bundles the emSign ECC Root CA - G3, which
+    # allows paths through distrusted emSign intermediates. Fixed in 1.0.10; the
+    # workspace takes it. The 0.26.11 copy has no patched 0.26.x release. It
+    # comes only through sqlx-core 0.8.6, under postgresql_embedded. Review-by:
+    # 2026-11-03, or when sqlx or postgresql_embedded moves to webpki-roots 1.x.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 under postgresql_embedded (no patched 0.26.x exists; 1.0.x copy is updated to 1.0.10); added 2026-10-20; review-by 2026-11-03" },
 ]
 
 [licenses]
