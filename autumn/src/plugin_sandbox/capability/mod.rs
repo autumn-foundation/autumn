@@ -830,10 +830,16 @@ impl CapabilityCall {
     /// denial it can read, not a failed request.
     #[must_use]
     pub const fn reply_reserve(&self) -> usize {
+        self.reply_reserve_for(MAX_RESULT_BYTES)
+    }
+
+    /// As [`reply_reserve`](Self::reply_reserve), with the plugin's own
+    /// `kv_value_bytes` as the ceiling for a KV read.
+    #[must_use]
+    pub const fn reply_reserve_for(&self, kv_value_bytes: usize) -> usize {
         match self {
-            Self::KvGet { .. } | Self::DbGet { .. } | Self::DbQuery { .. } => {
-                MAX_RESULT_BYTES + 4096
-            }
+            Self::KvGet { .. } => kv_value_bytes + 4096,
+            Self::DbGet { .. } | Self::DbQuery { .. } => MAX_RESULT_BYTES + 4096,
             Self::HttpFetch { .. } => {
                 MAX_RESULT_BYTES + outbound::MAX_RESPONSE_HEADER_BYTES * 6 + 4096
             }
@@ -1430,7 +1436,7 @@ impl CapabilityRuntime {
 
         // Room for the answer, before anything is charged or committed: once a
         // write has happened its reply can no longer be refused.
-        if reply_room < call.reply_reserve() {
+        if reply_room < call.reply_reserve_for(self.quotas().kv_value_bytes as usize) {
             return self.record(
                 call,
                 &target,
@@ -2081,7 +2087,7 @@ path = "/shop/panel"
             id: 2,
             key: "cart".to_owned(),
         };
-        let read = get.reply_reserve();
+        let read = get.reply_reserve_for(fixture.runtime.quotas().kv_value_bytes as usize);
         assert_eq!(
             fixture.runtime.dispatch_within(&get, read - 1).denial(),
             Some(DenialReason::QuotaExceeded)

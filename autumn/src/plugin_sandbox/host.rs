@@ -1262,7 +1262,15 @@ impl SandboxHost {
     /// Returns [`SandboxLoadError`] if the module does not compile, imports
     /// something the sandbox does not provide, or exports no `_start`.
     pub fn load(artifact: &SandboxArtifact) -> Result<Self, SandboxLoadError> {
-        Self::from_module(artifact.manifest().clone(), artifact.module())
+        // The whole container's digest, kept here so a direct `run` stamps jobs
+        // with it too, not only a host built through `SandboxedPlugin`.
+        let digest = artifact
+            .artifact_digest()
+            .map_err(|err| SandboxLoadError::InvalidManifest(err.to_string()))?;
+        Ok(
+            Self::from_module(artifact.manifest().clone(), artifact.module())?
+                .with_artifact_sha256(digest),
+        )
     }
 
     /// Compile a module against a manifest.

@@ -300,8 +300,7 @@ impl SandboxedPlugin {
         // reviewed is in the manifest, and the module digest does not move when
         // that does. See `SandboxArtifact::artifact_digest`.
         let digest = artifact.artifact_digest()?;
-        let host = SandboxHost::load(artifact)?.with_artifact_sha256(digest.clone());
-        let mut plugin = Self::new(host);
+        let mut plugin = Self::new(SandboxHost::load(artifact)?);
         plugin.artifact_sha256 = Some(digest);
         Ok(plugin)
     }
