@@ -211,6 +211,7 @@ impl PluginActivityLog {
         {
             summary.dropped = summary.dropped.saturating_add(*count);
         }
+        drop(state);
         summary
     }
 
@@ -225,14 +226,16 @@ impl PluginActivityLog {
     /// [`summary`]: Self::summary
     #[must_use]
     pub fn plugins(&self) -> Vec<String> {
-        let state = self.lock();
-        let mut names: Vec<String> = state
-            .entries
-            .iter()
-            .map(|(_, who, _)| who.clone())
-            .chain(state.dropped.values().map(|(who, _)| who.clone()))
-            .chain(state.folded.keys().cloned())
-            .collect();
+        let mut names: Vec<String> = {
+            let state = self.lock();
+            state
+                .entries
+                .iter()
+                .map(|(_, who, _)| who.clone())
+                .chain(state.dropped.values().map(|(who, _)| who.clone()))
+                .chain(state.folded.keys().cloned())
+                .collect()
+        };
         names.sort();
         names.dedup();
         names

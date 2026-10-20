@@ -852,7 +852,7 @@ impl CapabilityCall {
                     .char_indices()
                     .nth(URL_PREFIX_CHARS)
                     .map_or(url.len(), |(index, _)| index);
-                let prefix = &url[..end];
+                let prefix = url.get(..end).unwrap_or(url);
                 bounded_target(
                     &outbound::host_of(prefix)
                         .unwrap_or_else(|| outbound::attempted_authority(prefix)),
@@ -1942,11 +1942,7 @@ path = "/shop/panel"
     #[test]
     fn a_huge_target_is_cut_before_it_is_copied() {
         let key = "k".repeat(MAX_KV_KEY_BYTES * 1000);
-        let excerpt = CapabilityCall::KvGet {
-            id: 1,
-            key: key.clone(),
-        }
-        .target_excerpt();
+        let excerpt = CapabilityCall::KvGet { id: 1, key }.target_excerpt();
         assert!(
             excerpt.chars().count() <= MAX_TARGET_CHARS + 1,
             "{}",
