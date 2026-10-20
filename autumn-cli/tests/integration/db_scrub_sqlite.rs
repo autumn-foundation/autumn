@@ -573,3 +573,30 @@ fn rows_with_a_null_non_integer_key_get_distinct_tokens() {
         2
     );
 }
+
+#[test]
+fn a_purge_that_cascades_into_an_app_table_is_refused() {
+    let toml = format!(
+        "{SCRUB_TOML}\n[tables.refs]\nsafe = [\"id\", \"sync_id\"]\n\n[framework]\npurge = [\"autumn_sync_rows\"]\n"
+    );
+    let project = project(&toml);
+    let db = project.path().join("app.db");
+    open(&db)
+        .batch_execute(
+            "CREATE TABLE autumn_sync_rows (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); \
+             INSERT INTO autumn_sync_rows (payload) VALUES ('x'); \
+             CREATE TABLE refs (id INTEGER PRIMARY KEY, \
+                 sync_id INTEGER REFERENCES autumn_sync_rows(id) ON DELETE CASCADE); \
+             INSERT INTO refs (sync_id) VALUES (1);",
+        )
+        .expect("schema");
+    let (out, _, code) = run(project.path(), "dev", &["db", "scrub"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("refs -> autumn_sync_rows"), "{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS n FROM refs"),
+        1,
+        "nothing deleted"
+    );
+    assert_eq!(leaked(&db).len(), SECRETS.len(), "nothing scrubbed");
+}

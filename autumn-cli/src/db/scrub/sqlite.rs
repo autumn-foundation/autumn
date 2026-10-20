@@ -995,6 +995,45 @@ fn compact(conn: &mut SqliteConnection) -> Result<(), String> {
     }
 }
 
+#[derive(QueryableByName)]
+struct ActionRow {
+    #[diesel(sql_type = Text)]
+    child: String,
+    #[diesel(sql_type = Text)]
+    parent: String,
+}
+
+/// Tables outside the purge set that a purge would change through a foreign key
+/// action (`CASCADE`, `SET NULL`, `SET DEFAULT`), as `child -> parent`.
+fn purge_side_effects(
+    conn: &mut SqliteConnection,
+    facts: &DatabaseFacts,
+    purges: &[(String, String)],
+) -> Result<Vec<String>, ScrubError> {
+    let emptied: BTreeSet<&str> = purges.iter().map(|(table, _)| table.as_str()).collect();
+    let mut found = Vec::new();
+    for child in &facts.public_base_tables {
+        if emptied.contains(child.as_str()) {
+            continue;
+        }
+        let rows: Vec<ActionRow> = sql_query(format!(
+            "SELECT {} AS child, \"table\" AS parent FROM pragma_foreign_key_list({}) \
+             WHERE upper(on_delete) IN ('CASCADE', 'SET NULL', 'SET DEFAULT')",
+            quote_literal(child),
+            quote_literal(child)
+        ))
+        .load(conn)
+        .map_err(|e| sql_err(&e))?;
+        found.extend(
+            rows.into_iter()
+                .filter(|row| emptied.iter().any(|p| p.eq_ignore_ascii_case(&row.parent)))
+                .map(|row| format!("{} -> {}", row.child, row.parent)),
+        );
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// Name what changed between two probes.
 fn drift_entries(before: &DatabaseFacts, after: &DatabaseFacts) -> Vec<String> {
     let mut drift = super::schema_drift(
@@ -1066,6 +1105,18 @@ pub(super) fn classify_and_apply(
         })?;
 
         let purges = purges_for(&facts, &sources.config);
+        // A purge that cascades would change tables the plan never classified.
+        let side_effects = purge_side_effects(&mut conn, &facts, &purges)?;
+        if !side_effects.is_empty() {
+            return Err(ScrubError::UnsupportedOnSqlite {
+                what: "[framework] purge",
+                detail: format!(
+                    "a foreign key action would also change: {}. Drop the action, or \
+                     empty those tables first.",
+                    side_effects.join(", ")
+                ),
+            });
+        }
         // The emptying pass runs after every rewrite, so a delete trigger on a
         // purged table can write fresh rows into a table already scrubbed.
         let mut emptying_triggers: Vec<String> = purges
