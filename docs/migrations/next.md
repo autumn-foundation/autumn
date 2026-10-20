@@ -1604,6 +1604,42 @@ field. The macros fill it. Do not build these types by hand.
 
 **Automation:** `manual` — pass the state to `served`.
 
+### Billing: `Write` has a `Tie` variant
+
+**Why:** The reconciler read the stored subscription before the guarded write
+to find a same-second tie. Two webhooks at the same time could both miss it
+(issue #3111). The store now reports the tie inside the write.
+
+**Before (`{X.Y}`):**
+
+```rust
+match store.upsert_subscription(upsert).await? {
+    Write::Applied(row) | Write::Unchanged(row) | Write::Stale(row) => row,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match store.upsert_subscription(upsert).await? {
+    Write::Applied(row) | Write::Unchanged(row) | Write::Stale(row) | Write::Tie(row) => row,
+    _ => unreachable!("Write is non-exhaustive"),
+}
+```
+
+`Write` is `#[non_exhaustive]`, so a match needs a wildcard arm. Prefer
+`Write::into_inner` when you only need the row.
+
+A custom `BillingStore` must handle `SubscriptionUpsert::check_ties` inside
+`upsert_subscription`. When it is set, the incoming status differs from the
+stored one, both are not terminal, the instants are equal and the write is not
+`authoritative`: write nothing and return `Write::Tie(stored_row)`. Make the
+check and the write one atomic step. A store that never returns `Tie` still
+works, but concurrent same-second webhooks are ranked as before. Only
+subscription writes return `Tie`.
+
+**Automation:** `manual` — add the arm, and the check to a custom store.
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /

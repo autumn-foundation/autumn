@@ -450,6 +450,115 @@ pub async fn subscription_authoritative_settles_a_same_instant_tie(store: &dyn B
     assert!(!after_terminal.is_applied());
 }
 
+/// With the tie check on, a same-instant write of a different live status is
+/// reported, not ranked, and nothing is written. Every other case is as
+/// before.
+pub async fn subscription_tie_check_reports_a_same_instant_tie(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "sub-tie", None).await;
+    let tied =
+        |status, occurred| sub_upsert("sub-tie", &customer, "k", status, occurred).with_tie_check();
+    // A new subscription is never a tie.
+    let first = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 100))
+        .await
+        .unwrap();
+    assert!(first.is_applied());
+    // Same status, same instant: a redelivery.
+    let again = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 100))
+        .await
+        .unwrap();
+    assert!(again.is_unchanged());
+    // Different status, same instant, either rank direction: a tie.
+    for status in [SubscriptionStatus::PastDue, SubscriptionStatus::Paused] {
+        let tie = store.upsert_subscription(tied(status, 100)).await.unwrap();
+        assert!(tie.is_tie(), "{status:?}");
+        assert_eq!(tie.into_inner().status, SubscriptionStatus::Active);
+    }
+    // Without the check, the old ranking still applies.
+    let ranked = store
+        .upsert_subscription(sub_upsert(
+            "sub-tie",
+            &customer,
+            "k",
+            SubscriptionStatus::PastDue,
+            100,
+        ))
+        .await
+        .unwrap();
+    assert!(ranked.is_applied());
+    // An authoritative write is never a tie.
+    let live = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 100).with_authoritative())
+        .await
+        .unwrap();
+    assert!(live.is_applied());
+    // Other instants order as before.
+    let newer = store
+        .upsert_subscription(tied(SubscriptionStatus::PastDue, 101))
+        .await
+        .unwrap();
+    assert!(newer.is_applied());
+    let older = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 100))
+        .await
+        .unwrap();
+    assert!(!older.is_applied() && !older.is_tie());
+    // A terminal status on either side is final, not a tie.
+    let canceled = store
+        .upsert_subscription(tied(SubscriptionStatus::Canceled, 101))
+        .await
+        .unwrap();
+    assert!(canceled.is_applied());
+    let after = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 101))
+        .await
+        .unwrap();
+    assert!(!after.is_applied() && !after.is_tie());
+}
+
+/// Concurrent same-instant writers: exactly one write lands and the other
+/// sees the tie. Never two applies, never an error.
+pub async fn subscription_concurrent_ties_are_reported_once(
+    store: std::sync::Arc<dyn BillingStore>,
+) {
+    let customer = seed_customer(store.as_ref(), "sub-race", None).await;
+    // Round 0: a new subscription. Round 1: an existing one, one second on.
+    for round in 0..2_i64 {
+        for n in 0..8_i64 {
+            let key = format!("{round}-{n}");
+            let base = 100 + round * 10;
+            if round == 1 {
+                store
+                    .upsert_subscription(sub_upsert(
+                        "sub-race",
+                        &customer,
+                        &key,
+                        SubscriptionStatus::Trialing,
+                        base - 1,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let write = |status| {
+                let store = store.clone();
+                let upsert = sub_upsert("sub-race", &customer, &key, status, base).with_tie_check();
+                tokio::spawn(async move { store.upsert_subscription(upsert).await })
+            };
+            let a = write(SubscriptionStatus::Active);
+            let b = write(SubscriptionStatus::PastDue);
+            let (a, b) = (a.await.unwrap().unwrap(), b.await.unwrap().unwrap());
+            let applied = [&a, &b].iter().filter(|w| w.is_applied()).count();
+            let ties = [&a, &b].iter().filter(|w| w.is_tie()).count();
+            assert_eq!(
+                (applied, ties),
+                (1, 1),
+                "round {round} run {n}: {a:?} {b:?}"
+            );
+        }
+    }
+}
+
 /// At the same instant the higher rank wins; a lower rank is stale.
 pub async fn subscription_same_instant_higher_rank_wins(store: &dyn BillingStore) {
     let customer = seed_customer(store, "sub-b", None).await;
@@ -1541,6 +1650,7 @@ pub async fn run_contract(store: &dyn BillingStore) {
     subscription_newer_wins_older_stale(store).await;
     subscription_same_instant_higher_rank_wins(store).await;
     subscription_authoritative_settles_a_same_instant_tie(store).await;
+    subscription_tie_check_reports_a_same_instant_tie(store).await;
     subscription_terminal_never_left(store).await;
     subscriptions_for_customer_newest_first(store).await;
     subscription_set_status(store).await;
@@ -1589,6 +1699,7 @@ mod memory {
         subscription_newer_wins_older_stale,
         subscription_same_instant_higher_rank_wins,
         subscription_authoritative_settles_a_same_instant_tie,
+        subscription_tie_check_reports_a_same_instant_tie,
         subscription_terminal_never_left,
         subscriptions_for_customer_newest_first,
         subscription_set_status,
@@ -1612,6 +1723,12 @@ mod memory {
         settle_dunning_keeps_a_concurrent_link,
         prune_events_deletes_applied_rows_before,
     );
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_ties_are_reported_once() {
+        let store = std::sync::Arc::new(MemoryBillingStore::new());
+        super::subscription_concurrent_ties_are_reported_once(store).await;
+    }
 
     #[tokio::test]
     async fn whole_suite_on_one_shared_store() {

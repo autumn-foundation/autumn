@@ -160,6 +160,11 @@ impl FakeProvider {
         *self.live_subscription.lock().unwrap() = Some(snapshot);
     }
 
+    /// Back to "cannot look subscriptions up".
+    pub fn clear_live_subscription(&self) {
+        *self.live_subscription.lock().unwrap() = None;
+    }
+
     /// Number of `fetch_subscription` calls.
     pub fn fetch_calls(&self) -> usize {
         self.calls()
