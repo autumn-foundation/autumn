@@ -47,7 +47,6 @@
 //!   and its drift from the source of truth. `/actuator/derivations` serves it.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl as _;
@@ -198,7 +197,7 @@ impl DerivationDef {
             "tenant_column",
             self.tenant_column.unwrap_or("").as_bytes(),
         );
-        hex_lower(hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// The derivation as the SQL builders in `counter_cache` see it.
@@ -236,16 +235,6 @@ fn push_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
     hasher.update(b":");
     hasher.update(value);
     hasher.update(b";");
-}
-
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
 }
 
 // ── Registry ────────────────────────────────────────────────────────────────
@@ -366,7 +355,7 @@ pub(crate) fn registry_fingerprint() -> Option<String> {
         push_component(&mut hasher, "name", def.name.as_bytes());
         push_component(&mut hasher, "hash", def.definition_hash().as_bytes());
     }
-    Some(hex_lower(hasher.finalize()))
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// Whether the backfill of every registered derivation is complete on this

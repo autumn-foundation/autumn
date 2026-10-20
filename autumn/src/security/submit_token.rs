@@ -174,17 +174,6 @@ const fn is_mutating_method(method: &Method) -> bool {
     )
 }
 
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
-}
-
 /// Release this attempt's in-flight lock for `key`. Each attempt has its own
 /// `owner`: an attempt that outlived its lock must not free the lock of a retry
 /// that took the token since. An error is logged; the lock then expires by its
@@ -202,7 +191,7 @@ fn storage_key(token: &str) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"autumn.submit_token:v1:");
     hasher.update(token.as_bytes());
-    format!("submit:{}", hex_lower(hasher.finalize()))
+    format!("submit:{}", hex::encode(hasher.finalize()))
 }
 
 // ── Multipart / body scanning helpers ─────────────────────────────────────────
@@ -2393,7 +2382,7 @@ mod tests {
 
     /// Characterization for the Echo clone class: `storage_key` renders its
     /// digest through this file's own `hex_lower`, one of six byte-identical
-    /// copies across the crate. Pinned before `hex_lower` is replaced by the
+    /// copies across the crate. Pinned when `hex_lower` was replaced by the
     /// `hex` crate (already a dependency) at its call site.
     #[test]
     fn storage_key_is_pinned_hex() {

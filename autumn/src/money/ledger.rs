@@ -609,7 +609,7 @@ impl IdempotencyKey {
         let mut hasher = sha2::Sha256::new();
         push_field(&mut hasher, "namespace", namespace.as_bytes());
         push_normalized_postings(&mut hasher, postings);
-        Self(hex_lower(hasher.finalize()))
+        Self(hex::encode(hasher.finalize()))
     }
 
     /// The key as stored.
@@ -765,7 +765,7 @@ impl Transaction {
         let mut hasher = sha2::Sha256::new();
         push_field(&mut hasher, "currency", currency.code().as_bytes());
         push_normalized_postings(&mut hasher, &self.postings);
-        hex_lower(hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 }
 
@@ -957,16 +957,6 @@ fn push_normalized_postings(hasher: &mut sha2::Sha256, postings: &[Posting]) {
         push_field(hasher, "side", side.label().as_bytes());
         push_field(hasher, "currency", currency.as_bytes());
     }
-}
-
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
-        |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
 }
 
 fn check_text(field: &'static str, value: &str, max: usize) -> Result<(), LedgerError> {

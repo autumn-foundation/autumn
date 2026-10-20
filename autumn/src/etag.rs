@@ -291,7 +291,7 @@ impl IntoETag for (chrono::NaiveDateTime, i64) {
         hasher.update(self.0.and_utc().timestamp().to_be_bytes());
         hasher.update(self.0.and_utc().timestamp_subsec_nanos().to_be_bytes());
         hasher.update(self.1.to_be_bytes());
-        ETag::strong(hex_lower(hasher.finalize()))
+        ETag::strong(hex::encode(hasher.finalize()))
     }
 }
 
@@ -324,20 +324,7 @@ pub fn hash_etag<T: Hash>(value: &T) -> ETag {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    hex_lower(sha2::Sha256::digest(bytes))
-}
-
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    out.extend(bytes.iter().flat_map(|b| {
-        [
-            HEX[(b >> 4) as usize] as char,
-            HEX[(b & 0xf) as usize] as char,
-        ]
-    }));
-    out
+    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 // ── FreshWhen result ──────────────────────────────────────────────────────────
@@ -2137,7 +2124,7 @@ mod tests {
     /// Characterization for the Echo clone class: `sha256_hex` renders its
     /// digest through this file's own `hex_lower`, one of six byte-identical
     /// copies across the crate. Pinned against the well-known SHA-256("hello")
-    /// test vector before `hex_lower` is replaced by the `hex` crate (already
+    /// test vector when `hex_lower` was replaced by the `hex` crate (already
     /// a dependency) at its call site.
     #[test]
     fn sha256_hex_is_pinned_hex() {

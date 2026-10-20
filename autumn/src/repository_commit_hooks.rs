@@ -2281,7 +2281,7 @@ fn repository_commit_hook_id(
     } else {
         push_hook_id_component(&mut hasher, "record", record.as_bytes());
     }
-    format!("idempotent:{}", hex_lower(hasher.finalize()))
+    format!("idempotent:{}", hex::encode(hasher.finalize()))
 }
 
 fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
@@ -2291,17 +2291,6 @@ fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) 
     hasher.update(b":");
     hasher.update(value);
     hasher.update(b";");
-}
-
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
 }
 
 pub fn repository_commit_hook_worker_id() -> String {

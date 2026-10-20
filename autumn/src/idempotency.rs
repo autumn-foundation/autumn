@@ -76,17 +76,6 @@ fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
-}
-
 fn principal_scope_digest(session_id: Option<&str>) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"authorization:");
@@ -94,7 +83,7 @@ fn principal_scope_digest(session_id: Option<&str>) -> String {
     if let Some(session_id) = session_id {
         hasher.update(session_id.as_bytes());
     }
-    hex_lower(hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
@@ -199,7 +188,7 @@ fn bearer_scope_for_parts(parts: &axum::http::request::Parts) -> Option<BearerSc
         return Some(BearerScope::Verified(principal.0.clone()));
     }
     let header = parts.headers.get(axum::http::header::AUTHORIZATION)?;
-    Some(BearerScope::Header(hex_lower(sha2::Sha256::digest(
+    Some(BearerScope::Header(hex::encode(sha2::Sha256::digest(
         header.as_bytes(),
     ))))
 }
@@ -264,7 +253,7 @@ fn build_storage_key(
         push_storage_key_component(&mut hasher, "tenant", tenant.as_bytes());
     }
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
-    format!("v2:{}", hex_lower(hasher.finalize()))
+    format!("v2:{}", hex::encode(hasher.finalize()))
 }
 
 async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
@@ -2836,17 +2825,6 @@ mod tests {
         crate::session::Session::new_for_test(session_id.to_owned(), data)
     }
 
-    fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().fold(
-            String::with_capacity(bytes.as_ref().len() * 2),
-            |mut out, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{byte:02x}");
-                out
-            },
-        )
-    }
-
     fn expected_principal_digest(session_id: Option<&str>) -> String {
         use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
@@ -2855,7 +2833,7 @@ mod tests {
         if let Some(session_id) = session_id {
             hasher.update(session_id.as_bytes());
         }
-        hex_lower(hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     fn expected_storage_key(
@@ -2872,7 +2850,7 @@ mod tests {
         push_storage_key_component(&mut hasher, "scope-header-count", b"0");
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
-        format!("v2:{}", hex_lower(hasher.finalize()))
+        format!("v2:{}", hex::encode(hasher.finalize()))
     }
 
     /// The key a request with a raw `Authorization` header and no session
@@ -2885,7 +2863,7 @@ mod tests {
     ) -> String {
         use sha2::Digest as _;
         let principal = expected_principal_digest(None);
-        let digest = hex_lower(sha2::Sha256::digest(authorization.as_bytes()));
+        let digest = hex::encode(sha2::Sha256::digest(authorization.as_bytes()));
         let mut hasher = sha2::Sha256::new();
         push_storage_key_component(&mut hasher, "method", method.as_bytes());
         push_storage_key_component(&mut hasher, "target", path.as_bytes());
@@ -2893,12 +2871,12 @@ mod tests {
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "authorization", digest.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
-        format!("v2:{}", hex_lower(hasher.finalize()))
+        format!("v2:{}", hex::encode(hasher.finalize()))
     }
 
     fn header_scope(authorization: &str) -> BearerScope {
         use sha2::Digest as _;
-        BearerScope::Header(hex_lower(sha2::Sha256::digest(authorization.as_bytes())))
+        BearerScope::Header(hex::encode(sha2::Sha256::digest(authorization.as_bytes())))
     }
 
     /// Two token clients with no session must not share a cache slot. Before
