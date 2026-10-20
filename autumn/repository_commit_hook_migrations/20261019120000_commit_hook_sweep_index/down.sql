@@ -1,0 +1,2 @@
+-- Intentionally empty. The full framework set also creates this index.
+-- Neither set drops it on rollback, so an app that runs both keeps it.

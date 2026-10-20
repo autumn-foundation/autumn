@@ -2463,6 +2463,11 @@ jobs:
             tests::fleet_subcommands db::replica:: \
             | tee "$RUNNER_TEMP/cli-fleet-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
+          # Issue #2396: same gap for `db::retention::` (the force env and the
+          # purge pre-flight). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::retention:: \
+            | tee "$RUNNER_TEMP/cli-retention-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-retention-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
