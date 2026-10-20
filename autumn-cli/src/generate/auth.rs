@@ -11843,8 +11843,8 @@ mod tests {
 
     /// Issue #3170: every `<label>` must name a control. A bare label gives a
     /// screen reader no accessible name. A label is bound by `for` plus a
-    /// matching `id`, or by wrapping a checkbox. Every visible input needs an
-    /// `id` or an `aria-label`.
+    /// matching `id` in the same form, or by wrapping a checkbox. Every visible
+    /// input needs an `id` or an `aria-label`. Ids are unique in a form.
     #[test]
     fn generated_forms_bind_every_label_and_input() {
         let variants = [
@@ -11853,40 +11853,55 @@ mod tests {
             render_routes_file("User", "user", "users", &[], false, true),
             render_routes_file("User", "user", "users", &["github".to_owned()], true, true),
         ];
+        let mut bound = 0;
         for routes in &variants {
-            for (at, _) in routes.match_indices("label ") {
-                let before = routes[..at].chars().next_back();
-                if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"') {
-                    continue;
+            for form in routes.split("form action=").skip(1) {
+                let mut ids = Vec::new();
+                for (at, _) in form.match_indices("id=\"") {
+                    let rest = &form[at + 4..];
+                    let id = &rest[..rest.find('"').expect("id value ends")];
+                    if form[..at].ends_with("for=\"") {
+                        continue;
+                    }
+                    assert!(!ids.contains(&id), "duplicate id \"{id}\" in one form");
+                    ids.push(id);
                 }
-                let rest = &routes[at + "label ".len()..];
-                if let Some(after_for) = rest.strip_prefix("for=\"") {
-                    let id = &after_for[..after_for.find('"').expect("for value ends")];
+                for (at, _) in form.match_indices("label ") {
+                    if form[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"')
+                    {
+                        continue;
+                    }
+                    let rest = &form[at + "label ".len()..];
+                    if let Some(after_for) = rest.strip_prefix("for=\"") {
+                        let id = &after_for[..after_for.find('"').expect("for value ends")];
+                        assert!(ids.contains(&id), "label for=\"{id}\" has no input id");
+                        bound += 1;
+                    } else if rest.starts_with('{') {
+                        let window = &rest[..rest.find('}').expect("label ends")];
+                        assert!(
+                            window.contains("type=\"checkbox\""),
+                            "bare label names no control:\n{window}"
+                        );
+                    }
+                }
+                for (at, _) in form.match_indices("input type=\"") {
+                    let rest = &form[at..];
+                    let stmt = &rest[..rest.find(';').expect("input ends")];
+                    let kind = &stmt["input type=\"".len()..];
+                    if kind.starts_with("hidden") || kind.starts_with("checkbox") {
+                        continue;
+                    }
                     assert!(
-                        routes.contains(&format!("id=\"{id}\"")),
-                        "label for=\"{id}\" has no input with that id"
-                    );
-                } else if rest.starts_with('{') {
-                    let window = &rest[..rest.len().min(120)];
-                    assert!(
-                        window.contains("type=\"checkbox\""),
-                        "bare label names no control:\n{window}"
+                        stmt.contains("id=\"") || stmt.contains("aria-label="),
+                        "input has no id or aria-label:\n{stmt}"
                     );
                 }
-            }
-            for (at, _) in routes.match_indices("input type=\"") {
-                let rest = &routes[at..];
-                let stmt = &rest[..rest.find(';').expect("input ends")];
-                let kind = &stmt["input type=\"".len()..];
-                if kind.starts_with("hidden") || kind.starts_with("checkbox") {
-                    continue;
-                }
-                assert!(
-                    stmt.contains("id=\"") || stmt.contains("aria-label="),
-                    "input has no id or aria-label:\n{stmt}"
-                );
             }
         }
+        assert!(bound >= 40, "scan found too few labels: {bound}");
     }
 
     /// Issue #2347: while impersonating, `{snake}_id` is the target but the
