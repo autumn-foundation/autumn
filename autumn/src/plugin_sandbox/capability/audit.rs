@@ -81,6 +81,13 @@ pub struct CapabilityEvent {
     pub target: String,
     /// How it ended.
     pub outcome: CapabilityOutcome,
+    /// When the call ended, on the ambient clock.
+    ///
+    /// Taken where the call is recorded, not where the log ingests it. A request
+    /// can run for a long time, and stamping its events when it finishes made
+    /// its earliest calls look recent.
+    #[serde(skip)]
+    pub at: Instant,
 }
 
 /// The most events one plugin's log holds.
@@ -98,24 +105,30 @@ pub const MAX_LOG_EVENTS: usize = 4096;
 /// plugin but the ceiling has to hold across all of them.
 #[derive(Debug, Default)]
 pub struct PluginActivityLog {
-    /// A ring, not a `Vec`. Dropping the oldest entry from a `Vec` is a
-    /// memmove of every entry behind it, once per ingested event for as long as
-    /// the log stays full — quadratic in the call rate, under one mutex shared
-    /// by every plugin and every concurrent request. `VecDeque::pop_front` is
-    /// the same eviction in constant time.
-    entries: Mutex<VecDeque<(Instant, String, CapabilityEvent)>>,
-    /// Calls this log knows happened but cannot show: the ones a per-request
-    /// ledger could not hold, and the ones this ring itself evicted.
+    /// Both ledgers under one lock. A summary then never sees an event that has
+    /// left the ring and not yet reached the drop ledger. The work under the
+    /// lock is constant time per event.
+    state: Mutex<LogState>,
+}
+
+/// What [`PluginActivityLog`] guards.
+#[derive(Debug, Default)]
+struct LogState {
+    /// A ring, not a `Vec`: `pop_front` is constant time, a `Vec` shifts.
+    entries: VecDeque<(Instant, String, CapabilityEvent)>,
+    /// Calls the log knows happened but cannot show: those a per-request
+    /// ledger could not hold, and those the ring evicted.
     ///
-    /// Timestamped like `entries`, and windowed by the same cutoff. A lifetime
-    /// total would attach itself to every later summary — including one whose
-    /// window ended before any of those calls — and tell an operator that a
-    /// quiet hour was incomplete forever after one noisy second.
-    ///
-    /// Coalesced into [`DROPPED_BUCKET`] buckets per plugin so the ring cannot
-    /// grow one entry per evicted event, which is the growth it exists to
-    /// report.
-    dropped: Mutex<VecDeque<(Instant, String, u64)>>,
+    /// Keyed by time, so the oldest record is the first key whatever order the
+    /// records arrived in. The sequence number keeps equal times apart. Windowed
+    /// by the same cutoff as `entries`.
+    dropped: BTreeMap<(Instant, u64), (String, u64)>,
+    /// The next sequence number for `dropped`.
+    seq: u64,
+    /// Counts the full `dropped` ledger folded away, by plugin, with the newest
+    /// time folded in. A summary reports it while that time is in its window,
+    /// so it can over-report, never under-report.
+    folded: BTreeMap<String, (Instant, u64)>,
 }
 
 /// How coarsely dropped-call records are timestamped.
@@ -134,35 +147,27 @@ impl PluginActivityLog {
         Self::default()
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, LogState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Record everything one request's runtime gathered.
+    ///
+    /// Each event keeps the time it carries, not the time of this call.
     pub fn ingest(&self, plugin: &str, events: impl IntoIterator<Item = CapabilityEvent>) {
-        let now = crate::time::ambient_instant();
-        // What this ring evicts to make room, carried out of the critical
-        // section rather than recorded inside it: the two locks are never held
-        // at once, so neither orders the other and no future reader can
-        // deadlock the log an operator reads during an incident.
-        let mut evicted: Vec<(Instant, String)> = Vec::new();
-        {
-            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-            for event in events {
-                if entries.len() >= MAX_LOG_EVENTS
-                    && let Some((at, who, _)) = entries.pop_front()
-                {
-                    evicted.push((at, who));
-                }
-                entries.push_back((now, plugin.to_owned(), event));
+        let mut state = self.lock();
+        for event in events {
+            if state.entries.len() >= MAX_LOG_EVENTS
+                && let Some((at, who, _)) = state.entries.pop_front()
+            {
+                // An evicted event is a call the summary can no longer show.
+                // It is recorded under its own time, so a drop that has aged
+                // out of the window stops being reported with it.
+                state.note_dropped(at, &who, 1);
             }
-        }
-        if !evicted.is_empty() {
-            // An evicted event is a call the summary can no longer show. Left
-            // uncounted, a busy plugin's "last hour" would present the last few
-            // seconds as the whole hour, with no sign that the rest existed.
-            // Recorded under the *evicted* event's own timestamp, so a drop that
-            // has aged out of the window stops being reported with it.
-            let mut dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-            for (at, who) in evicted {
-                note_dropped(&mut dropped, at, &who, 1);
-            }
+            state
+                .entries
+                .push_back((event.at, plugin.to_owned(), event));
         }
     }
 
@@ -176,109 +181,95 @@ impl PluginActivityLog {
         if dropped == 0 {
             return;
         }
-        let mut ring = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-        note_dropped(&mut ring, crate::time::ambient_instant(), plugin, dropped);
+        self.lock()
+            .note_dropped(crate::time::ambient_instant(), plugin, dropped);
     }
 
     /// What `plugin` did within `window`.
     #[must_use]
     pub fn summary(&self, plugin: &str, window: Duration) -> ActivitySummary {
         let cutoff = crate::time::ambient_instant();
+        let in_window = |at: Instant| cutoff.saturating_duration_since(at) <= window;
         let mut summary = ActivitySummary {
             plugin: plugin.to_owned(),
             window,
             ..ActivitySummary::default()
         };
-        {
-            // Scoped so the entries lock is released before the `dropped` one
-            // is taken. Holding both at once would make this the only site that
-            // orders the two, and the next reader to take them the other way
-            // round would deadlock the log the operator reads during an
-            // incident.
-            let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-            for (at, who, event) in entries.iter() {
-                if who != plugin || cutoff.saturating_duration_since(*at) > window {
-                    continue;
-                }
+        let state = self.lock();
+        for (at, who, event) in &state.entries {
+            if who == plugin && in_window(*at) {
                 summary.record(event);
             }
         }
-        summary.dropped = {
-            let dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-            dropped
-                .iter()
-                .filter(|(at, who, _)| {
-                    who == plugin && cutoff.saturating_duration_since(*at) <= window
-                })
-                .fold(0_u64, |sum, (_, _, count)| sum.saturating_add(*count))
-        };
+        summary.dropped = state
+            .dropped
+            .iter()
+            .filter(|((at, _), (who, _))| who == plugin && in_window(*at))
+            .fold(0_u64, |sum, (_, (_, count))| sum.saturating_add(*count));
+        if let Some((at, count)) = state.folded.get(plugin)
+            && in_window(*at)
+        {
+            summary.dropped = summary.dropped.saturating_add(*count);
+        }
         summary
     }
 
     /// Every plugin this log has heard from.
     ///
-    /// Both ledgers, not only the event ring. A busy plugin can evict a quiet
+    /// All ledgers, not only the event ring. A busy plugin can evict a quiet
     /// one's every event while the drop ledger still carries the count of what
     /// was lost, and an operator surface that enumerates plugins here to ask
     /// each for a [`summary`] would then skip the one plugin whose activity is
-    /// only visible as drops — reporting nothing for a plugin about which this
-    /// log knows something.
+    /// only visible as drops.
     ///
     /// [`summary`]: Self::summary
     #[must_use]
     pub fn plugins(&self) -> Vec<String> {
-        let mut names: Vec<String> = {
-            let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-            entries.iter().map(|(_, who, _)| who.clone()).collect()
-        };
-        names.extend({
-            let dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-            dropped
-                .iter()
-                .map(|(_, who, _)| who.clone())
-                .collect::<Vec<_>>()
-        });
+        let state = self.lock();
+        let mut names: Vec<String> = state
+            .entries
+            .iter()
+            .map(|(_, who, _)| who.clone())
+            .chain(state.dropped.values().map(|(who, _)| who.clone()))
+            .chain(state.folded.keys().cloned())
+            .collect();
         names.sort();
         names.dedup();
         names
     }
 }
 
-/// Add `count` dropped calls for `plugin` at `at`, coalescing into the newest
-/// record when it is the same plugin within one [`DROPPED_BUCKET`].
-///
-/// Bounded by the same ceiling as the event ring, and evicting oldest-first for
-/// the same reason: a report of unbounded growth must not itself grow without
-/// bound.
-fn note_dropped(
-    ring: &mut VecDeque<(Instant, String, u64)>,
-    at: Instant,
-    plugin: &str,
-    count: u64,
-) {
-    if let Some((last, who, total)) = ring.back_mut() {
-        // Distance either way: an eviction record carries the *evicted* event's
-        // timestamp, which runs behind the wall clock a per-request overflow is
-        // stamped with, so the two interleave out of order.
-        let span = if at >= *last {
-            at.saturating_duration_since(*last)
-        } else {
-            last.saturating_duration_since(at)
-        };
-        if who == plugin && span < DROPPED_BUCKET {
-            // The newer of the two, so a bucket is reported for as long as any
-            // call in it belongs to the window. A bucket is one second against a
-            // window of an hour, so the edge it rounds is not one an operator
-            // can act on differently.
-            *last = (*last).max(at);
-            *total = total.saturating_add(count);
+impl LogState {
+    /// Add `count` dropped calls for `plugin` at `at`.
+    ///
+    /// Coalesces into the newest record when it is the same plugin within one
+    /// [`DROPPED_BUCKET`]. Bounded by [`MAX_LOG_EVENTS`]: the oldest record, by
+    /// time, folds into `folded` rather than vanishing.
+    fn note_dropped(&mut self, at: Instant, plugin: &str, count: u64) {
+        if let Some((&(last, seq), (who, _))) = self.dropped.last_key_value()
+            && who == plugin
+            && at.max(last).saturating_duration_since(at.min(last)) < DROPPED_BUCKET
+        {
+            // The newer of the two times, so a bucket is reported for as long
+            // as any call in it belongs to the window.
+            if let Some((who, total)) = self.dropped.remove(&(last, seq)) {
+                self.dropped
+                    .insert((last.max(at), seq), (who, total.saturating_add(count)));
+            }
             return;
         }
+        self.seq = self.seq.wrapping_add(1);
+        self.dropped
+            .insert((at, self.seq), (plugin.to_owned(), count));
+        while self.dropped.len() > MAX_LOG_EVENTS {
+            let Some(((oldest, _), (who, count))) = self.dropped.pop_first() else {
+                break;
+            };
+            let folded = self.folded.entry(who).or_insert((oldest, 0));
+            folded.0 = folded.0.max(oldest);
+            folded.1 = folded.1.saturating_add(count);
+        }
     }
-    if ring.len() >= MAX_LOG_EVENTS {
-        ring.pop_front();
-    }
-    ring.push_back((at, plugin.to_owned(), count));
 }
 
 /// The answer to "what did this plugin do".
@@ -351,9 +342,15 @@ impl ActivitySummary {
         // report that no runner will ever run, which is the one number an
         // operator reading this would act on.
         let enqueued = matches!(event.outcome, CapabilityOutcome::Allowed);
+        // Tables are the other exception: `StoreError::Backend` means the read
+        // or write did not happen, so only a call that did is a table touched.
+        let touched = matches!(
+            event.outcome,
+            CapabilityOutcome::Allowed | CapabilityOutcome::Denied(DenialReason::ResponseTooLarge)
+        );
         let bucket = match (event.capability, allowed) {
             (SandboxCapability::HttpOutbound, true) => Some(&mut self.hosts),
-            (SandboxCapability::Db, true) => Some(&mut self.tables),
+            (SandboxCapability::Db, true) if touched => Some(&mut self.tables),
             (SandboxCapability::Jobs, true) if enqueued => Some(&mut self.job_types),
             // Every remaining scoped call — refused outright, or a `jobs` call
             // that reached a sink which would not take it — is a target the
@@ -456,6 +453,7 @@ mod tests {
             operation,
             target: "cart".to_owned(),
             outcome,
+            at: crate::time::ambient_instant(),
         }
     }
 
@@ -634,9 +632,10 @@ mod tests {
             log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
         }
         let held = log
-            .dropped
+            .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .dropped
             .len();
         assert!(held <= MAX_LOG_EVENTS, "the dropped ring grew to {held}");
         assert!(
@@ -660,12 +659,14 @@ mod tests {
                     operation: "job-enqueue",
                     target: "reindex".to_owned(),
                     outcome: CapabilityOutcome::Allowed,
+                    at: crate::time::ambient_instant(),
                 },
                 CapabilityEvent {
                     capability: SandboxCapability::Jobs,
                     operation: "job-enqueue",
                     target: "reindex".to_owned(),
                     outcome: CapabilityOutcome::Denied(DenialReason::BackendError),
+                    at: crate::time::ambient_instant(),
                 },
             ],
         );
@@ -680,5 +681,159 @@ mod tests {
             Some(1),
             "and the refusal is still visible: {summary:?}"
         );
+    }
+    fn db_event(outcome: CapabilityOutcome) -> CapabilityEvent {
+        CapabilityEvent {
+            capability: SandboxCapability::Db,
+            operation: "db-insert",
+            target: "orders".to_owned(),
+            outcome,
+            at: crate::time::ambient_instant(),
+        }
+    }
+
+    #[test]
+    fn a_failed_db_call_is_not_a_table_touched() {
+        // `StoreError::Backend` means the read or write did not happen.
+        let log = PluginActivityLog::new();
+        log.ingest(
+            "shop",
+            [
+                db_event(CapabilityOutcome::Allowed),
+                db_event(CapabilityOutcome::Denied(DenialReason::BackendError)),
+            ],
+        );
+        let summary = log.summary("shop", Duration::from_secs(3600));
+        assert_eq!(
+            summary.tables.get("orders").copied(),
+            Some(1),
+            "{summary:?}"
+        );
+        assert_eq!(
+            summary.refused_targets.get("orders").copied(),
+            Some(1),
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn an_event_keeps_the_time_it_happened() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+
+        // A slow request: the call is made, two hours pass, the log ingests.
+        let early = event("kv-get", CapabilityOutcome::Allowed);
+        clock.advance(2 * hour);
+        let late = event("kv-set", CapabilityOutcome::Allowed);
+        log.ingest("shop", [early, late]);
+
+        let summary = log.summary("shop", hour);
+        assert_eq!(summary.allowed.get("kv-get"), None, "{summary:?}");
+        assert_eq!(summary.allowed.get("kv-set").copied(), Some(1));
+    }
+
+    #[test]
+    fn a_full_dropped_ledger_keeps_every_count() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+
+        let records = MAX_LOG_EVENTS + 50;
+        for _ in 0..records {
+            log.ingest_dropped("shop", 1);
+            // Past the coalescing span, so each is its own record.
+            clock.advance(Duration::from_secs(2));
+        }
+        let summary = log.summary("shop", Duration::from_secs(86_400));
+        assert_eq!(summary.dropped, records as u64);
+    }
+
+    #[test]
+    fn the_dropped_ledger_evicts_the_oldest_time_not_the_oldest_insert() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+
+        // Old events fill the event ring, then a long time passes.
+        let old: Vec<_> = (0..MAX_LOG_EVENTS)
+            .map(|_| event("kv-get", CapabilityOutcome::Allowed))
+            .collect();
+        clock.advance(10 * hour);
+        // The ledger fills with recent records.
+        for _ in 0..MAX_LOG_EVENTS {
+            log.ingest_dropped("shop", 1);
+            clock.advance(Duration::from_secs(2));
+        }
+        // Ingesting the old events, then new ones, evicts old events: those
+        // drops carry old times and land after the recent records.
+        log.ingest("shop", old);
+        log.ingest(
+            "shop",
+            (0..10).map(|_| event("kv-set", CapabilityOutcome::Allowed)),
+        );
+        log.ingest_dropped("shop", 1);
+
+        // Window: only the recent records. All 4096 + 1 are in it; the evicted
+        // old events are not.
+        let summary = log.summary("shop", Duration::from_secs(3 * 3600));
+        assert!(
+            summary.dropped > MAX_LOG_EVENTS as u64,
+            "recent drops were lost: {}",
+            summary.dropped
+        );
+    }
+
+    #[test]
+    fn a_summary_never_sees_a_call_in_neither_ledger() {
+        use std::sync::Arc;
+
+        let log = Arc::new(PluginActivityLog::new());
+        log.ingest(
+            "shop",
+            (0..MAX_LOG_EVENTS).map(|_| event("kv-get", CapabilityOutcome::Allowed)),
+        );
+        let writer = {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
+                }
+            })
+        };
+        let mut last = 0_u64;
+        while !writer.is_finished() {
+            let summary = log.summary("shop", Duration::from_secs(3600));
+            let seen = summary.allowed.get("kv-get").copied().unwrap_or(0) + summary.dropped;
+            assert!(
+                seen >= last,
+                "a call vanished mid-transfer: {seen} < {last}"
+            );
+            last = seen;
+        }
+        writer.join().expect("the writer finishes");
     }
 }

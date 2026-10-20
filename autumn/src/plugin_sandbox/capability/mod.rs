@@ -1531,6 +1531,7 @@ impl CapabilityRuntime {
                 operation: call.operation(),
                 target,
                 outcome,
+                at: crate::time::ambient_instant(),
             });
         } else {
             // Counted rather than dropped silently. The ledger is bounded
