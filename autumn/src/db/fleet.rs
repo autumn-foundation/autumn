@@ -194,6 +194,15 @@ pub enum FleetError {
         /// The database name.
         name: String,
     },
+    /// This host does not own the key's slot at the current epoch (`421`).
+    /// Another host serves it, or this host waits for the slot's lease.
+    #[error("fleet database {name}: this host does not own slot {slot}")]
+    NotOwner {
+        /// The database name.
+        name: String,
+        /// The routing slot.
+        slot: u16,
+    },
     /// A file operation failed (`500`).
     #[error("fleet {op}: {detail}")]
     Io {
@@ -216,6 +225,7 @@ impl FleetError {
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::AlreadyExists { .. } | Self::InUseElsewhere { .. } => StatusCode::CONFLICT,
             Self::Deleting { .. } => StatusCode::GONE,
+            Self::NotOwner { .. } => StatusCode::MISDIRECTED_REQUEST,
             Self::PendingMigrations { .. }
             | Self::Migration { .. }
             | Self::Unavailable { .. }
@@ -261,6 +271,9 @@ pub struct FleetDatabase {
     /// Counts the holders of this database. The fleet's own copy is one; any
     /// more and the database is in use, so it is never closed.
     lease: Arc<()>,
+    /// The ownership epoch this database opened under. `None` without
+    /// ownership.
+    epoch: Option<crate::lock::FencingToken>,
     /// Background work to stop before the pool closes. `None` once the stop
     /// has begun: a later registration is stopped at once.
     workers: Arc<Mutex<Option<Vec<Worker>>>>,
@@ -283,6 +296,13 @@ impl FleetDatabase {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The ownership epoch this database opened under (issue #3233). `None`
+    /// when the fleet has no ownership.
+    #[must_use]
+    pub const fn epoch(&self) -> Option<crate::lock::FencingToken> {
+        self.epoch
     }
 
     /// The database's connection pool.
@@ -804,6 +824,7 @@ struct Inner {
     migrations: FleetMigrations,
     replicating: AtomicBool,
     replication: std::sync::OnceLock<Arc<super::fleet_replication::FleetReplication>>,
+    ownership: std::sync::OnceLock<Arc<super::fleet_ownership::FleetOwnership>>,
     state: Mutex<State>,
     lifecycle: std::sync::RwLock<Vec<Arc<dyn FleetLifecycle>>>,
     counters: Counters,
@@ -963,6 +984,7 @@ impl DatabaseFleet {
                 migrations,
                 replicating: AtomicBool::new(false),
                 replication: std::sync::OnceLock::new(),
+                ownership: std::sync::OnceLock::new(),
                 state: Mutex::new(State::default()),
                 lifecycle: std::sync::RwLock::new(Vec::new()),
                 counters: Counters::default(),
@@ -1031,6 +1053,7 @@ impl DatabaseFleet {
         self.inner.replication.set(Arc::clone(&replication))?;
         self.inner.replicating.store(true, Ordering::Release);
         self.add_lifecycle(replication);
+        self.wire_fence_hook();
         Ok(())
     }
 
@@ -1044,6 +1067,126 @@ impl DatabaseFleet {
     #[must_use]
     pub fn replicating(&self) -> bool {
         self.inner.replicating.load(Ordering::Acquire)
+    }
+
+    /// Serve only the slots `ownership` holds (issue #3233). Install before
+    /// the first open, once, after a first
+    /// [`refresh`](super::fleet_ownership::FleetOwnership::refresh).
+    ///
+    /// # Errors
+    ///
+    /// The ownership that is already installed, when called twice.
+    pub fn install_ownership(
+        &self,
+        ownership: Arc<super::fleet_ownership::FleetOwnership>,
+    ) -> Result<(), Arc<super::fleet_ownership::FleetOwnership>> {
+        self.inner.ownership.set(ownership)?;
+        self.wire_fence_hook();
+        Ok(())
+    }
+
+    /// With both ownership and replication: a replicator that sees a newer
+    /// epoch drops this host's range, and the ownership loop closes it.
+    fn wire_fence_hook(&self) {
+        let (Some(replication), Some(ownership)) = (self.replication(), self.ownership()) else {
+            return;
+        };
+        let ownership = Arc::downgrade(ownership);
+        replication.set_fence_hook(Arc::new(move |key: &FleetDbKey, newest: u64| {
+            let newer = i64::try_from(newest)
+                .ok()
+                .and_then(|n| crate::lock::FencingToken::try_from(n).ok());
+            if let (Some(ownership), Some(newer)) = (ownership.upgrade(), newer) {
+                ownership.lose(key.routing_slot(), newer);
+            }
+        }));
+    }
+
+    /// The epoch to open `key` under: `None` without ownership.
+    fn owned_epoch(
+        &self,
+        key: &FleetDbKey,
+    ) -> Result<Option<crate::lock::FencingToken>, FleetError> {
+        let Some(ownership) = self.ownership() else {
+            return Ok(None);
+        };
+        let slot = key.routing_slot();
+        ownership
+            .epoch_for(slot)
+            .map(Some)
+            .ok_or_else(|| FleetError::NotOwner {
+                name: key.name(),
+                slot,
+            })
+    }
+
+    /// The installed ownership, if any.
+    #[must_use]
+    pub fn ownership(&self) -> Option<&Arc<super::fleet_ownership::FleetOwnership>> {
+        self.inner.ownership.get()
+    }
+
+    /// Whether this host may serve `key` now. Always `true` without
+    /// ownership.
+    #[must_use]
+    pub fn owns(&self, key: &FleetDbKey) -> bool {
+        self.owned_epoch(key).is_ok()
+    }
+
+    /// Begin to close each open database whose slot this host no longer
+    /// holds at the epoch it opened under. Returns how many began closing.
+    #[must_use = "the count is how many databases began closing"]
+    pub fn fence_unowned(&self) -> usize {
+        let Some(ownership) = self.ownership() else {
+            return 0;
+        };
+        let victims = self.begin_drains(|state| {
+            state
+                .open
+                .iter()
+                .filter(|(key, entry)| {
+                    entry
+                        .cell
+                        .get()
+                        .is_some_and(|db| ownership.epoch_for(key.routing_slot()) != db.epoch)
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        });
+        let fenced = victims.len();
+        for (key, db, drain) in victims {
+            tracing::warn!(database = %key, "fleet database closed: this host lost its slot");
+            // No settle: the data is not this host's any more.
+            self.spawn_drain(key, db, drain, false);
+        }
+        fenced
+    }
+
+    /// Renew this host's ranges and close what it lost, until `shutdown`
+    /// (issue #3233). It wakes every renew interval, when a local lease runs
+    /// out, and when a replicator sees a newer epoch. A no-op without
+    /// ownership.
+    #[must_use = "await the handle at shutdown"]
+    pub fn spawn_ownership(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+        let fleet = self.clone();
+        tokio::spawn(async move {
+            let Some(ownership) = fleet.ownership().cloned() else {
+                return;
+            };
+            loop {
+                let changed = ownership.changed().notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                ownership.refresh().await;
+                let _ = fleet.fence_unowned();
+                let wake = ownership.next_wake();
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep_until(wake) => {}
+                    () = &mut changed => {}
+                }
+            }
+        })
     }
 
     // ── Keys ─────────────────────────────────────────────────────────────
@@ -1187,6 +1330,7 @@ impl DatabaseFleet {
     /// when the create task fails. Or an [`open`](Self::open) error.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
+        self.owned_epoch(key)?;
         // Held to the end, so `close_all` also sees the open that follows.
         let _open_counted = self.admit_mutation(key)?;
         let (fleet, task_key, counted) = (self.clone(), key.clone(), MutationGuard::new(self));
@@ -1330,7 +1474,7 @@ impl DatabaseFleet {
         });
         let closing = !begun.is_empty();
         for (key, db, drain) in begun {
-            self.spawn_drain(key, db, drain);
+            self.spawn_drain(key, db, drain, true);
         }
         closing
     }
@@ -1345,6 +1489,9 @@ impl DatabaseFleet {
     ) -> Result<Option<BackgroundOpen>, FleetError> {
         self.check_key(key)?;
         loop {
+            // Before anything touches the disk: `restore_missing` runs only
+            // for a key this host owns (issue #3233).
+            let epoch = self.owned_epoch(key)?;
             let next = self.claim_entry(key, background)?;
             let (entry, elected) = match next {
                 Next::Wait(drain) => {
@@ -1356,7 +1503,8 @@ impl DatabaseFleet {
             };
             // No await between the claim and the spawn, so a cancelled caller
             // cannot leave an entry without an opener.
-            let opener = elected.then(|| self.spawn_opener(key, create, !background, &entry));
+            let opener =
+                elected.then(|| self.spawn_opener(key, create, !background, epoch, &entry));
             let result = match (entry.cell.get(), opener) {
                 (Some(db), _) => Ok(db.clone()),
                 (None, Some(opener)) => opener.await.unwrap_or_else(|error| {
@@ -1379,6 +1527,13 @@ impl DatabaseFleet {
                     // The pool is closed when the database was drained between
                     // our lookup and now; go round and open it fresh.
                     if db.pool.is_closed() {
+                        continue;
+                    }
+                    // Opened under another epoch: never serve it under this
+                    // one. Close it and open it fresh.
+                    if db.epoch != epoch {
+                        drop(db);
+                        self.close(key).await;
                         continue;
                     }
                     if !background {
@@ -1406,6 +1561,7 @@ impl DatabaseFleet {
         key: &FleetDbKey,
         create: bool,
         restore: bool,
+        epoch: Option<crate::lock::FencingToken>,
         entry: &Arc<Entry>,
     ) -> tokio::task::JoinHandle<Result<FleetDatabase, FleetError>> {
         let guard = OpenGuard {
@@ -1416,7 +1572,7 @@ impl DatabaseFleet {
         tokio::spawn(async move {
             match guard
                 .fleet
-                .open_now(guard.key.clone(), create, restore)
+                .open_now(guard.key.clone(), create, restore, epoch)
                 .await
             {
                 Ok(db) => {
@@ -1495,6 +1651,7 @@ impl DatabaseFleet {
         key: FleetDbKey,
         create: bool,
         restore: bool,
+        epoch: Option<crate::lock::FencingToken>,
     ) -> Result<FleetDatabase, FleetError> {
         let path = self.path_of(&key);
         let name = key.name();
@@ -1544,6 +1701,7 @@ impl DatabaseFleet {
             pool,
             closed: CancellationToken::new(),
             lease: Arc::new(()),
+            epoch,
             workers: Arc::new(Mutex::new(Some(Vec::new()))),
         };
         // The file is complete here — published fully migrated, restored, or
@@ -1717,7 +1875,7 @@ impl DatabaseFleet {
             idle.into_iter().map(|(_, key)| key).collect()
         });
         for (key, db, drain) in victims {
-            self.spawn_drain(key, db, drain);
+            self.spawn_drain(key, db, drain, true);
         }
     }
 
@@ -1745,7 +1903,7 @@ impl DatabaseFleet {
         });
         let closed = victims.len();
         for (key, db, drain) in victims {
-            self.spawn_drain(key, db, drain);
+            self.spawn_drain(key, db, drain, true);
         }
         closed
     }
@@ -1783,7 +1941,13 @@ impl DatabaseFleet {
         Some((key.clone(), Some(db), drain))
     }
 
-    fn spawn_drain(&self, key: FleetDbKey, db: Option<FleetDatabase>, drain: Arc<Drain>) {
+    fn spawn_drain(
+        &self,
+        key: FleetDbKey,
+        db: Option<FleetDatabase>,
+        drain: Arc<Drain>,
+        settle: bool,
+    ) {
         let fleet = self.clone();
         tokio::spawn(async move {
             let _finish = DrainGuard {
@@ -1791,7 +1955,7 @@ impl DatabaseFleet {
                 key: key.clone(),
                 drain,
             };
-            fleet.drain(&key, db, true).await;
+            fleet.drain(&key, db, settle).await;
         });
     }
 
@@ -2339,7 +2503,8 @@ impl DatabaseFleet {
     /// failure on one database does not stop the others.
     ///
     /// This opens every database, which churns the open set past `max_open`;
-    /// use it for admin work, not on a hot path.
+    /// use it for admin work, not on a hot path. With ownership, it skips the
+    /// files of slots this host does not own.
     ///
     /// # Errors
     ///
@@ -2355,9 +2520,10 @@ impl DatabaseFleet {
         F: Fn(FleetDatabase) -> Fut + Send + Sync,
     {
         use futures::StreamExt as _;
-        let keys = self.list().await?;
+        // With ownership, only the slots this host serves (issue #3233).
+        let keys = self.list().await?.into_iter().filter(|key| self.owns(key));
         let f = &f;
-        let results = futures::stream::iter(keys.into_iter().map(|key| async move {
+        let results = futures::stream::iter(keys.map(|key| async move {
             let result = match self.open_with(&key, false).await {
                 Ok(db) => f(db).await,
                 Err(error) => Err(error.into()),
@@ -3449,6 +3615,7 @@ mod tests {
             create_on_demand: None,
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         }
     }
 
@@ -5497,7 +5664,7 @@ mod tests {
         let Next::Open(entry, true) = fleet.claim_entry(&key, false).unwrap() else {
             panic!("expected to make the entry");
         };
-        let opener = fleet.spawn_opener(&key, true, true, &entry);
+        let opener = fleet.spawn_opener(&key, true, true, None, &entry);
         let (taken, held, drain) = fleet.begin_exclusive(&key, true).unwrap().unwrap();
         // The drain is in first: no new opener gets an entry.
         assert!(matches!(

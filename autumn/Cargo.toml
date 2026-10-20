@@ -1347,6 +1347,13 @@ path = "tests/sim_idempotency_db.rs"
 name = "sim_replicas"
 path = "tests/sim_replicas.rs"
 
+# Issue #3233: a partitioned old fleet owner, in virtual time. Runs in the
+# single-threaded multi-replica sim step.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_ownership`.
+[[test]]
+name = "sim_fleet_ownership"
+path = "tests/sim_fleet_ownership.rs"
+
 # Issue #3067: the same-seed trace check. Its own binary, because `tracing`
 # caches callsite interest for the whole process.
 # `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_trace`.

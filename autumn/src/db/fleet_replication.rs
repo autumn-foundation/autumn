@@ -96,6 +96,9 @@ struct ActiveReplica {
     /// Set once the database closes. A tick pass that still holds this
     /// replica must not claim the lock for it.
     retired: AtomicBool,
+    /// Set when a newer ownership epoch writes to the replica (issue #3233).
+    /// Such a replica ships nothing more, not even at close.
+    fenced: AtomicBool,
     status: Arc<ReplicationStatus>,
     registered_at: DateTime<Utc>,
 }
@@ -203,7 +206,12 @@ pub struct FleetReplication {
     unshipped: Mutex<Vec<String>>,
     /// When shutdown must be done. Close-time shipping stops at it.
     shutdown_cutoff: Mutex<Option<std::time::Instant>>,
+    /// Told when a replicator sees a newer epoch (issue #3233).
+    fence_hook: Mutex<Option<FenceHook>>,
 }
+
+/// Called with the database and the newer epoch a replicator saw.
+pub(crate) type FenceHook = Arc<dyn Fn(&FleetDbKey, u64) + Send + Sync>;
 
 impl FleetReplication {
     /// Replicate fleet databases next to the control database.
@@ -232,6 +240,32 @@ impl FleetReplication {
             final_flush_ms: AtomicU64::new(5_000),
             unshipped: Mutex::new(Vec::new()),
             shutdown_cutoff: Mutex::new(None),
+            fence_hook: Mutex::new(None),
+        }
+    }
+
+    /// Tell `hook` when a replicator sees a newer epoch. The fleet installs
+    /// it with its ownership.
+    pub(crate) fn set_fence_hook(&self, hook: FenceHook) {
+        *self
+            .fence_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Stop `replica` for good: a newer epoch owns its database.
+    fn fence(&self, key: &FleetDbKey, replica: &ActiveReplica, newest: u64) {
+        if replica.fenced.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        tracing::warn!(database = %key, newest, "fleet replication: a newer epoch owns this database; this host stops shipping it");
+        let hook = self
+            .fence_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(key, newest);
         }
     }
 
@@ -421,7 +455,7 @@ impl FleetReplication {
                 return;
             }
             // A database that another process replicates is retried each tick.
-            if !replica.claim(&key) {
+            if replica.fenced.load(Ordering::Acquire) || !replica.claim(&key) {
                 continue;
             }
             let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
@@ -429,6 +463,11 @@ impl FleetReplication {
             };
             if let Err(error) = replicator.tick() {
                 tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
+            }
+            let fenced_by = replicator.fenced_by();
+            drop(replicator);
+            if let Some(newest) = fenced_by {
+                self.fence(&key, &replica, newest);
             }
         }
         let parked: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
@@ -445,7 +484,14 @@ impl FleetReplication {
                 continue;
             };
             let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
+            let fenced_by = replicator.fenced_by();
             drop(replicator);
+            if let Some(newest) = fenced_by {
+                // Nothing more ships: let the file go.
+                self.fence(&key, &replica, newest);
+                self.retire_parked(&key, &replica);
+                continue;
+            }
             if caught_up && self.retire_parked(&key, &replica) {
                 tracing::info!(database = %key, "fleet replication: closed database caught up");
             }
@@ -647,10 +693,18 @@ impl FleetLifecycle for FleetReplication {
     fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
         // A closed database still shipping its backlog keeps its replicator:
         // two replicators on one file would both checkpoint it.
+        let epoch = db.epoch().map(crate::lock::FencingToken::get);
         let parked = self.parked().remove(db.key());
         if let Some(parked) = parked {
-            self.active().insert(db.key().clone(), parked);
-            return Ok(());
+            // A new epoch starts a new generation; a fenced replica cannot
+            // be reused.
+            if !parked.fenced.load(Ordering::Acquire) {
+                if let Some(mut replicator) = lock_replicator(&parked, &|| None) {
+                    replicator.set_epoch(epoch);
+                }
+                self.active().insert(db.key().clone(), parked);
+                return Ok(());
+            }
         }
         let settings = ReplicationSettings {
             database_path: db.path().to_path_buf(),
@@ -663,12 +717,14 @@ impl FleetLifecycle for FleetReplication {
         let status = Arc::new(ReplicationStatus::new(self.destination.describe()));
         let replicator =
             Replicator::new(settings, Arc::clone(&self.destination), Arc::clone(&status))
-                .with_clock(Arc::clone(&self.clock));
+                .with_clock(Arc::clone(&self.clock))
+                .with_epoch(epoch);
         let replica = Arc::new(ActiveReplica {
             replicator: Mutex::new(replicator),
             lock: Mutex::new(None),
             lock_error: Mutex::new(None),
             retired: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
             path: db.path().to_path_buf(),
             status,
             registered_at: self.clock.now(),
@@ -685,6 +741,11 @@ impl FleetLifecycle for FleetReplication {
         };
         // The owner may have left since the last tick. Try once, so commits
         // made meanwhile ship. Then no later tick may claim for this replica.
+        // A fenced replica ships nothing: a newer epoch owns the replica.
+        if replica.fenced.load(Ordering::Acquire) {
+            replica.retired.store(true, Ordering::Release);
+            return;
+        }
         let owner = self.claim_for_close(&replica, db.key());
         replica.retired.store(true, Ordering::Release);
         if !owner {
@@ -696,9 +757,24 @@ impl FleetLifecycle for FleetReplication {
         // The cutoff-aware lock: another thread may hold the replica, and
         // shutdown must not wait for it past the cutoff.
         let shipped = lock_replicator(&replica, &|| self.shutdown_cutoff()).map_or_else(
-            || Err("the shutdown cutoff passed before the close could ship".to_owned()),
-            |mut replicator| ship_until_caught_up(&mut replicator, &|| self.shutdown_cutoff()),
+            || {
+                Err((
+                    "the shutdown cutoff passed before the close could ship".to_owned(),
+                    None,
+                ))
+            },
+            |mut replicator| {
+                ship_until_caught_up(&mut replicator, &|| self.shutdown_cutoff())
+                    .map_err(|error| (error, replicator.fenced_by()))
+            },
         );
+        let shipped = match shipped {
+            Err((_, Some(newest))) => {
+                self.fence(db.key(), &replica, newest);
+                return;
+            }
+            other => other.map_err(|(error, _)| error),
+        };
         if let Err(error) = shipped {
             tracing::warn!(
                 database = %db.key(),
@@ -835,6 +911,7 @@ mod tests {
             create_on_demand: Some(true),
             idle_close_secs: 0,
             restore_missing,
+            ownership: None,
         })
         .build()
         .unwrap();
@@ -983,6 +1060,7 @@ mod tests {
             create_on_demand: None,
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         })
         .build()
         .unwrap();
@@ -1293,6 +1371,7 @@ mod tests {
             create_on_demand: Some(true),
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         })
         .build()
         .unwrap();
@@ -1547,6 +1626,7 @@ mod tests {
             create_on_demand: Some(true),
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         })
         .build()
         .unwrap();

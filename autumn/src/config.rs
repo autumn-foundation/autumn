@@ -93,6 +93,9 @@
 //! | `AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND` | `database.fleet.create_on_demand` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS` | `database.fleet.idle_close_secs` | `u64` |
 //! | `AUTUMN_DATABASE__FLEET__RESTORE_MISSING` | `database.fleet.restore_missing` | `bool` |
+//! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER` | `database.fleet.ownership.owner` | `String` (creates the section) |
+//! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS` | `database.fleet.ownership.slots` | comma-separated `N` / `A-B` |
+//! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS` | `database.fleet.ownership.lease_secs` | `u64` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__SLOTS` | `database.shards[i].slots` | CSV of indices / `A-B` ranges |
@@ -6824,6 +6827,7 @@ impl AutumnConfig {
                 create_on_demand: None,
                 idle_close_secs: default_fleet_idle_close_secs(),
                 restore_missing: false,
+                ownership: None,
             });
         }
         let Some(fleet) = self.database.fleet.as_mut() else {
@@ -6852,6 +6856,36 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__FLEET__RESTORE_MISSING",
             &mut fleet.restore_missing,
+        );
+        // Setting `..._OWNER` creates the ownership section.
+        if fleet.ownership.is_none()
+            && let Ok(owner) = env.var("AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER")
+        {
+            fleet.ownership = Some(FleetOwnershipConfig {
+                owner,
+                slots: Vec::new(),
+                lease_secs: default_fleet_lease_secs(),
+            });
+        }
+        let Some(ownership) = fleet.ownership.as_mut() else {
+            return;
+        };
+        parse_env_string(
+            env,
+            "AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER",
+            &mut ownership.owner,
+        );
+        // Comma-separated `N` and `A-B` entries, e.g. "0-8191,9000".
+        if let Ok(slots) = env.var("AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS") {
+            ownership.slots = slots
+                .split(',')
+                .map(|token| SlotSpec::Range(token.trim().to_owned()))
+                .collect();
+        }
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS",
+            &mut ownership.lease_secs,
         );
     }
 
@@ -10384,10 +10418,111 @@ pub struct DatabaseFleetConfig {
     ///
     /// This is how a host with a fresh volume takes over a slot range or a
     /// tenant: the first request restores the database from object storage.
-    /// Only turn it on once the previous owner has stopped writing, or both
-    /// hosts will diverge (ADR 0019 §5).
+    /// Turn on [`ownership`](Self::ownership) too, so the old owner is fenced
+    /// first (ADR 0019 §7).
     #[serde(default)]
     pub restore_missing: bool,
+
+    /// Slot ownership with epochs and fencing (issue #3233). `None`: this
+    /// host serves every slot and nothing fences it.
+    #[serde(default)]
+    pub ownership: Option<FleetOwnershipConfig>,
+}
+
+/// `[database.fleet.ownership]`: the slot ranges this host claims on the
+/// ownership table of the control database (ADR 0019 §7).
+///
+/// ```toml
+/// [database.fleet.ownership]
+/// owner = "host-a"       # unique per volume
+/// slots = ["0-8191"]     # default: every slot
+/// lease_secs = 30
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct FleetOwnershipConfig {
+    /// This host's id in the ownership table. Processes that share one fleet
+    /// root use the same id. Two hosts must never share one.
+    pub owner: String,
+
+    /// The slot ranges to claim, each `"A-B"` or `N`. Each entry is one claim.
+    /// Default: every slot, as one range.
+    #[serde(default)]
+    pub slots: Vec<SlotSpec>,
+
+    /// The lease, in seconds. The host renews every third of it. Default:
+    /// `30`. At least `3`. Host clocks must agree within a third of it.
+    #[serde(default = "default_fleet_lease_secs")]
+    pub lease_secs: u64,
+}
+
+impl FleetOwnershipConfig {
+    /// The ranges as inclusive `(start, end)` pairs, in order.
+    ///
+    /// # Errors
+    ///
+    /// A message for a malformed, inverted, out-of-range or overlapping range.
+    pub fn ranges(&self) -> Result<Vec<(u16, u16)>, String> {
+        if self.slots.is_empty() {
+            return Ok(vec![(0, SLOT_COUNT - 1)]);
+        }
+        let mut ranges = Vec::with_capacity(self.slots.len());
+        for spec in &self.slots {
+            let range = match spec {
+                SlotSpec::Index(slot) => (*slot, *slot),
+                SlotSpec::Range(text) => {
+                    let slots = spec.expand()?;
+                    match (slots.first(), slots.last()) {
+                        (Some(start), Some(end)) => (*start, *end),
+                        _ => return Err(format!("empty slot range {text:?}")),
+                    }
+                }
+            };
+            if range.1 >= SLOT_COUNT {
+                return Err(format!(
+                    "slot {} is out of range (0-{})",
+                    range.1,
+                    SLOT_COUNT - 1
+                ));
+            }
+            ranges.push(range);
+        }
+        ranges.sort_unstable();
+        if let Some(pair) = ranges.windows(2).find(|pair| pair[0].1 >= pair[1].0) {
+            return Err(format!(
+                "slot ranges {}-{} and {}-{} overlap",
+                pair[0].0, pair[0].1, pair[1].0, pair[1].1
+            ));
+        }
+        Ok(ranges)
+    }
+
+    /// Check the section.
+    ///
+    /// # Errors
+    ///
+    /// A [`ConfigError::Validation`] naming the field.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let owner = self.owner.trim();
+        if owner.is_empty() || owner.len() > 128 || owner.chars().any(char::is_control) {
+            return Err(ConfigError::Validation(
+                "database.fleet.ownership.owner must be 1 to 128 printable characters, \
+                 unique per host"
+                    .to_owned(),
+            ));
+        }
+        self.ranges()
+            .map_err(|e| ConfigError::Validation(format!("database.fleet.ownership.slots: {e}")))?;
+        if self.lease_secs < 3 {
+            return Err(ConfigError::Validation(
+                "database.fleet.ownership.lease_secs must be at least 3".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn default_fleet_lease_secs() -> u64 {
+    30
 }
 
 impl DatabaseFleetConfig {
@@ -10435,6 +10570,9 @@ impl DatabaseFleetConfig {
             return Err(ConfigError::Validation(
                 "database.fleet.pool_size must be at least 1".to_owned(),
             ));
+        }
+        if let Some(ownership) = &self.ownership {
+            ownership.validate()?;
         }
         Ok(())
     }
@@ -20155,6 +20293,7 @@ path = "/healthz"
             create_on_demand: None,
             idle_close_secs: 300,
             restore_missing: false,
+            ownership: None,
         }
     }
 
@@ -20356,6 +20495,74 @@ path = "/healthz"
         assert!(fleet.effective_create_on_demand());
         assert_eq!(fleet.idle_close_secs, 0);
         assert!(fleet.restore_missing);
+    }
+
+    #[test]
+    fn fleet_ownership_deserializes_and_validates() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [database]
+            url = "sqlite:///var/lib/app/control.db"
+
+            [database.fleet]
+            mode = "slot"
+            root = "/var/lib/app/fleet"
+
+            [database.fleet.ownership]
+            owner = "host-a"
+            slots = ["0-8191", 9000]
+            "#,
+        )
+        .unwrap();
+        let ownership = config
+            .database
+            .fleet
+            .as_ref()
+            .and_then(|f| f.ownership.clone())
+            .unwrap();
+        assert_eq!(ownership.lease_secs, 30);
+        assert_eq!(ownership.ranges().unwrap(), vec![(0, 8191), (9000, 9000)]);
+        config.database.validate().unwrap();
+
+        let every = FleetOwnershipConfig {
+            owner: "a".to_owned(),
+            slots: Vec::new(),
+            lease_secs: 30,
+        };
+        assert_eq!(every.ranges().unwrap(), vec![(0, SLOT_COUNT - 1)]);
+        let bad = |owner: &str, slots: &[&str], lease_secs| {
+            let mut fleet = fleet(crate::fleet_layout::FleetMode::Slot);
+            fleet.ownership = Some(FleetOwnershipConfig {
+                owner: owner.to_owned(),
+                slots: slots
+                    .iter()
+                    .map(|s| SlotSpec::Range((*s).to_owned()))
+                    .collect(),
+                lease_secs,
+            });
+            fleet_db(fleet).validate().unwrap_err().to_string()
+        };
+        assert!(bad("", &[], 30).contains("owner"));
+        assert!(bad("a", &["0-10", "10-20"], 30).contains("overlap"));
+        assert!(bad("a", &["0-16384"], 30).contains("out of range"));
+        assert!(bad("a", &["9-1"], 30).contains("inverted"));
+        assert!(bad("a", &[], 2).contains("lease_secs"));
+    }
+
+    #[test]
+    fn fleet_ownership_env_overrides_create_and_adjust_the_section() {
+        let mut config = AutumnConfig::default();
+        config.database.fleet = Some(fleet(crate::fleet_layout::FleetMode::Slot));
+        config.apply_env_overrides_with_env(
+            &MockEnv::new()
+                .with("AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER", "host-b")
+                .with("AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS", "0-99, 200")
+                .with("AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS", "12"),
+        );
+        let ownership = config.database.fleet.unwrap().ownership.unwrap();
+        assert_eq!(ownership.owner, "host-b");
+        assert_eq!(ownership.ranges().unwrap(), vec![(0, 99), (200, 200)]);
+        assert_eq!(ownership.lease_secs, 12);
     }
 
     #[test]

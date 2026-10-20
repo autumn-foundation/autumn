@@ -1167,6 +1167,12 @@ impl FleetSweeper {
                 // The file is gone: nothing can be pending in it.
                 Err(FleetError::NotFound { .. }) => return self.forget_database(&name).await,
                 Err(FleetError::Deleting { .. }) => return Visit::Skipped,
+                // Another host owns the slot (issue #3233): its work is not
+                // this host's to do. Keep the row for when the slot returns.
+                Err(FleetError::NotOwner { .. }) => {
+                    self.back_off(&name).await;
+                    return Visit::Skipped;
+                }
                 Err(error) => {
                     tracing::warn!(database = %name, %error, "fleet sweeper could not open a database");
                     self.back_off(&name).await;
@@ -1425,6 +1431,7 @@ mod tests {
             create_on_demand: None,
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         })
         .min_residency(Duration::ZERO)
         .framework_migrations()

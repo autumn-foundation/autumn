@@ -350,6 +350,23 @@ fn check_reaches_head(
     Ok(())
 }
 
+/// The epoch of each generation that has an epoch marker in `keys`. A
+/// generation with several markers takes the highest.
+pub(crate) fn generation_epochs(
+    root: &str,
+    keys: &[String],
+) -> std::collections::HashMap<String, u64> {
+    let mut epochs = std::collections::HashMap::new();
+    for (generation, epoch) in keys
+        .iter()
+        .filter_map(|key| segment::parse_generation_epoch_key(root, key))
+    {
+        let entry = epochs.entry(generation).or_insert(epoch);
+        *entry = (*entry).max(epoch);
+    }
+    epochs
+}
+
 /// Decide what to restore, reading only the destination's key listing.
 ///
 /// `target` is the instant to restore to; `None` means "the latest replicated
@@ -367,7 +384,9 @@ pub fn plan(
     let keys = destination.list(&segment::generations_prefix(root))?;
 
     // A generation counts only once its snapshot metadata (written last) exists.
-    let mut complete: Vec<(String, i64)> = Vec::new();
+    // Its epoch (issue #3233) is in the same listing; none means 0.
+    let epochs = generation_epochs(root, &keys);
+    let mut complete: Vec<(u64, i64, String)> = Vec::new();
     for key in &keys {
         if !key.ends_with(segment::SNAPSHOT_META_OBJECT) {
             continue;
@@ -378,22 +397,24 @@ pub fn plan(
         let Some(info) = segment::parse_generation_id(&generation) else {
             continue;
         };
-        complete.push((generation, info.created_ms));
+        let epoch = epochs.get(&generation).copied().unwrap_or(0);
+        complete.push((epoch, info.created_ms, generation));
     }
-    complete.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    // The newest epoch first, then the newest time: a fenced old owner can
+    // ship a later generation, and it must never win.
+    complete.sort();
 
-    let Some((oldest_gen, oldest_ms)) = complete.first().cloned() else {
+    let Some(oldest_ms) = complete.iter().map(|(_, ms, _)| *ms).min() else {
         return Err(RestoreError::NoReplica {
             root: root.to_owned(),
         });
     };
-    let _ = oldest_gen;
 
     let target_ms = target.map_or(i64::MAX, |t| t.timestamp_millis());
-    let Some((generation, generation_ms)) = complete
+    let Some((_, generation_ms, generation)) = complete
         .iter()
         .rev()
-        .find(|(_, ms)| *ms <= target_ms)
+        .find(|(_, ms, _)| *ms <= target_ms)
         .cloned()
     else {
         return Err(RestoreError::TargetBeforeRetention {
@@ -905,4 +926,85 @@ fn sha256_file(path: &Path) -> Result<String, RestoreError> {
         hasher.update(chunk);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replication::FileDestination;
+
+    const ROOT: &str = "app/test/fleet/tenant/acme";
+
+    /// A complete generation: its marker objects only, which is all a plan
+    /// reads.
+    fn generation(
+        destination: &FileDestination,
+        created_ms: i64,
+        nonce: u64,
+        epoch: Option<u64>,
+    ) -> String {
+        let id = segment::generation_id(created_ms, nonce);
+        if let Some(epoch) = epoch {
+            destination
+                .put(&segment::generation_epoch_key(ROOT, &id, epoch), b"{}")
+                .unwrap();
+        }
+        destination
+            .put(&segment::snapshot_meta_key(ROOT, &id), b"{}")
+            .unwrap();
+        id
+    }
+
+    fn at(ms: i64) -> Option<DateTime<Utc>> {
+        DateTime::from_timestamp_millis(ms)
+    }
+
+    #[test]
+    fn restore_takes_the_newest_epoch_before_the_newest_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = FileDestination::new(dir.path()).unwrap();
+        let owner = generation(&destination, 1_000, 1, Some(2));
+        // A fenced old owner shipped later, under epoch 1.
+        let _stale = generation(&destination, 2_000, 2, Some(1));
+        assert_eq!(plan(&destination, ROOT, None).unwrap().generation, owner);
+        assert_eq!(
+            plan(&destination, ROOT, at(1_500)).unwrap().generation,
+            owner
+        );
+        assert!(matches!(
+            plan(&destination, ROOT, at(500)),
+            Err(RestoreError::TargetBeforeRetention { .. })
+        ));
+    }
+
+    #[test]
+    fn a_generation_without_an_epoch_is_epoch_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = FileDestination::new(dir.path()).unwrap();
+        let fenced = generation(&destination, 1_000, 1, Some(1));
+        let _legacy = generation(&destination, 2_000, 2, None);
+        assert_eq!(plan(&destination, ROOT, None).unwrap().generation, fenced);
+    }
+
+    #[test]
+    fn without_epochs_the_newest_generation_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = FileDestination::new(dir.path()).unwrap();
+        let _old = generation(&destination, 1_000, 1, None);
+        let new = generation(&destination, 2_000, 2, None);
+        assert_eq!(plan(&destination, ROOT, None).unwrap().generation, new);
+    }
+
+    #[test]
+    fn epoch_keys_round_trip() {
+        let id = segment::generation_id(1_000, 7);
+        let key = segment::generation_epoch_key(ROOT, &id, 42);
+        assert_eq!(
+            segment::parse_generation_epoch_key(ROOT, &key),
+            Some((id, 42))
+        );
+        let marker = segment::epoch_marker_key(ROOT, 9);
+        assert_eq!(segment::parse_epoch_marker_key(ROOT, &marker), Some(9));
+        assert!(!marker.starts_with(&segment::generations_prefix(ROOT)));
+    }
 }
