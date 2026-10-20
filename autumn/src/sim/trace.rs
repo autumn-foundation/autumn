@@ -250,6 +250,10 @@ pub(crate) fn alias(kind: &str, token: &str) {
 struct Router;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Router {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+        target_capture().is_some_and(|capture| capture.wants(metadata.target()))
+    }
+
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let metadata = event.metadata();
         let Some(capture) = target_capture() else {
@@ -353,6 +357,20 @@ mod tests {
             second.lines().iter().all(|l| l.contains("name=b")),
             "{second:?}"
         );
+    }
+
+    /// An event whose target no capture wants is off: its fields are not
+    /// evaluated.
+    #[tokio::test(start_paused = true)]
+    async fn sim_trace_capture_skips_the_fields_of_unwanted_targets() {
+        let evaluated = std::cell::Cell::new(false);
+        let ((), trace) = capture_targets(&["mine"], async {
+            tracing::warn!(target: "elsewhere", value = { evaluated.set(true); 1 }, "no");
+            tracing::warn!(target: "mine", "yes");
+        })
+        .await;
+        assert_eq!(trace.len(), 1);
+        assert!(!evaluated.get(), "the fields of an unwanted event ran");
     }
 
     /// Tasks the captured future spawns are recorded too.
