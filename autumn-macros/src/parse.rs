@@ -159,6 +159,9 @@ pub struct RouteAttrArgs {
     pub timeout: RouteTimeoutAttr,
     /// Admission-control class (`critical`, `default`, `sheddable`).
     pub criticality: RouteCriticalityAttr,
+    /// `false` when the route opts out of the app-level idempotency layer
+    /// with `idempotent = false`. Defaults to `true`.
+    pub idempotent: bool,
     /// Route-level SEO meta tag defaults from the `seo(...)` argument.
     pub seo: SeoAttrArgs,
 }
@@ -205,6 +208,7 @@ impl syn::parse::Parse for RouteAttrArgs {
         let mut sunset_opt_out = false;
         let mut timeout = RouteTimeoutAttr::Inherit;
         let mut criticality = RouteCriticalityAttr::Default;
+        let mut idempotent = true;
         let mut seo = SeoAttrArgs::default();
         let mut seen_seo = false;
 
@@ -261,6 +265,9 @@ impl syn::parse::Parse for RouteAttrArgs {
                         ));
                     }
                 }
+            } else if key == "idempotent" {
+                let val: syn::LitBool = input.parse()?;
+                idempotent = val.value();
             } else if key == "criticality" {
                 let val: LitStr = input.parse()?;
                 criticality = match val.value().as_str() {
@@ -283,7 +290,7 @@ impl syn::parse::Parse for RouteAttrArgs {
                     format!(
                         "unknown route attribute key `{key}`. Supported keys: `name`, \
                          `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout`, \
-                         `criticality`, `seo(...)`."
+                         `criticality`, `idempotent`, `seo(...)`."
                     ),
                 ));
             }
@@ -296,6 +303,7 @@ impl syn::parse::Parse for RouteAttrArgs {
             sunset_opt_out,
             timeout,
             criticality,
+            idempotent,
             seo,
         })
     }

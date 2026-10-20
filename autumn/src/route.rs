@@ -84,6 +84,15 @@ pub enum RouteIdempotency {
     /// [`crate::idempotency::IdempotencyReplayLayer`] after those checks and
     /// before the mutating handler.
     ReplayThroughInner,
+    /// The route opted out with `#[post("/x", idempotent = false)]`: the
+    /// app-level layer is not mounted on it at all, so it neither stores nor
+    /// replays, and the handler runs on every request.
+    ///
+    /// For a route that dedupes by its own key — a durable workflow route
+    /// keyed by `Idempotency-Key` and the caller's scope, say — where a second
+    /// cache in front of it would only answer before the route's own check
+    /// runs.
+    Off,
 }
 
 /// Per-route override for the global inbound request timeout

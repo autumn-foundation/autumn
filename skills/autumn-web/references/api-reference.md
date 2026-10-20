@@ -1275,6 +1275,14 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `idem.recovery_point(&mut db)` on retry. Another body with the same key
   gets `422`.
 - `IdempotencyTx` methods are no-ops without a key or with another backend.
+- Scope: session, resolved tenant, and for token clients the bearer
+  principal. Mount `RequireApiToken` with `AppBuilder::layer` so the key uses
+  the verified principal (a rotated token still replays, and retries replay
+  instead of `409`). Without it and without a session, the key uses a digest
+  of the raw `Authorization` header. Fine for agent / MCP token APIs.
+- `#[post("/x", idempotent = false)]` (`RouteIdempotency::Off`) keeps the
+  layer off a route that dedupes by its own key, e.g. a durable workflow
+  route.
 - Custom store: implement the async `IdempotencyStore` trait (`get`, `set`
   returning whether it stored, `try_lock(key, owner, ttl)`,
   `unlock(key, owner)`, and optionally `renew_lock(key, owner, ttl)`; each

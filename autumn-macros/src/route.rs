@@ -209,7 +209,9 @@ pub fn route_macro(
             ))
         };
     }
-    let route_idempotency = if intercepted_route {
+    let route_idempotency = if !route_args.idempotent {
+        quote! { ::autumn_web::RouteIdempotency::Off }
+    } else if intercepted_route {
         quote! { ::autumn_web::RouteIdempotency::Direct }
     } else {
         quote! { ::autumn_web::RouteIdempotency::ReplayThroughInner }
@@ -1888,6 +1890,74 @@ mod tests {
             generated.contains("invalid `criticality` value"),
             "{generated}"
         );
+    }
+
+    // ── idempotent = false ──────────────────────────────────────────────────
+
+    #[test]
+    fn route_macro_defaults_to_the_idempotency_layer() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/x" },
+            quote! { async fn x() -> &'static str { "x" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("RouteIdempotency :: ReplayThroughInner"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_parses_idempotent_false_as_off() {
+        for attr in [
+            quote! { "/x", idempotent = false },
+            // The opt-out wins over the intercept-driven `Direct` choice.
+            quote! { "/x", criticality = "critical", idempotent = false },
+        ] {
+            let generated = route_macro(
+                "POST",
+                "post",
+                attr.clone(),
+                quote! {
+                    #[intercept(TenantLayer)]
+                    async fn x() -> &'static str { "x" }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("RouteIdempotency :: Off"),
+                "{attr}: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_macro_accepts_idempotent_true_as_the_default() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/x", idempotent = true },
+            quote! { async fn x() -> &'static str { "x" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("RouteIdempotency :: ReplayThroughInner"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_a_non_bool_idempotent() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/x", idempotent = "no" },
+            quote! { async fn x() -> &'static str { "x" } },
+        )
+        .to_string();
+        assert!(generated.contains("compile_error"), "{generated}");
     }
 
     // ── #[authorize] bindings recorded in ApiDoc (#1627) ────────────────────

@@ -1508,6 +1508,75 @@ Most apps need no change. Two cases need work:
 
 **Automation:** `manual` — a flagged read needs a human decision.
 
+### Idempotency: `RouteIdempotency` has an `Off` variant
+
+**Why:** A route can now opt out of `.idempotent()` with
+`#[post("/x", idempotent = false)]`, for a route that dedupes by its own key
+(a durable workflow route, say). The macro records that as
+`RouteIdempotency::Off`. `RouteIdempotency` is not `#[non_exhaustive]`, so a
+new variant breaks an exhaustive `match`.
+
+**Before (`{X.Y}`):**
+
+```rust
+match route.idempotency {
+    RouteIdempotency::Direct => "fail closed",
+    RouteIdempotency::ReplayThroughInner => "replay",
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match route.idempotency {
+    RouteIdempotency::Direct => "fail closed",
+    RouteIdempotency::ReplayThroughInner => "replay",
+    RouteIdempotency::Off => "not cached",
+}
+```
+
+Code that only builds a `Route` with `Direct` or `ReplayThroughInner`, or
+that tests with `matches!`, needs no change.
+
+**Automation:** `manual` — a new enum variant needs a new match arm, and no
+safe rewrite can choose its body.
+
+### Idempotency: bearer-token requests get their own cache slot
+
+**Why:** A request with no cookie-backed session used to compute a storage key
+with no principal in it, so two token clients that sent the same
+`Idempotency-Key` and body to a route shared one cached response. The key now
+carries the principal `RequireApiToken` verified, or a SHA-256 digest of the
+raw `Authorization` header when the route checks the token itself. See
+[the idempotency guide](../guide/idempotency.md#bearer-token-clients).
+
+**Before (`{X.Y}`):**
+
+- Client B with client A's key and body was served A's stored response.
+- A retry with the `Authorization` header changed or dropped replayed.
+- `RequireApiToken` on `AppBuilder::layer` forced fail-closed replay app-wide:
+  every cache hit, a same-client retry included, answered `409`.
+
+**After (`{(X+1).0}`):**
+
+- Each bearer client replays only its own response.
+- A retry with a different raw `Authorization` header (on a route without
+  `RequireApiToken`) runs the handler again.
+- `RequireApiToken` registered directly with `AppBuilder::layer` or
+  `static_gate` no longer forces fail-closed replay: a retry replays. A
+  `ServiceBuilder` stack around it still fails closed.
+
+Most apps need no change. Two cases need a look:
+
+- A request in flight across the upgrade that carries `Authorization` and no
+  session gets a new key, so its retry runs the handler once more. Session-only
+  apps keep byte-identical keys.
+- A client that refreshes its token between retries, on a route that checks the
+  token in the handler, now runs the handler again. Mount `RequireApiToken` with
+  `AppBuilder::layer` to key on the principal instead of the token.
+
+**Automation:** `manual` — whether a retry may run twice is the app's call.
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /
