@@ -750,6 +750,9 @@ pub struct FleetOwnership {
     /// Per range of `ranges`: the newest epoch a replicator saw at the
     /// destination for a slot in it. Claims of the range go above it.
     fence_floors: Vec<std::sync::atomic::AtomicU64>,
+    /// A store call outlived the shutdown wait. It may still land and
+    /// extend a lease, so the ranges lapse instead of being released.
+    unsettled: std::sync::atomic::AtomicBool,
 }
 
 impl fmt::Debug for FleetOwnership {
@@ -803,6 +806,7 @@ impl FleetOwnership {
             last: Mutex::new(RefreshReport::default()),
             changed: Notify::new(),
             fence_floors,
+            unsettled: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1000,6 +1004,17 @@ impl FleetOwnership {
             .min()
     }
 
+    /// Mark that a store call outlived the shutdown wait.
+    pub(crate) fn mark_unsettled(&self) {
+        self.unsettled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a store call may still land: no release then.
+    pub(crate) fn unsettled(&self) -> bool {
+        self.unsettled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Wakes when a range is lost.
     pub(crate) const fn changed(&self) -> &Notify {
         &self.changed
@@ -1045,7 +1060,10 @@ impl FleetOwnership {
                 .collect::<Vec<_>>()
                 .into(),
         );
-        if report.failed.is_empty() {
+        // A held range whose local lease ran out was not renewed in time:
+        // the last call failed, or it still hangs.
+        let lapsed = self.read_held().iter().any(|held| now >= held.valid_until);
+        if report.failed.is_empty() && !lapsed {
             HealthCheckOutput::up().with_details(details)
         } else {
             HealthCheckOutput::down().with_details(details)
@@ -1420,9 +1438,10 @@ mod tests {
     struct Scripted {
         inner: SqlSlotOwnership,
         hang: std::sync::atomic::AtomicBool,
-        /// Renewals run on another task, a second late: dropping the call
-        /// does not stop them, as with work handed to `spawn_blocking`.
-        slow: std::sync::atomic::AtomicBool,
+        /// Milliseconds a renewal waits, on another task: dropping the call
+        /// does not stop it, as with work handed to `spawn_blocking`. 0 is
+        /// no wait.
+        slow_ms: std::sync::atomic::AtomicU64,
         /// Runs once, before the next renew reaches the store.
         before_renew: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// Runs once, after the next claim reached the store.
@@ -1434,7 +1453,7 @@ mod tests {
             Self {
                 inner,
                 hang: std::sync::atomic::AtomicBool::new(false),
-                slow: std::sync::atomic::AtomicBool::new(false),
+                slow_ms: std::sync::atomic::AtomicU64::new(0),
                 before_renew: Mutex::new(None),
                 after_claim: Mutex::new(None),
             }
@@ -1478,10 +1497,11 @@ mod tests {
                 if let Some(step) = step {
                     step();
                 }
-                if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+                let slow = self.slow_ms.load(std::sync::atomic::Ordering::SeqCst);
+                if slow > 0 {
                     let (inner, owner) = (self.inner.clone(), owner.clone());
                     return tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(Duration::from_millis(slow)).await;
                         inner.renew(range, &owner, epoch, ttl).await
                     })
                     .await
@@ -1633,6 +1653,33 @@ mod tests {
             1,
             "released, so claimable at once"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_indicator_is_down_while_a_hung_renewal_lets_the_lease_lapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = clock_at(1_000_000);
+        let scripted = Arc::new(Scripted::new(store(dir.path(), &clock).await));
+        let a = Arc::new(
+            FleetOwnership::new(scripted.clone(), owner("a"), vec![SlotRange::ALL], TTL).unwrap(),
+        );
+        a.refresh().await;
+        assert_eq!(
+            a.indicator().check().await.status,
+            crate::actuator::HealthStatus::Up
+        );
+        scripted
+            .hang
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let hung = Arc::clone(&a);
+        let renewal = tokio::spawn(async move { hung.refresh().await });
+        tokio::time::sleep(TTL).await;
+        assert_eq!(a.epoch_for(7), None);
+        assert_eq!(
+            a.indicator().check().await.status,
+            crate::actuator::HealthStatus::Down
+        );
+        renewal.abort();
     }
 
     #[tokio::test]
@@ -1971,8 +2018,8 @@ mod tests {
             );
             fleet.start_ownership(Arc::clone(&ownership)).await.unwrap();
             scripted
-                .slow
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+                .slow_ms
+                .store(1_000, std::sync::atomic::Ordering::SeqCst);
             let stop = tokio_util::sync::CancellationToken::new();
             let handle = fleet.spawn_ownership(stop.clone());
             // The loop's renewal is running when shutdown starts.
@@ -1993,6 +2040,33 @@ mod tests {
             )
             .unwrap();
             assert_eq!(b.refresh().await.claimed.len(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_renewal_still_running_after_the_shutdown_wait_blocks_the_release() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let scripted = Arc::new(Scripted::new(store(dir.path(), &clock).await));
+            let (fleet, _replication, _) = plain(dir.path(), "vol");
+            let ownership = Arc::new(
+                FleetOwnership::new(scripted.clone(), owner("a"), vec![SlotRange::ALL], TTL)
+                    .unwrap(),
+            );
+            fleet.start_ownership(Arc::clone(&ownership)).await.unwrap();
+            // Slower than the shutdown wait, but it does land.
+            let slow = ownership.renew_interval() + Duration::from_secs(5);
+            scripted.slow_ms.store(
+                u64::try_from(slow.as_millis()).unwrap(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let stop = tokio_util::sync::CancellationToken::new();
+            let handle = fleet.spawn_ownership(stop.clone());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stop.cancel();
+            handle.await.unwrap();
+            // The renewal may land after a release and extend the lease
+            // again: the ranges lapse instead.
+            assert!(!fleet.release_ownership().await);
         }
 
         #[tokio::test]

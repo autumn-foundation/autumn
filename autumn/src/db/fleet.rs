@@ -1134,14 +1134,20 @@ impl DatabaseFleet {
     /// It releases only when this is the last process on the volume (the
     /// processes share the owner id and the epoch) and nothing committed is
     /// left unshipped. Otherwise the leases lapse. They also lapse when the
-    /// store does not answer within a renew interval: a hung store must not
-    /// hold shutdown.
+    /// store does not answer within a renew interval, or when a store call
+    /// outlived the loop's shutdown wait: it may still extend a lease.
     pub async fn release_ownership(&self) -> bool {
         let Some(ownership) = self.ownership() else {
             return false;
         };
         if self.replication().is_some_and(|r| r.closing() > 0) {
             tracing::warn!("fleet ownership: unshipped frames; the ranges lapse instead");
+            return false;
+        }
+        if ownership.unsettled() {
+            tracing::warn!(
+                "fleet ownership: a store call is still running; the ranges lapse instead"
+            );
             return false;
         }
         let shared = self
@@ -1291,7 +1297,12 @@ impl DatabaseFleet {
                     // release extends the lease again. So let it finish
                     // first, within a renew interval: a hung store must not
                     // hold shutdown.
-                    let _ = tokio::time::timeout(ownership.renew_interval(), &mut refresh).await;
+                    if tokio::time::timeout(ownership.renew_interval(), &mut refresh)
+                        .await
+                        .is_err()
+                    {
+                        ownership.mark_unsettled();
+                    }
                     return;
                 }
                 let _ = fleet.fence_unowned();

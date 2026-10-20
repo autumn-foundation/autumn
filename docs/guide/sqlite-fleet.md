@@ -403,7 +403,8 @@ the first request.
 `/actuator/health` reports `fleet:ownership`. The details are the `owner`,
 the `held` ranges with their epoch and whether the host serves them now, and
 the ranges that are `waiting`, `lost` or `failed`. The status is `Down` when
-the last claim or renew could not reach the table.
+the last claim or renew could not reach the table, or when a held range
+stopped serving because a renew did not come back in time.
 
 ### Clocks
 
