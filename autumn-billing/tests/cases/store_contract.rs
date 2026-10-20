@@ -451,8 +451,8 @@ pub async fn subscription_authoritative_settles_a_same_instant_tie(store: &dyn B
 }
 
 /// With the tie check on, a same-instant write of a different live status is
-/// reported, not ranked, and nothing is written. Every other case is as
-/// before.
+/// reported, not ranked, and nothing is written. Other cases keep the
+/// existing rules.
 pub async fn subscription_tie_check_reports_a_same_instant_tie(store: &dyn BillingStore) {
     let customer = seed_customer(store, "sub-tie", None).await;
     let tied =
@@ -517,13 +517,16 @@ pub async fn subscription_tie_check_reports_a_same_instant_tie(store: &dyn Billi
     assert!(!after.is_applied() && !after.is_tie());
 }
 
-/// Concurrent same-instant writers: exactly one write lands and the other
-/// sees the tie. Never two applies, never an error.
+/// Concurrent same-instant writers with different statuses. Exactly one write
+/// is applied and the others return `Tie`. No call returns an error. The
+/// memory store is mutex-atomic, so it checks the contract only. The Postgres
+/// run checks the race.
 pub async fn subscription_concurrent_ties_are_reported_once(
     store: std::sync::Arc<dyn BillingStore>,
 ) {
     let customer = seed_customer(store.as_ref(), "sub-race", None).await;
-    // Round 0: a new subscription. Round 1: an existing one, one second on.
+    // Round 0 writes a new subscription. Round 1 writes to an existing
+    // subscription, one second later.
     for round in 0..2_i64 {
         for n in 0..8_i64 {
             let key = format!("{round}-{n}");
@@ -545,16 +548,20 @@ pub async fn subscription_concurrent_ties_are_reported_once(
                 let upsert = sub_upsert("sub-race", &customer, &key, status, base).with_tie_check();
                 tokio::spawn(async move { store.upsert_subscription(upsert).await })
             };
-            let a = write(SubscriptionStatus::Active);
-            let b = write(SubscriptionStatus::PastDue);
-            let (a, b) = (a.await.unwrap().unwrap(), b.await.unwrap().unwrap());
-            let applied = [&a, &b].iter().filter(|w| w.is_applied()).count();
-            let ties = [&a, &b].iter().filter(|w| w.is_tie()).count();
-            assert_eq!(
-                (applied, ties),
-                (1, 1),
-                "round {round} run {n}: {a:?} {b:?}"
-            );
+            let tasks = [
+                SubscriptionStatus::Active,
+                SubscriptionStatus::PastDue,
+                SubscriptionStatus::Paused,
+                SubscriptionStatus::Trialing,
+            ]
+            .map(write);
+            let mut writes = Vec::new();
+            for task in tasks {
+                writes.push(task.await.unwrap().unwrap());
+            }
+            let applied = writes.iter().filter(|w| w.is_applied()).count();
+            let ties = writes.iter().filter(|w| w.is_tie()).count();
+            assert_eq!((applied, ties), (1, 3), "round {round} run {n}: {writes:?}");
         }
     }
 }

@@ -1631,12 +1631,12 @@ match store.upsert_subscription(upsert).await? {
 `Write::into_inner` when you only need the row.
 
 A custom `BillingStore` must handle `SubscriptionUpsert::check_ties` inside
-`upsert_subscription`. When it is set, the incoming status differs from the
-stored one, both are not terminal, the instants are equal and the write is not
-`authoritative`: write nothing and return `Write::Tie(stored_row)`. Make the
-check and the write one atomic step. A store that never returns `Tie` still
-works, but concurrent same-second webhooks are ranked as before. Only
-subscription writes return `Tie`.
+`upsert_subscription`. Return `Write::Tie(stored_row)` and write nothing when
+all of these are true: the flag is set, the statuses differ, neither status is
+terminal, the instants are equal, and the write is not `authoritative`. Make
+the check and the write one atomic step. A store that never returns `Tie` still
+compiles. It ranks concurrent same-second webhooks as before. Only subscription
+writes return `Tie`.
 
 **Automation:** `manual` — add the arm, and the check to a custom store.
 

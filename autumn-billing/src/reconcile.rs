@@ -243,9 +243,9 @@ impl Ctx<'_> {
     /// in order: the provider's timestamps are coarse (Stripe's are whole
     /// seconds) and its event ids are not ordered. Ranking them would drop a
     /// legitimate reversal (`past_due -> active`, `active -> paused`). The
-    /// store therefore reports the tie inside the write, which holds for
-    /// concurrent webhooks. Then ask the provider for the current state and
-    /// write it as authoritative at the tied instant. No timestamp is
+    /// store reports the tie inside the write. This also works for concurrent
+    /// webhooks. The caller then asks the provider for the current state and
+    /// writes it as authoritative at the tied instant. No timestamp is
     /// invented, so a later event still compares against a real provider
     /// time.
     ///

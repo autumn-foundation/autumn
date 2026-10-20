@@ -427,8 +427,8 @@ impl DbBillingStore {
     /// the row between the read and the write, so the caller reads again.
     ///
     /// The write is a compare-and-set on the row it read, and an insert
-    /// that loses the unique key. Either way, the guard (and with it the tie
-    /// check) always runs on the row that is stored when the write lands.
+    /// that loses the unique key. The guard and the tie check always run
+    /// against the row that is in the database at write time.
     async fn try_upsert_subscription(
         &self,
         upsert: SubscriptionUpsert,

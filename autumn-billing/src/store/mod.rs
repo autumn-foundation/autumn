@@ -149,8 +149,8 @@ pub(crate) fn guard(
 /// [`guard`] for a subscription write.
 ///
 /// An authoritative write (see [`SubscriptionUpsert::authoritative`]) replaces
-/// the stored row at the SAME instant, so the provider's answer settles a tie
-/// instead of the ranking. That includes an equal status: the lookup may differ
+/// the stored row at the SAME instant. The provider's answer then settles a
+/// tie, not the ranking. That includes an equal status: the lookup may differ
 /// in quantity, price, period end or cancellation. It never leaves a terminal
 /// status, never goes back in time, and does not move the stored instant.
 ///
