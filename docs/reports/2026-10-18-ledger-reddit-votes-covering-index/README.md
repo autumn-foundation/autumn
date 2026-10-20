@@ -20,7 +20,7 @@ Reproduce (one database for every command; the default matches `docker-compose.y
 ```
 export DATABASE_URL=postgres://autumn:autumn@127.0.0.1:5433/reddit
 # boot the app once so it applies migrations (the new index is built then), then:
-psql "$DATABASE_URL" -f examples/reddit-clone/perf/seed.sql       # ~4 min
+psql "$DATABASE_URL" -f examples/reddit-clone/perf/seed.sql       # ~4 min   # both .sql files set ON_ERROR_STOP themselves
 examples/reddit-clone/perf/compare.sh out/                         # drops the index -> out/before, rebuilds it -> out/after
 psql "$DATABASE_URL" -f docs/reports/2026-10-18-ledger-reddit-votes-covering-index/after/equivalence.sql
 ```

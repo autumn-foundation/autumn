@@ -1,3 +1,4 @@
+\set ON_ERROR_STOP on
 -- Deterministic, production-shaped fixture for the reddit-clone read workload.
 -- Run AFTER the app has booted once (it applies the migrations).
 -- Skew: subreddit popularity and post comment counts are power-law (u^k).
