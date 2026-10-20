@@ -369,10 +369,10 @@ rcgen = { workspace = true, optional = true }
 # Build the dual-stack (`[::]`, IPV6_V6ONLY=false) HTTP-01 challenge listener so
 # the ACME CA can validate over IPv6 on AAAA-only deployments (issue #1608).
 socket2 = { workspace = true, optional = true }
-postgresql_embedded = { version = "0.21", optional = true, default-features = false, features = [
+postgresql_embedded = { version = "0.19", optional = true, default-features = false, features = [
     "tokio",
     "theseus",
-    "tls-rustls-ring",
+    "rustls",
 ] }
 futures.workspace = true
 http.workspace = true

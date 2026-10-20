@@ -102,6 +102,15 @@ ignore = [
     # default. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), or whenever the MSRV floor rises far enough
     # to take an aws-sdk-s3 that resolves a fixed `lru`.
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — webpki-roots 0.26.11 bundles the distrusted emSign
+    # ECC G3 root. The fix is 1.0.10+ only; no 0.26.x patch exists. Ingress:
+    # sqlx-core 0.8.6 -> postgresql_embedded 0.19 (managed-pg feature). Newer
+    # postgresql_embedded takes webpki-roots 1.x, but 0.20.0 needs Rust 1.89 and
+    # 0.20.2+ and 0.21 need 1.92 or 1.94, above the 1.88 MSRV. The crate uses sqlx
+    # only for CREATE/DROP DATABASE against the local server it starts, so no
+    # remote certificate is ever checked against this root store. Other
+    # webpki-roots in the graph are fixed at 1.0.10.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 in MSRV-pinned postgresql_embedded 0.19 (no 0.26.x fix; 1.x needs Rust >= 1.89); used only for local CREATE/DROP DATABASE, no remote TLS trust; review-by 2026-11-17" },
 ]
 
 [licenses]

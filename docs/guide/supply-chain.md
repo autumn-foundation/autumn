@@ -443,9 +443,10 @@ in a pull request rather than living in someone's memory.
 Your generated `deny.toml` ships with a waiver already in it:
 `RUSTSEC-2023-0071`. `rsa` reaches every Autumn app through `jsonwebtoken`,
 which `autumn-web` depends on unconditionally, and no patched `rsa` release
-exists. An app generated with `--bundled-pg` gets a second one
-(`RUSTSEC-2024-0384`, `instant`, unmaintained, reachable only through the
-embedded-Postgres build stack) — and only that flavor gets it, so cargo-deny's
+exists. An app generated with `--bundled-pg` gets two more
+(`RUSTSEC-2024-0384`, `instant`, unmaintained, and `RUSTSEC-2026-0381`,
+`webpki-roots` 0.26, a distrusted root; both reachable only through the
+embedded-Postgres build stack) — and only that flavor gets them, so cargo-deny's
 "this waiver is unused" warning stays available to tell you when one of *your*
 waivers has gone stale.
 
