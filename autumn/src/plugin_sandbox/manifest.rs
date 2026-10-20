@@ -1198,29 +1198,42 @@ impl SandboxManifest {
 
     /// Refuse quotas whose largest call cannot be written to stdout.
     ///
-    /// The host caps a guest's stdout line at `2 × max_response_bytes + 4096`,
-    /// sized for a response. A call frame is sized by its own quota, and JSON
-    /// writes one byte as up to six. Left unchecked, a plugin may be told it can
-    /// send a body its own manifest makes untransmittable.
+    /// The host limits a guest stdout line to `2 × max_response_bytes + 4096`.
+    /// A call frame follows its own limit, not that one. Without this check, a
+    /// manifest can allow a call that the host cannot receive.
+    ///
+    /// An outbound body is raw bytes, and JSON writes one byte as up to six. A
+    /// KV value or a row is already measured as encoded, so it counts once.
     fn check_call_frames(&self) -> Result<(), ManifestError> {
         let budget = (self.limits.max_response_bytes as u128)
             .saturating_mul(2)
             .saturating_add(4096);
-        // Framing, the key or URL, and the other fields of the frame.
+        // Framing, the key, URL or table name, and the other frame fields.
         let overhead = 4096_u128;
-        for (capability, field, bytes) in [
+        let row = crate::plugin_sandbox::capability::MAX_ROW_BYTES as u128;
+        for (capability, field, frame) in [
             (
                 SandboxCapability::HttpOutbound,
                 "outbound_request_bytes (its call frame must fit 2 × max_response_bytes + 4096)",
-                self.quotas.outbound_request_bytes,
+                u128::from(self.quotas.outbound_request_bytes).saturating_mul(6),
             ),
             (
                 SandboxCapability::Kv,
                 "kv_value_bytes (its call frame must fit 2 × max_response_bytes + 4096)",
-                self.quotas.kv_value_bytes,
+                u128::from(self.quotas.kv_value_bytes),
+            ),
+            (
+                SandboxCapability::Db,
+                "the largest db row (its call frame must fit 2 × max_response_bytes + 4096)",
+                row,
+            ),
+            (
+                SandboxCapability::Jobs,
+                "the largest job payload (its call frame must fit 2 × max_response_bytes + 4096)",
+                row,
             ),
         ] {
-            let frame = u128::from(bytes).saturating_mul(6).saturating_add(overhead);
+            let frame = frame.saturating_add(overhead);
             if self.is_granted(capability) && frame > budget {
                 return Err(ManifestError::LimitOutOfRange {
                     field,
@@ -3009,5 +3022,47 @@ hosts = ["api.example.com"]
             "{err:?}"
         );
         assert!(SandboxManifest::parse(&toml("max_response_bytes = 4194304")).is_ok());
+    }
+
+    #[test]
+    fn the_call_frame_check_is_exact_and_follows_the_grant() {
+        let parse = |caps: &str, grants: &str, limits: &str| {
+            SandboxManifest::parse(&format!(
+                r#"
+name = "shop"
+version = "0.1.0"
+wire_version = 1
+prefix = "/shop"
+capabilities = [{caps}]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "/shop/panel"
+
+[grants]
+{grants}
+
+[limits]
+{limits}
+
+[quotas]
+outbound_request_bytes = 1000
+"#,
+                digest = "c".repeat(64)
+            ))
+        };
+        let http = r#""http-request", "http-outbound""#;
+        let hosts = r#"hosts = ["api.example.com"]"#;
+        // 6 * 1000 + 4096 = 10096 = 2 * 3000 + 4096.
+        assert!(parse(http, hosts, "max_response_bytes = 3000").is_ok());
+        assert!(parse(http, hosts, "max_response_bytes = 2999").is_err());
+        // Not granted: the quota cannot be used, so it is not checked.
+        assert!(parse(r#""http-request""#, "", "max_response_bytes = 512").is_ok());
+        // A db grant needs room for a whole row.
+        let db = r#""http-request", "db""#;
+        let tables = r#"tables = ["orders"]"#;
+        assert!(parse(db, tables, "max_response_bytes = 512").is_err());
+        assert!(parse(db, tables, "max_response_bytes = 4194304").is_ok());
     }
 }

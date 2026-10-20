@@ -824,12 +824,17 @@ impl CapabilityCall {
 
     /// Bytes a reply to this call may take, at its worst.
     ///
-    /// Only an outbound call can have a reply near [`MAX_RESULT_BYTES`]; every
-    /// other call that changes state answers with `done` or an id.
+    /// Zero for a read: a reply that does not fit fails only the guest's own
+    /// request, and nothing has changed. A call that changes state reserves
+    /// room first. Only an outbound reply can be large; headers count at the
+    /// JSON worst case of six bytes per byte.
     #[must_use]
     pub const fn reply_reserve(&self) -> usize {
         match self {
-            Self::HttpFetch { .. } => MAX_RESULT_BYTES + outbound::MAX_RESPONSE_HEADER_BYTES + 4096,
+            Self::KvGet { .. } | Self::DbGet { .. } | Self::DbQuery { .. } => 0,
+            Self::HttpFetch { .. } => {
+                MAX_RESULT_BYTES + outbound::MAX_RESPONSE_HEADER_BYTES * 6 + 4096
+            }
             _ => 4096,
         }
     }
@@ -841,22 +846,23 @@ impl CapabilityCall {
     /// keep the host parse bounded too.
     #[must_use]
     pub fn target_excerpt(&self) -> String {
-        /// Enough for any real authority; the excerpt is far shorter.
+        /// Bytes of URL parsed as a whole; a longer URL is scanned in place.
         const URL_PREFIX_CHARS: usize = 4096;
         match self {
             Self::KvGet { key, .. } | Self::KvSet { key, .. } | Self::KvDelete { key, .. } => {
                 bounded_target(key)
             }
+            Self::HttpFetch { url, .. } if url.len() <= URL_PREFIX_CHARS => bounded_target(
+                &outbound::host_of(url).unwrap_or_else(|| outbound::attempted_authority(url)),
+            ),
+            // A long URL: scan for the authority in place, copy nothing, and
+            // keep the text after the last `@` as a client would.
             Self::HttpFetch { url, .. } => {
-                let end = url
-                    .char_indices()
-                    .nth(URL_PREFIX_CHARS)
-                    .map_or(url.len(), |(index, _)| index);
-                let prefix = url.get(..end).unwrap_or(url);
-                bounded_target(
-                    &outbound::host_of(prefix)
-                        .unwrap_or_else(|| outbound::attempted_authority(prefix)),
-                )
+                let rest = url.split_once("://").map_or(url.as_str(), |(_, rest)| rest);
+                let rest = rest.trim_start_matches('/');
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+                let host = authority.rsplit('@').next().unwrap_or(authority);
+                bounded_target(host).to_ascii_lowercase()
             }
             Self::DbInsert { table, .. }
             | Self::DbGet { table, .. }
@@ -915,6 +921,11 @@ pub enum DenialReason {
     /// host, and this means the call *was made* and the answer was discarded.
     /// The audit surface counts the host as called.
     ResponseTooLarge,
+    /// The call ran, and the host refused the answer the backend gave.
+    ///
+    /// The write or enqueue may have happened, so a guest MUST NOT retry. The
+    /// audit surface counts the target as touched.
+    ResultRejected,
 }
 
 impl DenialReason {
@@ -929,6 +940,7 @@ impl DenialReason {
             Self::Unavailable => "unavailable",
             Self::BackendError => "backend-error",
             Self::ResponseTooLarge => "response-too-large",
+            Self::ResultRejected => "result-rejected",
         }
     }
 }
@@ -1267,6 +1279,15 @@ impl CapabilityRuntime {
             dropped_events: 0,
             warned: Vec::new(),
         }
+    }
+
+    /// Stamp jobs with the sealed digest of the whole artifact.
+    ///
+    /// Defaults to the module digest, which is all a bare host has.
+    #[must_use]
+    pub fn with_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.artifact_sha256 = digest.into();
+        self
     }
 
     /// The quotas this runtime enforces.
@@ -1819,7 +1840,7 @@ path = "/shop/panel"
         let mut runtime = rogue_db("r1", vec![fat.clone()]);
         assert_eq!(
             runtime.dispatch(&db_get()).denial(),
-            Some(DenialReason::BackendError)
+            Some(DenialReason::ResultRejected)
         );
         let query = CapabilityCall::DbQuery {
             id: 2,
@@ -1828,10 +1849,10 @@ path = "/shop/panel"
             limit: 0,
             after: None,
         };
-        assert_eq!(
-            runtime.dispatch(&query).denial(),
-            Some(DenialReason::BackendError)
-        );
+        let rejected = runtime.dispatch(&query);
+        assert_eq!(rejected.denial(), Some(DenialReason::ResultRejected));
+        // The row id is named, so the guest can `db-delete` the row.
+        assert!(format!("{rejected:?}").contains("r1"), "{rejected:?}");
     }
 
     #[test]
@@ -1844,7 +1865,28 @@ path = "/shop/panel"
             let mut runtime = rogue_db("r1", vec![stored]);
             assert_eq!(
                 runtime.dispatch(&db_get()).denial(),
-                Some(DenialReason::BackendError)
+                Some(DenialReason::ResultRejected)
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_row_without_a_usable_id_is_not_served() {
+        let long = "r".repeat(MAX_ROW_ID_BYTES + 1);
+        for id in [
+            None,
+            Some(PluginValue::Int(7)),
+            Some(PluginValue::Text(String::new())),
+            Some(PluginValue::Text(long)),
+        ] {
+            let mut stored = row(&[("sku", "A-1")]);
+            if let Some(id) = id {
+                stored.insert("row_id".to_owned(), id);
+            }
+            let mut runtime = rogue_db("r1", vec![stored]);
+            assert_eq!(
+                runtime.dispatch(&db_get()).denial(),
+                Some(DenialReason::ResultRejected)
             );
         }
     }
@@ -1856,7 +1898,7 @@ path = "/shop/panel"
     }
 
     #[test]
-    fn a_store_assigned_id_the_guest_could_not_use_is_a_backend_error() {
+    fn a_store_assigned_id_the_guest_could_not_use_is_a_rejected_result() {
         for bad in [String::new(), "r".repeat(MAX_ROW_ID_BYTES + 1)] {
             let mut runtime = rogue_db(&bad, Vec::new());
             let result = runtime.dispatch(&CapabilityCall::DbInsert {
@@ -1866,7 +1908,7 @@ path = "/shop/panel"
             });
             assert_eq!(
                 result.denial(),
-                Some(DenialReason::BackendError),
+                Some(DenialReason::ResultRejected),
                 "{} byte id",
                 bad.len()
             );
@@ -1885,7 +1927,7 @@ path = "/shop/panel"
             job_type: "reindex".to_owned(),
             payload: PluginRow::new(),
         });
-        assert_eq!(result.denial(), Some(DenialReason::ResponseTooLarge));
+        assert_eq!(result.denial(), Some(DenialReason::ResultRejected));
         let log = PluginActivityLog::new();
         log.ingest("shop", runtime.take_events());
         let summary = log.summary("shop", std::time::Duration::from_secs(60));
@@ -1962,6 +2004,103 @@ path = "/shop/panel"
             "{}",
             excerpt.len()
         );
+    }
+
+    #[test]
+    fn a_row_exactly_at_the_ceiling_is_served_and_one_byte_over_is_not() {
+        let at_ceiling = |extra: usize| {
+            // 3 names ("c0".."c2", "row_id" excluded from the count) + values.
+            let mut stored = row(&[("row_id", "r1")]);
+            let mut left = MAX_ROW_BYTES + extra;
+            for column in 0..4 {
+                let name = format!("c{column}");
+                left -= name.len();
+                let take = left.min(MAX_VALUE_TEXT_BYTES);
+                left -= take;
+                stored.insert(name, PluginValue::Text("x".repeat(take)));
+            }
+            assert_eq!(left, 0);
+            stored
+        };
+        assert!(
+            rogue_db("r1", vec![at_ceiling(0)])
+                .dispatch(&db_get())
+                .denial()
+                .is_none()
+        );
+        assert_eq!(
+            rogue_db("r1", vec![at_ceiling(1)])
+                .dispatch(&db_get())
+                .denial(),
+            Some(DenialReason::ResultRejected)
+        );
+    }
+
+    #[test]
+    fn a_job_id_at_its_ceiling_is_returned_and_an_empty_one_is_not() {
+        for (id, rejected) in [("j".repeat(MAX_JOB_ID_BYTES), false), (String::new(), true)] {
+            let services = CapabilityServices {
+                jobs: Some(Arc::new(RogueSink(id)) as Arc<dyn JobSink>),
+                ..CapabilityServices::none()
+            };
+            let mut runtime = CapabilityRuntime::new(&manifest(&everything()), services);
+            let result = runtime.dispatch(&CapabilityCall::JobEnqueue {
+                id: 1,
+                job_type: "reindex".to_owned(),
+                payload: PluginRow::new(),
+            });
+            assert_eq!(
+                result.denial() == Some(DenialReason::ResultRejected),
+                rejected,
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reply_room_is_checked_at_its_exact_edge() {
+        let post = CapabilityCall::HttpFetch {
+            id: 1,
+            method: "POST".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let reserve = post.reply_reserve();
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let short = fixture.runtime.dispatch_within(&post, reserve - 1);
+        assert_eq!(short.denial(), Some(DenialReason::QuotaExceeded));
+        assert!(fixture.http.seen().is_empty(), "the POST ran");
+        let fits = fixture.runtime.dispatch_within(&post, reserve);
+        assert_ne!(fits.denial(), Some(DenialReason::QuotaExceeded), "{fits:?}");
+        // A read reserves nothing.
+        let get = CapabilityCall::KvGet {
+            id: 2,
+            key: "cart".to_owned(),
+        };
+        assert_eq!(get.reply_reserve(), 0);
+        assert!(fixture.runtime.dispatch_within(&get, 0).denial().is_none());
+    }
+
+    #[test]
+    fn an_oversized_kv_value_is_refused_without_spending_the_write_quota() {
+        let mut fixture = fixture(&everything(), Some("alpha"));
+        let huge = PluginValue::Text("x".repeat(64 * 1024 + 1));
+        for _ in 0..40 {
+            let result = fixture.runtime.dispatch(&CapabilityCall::KvSet {
+                id: 1,
+                key: "cart".to_owned(),
+                value: huge.clone(),
+            });
+            assert_eq!(result.denial(), Some(DenialReason::QuotaExceeded));
+        }
+        // 40 refusals, `kv_writes` is 32: a valid write still succeeds.
+        let ok = fixture.runtime.dispatch(&CapabilityCall::KvSet {
+            id: 2,
+            key: "cart".to_owned(),
+            value: PluginValue::Int(1),
+        });
+        assert!(ok.denial().is_none(), "{ok:?}");
     }
 
     // ── Capability gating ────────────────────────────────────────────

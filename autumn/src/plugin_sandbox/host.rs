@@ -1182,6 +1182,9 @@ pub struct SandboxHost {
     /// is only ever the binding constraint on a direct caller, which is the
     /// one it exists for.
     permits: Semaphore,
+    /// The sealed digest of the whole artifact, when this host came from one.
+    /// Stamped on every job the plugin enqueues.
+    artifact_sha256: Option<String>,
     /// The paths this plugin declared, as the router matches them.
     ///
     /// Built once here because a redirect may only name a route the plugin
@@ -1384,6 +1387,7 @@ impl SandboxHost {
             engine,
             module,
             permits: Semaphore::new(manifest.limits.max_concurrency),
+            artifact_sha256: None,
             instantiation_fuel: instantiation,
             owned_routes: super::wire::OwnedRoutes::from_routes(
                 manifest
@@ -1393,6 +1397,13 @@ impl SandboxHost {
             ),
             manifest,
         })
+    }
+
+    /// Record the sealed digest of the artifact this host came from.
+    #[must_use]
+    pub(super) fn with_artifact_sha256(mut self, digest: String) -> Self {
+        self.artifact_sha256 = Some(digest);
+        self
     }
 
     /// The manifest this host enforces.
@@ -1717,7 +1728,12 @@ impl SandboxHost {
             limits,
             line.as_bytes(),
             exchange,
-            crate::plugin_sandbox::capability::CapabilityRuntime::new(&self.manifest, services),
+            crate::plugin_sandbox::capability::CapabilityRuntime::new(&self.manifest, services)
+                .with_artifact_sha256(
+                    self.artifact_sha256
+                        .clone()
+                        .unwrap_or_else(|| self.manifest.sha256.clone()),
+                ),
         );
         state.stdin = VecDeque::from(line.into_bytes());
 
@@ -3221,9 +3237,11 @@ impl HostState {
         // for the guest. A call that does not fit is answered with a denial the
         // guest can read, and nothing runs.
         let queue_room = MAX_QUEUED_REPLY_BYTES.saturating_sub(self.queued_replies);
+        // A quarter of the budget at most, so a small budget still serves calls.
+        let allowance = FINISH_ALLOWANCE_FUEL.min(self.limits.fuel / 4);
         let fuel_room = usize::try_from(
             fuel_left
-                .saturating_sub(FINISH_ALLOWANCE_FUEL)
+                .saturating_sub(allowance)
                 .saturating_mul(BYTES_PER_FUEL),
         )
         .unwrap_or(usize::MAX);
@@ -8076,5 +8094,30 @@ hosts = ["api.example.com"]
         let (mut state, http) = outbound_state(0);
         state.service(&post(), u64::MAX);
         assert_eq!(http.seen().len(), 1);
+    }
+    #[test]
+    fn the_fuel_edge_for_a_reply_is_exact() {
+        let reserve = post().reply_reserve();
+        let allowance = FINISH_ALLOWANCE_FUEL.min(ResourceLimits::default().fuel / 4);
+        let need = allowance + (reserve as u64).div_ceil(BYTES_PER_FUEL);
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), need - 1);
+        assert!(http.seen().is_empty(), "one unit short must not dispatch");
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), need);
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn a_read_is_served_on_a_small_fuel_budget() {
+        let (mut state, _) = outbound_state(0);
+        let read = crate::plugin_sandbox::CapabilityCall::KvGet {
+            id: 1,
+            key: "cart".to_owned(),
+        };
+        state.service(&read, 10);
+        let queued =
+            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned();
+        assert!(!queued.contains("not room"), "{queued}");
     }
 }

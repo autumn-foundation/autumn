@@ -36,7 +36,7 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -114,8 +114,10 @@ pub struct PluginActivityLog {
 /// What [`PluginActivityLog`] guards.
 #[derive(Debug, Default)]
 struct LogState {
-    /// A ring, not a `Vec`: `pop_front` is constant time, a `Vec` shifts.
-    entries: VecDeque<(Instant, String, CapabilityEvent)>,
+    /// Keyed by the event's own time, so the oldest event is the first key
+    /// whatever order requests finished in. The sequence number separates equal
+    /// times.
+    entries: BTreeMap<(Instant, u64), (String, CapabilityEvent)>,
     /// Calls the log knows happened but cannot show: those a per-request
     /// ledger could not hold, and those the ring evicted.
     ///
@@ -125,11 +127,17 @@ struct LogState {
     dropped: BTreeMap<(Instant, u64), (String, u64)>,
     /// The next sequence number for `dropped`.
     seq: u64,
-    /// Counts the full `dropped` ledger folded away, by plugin, with the newest
-    /// time folded in. A summary reports it while that time is in its window,
-    /// so it can over-report, never under-report.
-    folded: BTreeMap<String, (Instant, u64)>,
+    /// Counts the full `dropped` ledger folded away, by plugin and hour, with
+    /// the newest time folded into each bucket. A summary reports a bucket
+    /// while that time is in its window. It can over-report by under one hour
+    /// of drops, and never under-reports.
+    folded: BTreeMap<(String, u64), (Instant, u64)>,
+    /// The time the hour buckets count from. Set by the first fold.
+    origin: Option<Instant>,
 }
+
+/// How long one `folded` bucket spans.
+const FOLD_BUCKET_SECS: u64 = 3600;
 
 /// How coarsely dropped-call records are timestamped.
 ///
@@ -158,16 +166,16 @@ impl PluginActivityLog {
         let mut state = self.lock();
         for event in events {
             if state.entries.len() >= MAX_LOG_EVENTS
-                && let Some((at, who, _)) = state.entries.pop_front()
+                && let Some(((at, _), (who, _))) = state.entries.pop_first()
             {
                 // An evicted event is a call the summary can no longer show.
                 // It is recorded under its own time, so a drop that has aged
                 // out of the window stops being reported with it.
                 state.note_dropped(at, &who, 1);
             }
-            state
-                .entries
-                .push_back((event.at, plugin.to_owned(), event));
+            state.seq = state.seq.wrapping_add(1);
+            let key = (event.at, state.seq);
+            state.entries.insert(key, (plugin.to_owned(), event));
         }
     }
 
@@ -196,7 +204,7 @@ impl PluginActivityLog {
             ..ActivitySummary::default()
         };
         let state = self.lock();
-        for (at, who, event) in &state.entries {
+        for ((at, _), (who, event)) in &state.entries {
             if who == plugin && in_window(*at) {
                 summary.record(event);
             }
@@ -206,11 +214,12 @@ impl PluginActivityLog {
             .iter()
             .filter(|((at, _), (who, _))| who == plugin && in_window(*at))
             .fold(0_u64, |sum, (_, (_, count))| sum.saturating_add(*count));
-        if let Some((at, count)) = state.folded.get(plugin)
-            && in_window(*at)
-        {
-            summary.dropped = summary.dropped.saturating_add(*count);
-        }
+        let folded: u64 = state
+            .folded
+            .range((plugin.to_owned(), 0)..=(plugin.to_owned(), u64::MAX))
+            .filter(|(_, (at, _))| in_window(*at))
+            .fold(0_u64, |sum, (_, (_, count))| sum.saturating_add(*count));
+        summary.dropped = summary.dropped.saturating_add(folded);
         drop(state);
         summary
     }
@@ -230,10 +239,10 @@ impl PluginActivityLog {
             let state = self.lock();
             state
                 .entries
-                .iter()
-                .map(|(_, who, _)| who.clone())
+                .values()
+                .map(|(who, _)| who.clone())
                 .chain(state.dropped.values().map(|(who, _)| who.clone()))
-                .chain(state.folded.keys().cloned())
+                .chain(state.folded.keys().map(|(who, _)| who.clone()))
                 .collect()
         };
         names.sort();
@@ -268,9 +277,19 @@ impl LogState {
             let Some(((oldest, _), (who, count))) = self.dropped.pop_first() else {
                 break;
             };
-            let folded = self.folded.entry(who).or_insert((oldest, 0));
+            let origin = *self.origin.get_or_insert(oldest);
+            let hour = oldest.saturating_duration_since(origin).as_secs() / FOLD_BUCKET_SECS;
+            let folded = self.folded.entry((who, hour)).or_insert((oldest, 0));
             folded.0 = folded.0.max(oldest);
             folded.1 = folded.1.saturating_add(count);
+        }
+        // Bounded like the other ledgers. Past this the oldest hour goes, which
+        // takes thousands of plugin-hours of overflow to reach.
+        while self.folded.len() > MAX_LOG_EVENTS {
+            let Some(oldest) = self.folded.keys().min_by_key(|(_, hour)| *hour).cloned() else {
+                break;
+            };
+            self.folded.remove(&oldest);
         }
     }
 }
@@ -336,7 +355,17 @@ impl ActivitySummary {
             event.outcome,
             CapabilityOutcome::Allowed
                 | CapabilityOutcome::Denied(
-                    DenialReason::ResponseTooLarge | DenialReason::BackendError
+                    DenialReason::ResponseTooLarge
+                        | DenialReason::ResultRejected
+                        | DenialReason::BackendError
+                )
+        );
+        // The call ran and the host refused its answer.
+        let ran = matches!(
+            event.outcome,
+            CapabilityOutcome::Allowed
+                | CapabilityOutcome::Denied(
+                    DenialReason::ResponseTooLarge | DenialReason::ResultRejected
                 )
         );
         // Jobs are the exception to "reached the host counts": `job_types` is
@@ -344,18 +373,11 @@ impl ActivitySummary {
         // depth ceiling — enqueued nothing. Counting it would put a job in the
         // report that no runner will ever run, which is the one number an
         // operator reading this would act on.
-        // A `ResponseTooLarge` enqueue ran: the queue took the job and the guest's
-        // copy of the id was discarded.
-        let enqueued = matches!(
-            event.outcome,
-            CapabilityOutcome::Allowed | CapabilityOutcome::Denied(DenialReason::ResponseTooLarge)
-        );
+        // A rejected result still ran: the queue took the job.
+        let enqueued = ran;
         // Tables are the other exception: `StoreError::Backend` means the read
-        // or write did not happen, so only a call that did is a table touched.
-        let touched = matches!(
-            event.outcome,
-            CapabilityOutcome::Allowed | CapabilityOutcome::Denied(DenialReason::ResponseTooLarge)
-        );
+        // or write did not happen, so only a call that ran is a table touched.
+        let touched = ran;
         let bucket = match (event.capability, allowed) {
             (SandboxCapability::HttpOutbound, true) => Some(&mut self.hosts),
             (SandboxCapability::Db, true) if touched => Some(&mut self.tables),
@@ -807,12 +829,12 @@ mod tests {
 
         // Window: only the recent records. All 4096 + 1 are in it; the evicted
         // old events are not.
-        let summary = log.summary("shop", Duration::from_secs(3 * 3600));
-        assert!(
-            summary.dropped > MAX_LOG_EVENTS as u64,
-            "recent drops were lost: {}",
-            summary.dropped
-        );
+        // The recent window holds every recent record and nothing old.
+        let recent = log.summary("shop", Duration::from_secs(3 * 3600));
+        assert_eq!(recent.dropped, MAX_LOG_EVENTS as u64 + 1);
+        // A wider window adds the old events the ring evicted.
+        let wide = log.summary("shop", 24 * hour);
+        assert!(wide.dropped > recent.dropped, "{}", wide.dropped);
     }
 
     #[test]
@@ -833,7 +855,7 @@ mod tests {
             })
         };
         let mut last = 0_u64;
-        while !writer.is_finished() {
+        for _ in 0..2_000 {
             let summary = log.summary("shop", Duration::from_secs(3600));
             let seen = summary.allowed.get("kv-get").copied().unwrap_or(0) + summary.dropped;
             assert!(
@@ -843,5 +865,65 @@ mod tests {
             last = seen;
         }
         writer.join().expect("the writer finishes");
+    }
+    #[test]
+    fn the_ring_evicts_the_oldest_event_by_time_not_by_arrival() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+
+        // A slow request made its calls long ago and finishes last.
+        let old: Vec<_> = (0..MAX_LOG_EVENTS)
+            .map(|_| event("kv-get", CapabilityOutcome::Allowed))
+            .collect();
+        clock.advance(10 * hour);
+        log.ingest("shop", [event("kv-set", CapabilityOutcome::Allowed)]);
+        log.ingest("shop", old);
+        // One more event evicts. The oldest by time must go, not the newest.
+        log.ingest("shop", [event("kv-delete", CapabilityOutcome::Allowed)]);
+
+        let recent = log.summary("shop", hour);
+        assert_eq!(recent.allowed.get("kv-set").copied(), Some(1), "{recent:?}");
+        assert_eq!(recent.allowed.get("kv-delete").copied(), Some(1));
+    }
+
+    #[test]
+    fn folded_counts_leave_the_window_with_their_hour() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+
+        // Two hours of drop records, each its own record, then overflow.
+        for _ in 0..MAX_LOG_EVENTS {
+            log.ingest_dropped("shop", 1);
+            clock.advance(Duration::from_secs(2));
+        }
+        clock.advance(10 * hour);
+        for _ in 0..MAX_LOG_EVENTS {
+            log.ingest_dropped("shop", 1);
+            clock.advance(Duration::from_secs(2));
+        }
+        // The first batch folded away, ten hours back. It is not in the last
+        // two hours, though the second batch is.
+        let recent = log.summary("shop", 3 * hour);
+        assert_eq!(recent.dropped, MAX_LOG_EVENTS as u64, "{}", recent.dropped);
+        let all = log.summary("shop", 100 * hour);
+        assert_eq!(all.dropped, 2 * MAX_LOG_EVENTS as u64);
     }
 }

@@ -359,14 +359,31 @@ pub(super) fn validate(call: &CapabilityCall) -> Result<(), CallResult> {
 
 /// Refuse rows a store hands back that the host would not have stored.
 ///
-/// The same ceilings as the write side, so a read is not more permissive than
-/// the insert that made the row. Refused as a whole, as a backend fault: a
-/// quietly shortened page would read as the end of the table.
+/// The limits match the write side, and every row must carry a usable
+/// [`ID_COLUMN`]. The host refuses the whole page: a shortened page would look
+/// like the end of the table. The detail names the row, so the guest can
+/// `db-delete` it, and the log names it for the operator.
 fn check_stored_rows<'a>(rows: impl IntoIterator<Item = &'a PluginRow>) -> Result<(), String> {
     for row in rows {
-        super::check_row_without(row, Some(ID_COLUMN)).map_err(|detail| {
-            format!("the store returned a row the host would not store: {detail}")
-        })?;
+        let id = match row.get(ID_COLUMN) {
+            Some(super::PluginValue::Text(id)) if check_row_id(id).is_ok() => Some(id.as_str()),
+            _ => None,
+        };
+        let fault = match (id, super::check_row_without(row, Some(ID_COLUMN))) {
+            (None, _) => Some("it carries no usable row id".to_owned()),
+            (Some(_), Err(detail)) => Some(detail),
+            (Some(_), Ok(())) => None,
+        };
+        if let Some(fault) = fault {
+            let named = id.unwrap_or("?");
+            tracing::warn!(
+                row_id = named,
+                "a plugin store returned a row the host would not store"
+            );
+            return Err(format!(
+                "the store returned row {named:?}, which the host would not store: {fault}"
+            ));
+        }
     }
     Ok(())
 }
@@ -411,9 +428,10 @@ pub(super) fn perform(
                 // operation that caused it.
                 Ok(row_id) if check_row_id(&row_id).is_err() => CallResult::denied(
                     id,
-                    DenialReason::BackendError,
+                    DenialReason::ResultRejected,
                     format!(
-                        "the store assigned an id the host cannot address: 1..={} bytes expected",
+                        "the row was inserted, but the store assigned an id outside 1..={} \
+                         bytes; do not retry",
                         super::MAX_ROW_ID_BYTES
                     ),
                 ),
@@ -431,7 +449,7 @@ pub(super) fn perform(
             match store.get(&scope, row_id) {
                 Ok(found) => {
                     if let Err(detail) = check_stored_rows(found.iter()) {
-                        return CallResult::denied(id, DenialReason::BackendError, detail);
+                        return CallResult::denied(id, DenialReason::ResultRejected, detail);
                     }
                     // Through the same bound as a query, though a single row is
                     // under `MAX_ROW_BYTES` and therefore always survives it: a
@@ -478,7 +496,7 @@ pub(super) fn perform(
                 ) {
                     Ok(page) => {
                         if let Err(detail) = check_stored_rows(page.rows.iter()) {
-                            return CallResult::denied(id, DenialReason::BackendError, detail);
+                            return CallResult::denied(id, DenialReason::ResultRejected, detail);
                         }
                         let mut rows = page.rows;
                         // Recorded before the cut, not inferred after it. A
