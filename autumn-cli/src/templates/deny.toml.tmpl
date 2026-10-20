@@ -114,6 +114,15 @@ ignore = [
     # exploit here, and no safe upgrade (the author recommends `web-time`).
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — `webpki-roots` 0.26 bundles a distrusted emSign root.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0381
+    #
+    # Present for the same reason: `sqlx-core` 0.8 pins `webpki-roots` 0.26, and
+    # it arrives through the *build-time* `postgresql_embedded`, which only
+    # fetches a local development Postgres. The fix is `webpki-roots` 1.0.10 or
+    # later, and no 0.26 fix exists. Autumn drops this waiver when sqlx takes 1.x.
+    # Review-by: 2026-11-03.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26 only, pinned by sqlx-core 0.8 via build-time postgresql_embedded (managed-pg-bundled); no 0.26 fix; review-by 2026-11-03" },
     # <<< autumn:bundled-pg-waiver
 ]
 
