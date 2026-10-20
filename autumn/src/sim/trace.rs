@@ -117,10 +117,16 @@ pub async fn capture_targets<F: std::future::Future>(
         start: tokio::time::Instant::now(),
     });
     let _live = Live::new(&state);
-    let mut future = std::pin::pin!(future);
+    let mut future = Some(Box::pin(future));
     let output = std::future::poll_fn(|cx| {
         let _polling = Polling::new(&state);
-        future.as_mut().poll(cx)
+        let Some(running) = future.as_mut() else {
+            unreachable!("capture polled after it ended");
+        };
+        let output = std::task::ready!(running.as_mut().poll(cx));
+        // Drop it here: events from its `Drop` belong to this capture.
+        future = None;
+        std::task::Poll::Ready(output)
     })
     .await;
     let mut aliases = std::mem::take(&mut *lock(&state.aliases));
@@ -371,6 +377,28 @@ mod tests {
         .await;
         assert_eq!(trace.len(), 1);
         assert!(!evaluated.get(), "the fields of an unwanted event ran");
+    }
+
+    /// A future that logs when it drops is still recorded.
+    #[tokio::test(start_paused = true)]
+    async fn sim_trace_capture_records_the_drop_of_the_future() {
+        struct Noisy(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>);
+        impl std::future::Future for Noisy {
+            type Output = ();
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                self.0.as_mut().poll(cx)
+            }
+        }
+        impl Drop for Noisy {
+            fn drop(&mut self) {
+                tracing::info!(target: "autumn_web::x", "dropped");
+            }
+        }
+        let ((), trace) = capture(Noisy(Box::pin(async {}))).await;
+        assert_eq!(trace.len(), 1, "{trace:?}");
     }
 
     /// Tasks the captured future spawns are recorded too.
