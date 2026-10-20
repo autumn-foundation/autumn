@@ -435,3 +435,36 @@ impl AutumnRetentionAll {
         RetentionRunOptions::default()
     }
 }
+
+#[tokio::test]
+async fn an_older_jobs_table_is_skipped_not_swept_and_not_failed() {
+    let fx = start().await;
+    // A table from before `unique_ttl_ms` existed.
+    exec(&fx.pool, "DROP TABLE autumn_jobs").await;
+    exec(
+        &fx.pool,
+        "CREATE TABLE autumn_jobs (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, \
+         status TEXT NOT NULL, enqueued_at BIGINT NOT NULL DEFAULT 0, finished_at BIGINT, \
+         unique_key TEXT, unique_window TEXT)",
+    )
+    .await;
+    insert_job(&fx.pool, "old", "completed", 90).await;
+    let state = state_with(&fx.pool, config_with_windows());
+    let reports = run_retention(&state, &options(Some("job_history"), false))
+        .await
+        .expect("run");
+    assert_eq!(reports[0].error, None, "{:?}", reports[0]);
+    assert_eq!(reports[0].rows_removed, 0);
+    assert!(
+        reports[0]
+            .skipped
+            .as_deref()
+            .is_some_and(|s| s.contains("unique_ttl_ms")),
+        "{:?}",
+        reports[0]
+    );
+    assert_eq!(
+        count(&fx.pool, "SELECT COUNT(*) AS n FROM autumn_jobs").await,
+        1
+    );
+}

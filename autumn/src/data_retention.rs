@@ -986,6 +986,10 @@ async fn apply_sweep(
             ));
             return;
         }
+        Ok(SqliteSweep::Skipped(reason)) => {
+            report.skipped = Some(reason);
+            return;
+        }
         Err(failure) => Err(failure),
     };
     match outcome {
@@ -1375,6 +1379,8 @@ enum SqliteSweep {
     Swept(SweptDataset),
     /// A dataset table this database does not have.
     MissingTable(&'static str),
+    /// The table exists but its schema is too old to sweep safely.
+    Skipped(String),
 }
 
 #[cfg(all(feature = "db", feature = "sqlite"))]
@@ -1419,6 +1425,17 @@ async fn sweep_sqlite(
         if !sqlite_table_exists(&mut conn, needed).await? {
             return Ok(SqliteSweep::MissingTable(needed));
         }
+    }
+
+    // The job runtime adds `unique_ttl_ms` when it starts. A sweep that runs
+    // first on an older file must not guess: skip it and delete nothing.
+    if dataset == RetentionDataset::JobHistory
+        && !sqlite_column_exists(&mut conn, table, "unique_ttl_ms").await?
+    {
+        return Ok(SqliteSweep::Skipped(format!(
+            "{table} predates the unique_ttl_ms column, so the sweep cannot check TTL holds. \
+             Start the app once so the job runtime upgrades the table, then run this again"
+        )));
     }
 
     let (cutoff_at, cutoff) = resolve_sqlite_cutoff(&mut conn, table, window, clock).await?;
@@ -1506,6 +1523,23 @@ async fn sqlite_table_exists(
     .await
     .map(|row| row.count > 0)
     .map_err(|e| sweep_failed(0, format!("retention could not look for {table}: {e}")))
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn sqlite_column_exists(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    diesel::sql_query("SELECT COUNT(*) AS count FROM pragma_table_info(?1) WHERE name = ?2")
+        .bind::<diesel::sql_types::Text, _>(table)
+        .bind::<diesel::sql_types::Text, _>(column)
+        .get_result::<SqliteCount>(&mut **conn)
+        .await
+        .map(|row| row.count > 0)
+        .map_err(|e| sweep_failed(0, format!("retention could not inspect {table}: {e}")))
 }
 
 /// Resolve `now - window` **on the database**, as an instant and in the form
