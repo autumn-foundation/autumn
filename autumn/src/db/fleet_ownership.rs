@@ -863,24 +863,15 @@ impl FleetOwnership {
             .zip(&self.fence_floors)
             .map(|(&range, floor)| async move { (range, self.refresh_range(range, floor).await) });
         let mut report = RefreshReport::default();
-        let mut timed_out = false;
         for (range, outcome) in futures::future::join_all(calls).await {
             match outcome {
-                Outcome::TimedOut => {
-                    timed_out = true;
-                    report.failed.push((range, TIMED_OUT.to_owned()));
-                }
+                Outcome::TimedOut => report.failed.push((range, TIMED_OUT.to_owned())),
                 Outcome::Claimed(epoch) => report.claimed.push((range, epoch)),
                 Outcome::Renewed => report.renewed.push(range),
                 Outcome::Lost => report.lost.push(range),
                 Outcome::Waiting => report.waiting.push(range),
                 Outcome::Failed(error) => report.failed.push((range, error)),
             }
-        }
-        if !timed_out {
-            // Every call answered, so no dropped call is still running.
-            self.unsettled
-                .store(false, std::sync::atomic::Ordering::Release);
         }
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = report.clone();
         report
@@ -908,7 +899,8 @@ impl FleetOwnership {
             Err(_elapsed) => {
                 // The dropped call may still finish and extend the lease at
                 // the store. The local lease does not grow, so serving stays
-                // safe. A refresh with no time-out clears the mark.
+                // safe. The mark stays: a later answer does not show that the
+                // dropped call has finished.
                 self.mark_unsettled();
                 tracing::warn!(range = %range, "fleet slot ownership call timed out");
                 return Outcome::TimedOut;
@@ -1099,8 +1091,9 @@ impl FleetOwnership {
         use crate::actuator::HealthCheckOutput;
         let report = self.last_report();
         let now = tokio::time::Instant::now();
-        let held: Vec<serde_json::Value> = self
-            .read_held()
+        let mut ranges: Vec<Held> = self.read_held().clone();
+        ranges.sort_unstable_by_key(|held| held.range);
+        let held: Vec<serde_json::Value> = ranges
             .iter()
             .map(|held| {
                 serde_json::json!({
@@ -1751,7 +1744,11 @@ mod tests {
         assert!(report.failed.is_empty());
         assert_eq!(report.claimed.len(), 1);
         assert_eq!(report.renewed, vec![range(10, 19)]);
-        assert!(!a.unsettled(), "every call answered");
+        assert!(a.unsettled(), "a dropped call may still run");
+        // 0-9 was claimed after 10-19, but the details keep config order.
+        let health = a.indicator().check().await;
+        assert_eq!(health.details["held"][0]["range"], "0-9");
+        assert_eq!(health.details["held"][1]["range"], "10-19");
     }
 
     #[tokio::test(start_paused = true)]
