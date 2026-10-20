@@ -2892,6 +2892,8 @@ enum DbCommands {
     /// Refuses to run outside the `dev`/`test` profile without `--force`, the
     /// same guard as `autumn db drop`.
     ///
+    /// Works on Postgres and SQLite targets. `--sample` is Postgres-only.
+    ///
     /// # Examples
     ///
     ///   # Refresh staging from a production backup:
@@ -2958,7 +2960,7 @@ enum DbCommands {
     /// sticky experiment assignments, webhook replay markers, sessions, audit
     /// archives. This reports every one of them: the retention window in
     /// effect, which setting produced it, how it is enforced, and how many
-    /// rows are eligible for purge right now.
+    /// rows are eligible for purge right now. Sweeps run on Postgres and SQLite.
     ///
     /// Windows are declared in the `[retention]` section of `autumn.toml` and
     /// are enforced automatically on a recurring in-process sweep — this

@@ -107,8 +107,8 @@ side effect of a job-history window.
 The datasets are genuinely heterogeneous, and the report says so per row
 rather than pretending they all work the same way.
 
-**`sweep`** — a scheduled batched `DELETE` against a framework-owned Postgres
-table. Rows are deleted in batches of 500, up to 1000 batches per dataset per
+**`sweep`** — a scheduled batched `DELETE` against a framework-owned Postgres or
+SQLite table. Rows are deleted in batches of 500, up to 1000 batches per dataset per
 run, so one run never holds a long lock or spikes replication lag; a first
 sweep of a years-old table finishes over several ticks. Completeness is
 established by re-counting the stale rows at the end of the run, not inferred
@@ -179,7 +179,8 @@ one guards an invariant another subsystem depends on:
   `NOT enforced`. Redis keeps finished jobs in lists that a count limit bounds.
 
   On `sqlite` the sweeps run in the app's database file. The cutoff comes from
-  the SQLite clock. A dataset whose table is not in the file is skipped, and the
+  the SQLite clock. The sweep covers `job_history`, `commit_hooks` and
+  `experiment_assignments` only. A dataset whose table is not in the file is skipped, and the
   report names the table.
 
 **`backend ttl`** — the storage backend expires the record itself, so there is

@@ -7,7 +7,7 @@
 
 ## Context
 
-Issue #2553. Two subsystems stop at Postgres:
+Issue #2553. Two subsystems work only on Postgres:
 
 - `autumn db scrub` (#1602) opens a `PgConnection`. It reads Postgres catalogs.
   It builds Postgres SQL (`md5`, `ctid`, `::text`, `"public".`).
@@ -22,7 +22,7 @@ Issue #2553. Two subsystems stop at Postgres:
 
 | Idea | Verdict |
 | --- | --- |
-| Rewrite scrub on a generic `Backend` trait | Rejected. 11k lines. High risk to Postgres. |
+| Rewrite scrub on a generic `Backend` trait | Rejected. About 11,000 lines of code. High risk to Postgres. |
 | Copy `scrub.rs` into a SQLite twin | Rejected. Two classifiers drift apart. |
 | Keep one classifier. Add a `Dialect` to the SQL builders. Add a SQLite probe and apply module. | **Chosen.** |
 | Hash in SQL with a SQLite extension | Rejected. No `md5`/`sha256` built in. |
@@ -50,8 +50,8 @@ Issue #2553. Two subsystems stop at Postgres:
 
 - **White (facts).** SQLite lacks `md5`, `translate`, `ctid`, `::`. `rowid`,
   `replace`, `quote`, `CAST` exist. The CLI links diesel SQLite always.
-- **Red (feelings).** Operators fear a "clean" copy that is not. Prefer a loud
-  refusal to a quiet pass.
+- **Red (feelings).** Operators must trust that a "clean" copy is clean. Refuse
+  loudly. Do not pass quietly.
 - **Black (risks).** See the table above. The highest risk is a changed
   Postgres plan. Pin it with the existing tests plus a golden-SQL test.
 - **Yellow (benefits).** One binary and one file. A laptop copy of a SQLite
@@ -70,7 +70,7 @@ Issue #2553. Two subsystems stop at Postgres:
 4. `--sample` on SQLite is refused.
 5. Add `sweep_sqlite` in `data_retention.rs` for `job_history`,
    `commit_hooks`, and `experiment_assignments`.
-6. Move both rows in `sqlite-in-production.md` to **Available now**.
+6. Mark both rows **Available now** in `sqlite-in-production.md`.
 
 ## Consequences
 

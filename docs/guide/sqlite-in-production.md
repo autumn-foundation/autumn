@@ -140,7 +140,7 @@ buckets on SQLite:
 | Runtime config store (`runtime_config::pg`) | ✅ `pg_advisory_xact_lock` | ⚠️ | Same shape: `PgConfigStore::from_database_config` returns `None` on a SQLite target, and `new(url)` refuses one at its first connect; pass `InMemoryConfigStore` or a custom `ConfigStore` instead. | ⚠️ **Available now — no DB-backed store** |
 | ISR regeneration coordinator (`static_gen`) | ✅ `pg_try_advisory_lock` | ⚠️ | `PostgresIsrCoordinator` takes a `Pool<AsyncPgConnection>`, which a SQLite build's app state cannot produce — it is unreachable under the flip rather than refused. Single-host ISR uses the in-process coordinator, which is what one host needs. | ⚠️ **Available now — in-process coordinator** |
 | `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file with SQLite's own `VACUUM INTO` — one transactional statement, safe against a live app, and **no external tools**. `restore` verifies the artifact with `PRAGMA integrity_check` before replacing the file, and clears the stale `-wal`/`-shm`. Retention (`--keep`) and offsite upload (`--upload`) work unchanged. | ✅ **Available now** (#1909) |
-| `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file, or a `.sqlite` backup artifact (`--artifact`), with the same fail-closed classification as Postgres. One transaction per file. `VACUUM` and a WAL truncate follow the commit, so old values do not stay in free pages. No external tools. `--sample` is Postgres-only and is refused. See [Data scrubbing](./data-scrubbing.md#sqlite). | ✅ **Available now** (#2553) |
+| `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file, or a `.sqlite` backup artifact (`--artifact`), with the same fail-closed classification as Postgres. One transaction per file. `VACUUM` and a WAL truncate follow the commit, so free pages do not keep the old values. No external tools. `--sample` is Postgres-only and is refused. See [Data scrubbing](./data-scrubbing.md#sqlite). | ✅ **Available now** (#2553) |
 | Retention sweeps | ✅ | ✅ | `autumn db retention` sweeps `job_history`, `commit_hooks` and `experiment_assignments` in the SQLite file. The cutoff comes from the database clock. The report has the same shape as on Postgres. | ✅ **Available now** (#2553) |
 | `autumn deploy` data-file persistence | ✅ | ✅ | The data file is **persistent state**: it lives in `app_dir/shared/data` and each release is linked at it, so deploy, rollback and release retention never clobber or orphan it. See [where a SQLite data file lives](./deployment.md#where-a-sqlite-data-file-lives). | ✅ **Available now** (#1909) |
 | Read replicas (`replica_url`) | ✅ | ⛔ | **Boot-refuse.** No networked replicas on a single-file DB — out of scope. | ✅ **Available now — boot-refuse** |
@@ -226,10 +226,9 @@ Postgres-only `TestDb` testcontainer and `TRUNCATE … RESTART IDENTITY`. The
 runtime landed without a SQLite-native scaffold smoke harness; that is tracked
 in #2555.
 
-The support-matrix rows still marked **Planned** name follow-on subsystem slices
-whose SQLite support has not landed yet (durable jobs and `#[scheduled]` tasks
-#1907). Backup/restore and `autumn deploy` data-file persistence landed in
-#1909. Scrub and retention sweeps landed in #2553. A **Planned** row does **not** mean the
+One support-matrix row is still **Planned**: durable jobs and `#[scheduled]`
+tasks (#1907). #1909 added backup/restore and `autumn deploy` data-file
+persistence. #2553 added scrub and retention sweeps. A **Planned** row does **not** mean the
 app refuses to boot — the runtime
 boots and serves; those subsystems are simply not wired for SQLite until their
 tracking issue lands.
