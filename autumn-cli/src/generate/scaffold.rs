@@ -2276,12 +2276,12 @@ fn plan_scaffold_with_options_impl(
         // Say so at generate time rather than let `cargo test` be the messenger.
         if !for_revert {
             plan.warn(format!(
-                "tests/{snake_name}.rs uses `autumn_web::test::TestDb`, a Postgres-only \
-                 testcontainer, so `cargo test` will not compile on this SQLite app. The app \
-                 itself is unaffected — `cargo run`, `cargo build` and `autumn migrate` all \
-                 work. A SQLite-native smoke harness is tracked in \
-                 https://github.com/autumn-foundation/autumn/issues/2555 — until then, delete \
-                 that file or gate it behind a Postgres-only cargo feature."
+                "tests/{snake_name}.rs uses `autumn_web::test::TestDb`. `TestDb` works only \
+                 with Postgres, so `cargo test` does not compile on this SQLite app. The app \
+                 is not affected: `cargo run`, `cargo build` and `autumn migrate` work. The \
+                 issue for a SQLite smoke harness is \
+                 https://github.com/autumn-foundation/autumn/issues/2555. Until it is done, \
+                 delete that file or put it behind a Postgres-only cargo feature."
             ));
         }
     }
@@ -18950,8 +18950,7 @@ async fn main() {
         );
     }
 
-    /// The `SQLite` smoke-test warning cites the open tracker (#2555), not the
-    /// closed runtime slice (#1905).
+    /// The `SQLite` smoke-test warning cites open issue #2555, not closed #1905.
     #[test]
     fn scaffold_on_sqlite_app_warning_cites_open_tracker() {
         temp_env::with_vars(

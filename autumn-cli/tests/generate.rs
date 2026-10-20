@@ -2067,7 +2067,7 @@ fn generate_model_help_shows_example() {
 ///
 /// `cargo check`, not `--all-targets`: the scaffold's `tests/<model>.rs` smoke
 /// test still uses `autumn_web::test::TestDb`, a Postgres-only testcontainer.
-/// A `SQLite`-native harness is tracked in #2555 — see
+/// Issue #2555 tracks a `SQLite`-native harness. See
 /// `docs/guide/sqlite-in-production.md`.
 ///
 /// Ignored by default; run with:
