@@ -499,8 +499,6 @@ fn an_encrypted_column_is_resealed() {
     )
     .expect("model");
     super::db_scrub::write_encryption_credentials(root);
-    let toml = SCRUB_TOML.replace("safe = [\"user_id\"]", "safe = [\"user_id\"]");
-    std::fs::write(root.join("scrub.toml"), toml).expect("toml");
 
     let (out, _, code) = run(root, "dev", &["db", "scrub"]);
     assert_eq!(code, Some(0), "{out}");
@@ -551,5 +549,27 @@ fn a_purge_that_breaks_a_foreign_key_rolls_everything_back() {
         leaked(&db).len(),
         SECRETS.len(),
         "the rewrite rolled back with the purge"
+    );
+}
+
+#[test]
+fn rows_with_a_null_non_integer_key_get_distinct_tokens() {
+    let toml = format!(
+        "{SCRUB_TOML}\n[tables.legacy]\nsafe = [\"code\"]\n\n[tables.legacy.pii]\nemail = \"email\"\n"
+    );
+    let project = project(&toml);
+    let db = project.path().join("app.db");
+    // SQLite allows several NULL keys in a rowid table with a TEXT primary key.
+    open(&db)
+        .batch_execute(
+            "CREATE TABLE legacy (code TEXT PRIMARY KEY, email TEXT UNIQUE); \
+             INSERT INTO legacy VALUES (NULL, 'a@real-corp.example'), (NULL, 'b@real-corp.example');",
+        )
+        .expect("legacy");
+    let (out, _, code) = run(project.path(), "dev", &["db", "scrub"]);
+    assert_eq!(code, Some(0), "unique column stays unique:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        2
     );
 }

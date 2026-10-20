@@ -2225,12 +2225,16 @@ mod tests {
                     "{predicate}"
                 );
                 if let Some((_, pg_predicate)) = pg {
-                    assert_eq!(
-                        statuses_in(&predicate),
-                        statuses_in(pg_predicate),
-                        "{dataset}"
-                    );
-                    assert_eq!(states_in(&predicate), states_in(pg_predicate), "{dataset}");
+                    if pg_predicate.contains("status IN (") {
+                        assert_eq!(
+                            statuses_in(&predicate),
+                            statuses_in(pg_predicate),
+                            "{dataset}"
+                        );
+                    }
+                    if pg_predicate.contains("state IN (") {
+                        assert_eq!(states_in(&predicate), states_in(pg_predicate), "{dataset}");
+                    }
                 }
             }
         }

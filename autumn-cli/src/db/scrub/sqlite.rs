@@ -110,7 +110,10 @@ fn connect(label: &str, url: &str) -> Result<SqliteConnection, ScrubError> {
 // ─── SQL builders ───────────────────────────────────────────────────────────
 
 /// The SQL expression that identifies a row: its primary key, else `rowid`.
-pub(super) fn row_key_expr(table: &Table) -> String {
+///
+/// A rowid table can hold several rows with a `NULL` non-integer key. Those fall
+/// back to `rowid`, or they would share one seed and one token.
+pub(super) fn row_key_expr(table: &Table, facts: &DatabaseFacts) -> String {
     let mut keys: Vec<&str> = table.primary_key.iter().map(String::as_str).collect();
     if keys.is_empty() {
         keys = table
@@ -120,8 +123,8 @@ pub(super) fn row_key_expr(table: &Table) -> String {
             .map(|c| c.name.as_str())
             .collect();
     }
-    match keys.as_slice() {
-        [] => "CAST(rowid AS TEXT)".to_owned(),
+    let key = match keys.as_slice() {
+        [] => return "CAST(rowid AS TEXT)".to_owned(),
         [key] => format!("coalesce(CAST({} AS TEXT), '')", quote_ident(key)),
         // `quote()` renders each part as a SQL literal, so ('a|','b') and
         // ('a','|b') cannot collapse to one key.
@@ -130,13 +133,27 @@ pub(super) fn row_key_expr(table: &Table) -> String {
             .map(|key| format!("quote({})", quote_ident(key)))
             .collect::<Vec<_>>()
             .join(" || ',' || "),
+    };
+    if !facts.rowid_tables.contains(&table.name) {
+        return key;
     }
+    let any_null = keys
+        .iter()
+        .map(|key| format!("{} IS NULL", quote_ident(key)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!("CASE WHEN {any_null} THEN 'rowid:' || rowid ELSE {key} END")
 }
 
 /// The per-row, per-column token every replacement derives from. The column
 /// name salts it, so two PII columns of one row differ.
-pub(super) fn token_expr(table: &Table, column: &str, unique: bool) -> String {
-    token_expr_from(&row_key_expr(table), column, unique)
+pub(super) fn token_expr(
+    table: &Table,
+    facts: &DatabaseFacts,
+    column: &str,
+    unique: bool,
+) -> String {
+    token_expr_from(&row_key_expr(table, facts), column, unique)
 }
 
 fn token_expr_from(row_key: &str, column: &str, unique: bool) -> String {
@@ -185,7 +202,7 @@ pub(super) fn auto_strategy(column: &Column) -> Result<Strategy, ScrubError> {
                 });
             }
         }
-        other => {
+        other @ ColumnType::Enum { .. } => {
             return Err(ScrubError::NoAutoStrategy {
                 column: column.name.clone(),
                 detail: format!("{other:?}"),
@@ -432,6 +449,16 @@ fn names_in(sql: &str) -> BTreeSet<String> {
             Token::Punct(_) => None,
         })
         .collect()
+}
+
+/// Whether a `CREATE TABLE` ends in `WITHOUT ROWID`.
+fn is_without_rowid(sql: &str) -> bool {
+    tokenize(sql).windows(2).any(|pair| {
+        pair == [
+            Token::Word("without".to_owned()),
+            Token::Word("rowid".to_owned()),
+        ]
+    })
 }
 
 /// Whether the text is `CREATE VIRTUAL TABLE …`. A `VIRTUAL` generated column
@@ -687,6 +714,11 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
         }
     }
 
+    let rowid_tables: BTreeSet<String> = tables
+        .iter()
+        .filter(|t| !t.sql.as_deref().is_some_and(is_without_rowid))
+        .map(|t| t.name.clone())
+        .collect();
     let present: BTreeSet<String> = canon_table.values().cloned().collect();
     let framework_tables = probe_table_names(config)
         .into_iter()
@@ -696,6 +728,7 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
     Ok(Probed {
         facts: DatabaseFacts {
             dialect: Dialect::Sqlite,
+            rowid_tables,
             foreign_key_columns,
             checked_columns,
             generated_columns,
@@ -861,11 +894,11 @@ fn apply(
         }
         let violations_before = foreign_key_violations(conn)?;
 
-        let mut purged: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut emptied: BTreeMap<&str, usize> = BTreeMap::new();
         for step in steps(plan, purges) {
             let rows = sql_query(step.sql()).execute(conn)?;
             match step {
-                Step::Purge { table, .. } => *purged.entry(table).or_default() += rows,
+                Step::Purge { table, .. } => *emptied.entry(table).or_default() += rows,
                 Step::Rewrite { table, .. } => counts.push((table.to_owned(), rows)),
             }
         }
@@ -875,7 +908,7 @@ fn apply(
                 counts.push((format!("{}.{}", table.table, rewrite.column), rows));
             }
         }
-        for (table, rows) in purged {
+        for (table, rows) in emptied {
             counts.push((format!("{table} (emptied)"), rows));
         }
 
@@ -989,6 +1022,7 @@ struct Planned<'a> {
 /// # Errors
 ///
 /// Every refusal the Postgres path has, plus those in [`check_targets`].
+#[allow(clippy::too_many_lines)]
 pub(super) fn classify_and_apply(
     args: &ScrubArgs,
     profile: &str,
@@ -1173,6 +1207,12 @@ mod tests {
 
     use super::*;
 
+    #[derive(QueryableByName)]
+    struct One {
+        #[diesel(sql_type = Text)]
+        v: String,
+    }
+
     fn column(name: &str, ty: ColumnType) -> Column {
         let mut column = Column::new(name, ty);
         column.nullable = true;
@@ -1343,11 +1383,34 @@ mod tests {
     #[test]
     fn row_key_uses_the_key_columns_or_rowid() {
         let mut table = Table::new("t", Backend::Sqlite);
-        assert_eq!(row_key_expr(&table), "CAST(rowid AS TEXT)");
+        let mut facts = DatabaseFacts::default();
+        assert_eq!(row_key_expr(&table, &facts), "CAST(rowid AS TEXT)");
         table.primary_key = vec!["id".to_owned()];
-        assert_eq!(row_key_expr(&table), "coalesce(CAST(\"id\" AS TEXT), '')");
+        assert_eq!(
+            row_key_expr(&table, &facts),
+            "coalesce(CAST(\"id\" AS TEXT), '')"
+        );
         table.primary_key = vec!["a".to_owned(), "b".to_owned()];
-        assert_eq!(row_key_expr(&table), "quote(\"a\") || ',' || quote(\"b\")");
+        assert_eq!(
+            row_key_expr(&table, &facts),
+            "quote(\"a\") || ',' || quote(\"b\")"
+        );
+        // A rowid table can hold several NULL keys. They fall back to rowid.
+        facts.rowid_tables.insert("t".to_owned());
+        let key = row_key_expr(&table, &facts);
+        assert!(
+            key.starts_with("CASE WHEN \"a\" IS NULL OR \"b\" IS NULL THEN 'rowid:' || rowid"),
+            "{key}"
+        );
+    }
+
+    #[test]
+    fn without_rowid_tables_are_not_rowid_tables() {
+        assert!(is_without_rowid(
+            "CREATE TABLE t (a TEXT PRIMARY KEY) WITHOUT ROWID"
+        ));
+        assert!(!is_without_rowid("CREATE TABLE t (a TEXT PRIMARY KEY)"));
+        assert!(!is_without_rowid("CREATE TABLE t (without_rowid TEXT)"));
     }
 
     #[test]
@@ -1368,11 +1431,6 @@ mod tests {
             hex::encode(Sha256::digest(v.as_bytes()))
         })
         .expect("register");
-        #[derive(QueryableByName)]
-        struct One {
-            #[diesel(sql_type = Text)]
-            v: String,
-        }
         let row: One = sql_query("SELECT autumn_sha256('abc') AS v")
             .get_result(&mut conn)
             .expect("call");
@@ -1480,11 +1538,6 @@ mod tests {
             matches!(&result, Err(ScrubError::SchemaChanged { entries }) if entries.iter().any(|e| e.contains("ssn"))),
             "{result:?}"
         );
-        #[derive(QueryableByName)]
-        struct One {
-            #[diesel(sql_type = Text)]
-            v: String,
-        }
         let kept: One = sql_query("SELECT email AS v FROM users")
             .get_result(&mut conn)
             .expect("read");

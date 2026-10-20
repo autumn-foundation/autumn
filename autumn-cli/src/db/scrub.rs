@@ -1690,7 +1690,7 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                     replacement_expr(plan.strategy, column, &token, unique)
                 }
                 Dialect::Sqlite => {
-                    let token = sqlite::token_expr(table, &column.name, unique);
+                    let token = sqlite::token_expr(table, inputs.facts, &column.name, unique);
                     sqlite::replacement_expr(plan.strategy, column, &token)
                 }
             }
@@ -1700,7 +1700,10 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
         }
         let (target, row_key) = match inputs.facts.dialect {
             Dialect::Postgres => (qualified_ident(&table.name), row_key_expr(table)),
-            Dialect::Sqlite => (quote_ident(&table.name), sqlite::row_key_expr(table)),
+            Dialect::Sqlite => (
+                quote_ident(&table.name),
+                sqlite::row_key_expr(table, inputs.facts),
+            ),
         };
         out.tables.push(TablePlan {
             table: table.name.clone(),
@@ -4797,6 +4800,10 @@ pub enum Dialect {
 pub struct DatabaseFacts {
     /// The dialect the plan's SQL is written in. Defaults to Postgres.
     pub dialect: Dialect,
+    /// `SQLite` tables that have a `rowid` (all but `WITHOUT ROWID` tables).
+    /// Such a table can hold several rows whose non-integer primary key is
+    /// `NULL`, so the row key falls back to `rowid`. Empty on Postgres.
+    pub rowid_tables: BTreeSet<String>,
     /// Every column on either side of any foreign key, all components of a
     /// composite key included, as `(table, column)`. Rewriting any of them
     /// breaks referential integrity (or is silently cascaded into a child).

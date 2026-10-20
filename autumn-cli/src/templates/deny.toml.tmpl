@@ -114,6 +114,16 @@ ignore = [
     # exploit here, and no safe upgrade (the author recommends `web-time`).
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — `webpki-roots` 0.26.x bundles a root CA that accepts
+    # distrusted emSign intermediates. Fixed in webpki-roots >=1.0.10.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0381
+    #
+    # Present for the same reason: the 0.26.11 copy arrives as a *build-time*
+    # transitive of the embedded-Postgres stack (sqlx-core -> postgresql_embedded).
+    # It verifies TLS only while that stack downloads a Postgres archive for local
+    # development, not on any production request path. No 0.26.x release has the
+    # fix. Review-by: 2026-11-03.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 build-time transitive of the managed-pg-bundled embedded-Postgres stack; dev-time archive download only; no 0.26.x fix; review-by 2026-11-03" },
     # <<< autumn:bundled-pg-waiver
 ]
 
