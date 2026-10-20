@@ -737,8 +737,8 @@ pub struct RefreshReport {
     pub failed: Vec<(SlotRange, String)>,
 }
 
-/// The ranges one host claims, and the epochs it holds. Installed with
-/// `DatabaseFleet::install_ownership`.
+/// The ranges one host claims, and the epochs it holds. Started with
+/// `DatabaseFleet::start_ownership`.
 pub struct FleetOwnership {
     store: Arc<dyn SlotOwnershipStore>,
     owner: OwnerId,
@@ -842,6 +842,15 @@ impl FleetOwnership {
                 self.store.claim(range, &self.owner, self.ttl, floor).await
             };
             match result {
+                // A replicator saw a newer epoch while the call ran.
+                Ok(grant)
+                    if grant.epoch.get()
+                        < self.fence_floor.load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    tracing::warn!(range = %range, epoch = %grant.epoch, "fleet slot range fenced while the store call ran");
+                    self.drop_range(range);
+                    report.lost.push(range);
+                }
                 Ok(grant) => {
                     let valid_for = self.ttl.saturating_sub(self.renew_interval());
                     self.hold(grant, later(sent, valid_for));
@@ -1400,6 +1409,83 @@ mod tests {
         }
     }
 
+    /// A store a test can script: hang every call, or run a step inside one.
+    struct Scripted {
+        inner: SqlSlotOwnership,
+        hang: std::sync::atomic::AtomicBool,
+        /// Runs once, before the next renew reaches the store.
+        before_renew: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Runs once, after the next claim reached the store.
+        after_claim: Mutex<Option<Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>>>,
+    }
+
+    impl Scripted {
+        fn new(inner: SqlSlotOwnership) -> Self {
+            Self {
+                inner,
+                hang: std::sync::atomic::AtomicBool::new(false),
+                before_renew: Mutex::new(None),
+                after_claim: Mutex::new(None),
+            }
+        }
+
+        async fn gate(&self) {
+            if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    impl SlotOwnershipStore for Scripted {
+        fn claim<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            ttl: Duration,
+            floor: u64,
+        ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+            Box::pin(async move {
+                self.gate().await;
+                let grant = self.inner.claim(range, owner, ttl, floor).await;
+                let step = self.after_claim.lock().unwrap().take();
+                if let Some(step) = step {
+                    step().await;
+                }
+                grant
+            })
+        }
+        fn renew<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            epoch: FencingToken,
+            ttl: Duration,
+        ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+            Box::pin(async move {
+                self.gate().await;
+                let step = self.before_renew.lock().unwrap().take();
+                if let Some(step) = step {
+                    step();
+                }
+                self.inner.renew(range, owner, epoch, ttl).await
+            })
+        }
+        fn release<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            epoch: FencingToken,
+        ) -> BoxFuture<'a, Result<bool, OwnershipError>> {
+            Box::pin(async move {
+                self.gate().await;
+                self.inner.release(range, owner, epoch).await
+            })
+        }
+        fn rows(&self) -> BoxFuture<'_, Result<Vec<OwnershipRow>, OwnershipError>> {
+            self.inner.rows()
+        }
+    }
+
     #[test]
     fn ownership_refuses_overlapping_ranges_and_a_short_lease() {
         let dir = tempfile::tempdir().unwrap();
@@ -1529,6 +1615,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_renewal_that_returns_after_a_fence_does_not_bring_the_range_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = clock_at(1_000_000);
+        let scripted = Arc::new(Scripted::new(store(dir.path(), &clock).await));
+        let a = Arc::new(
+            FleetOwnership::new(scripted.clone(), owner("a"), vec![SlotRange::ALL], TTL).unwrap(),
+        );
+        assert_eq!(a.refresh().await.claimed, vec![(SlotRange::ALL, token(1))]);
+        // A replicator sees epoch 5 while the renewal is in flight.
+        let fenced = Arc::clone(&a);
+        *scripted.before_renew.lock().unwrap() = Some(Box::new(move || {
+            assert!(fenced.lose(7, token(5)));
+        }));
+        assert_eq!(a.refresh().await.lost, vec![SlotRange::ALL]);
+        assert_eq!(a.epoch_for(7), None, "the renewed epoch is under the floor");
+        // The next refresh claims above the floor.
+        assert_eq!(a.refresh().await.claimed, vec![(SlotRange::ALL, token(6))]);
+    }
+
     // ── The fleet ───────────────────────────────────────────────────────────
 
     mod fleet {
@@ -1568,8 +1674,7 @@ mod tests {
             let (fleet, replication, clock) = plain(dir, volume);
             let store = Arc::new(store(dir, store_clock).await);
             let ownership = Arc::new(FleetOwnership::new(store, owner(name), ranges, TTL).unwrap());
-            ownership.refresh().await;
-            fleet.install_ownership(Arc::clone(&ownership)).unwrap();
+            fleet.start_ownership(Arc::clone(&ownership)).await.unwrap();
             Host {
                 fleet,
                 replication,
@@ -1750,6 +1855,71 @@ mod tests {
                 a.fleet.open(&key).await,
                 Err(FleetError::NotOwner { .. })
             ));
+        }
+
+        #[tokio::test]
+        async fn a_restarting_process_locks_the_volume_before_it_claims() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            // The old process of owner "a" serves the volume.
+            let old = host_on(dir.path(), "vol", "a", &clock, vec![SlotRange::ALL]).await;
+            // The new process starts. Right after its claim reaches the
+            // store, the old process stops and tries to release.
+            let (fleet, _replication, _) = plain(dir.path(), "vol");
+            let scripted = Arc::new(Scripted::new(store(dir.path(), &clock).await));
+            let released = Arc::new(Mutex::new(None));
+            let (stopping, seen) = (old.fleet.clone(), Arc::clone(&released));
+            *scripted.after_claim.lock().unwrap() = Some(Box::new(move || {
+                Box::pin(async move {
+                    stopping.close_all().await;
+                    let last = stopping.release_ownership().await;
+                    *seen.lock().unwrap() = Some(last);
+                })
+            }));
+            let ownership = Arc::new(
+                FleetOwnership::new(scripted, owner("a"), vec![SlotRange::ALL], TTL).unwrap(),
+            );
+            fleet.start_ownership(Arc::clone(&ownership)).await.unwrap();
+            assert_eq!(
+                *released.lock().unwrap(),
+                Some(false),
+                "the new process holds the volume"
+            );
+            assert_eq!(ownership.held(), vec![(SlotRange::ALL, token(1))]);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            assert!(b.ownership.held().is_empty(), "nobody else may claim it");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_ends_the_ownership_loop_while_the_store_hangs() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let scripted = Arc::new(Scripted::new(store(dir.path(), &clock).await));
+            let (fleet, _replication, _) = plain(dir.path(), "vol");
+            let ownership = Arc::new(
+                FleetOwnership::new(scripted.clone(), owner("a"), vec![SlotRange::ALL], TTL)
+                    .unwrap(),
+            );
+            fleet.start_ownership(Arc::clone(&ownership)).await.unwrap();
+            scripted
+                .hang
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let stop = tokio_util::sync::CancellationToken::new();
+            let handle = fleet.spawn_ownership(stop.clone());
+            // Past the local lease: the loop waits on a renewal that never
+            // ends.
+            tokio::time::sleep(TTL).await;
+            assert_eq!(ownership.epoch_for(7), None);
+            stop.cancel();
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("the loop ends at shutdown")
+                .unwrap();
+            // The release cannot hold shutdown either: the leases lapse.
+            let released = tokio::time::timeout(TTL, fleet.release_ownership())
+                .await
+                .expect("the release ends at shutdown");
+            assert!(!released);
         }
 
         #[tokio::test]

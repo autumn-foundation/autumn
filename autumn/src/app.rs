@@ -13633,7 +13633,10 @@ async fn start_fleet_ownership(
     );
     // Claim before the first open. A range another host holds waits for its
     // lease; the loop claims it then.
-    let report = ownership.refresh().await;
+    let report = fleet
+        .start_ownership(Arc::clone(&ownership))
+        .await
+        .map_err(|_| "the fleet already has ownership".to_owned())?;
     tracing::info!(
         owner = %ownership.owner(),
         claimed = report.claimed.len(),
@@ -13641,9 +13644,6 @@ async fn start_fleet_ownership(
         failed = report.failed.len(),
         "fleet slot ownership installed"
     );
-    fleet
-        .install_ownership(Arc::clone(&ownership))
-        .map_err(|_| "the fleet already has ownership".to_owned())?;
     if let Err(e) = state.health_indicator_registry.register(
         OWNERSHIP_INDICATOR,
         crate::actuator::IndicatorGroup::HealthOnly,

@@ -8,7 +8,7 @@
   restore takes the newest epoch, and a replicator that sees a newer epoch
   stops. `/actuator/health` reports `fleet:ownership`. New:
   `autumn_web::db::fleet_ownership`, `DatabaseFleet::install_ownership`,
-  `DatabaseFleet::spawn_ownership`, `DatabaseFleet::release_ownership`,
+  `DatabaseFleet::start_ownership`, `DatabaseFleet::spawn_ownership`, `DatabaseFleet::release_ownership`,
   `DatabaseFleet::owns`,
   `DatabaseFleet::fence_unowned`, `FleetDatabase::epoch` and
   `Replicator::with_epoch`. The built-in table is on the control database, so

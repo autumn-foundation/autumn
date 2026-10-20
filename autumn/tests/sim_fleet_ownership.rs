@@ -162,9 +162,8 @@ async fn host(dir: &std::path::Path, name: &str) -> Host {
         )
         .unwrap(),
     );
-    // As boot does: claim first, then install and run the loop.
-    ownership.refresh().await;
-    assert!(fleet.install_ownership(Arc::clone(&ownership)).is_ok());
+    // As boot does: install and claim, then run the loop.
+    assert!(fleet.start_ownership(Arc::clone(&ownership)).await.is_ok());
     let stop = CancellationToken::new();
     let renewals = fleet.spawn_ownership(stop.clone());
     Host {

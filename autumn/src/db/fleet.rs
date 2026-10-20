@@ -1073,8 +1073,9 @@ impl DatabaseFleet {
     }
 
     /// Serve only the slots `ownership` holds (issue #3233). Install before
-    /// the first open, once, after a first
-    /// [`refresh`](super::fleet_ownership::FleetOwnership::refresh).
+    /// the first open, once, and before the first
+    /// [`refresh`](super::fleet_ownership::FleetOwnership::refresh):
+    /// [`start_ownership`](Self::start_ownership) does both in that order.
     ///
     /// The process also takes a shared OS lock on the root, so that
     /// [`release_ownership`](Self::release_ownership) knows when it is the
@@ -1104,12 +1105,33 @@ impl DatabaseFleet {
         Ok(())
     }
 
+    /// Install `ownership` and make its first claim. Run it before the first
+    /// open.
+    ///
+    /// The install takes the volume lock before the claim. Otherwise an old
+    /// process that stops meanwhile sees itself as the last one and releases
+    /// the epoch this process just claimed.
+    ///
+    /// # Errors
+    ///
+    /// The ownership that is already installed, when called twice.
+    pub async fn start_ownership(
+        &self,
+        ownership: Arc<super::fleet_ownership::FleetOwnership>,
+    ) -> Result<super::fleet_ownership::RefreshReport, Arc<super::fleet_ownership::FleetOwnership>>
+    {
+        self.install_ownership(Arc::clone(&ownership))?;
+        Ok(ownership.refresh().await)
+    }
+
     /// Release this host's ranges at shutdown, after the databases closed,
     /// so the next owner can claim them at once. Returns whether it released.
     ///
     /// It releases only when this is the last process on the volume (the
     /// processes share the owner id and the epoch) and nothing committed is
-    /// left unshipped. Otherwise the leases lapse.
+    /// left unshipped. Otherwise the leases lapse. They also lapse when the
+    /// store does not answer within a renew interval: a hung store must not
+    /// hold shutdown.
     pub async fn release_ownership(&self) -> bool {
         let Some(ownership) = self.ownership() else {
             return false;
@@ -1138,7 +1160,13 @@ impl DatabaseFleet {
             tracing::info!("fleet ownership: another process on this volume serves; not released");
             return false;
         };
-        ownership.release_all().await;
+        if tokio::time::timeout(ownership.renew_interval(), ownership.release_all())
+            .await
+            .is_err()
+        {
+            tracing::warn!("fleet ownership: the store did not answer; the ranges lapse instead");
+            return false;
+        }
         true
     }
 
@@ -1246,6 +1274,8 @@ impl DatabaseFleet {
                         () = sleep_until_some(lapse) => {
                             let _ = fleet.fence_unowned();
                         }
+                        // A hung store must not hold shutdown.
+                        () = shutdown.cancelled() => return,
                     }
                 }
                 let _ = fleet.fence_unowned();

@@ -367,8 +367,9 @@ All hosts of the fleet must use the same table. The control database is a
 local SQLite file, so the built-in table fences only the processes of one
 host. For hosts on different machines, implement `SlotOwnershipStore` (in
 `autumn_web::db::fleet_ownership`) on a store that all hosts reach. Then
-install a `FleetOwnership` with `DatabaseFleet::install_ownership`, and start
-`DatabaseFleet::spawn_ownership` before the first request.
+start a `FleetOwnership` with `DatabaseFleet::start_ownership` (it takes the
+volume lock, then claims), and start `DatabaseFleet::spawn_ownership` before
+the first request.
 
 ### The failover procedure
 
