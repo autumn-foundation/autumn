@@ -5902,6 +5902,7 @@ fn probe_database_facts(
 
     Ok(DatabaseFacts {
         dialect: Dialect::Postgres,
+        rowid_tables: BTreeSet::new(),
         foreign_key_columns,
         checked_columns,
         generated_columns,
