@@ -686,6 +686,48 @@ async fn a_busy_database_takes_its_turn_again_after_its_budget() {
     assert!(pending(&sweeper).await.is_empty());
 }
 
+// Issue 3350: busy open databases must not take every pass.
+#[tokio::test]
+async fn a_closed_database_is_visited_when_more_busy_databases_are_open_than_a_pass_visits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8);
+    let client = app(tmp.path(), fleet.clone());
+    let budget = 2;
+    let sweeper = install_with(
+        &client,
+        FleetSweeperOptions {
+            max_databases_per_pass: budget,
+            max_messages_per_database: 1,
+            ..FleetSweeperOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(post(&client, "quiet", "/orders/100").await, 200);
+    fleet.close(&key(&fleet, "quiet")).await;
+    let busy = ["busy-a", "busy-b", "busy-c"];
+    for tenant in busy {
+        for id in 1..=5 {
+            assert_eq!(post(&client, tenant, &format!("/orders/{id}")).await, 200);
+        }
+    }
+    let quiet_relayed = |state: &AppState| {
+        relayed(state)
+            .iter()
+            .any(|(tenant, _)| tenant.as_deref() == Some("quiet"))
+    };
+
+    // Each pass relays one message per database: the busy ones keep work.
+    let bound = busy.len().div_ceil(budget) + 1;
+    for pass in 1..=bound {
+        let report = sweeper.sweep_once().await;
+        assert_eq!(report.visited, budget, "pass {pass}: {report:?}");
+        if quiet_relayed(client.state()) {
+            return;
+        }
+    }
+    panic!("the closed database waited more than {bound} passes");
+}
+
 #[tokio::test]
 async fn install_refuses_a_second_sweeper_and_skips_an_app_without_a_fleet() {
     let tmp = tempfile::tempdir().unwrap();
