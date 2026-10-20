@@ -258,3 +258,44 @@ path.
 When a protocol changes, change its model in the same PR. `cargo test
 --workspace` runs the models. The `Protocol models` job in `ci.yml` also runs
 them.
+
+## TLA+ specs
+
+`tla/` holds TLA+ specs, checked with TLC (`docs/adr/0020-tla-plus-protocol-specs.md`).
+Three are second encodings of the Stateright models, written from the SQL
+again. A modelling error in one encoding then shows up as a disagreement. The
+fourth checks the fleet slot ownership over every interleaving:
+
+| Spec | Production code | Properties |
+| --- | --- | --- |
+| `JobClaim` | `autumn/src/job.rs` | A stale holder's settle is rejected. At most one execution runs at a time. |
+| `TickElection` | `autumn/src/scheduler.rs` | Each tick runs at most once. |
+| `LeaseLock` | `autumn/src/lock/lease.rs` | A stale write is rejected. Tokens are unique. At most one holder trusts its lease. |
+| `FleetSlotOwnership` | `autumn/src/db/fleet_ownership.rs`, `autumn/src/replication/engine.rs`, `restore.rs` | At most one host serves. A serving host's epoch is current. Epochs are unique. A restore takes the newest epoch. The current owner is never fenced. |
+
+The Verus spec `fleet_slot_ownership.rs` proves each table decision. The TLA+
+spec adds what one step cannot show: host 2's clock runs ahead of host 1's, a
+host serves on its local lease, and a replicator lists the epoch markers and
+writes its generation in two steps. The witness `StaleGenerationLandsLate`
+shows that an old replicator does write a generation after a newer marker
+landed. The seeded bug `RestoreByTime` then restores it. So the (epoch, time)
+order of `restore::plan` is required, not a tie-break.
+
+`tla/checks.txt` lists every check. Each spec has a `Variant` constant, as in
+the Stateright models: `Correct` must hold every invariant (`holds`) and reach
+every witness (`reaches`), and each seeded bug must give a counterexample
+(`violates`). Run them with:
+
+```sh
+curl -fsSLO https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+TLA2TOOLS_JAR=$PWD/tla2tools.jar scripts/verify-tla.sh
+TLA2TOOLS_JAR=$PWD/tla2tools.jar scripts/verify-tla.sh FleetSlotOwnership  # one spec
+```
+
+`.github/workflows/tla.yml` runs `scripts/verify-tla.sh` on a change to
+`verification/tla/`, and each Monday. It pins the TLC release and its
+SHA-256. It is not a required check yet. `cargo test -p
+autumn-protocol-models` runs `tests/tla_checks.rs`, with no Java: it fails
+when a Stateright seeded bug has no line in `checks.txt`, or when a spec has
+no correct or seeded check. When a protocol changes, change its Stateright
+model and its TLA+ spec in the same PR.
