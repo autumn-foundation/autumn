@@ -1192,7 +1192,44 @@ impl SandboxManifest {
                 inserted.push(route.path.as_str());
             }
         }
-        self.limits.validate()
+        self.limits.validate()?;
+        self.check_call_frames()
+    }
+
+    /// Refuse quotas whose largest call cannot be written to stdout.
+    ///
+    /// The host caps a guest's stdout line at `2 × max_response_bytes + 4096`,
+    /// sized for a response. A call frame is sized by its own quota, and JSON
+    /// writes one byte as up to six. Left unchecked, a plugin may be told it can
+    /// send a body its own manifest makes untransmittable.
+    fn check_call_frames(&self) -> Result<(), ManifestError> {
+        let budget = (self.limits.max_response_bytes as u128)
+            .saturating_mul(2)
+            .saturating_add(4096);
+        // Framing, the key or URL, and the other fields of the frame.
+        let overhead = 4096_u128;
+        for (capability, field, bytes) in [
+            (
+                SandboxCapability::HttpOutbound,
+                "outbound_request_bytes (its call frame must fit 2 × max_response_bytes + 4096)",
+                self.quotas.outbound_request_bytes,
+            ),
+            (
+                SandboxCapability::Kv,
+                "kv_value_bytes (its call frame must fit 2 × max_response_bytes + 4096)",
+                self.quotas.kv_value_bytes,
+            ),
+        ] {
+            let frame = u128::from(bytes).saturating_mul(6).saturating_add(overhead);
+            if self.is_granted(capability) && frame > budget {
+                return Err(ManifestError::LimitOutOfRange {
+                    field,
+                    value: frame,
+                    max: budget,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2937,5 +2974,40 @@ slots = ["order-summary"]
             infos[0].source,
             crate::route_listing::RouteSource::Plugin("autumn-plugin-hello".to_owned())
         );
+    }
+
+    #[test]
+    fn a_quota_whose_call_frame_cannot_reach_stdout_is_refused_at_load() {
+        // The default `outbound_request_bytes` (256 KiB) against a 512-byte
+        // response ceiling: the host would trap the call frame at about 5 KiB.
+        let toml = |limits: &str| {
+            format!(
+                r#"
+name = "shop"
+version = "0.1.0"
+wire_version = 1
+prefix = "/shop"
+capabilities = ["http-request", "http-outbound"]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "/shop/panel"
+
+[grants]
+hosts = ["api.example.com"]
+
+[limits]
+{limits}
+"#,
+                digest = "c".repeat(64)
+            )
+        };
+        let err = SandboxManifest::parse(&toml("max_response_bytes = 512")).unwrap_err();
+        assert!(
+            matches!(err, ManifestError::LimitOutOfRange { field, .. } if field.contains("outbound_request_bytes")),
+            "{err:?}"
+        );
+        assert!(SandboxManifest::parse(&toml("max_response_bytes = 4194304")).is_ok());
     }
 }

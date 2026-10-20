@@ -822,6 +822,18 @@ impl CapabilityCall {
         }
     }
 
+    /// Bytes a reply to this call may take, at its worst.
+    ///
+    /// Only an outbound call can have a reply near [`MAX_RESULT_BYTES`]; every
+    /// other call that changes state answers with `done` or an id.
+    #[must_use]
+    pub const fn reply_reserve(&self) -> usize {
+        match self {
+            Self::HttpFetch { .. } => MAX_RESULT_BYTES + outbound::MAX_RESPONSE_HEADER_BYTES + 4096,
+            _ => 4096,
+        }
+    }
+
     /// [`target`](Self::target), already cut to what the ledger keeps.
     ///
     /// Used before any check has run, so it never copies more than
@@ -1170,6 +1182,9 @@ pub struct CapabilityRuntime {
     /// Read by each capability module to name itself in a derived key or a
     /// job record; never written after construction.
     pub(super) plugin: String,
+    /// The sealed digest of the artifact this runtime serves, stamped on every
+    /// job it enqueues.
+    pub(super) artifact_sha256: String,
     capabilities: Vec<SandboxCapability>,
     /// Read by the outbound module to hand an implementation the host list it
     /// needs for a per-hop decision; never written after construction.
@@ -1242,6 +1257,7 @@ impl CapabilityRuntime {
     pub fn new(manifest: &SandboxManifest, services: CapabilityServices) -> Self {
         Self {
             plugin: manifest.name.clone(),
+            artifact_sha256: manifest.sha256.clone(),
             capabilities: manifest.capabilities.clone(),
             grants: manifest.grants.clone(),
             rate: services.rate.clone(),
@@ -1321,6 +1337,15 @@ impl CapabilityRuntime {
     /// Never fails and never panics: everything a guest can get wrong comes back
     /// as a [`CallResult::Denied`] it can read.
     pub fn dispatch(&mut self, call: &CapabilityCall) -> CallResult {
+        self.dispatch_within(call, usize::MAX)
+    }
+
+    /// As [`dispatch`](Self::dispatch), for a caller that has `reply_room`
+    /// bytes left to carry the answer.
+    ///
+    /// A call whose worst-case reply does not fit is refused before it runs.
+    /// See [`CapabilityCall::reply_reserve`].
+    pub fn dispatch_within(&mut self, call: &CapabilityCall, reply_room: usize) -> CallResult {
         let id = call.id();
         let capability = call.capability();
         // What the call *names*, computed before any check, so every refusal
@@ -1379,6 +1404,21 @@ impl CapabilityRuntime {
             Ok(target) => target,
             Err(result) => return self.record(call, &named, result),
         };
+
+        // Room for the answer, before anything is charged or committed: once a
+        // write has happened its reply can no longer be refused.
+        if reply_room < call.reply_reserve() {
+            return self.record(
+                call,
+                &target,
+                CallResult::denied(
+                    id,
+                    DenialReason::QuotaExceeded,
+                    "there is not room to deliver this call's answer; read the pending replies \
+                     and retry",
+                ),
+            );
+        }
 
         // Shape before the per-capability charge, for the same reason: a call
         // refused for its own malformed content never reaches a backend, and
@@ -3077,6 +3117,7 @@ path = "/shop/panel"
         for _ in 0..64 {
             let job = PluginJob {
                 plugin: "shop".to_owned(),
+                artifact_sha256: "c".repeat(64),
                 tenant: Some("alpha".to_owned()),
                 job_type: "reindex".to_owned(),
                 payload: row(&[("blob", "x".repeat(2048).as_str())]),
@@ -3696,6 +3737,7 @@ path = "/shop/panel"
             fixture.jobs.queued(),
             vec![jobs::PluginJob {
                 plugin: "shop".to_owned(),
+                artifact_sha256: "c".repeat(64),
                 job_type: "reindex".to_owned(),
                 tenant: Some("alpha".to_owned()),
                 payload: row(&[("since", "2026-01-01")]),
@@ -4133,6 +4175,7 @@ path = "/shop/panel"
         let sink = jobs::MemoryJobSink::new();
         let job = || PluginJob {
             plugin: "shop".to_owned(),
+            artifact_sha256: "c".repeat(64),
             job_type: "reindex".to_owned(),
             tenant: Some("alpha".to_owned()),
             payload: PluginRow::new(),

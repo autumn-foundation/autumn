@@ -5,7 +5,7 @@
 //! carries:
 //!
 //! ```text
-//! PluginJob { plugin, job_type, tenant, payload }
+//! PluginJob { plugin, artifact_sha256, job_type, tenant, payload }
 //!             ─┬────  ─┬──────  ─┬────
 //!              │       │         └─ the tenant that was active when it was enqueued
 //!              │       └─ one of `[grants].job_types`, checked at enqueue
@@ -19,7 +19,8 @@
 //! rule a runner has to remember, because there is nowhere in the record for a
 //! different plugin or tenant to be written.
 //!
-//! A runner reconstructs the sandbox from `plugin`, builds
+//! A runner reconstructs the sandbox from `plugin`, refuses the job unless
+//! `artifact_sha256` is the installed artifact's, builds
 //! [`CapabilityServices`](super::CapabilityServices) bound to `tenant`, and runs
 //! the plugin's job entry point. It cannot widen the grant, because the grant
 //! comes from the manifest the operator approved and not from the job.
@@ -36,6 +37,13 @@ use super::{
 pub struct PluginJob {
     /// The plugin whose grants and quotas the run executes under.
     pub plugin: String,
+    /// The sealed digest of the artifact that enqueued the job.
+    ///
+    /// A runner MUST refuse a job whose digest is not the installed artifact's.
+    /// The name alone resolves whatever is installed *now*, and an upgrade may
+    /// have gained hosts, tables or quotas the operator never approved for this
+    /// job. Refusing is the safe direction: drain the queue before an upgrade.
+    pub artifact_sha256: String,
     /// One of the plugin's declared job types.
     pub job_type: String,
     /// The tenant that was active at enqueue, and that the run binds to.
@@ -101,6 +109,7 @@ pub(super) fn perform(
     }
     let job = PluginJob {
         plugin: runtime.plugin.clone(),
+        artifact_sha256: runtime.artifact_sha256.clone(),
         job_type: job_type.to_owned(),
         tenant: runtime.tenant().map(str::to_owned),
         payload: payload.clone(),

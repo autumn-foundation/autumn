@@ -338,7 +338,7 @@ would the GET and the host discards the body for you.
 | `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — the module's data and element segments, which every request re-instantiates, and the request frame itself, which is cloned and base64-expanded into the guest's stdin — at 64 bytes per unit. Each byte the guest writes to stdout also costs one unit, because the host parses it | 504 on the plugin's prefix |
 | `memory_bytes` | one instance's linear memory | the guest's `memory.grow` fails; usually a trap, then 502 |
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
-| `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
+| `max_response_bytes` | the frame accepted back. It also bounds each frame the guest writes: a manifest whose `outbound_request_bytes` or `kv_value_bytes` call frame (6 bytes per byte, worst case) is over `2 × max_response_bytes + 4096` is refused at load | 502 for an oversized frame; 504 for one that never ends |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
 | shared guest pool | guests that run at once in the whole process, all plugins together. Default 128. Set it with `plugin_sandbox::set_guest_slots` before you build any plugin, to at most a quarter of `max_blocking_threads` | 503 with `Retry-After`. It can refuse a request that `max_concurrency` allows. The first request to arrive gets the slot, so keep each `max_concurrency` well under the limit |
 | `request_body_timeout_ms` | how long a request may take to send its body | 408, and the permit goes back |
@@ -587,7 +587,7 @@ The guest names a **logical** thing; the host derives the physical one:
 | --- | --- |
 | `key: "cart"` | `plugin-kv:<plugin>:<tenant>:cart`, every segment escaped |
 | `table: "orders"` | `plugin_<escaped plugin>__orders`, filtered by the active tenant |
-| `job_type: "reindex"` | a `PluginJob` stamped with this plugin and this tenant |
+| `job_type: "reindex"` | a `PluginJob` stamped with this plugin, this tenant and this artifact's sha256 |
 
 The plugin half is hex-escaped rather than tidied, so
 `autumn-plugin-shop` owning `orders` is `plugin_autumn_2dplugin_2dshop__orders` —
@@ -772,8 +772,9 @@ Rules:
   cannot be pointed at a local upstream in development. IP-range (SSRF) guarding
   for the app-level client is #1627's.
 - The `jobs` capability **enqueues**; nothing in this slice runs the result. The
-  record carries the enqueuing plugin and tenant, so a runner built on it cannot
-  widen the grant — but there is no wire frame for delivering a job back into a
+  record carries the enqueuing plugin, tenant and artifact sha256. A runner
+  must refuse a job whose sha256 is not the installed artifact's. After an
+  upgrade, drain the queue first. A runner built on it cannot widen the grant — but there is no wire frame for delivering a job back into a
   guest, and adding one is a later slice.
 - The shipped `PluginStore`, `JobSink` and `OutboundHttp` implementations are
   in-process: `MemoryPluginStore` and `MemoryJobSink` are bounded — the job

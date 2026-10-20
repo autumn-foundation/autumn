@@ -7,3 +7,7 @@
   ceilings. A store-assigned row id or job id the guest cannot use is refused.
   A call refused for its shape no longer spends its per-capability quota, and
   the audit target is cut before it is copied (issue #2523).
+- **plugin sandbox:** the host reserves reply room and fuel before it runs a
+  capability call, so a committed write cannot fail its own request. A job
+  carries its artifact sha256. A manifest whose call frame cannot fit the
+  stdout line ceiling is refused at load (issue #2523).
