@@ -845,9 +845,24 @@ impl CapabilityCall {
         match self {
             Self::KvGet { .. } => kv_value_bytes.saturating_add(4096),
             Self::DbGet { .. } => MAX_RESULT_BYTES + ROW_FRAMING + 4096,
-            Self::DbQuery { .. } => MAX_RESULT_BYTES
-                .saturating_add(db_rows.saturating_mul(ROW_FRAMING))
-                .saturating_add(4096),
+            Self::DbQuery { limit, .. } => {
+                // The page the call can return: its own limit, within the quota.
+                let asked = *limit as usize;
+                let rows = if asked == 0 || asked > db_rows {
+                    db_rows
+                } else {
+                    asked
+                };
+                let reserve = MAX_RESULT_BYTES
+                    .saturating_add(rows.saturating_mul(ROW_FRAMING))
+                    .saturating_add(4096);
+                // Never more than the reply queue holds, or no query could run.
+                if reserve > super::host::MAX_QUEUED_REPLY_BYTES {
+                    super::host::MAX_QUEUED_REPLY_BYTES
+                } else {
+                    reserve
+                }
+            }
             Self::HttpFetch { .. } => {
                 MAX_RESULT_BYTES + outbound::MAX_RESPONSE_HEADER_BYTES * 6 + 4096
             }
@@ -2075,6 +2090,23 @@ path = "/shop/panel"
                 "{result:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_query_reserve_follows_its_page_and_fits_the_queue() {
+        let query = |limit| CapabilityCall::DbQuery {
+            id: 1,
+            table: "orders".to_owned(),
+            filter: PluginRow::new(),
+            limit,
+            after: None,
+        };
+        // A huge quota must not make every query undeliverable.
+        let huge = 1_000_000;
+        assert!(query(1).reply_reserve_for(0, huge) < query(0).reply_reserve_for(0, huge));
+        assert!(query(0).reply_reserve_for(0, huge) <= super::super::host::MAX_QUEUED_REPLY_BYTES);
+        // A page of one row reserves one row of framing.
+        assert!(query(1).reply_reserve_for(0, huge) < MAX_RESULT_BYTES + 8192);
     }
 
     #[test]
