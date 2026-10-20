@@ -819,7 +819,12 @@ fn ci_job<'a>(ci: &'a str, name: &str) -> &'a str {
             *off += l.len() + 1;
             Some((at, l))
         })
-        .find(|(_, l)| l.starts_with("  ") && !l.starts_with("   ") && l.trim_end().ends_with(':'))
+        .find(|(_, l)| {
+            l.starts_with("  ")
+                && !l.starts_with("   ")
+                && !l.trim_start().starts_with('#')
+                && l.trim_end().ends_with(':')
+        })
         .map_or(body.len(), |(at, _)| at);
     &body[..end]
 }
@@ -851,7 +856,8 @@ fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
     );
     let gate = ci_job(&ci, "test-gate");
     assert!(
-        gate.contains("test-docker-deploy"),
+        gate.lines()
+            .any(|l| l.trim_start().starts_with("needs:") && l.contains("test-docker-deploy")),
         "`test-gate` must need `test-docker-deploy`"
     );
 }
