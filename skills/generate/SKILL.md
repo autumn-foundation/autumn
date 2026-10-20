@@ -132,7 +132,7 @@ newtypes that are `Copy`, deref to the wrapped type, and are
 types no crate but their own can convert for SQLite). `--searchable` works via
 FTS5 (#1910); UUID primary keys and `--sharded` remain Postgres-only. A
 scaffolded SQLite app's `tests/<model>.rs` still uses the Postgres-only
-`TestDb`, so `cargo test` on it does not compile yet (#1905).
+`TestDb`, so `cargo test` on it does not compile yet (#2555).
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and
