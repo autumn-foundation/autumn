@@ -600,3 +600,31 @@ fn a_purge_that_cascades_into_an_app_table_is_refused() {
     );
     assert_eq!(leaked(&db).len(), SECRETS.len(), "nothing scrubbed");
 }
+
+#[test]
+fn a_blob_primary_key_with_invalid_utf8_scrubs() {
+    let toml = format!(
+        "{SCRUB_TOML}\n[tables.blobs]\nsafe = [\"id\"]\n\n[tables.blobs.pii]\nemail = \"email\"\n"
+    );
+    let project = project(&toml);
+    let db = project.path().join("app.db");
+    open(&db)
+        .batch_execute(
+            "CREATE TABLE blobs (id BLOB PRIMARY KEY, email TEXT UNIQUE); \
+             INSERT INTO blobs VALUES (x'80ff', 'a@real-corp.example'), (x'ff80', 'b@real-corp.example');",
+        )
+        .expect("blobs");
+    let (out, _, code) = run(project.path(), "dev", &["db", "scrub"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM blobs"),
+        2
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM blobs WHERE email LIKE 'scrubbed+%'"
+        ),
+        2
+    );
+}

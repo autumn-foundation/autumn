@@ -126,7 +126,14 @@ pub(super) fn row_key_expr(table: &Table, facts: &DatabaseFacts) -> String {
     }
     let key = match keys.as_slice() {
         [] => return "CAST(rowid AS TEXT)".to_owned(),
-        [key] => format!("coalesce(CAST({} AS TEXT), '')", quote_ident(key)),
+        // A blob key may hold bytes that are not valid text, so hex-encode it.
+        [key] => {
+            let key = quote_ident(key);
+            format!(
+                "coalesce(CASE typeof({key}) WHEN 'blob' THEN hex({key}) \
+                 ELSE CAST({key} AS TEXT) END, '')"
+            )
+        }
         // `quote()` renders each part as a SQL literal, so ('a|','b') and
         // ('a','|b') cannot collapse to one key.
         many => many
@@ -1447,10 +1454,9 @@ mod tests {
         let mut facts = DatabaseFacts::default();
         assert_eq!(row_key_expr(&table, &facts), "CAST(rowid AS TEXT)");
         table.primary_key = vec!["id".to_owned()];
-        assert_eq!(
-            row_key_expr(&table, &facts),
-            "coalesce(CAST(\"id\" AS TEXT), '')"
-        );
+        let single = row_key_expr(&table, &facts);
+        assert!(single.contains("WHEN 'blob' THEN hex(\"id\")"), "{single}");
+        assert!(single.contains("ELSE CAST(\"id\" AS TEXT) END"), "{single}");
         table.primary_key = vec!["a".to_owned(), "b".to_owned()];
         assert_eq!(
             row_key_expr(&table, &facts),
