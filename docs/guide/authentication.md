@@ -670,7 +670,8 @@ generated login handler therefore also counts failures **per account**:
 
 1. Each failed login increments `failed_attempts` on the account row.
 2. At `threshold`, `locked_at` is stamped and a `tracing::warn!` fires with
-   `event = "account_locked"`, a salted SHA-256 account digest truncated to 8
+   `event = "account_locked"` — once per lock, even when many requests fail at
+   the same time. Only the request that sets `locked_at` logs, a salted SHA-256 account digest truncated to 8
    bytes, and an IP prefix (IPv4 /24, IPv6 /64) — correlatable across log lines
    for incident response without putting a raw account id in the logs.
 
