@@ -669,10 +669,12 @@ IP rate limiting does not stop credential stuffing that rotates source IPs. The
 generated login handler therefore also counts failures **per account**:
 
 1. Each failed login increments `failed_attempts` on the account row.
-2. At `threshold`, `locked_at` is stamped and a `tracing::warn!` fires with
+2. At `threshold`, `locked_at` is stamped. A `tracing::warn!` fires with
    `event = "account_locked"`, a salted SHA-256 account digest truncated to 8
-   bytes, and an IP prefix (IPv4 /24, IPv6 /64) — correlatable across log lines
-   for incident response without putting a raw account id in the logs.
+   bytes, and an IP prefix (IPv4 /24, IPv6 /64). Only the request that sets
+   `locked_at` logs, so each lock logs once, also when many requests fail at
+   the same time. The digest and prefix let you correlate log lines without a
+   raw account id.
 
    **Set the salt.** The digest is salted from the app's
    [signing secret](./signing-secrets.md)

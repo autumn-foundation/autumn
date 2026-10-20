@@ -2473,6 +2473,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::retention:: \
             | tee "$RUNNER_TEMP/cli-retention-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-retention-cov.log"
+          # Issue #2531: same gap for `generate::auth::` (the generated auth
+          # routes and their tests). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::auth:: \
+            | tee "$RUNNER_TEMP/cli-generate-auth-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-auth-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
