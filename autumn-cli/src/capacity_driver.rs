@@ -495,7 +495,8 @@ fn dump_routes(
     manifest_dir: Option<&Path>,
 ) -> Result<Vec<DumpedRoute>, String> {
     let mut command = Command::new(binary);
-    command.env("AUTUMN_DUMP_ROUTES", "1");
+    command.env(crate::routes::DUMP_ENV, "1");
+    crate::routes::clear_other_dump_modes(&mut command, crate::routes::DUMP_ENV);
     // The route graph is profile-dependent, so the dump must be taken under
     // the same profile the ladder will run under.
     for (key, value) in child_env(profile) {

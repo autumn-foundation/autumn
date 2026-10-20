@@ -7738,13 +7738,19 @@ fn emit_state_machine_on_conn(
                         "{}:{}:{}:{}:{}",
                         #model_str, #field_str, __record_id, #from, #to,
                     );
-                    let __effect = ::autumn_web::TransitionEffect {
-                        model: ::std::string::String::from(#model_str),
-                        field: ::std::string::String::from(#field_str),
-                        record_id: __record_id,
-                        from_state: ::std::string::String::from(#from),
-                        to_state: ::std::string::String::from(#to),
-                        idempotency_key: __idempotency_key,
+                    // The borrowed twin of `TransitionEffect`: `enqueue_on_conn`
+                    // only serializes its args, and the twin serializes to the
+                    // identical JSON, so the job still receives a
+                    // `TransitionEffect` — without first copying the literal
+                    // model/field/state names into owned `String`s for
+                    // `serde_json::to_value` to copy again.
+                    let __effect = ::autumn_web::__private::TransitionEffectRef {
+                        model: #model_str,
+                        field: #field_str,
+                        record_id: &__record_id,
+                        from_state: #from,
+                        to_state: #to,
+                        idempotency_key: &__idempotency_key,
                     };
                     ::autumn_web::job::enqueue_on_conn(
                         <#job>::NAME,
@@ -19271,6 +19277,54 @@ mod tests {
             generated.contains("enqueue_on_conn")
                 && generated.contains("< SendShippedEmailJob > :: NAME"),
             "the effect must enqueue the named job on the connection: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_commit_enqueues_the_borrowed_effect_payload() {
+        // The enqueued args are only serialized, so the effect is built as the
+        // borrowed `TransitionEffectRef` twin (same JSON as `TransitionEffect`):
+        // the macro-time names go in as literals and the per-call record id and
+        // idempotency key are borrowed, instead of four `String::from` copies.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains(":: autumn_web :: __private :: TransitionEffectRef {"),
+            "the effect payload must be the borrowed twin: {generated}"
+        );
+        for field in [
+            "model : \"Order\" ,",
+            "field : \"status\" ,",
+            "record_id : & __record_id ,",
+            "from_state : \"processing\" ,",
+            "to_state : \"shipped\" ,",
+            "idempotency_key : & __idempotency_key ,",
+        ] {
+            assert!(
+                generated.contains(field),
+                "the effect payload must carry `{field}`: {generated}"
+            );
+        }
+        assert!(
+            !generated.contains("from_state : :: std :: string :: String :: from"),
+            "the literal state names must not be copied into owned Strings: {generated}"
+        );
+        assert!(
+            !generated.contains(":: autumn_web :: TransitionEffect {"),
+            "the owned payload must no longer be built: {generated}"
         );
     }
 

@@ -312,9 +312,12 @@ mod tests {
         module_path: "app::tasks",
         schedule: "15m",
         mutating: true,
+        mutating_symbols: &[],
         file: "src/tasks.rs",
         line: 1,
         signature_symbols: &[],
+        signature_bindings: &[],
+        dot_mutation_receivers: &[],
         body_symbols: &["posts"],
         sql_symbols: &[],
     }];

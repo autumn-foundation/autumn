@@ -35,6 +35,7 @@ mod edge_scan;
 mod experiments;
 mod export;
 mod flags;
+mod fleet;
 mod generate;
 mod git_root;
 mod graph;
@@ -1560,6 +1561,21 @@ enum Commands {
     },
     /// Shard operations (e.g. moving a tenant's data between shards)
     Shard(ShardCommands),
+    /// Operate a `SQLite` database fleet: list, migrate, back up, delete, restore.
+    ///
+    /// Reads `[database.fleet]` from the app config. `restore` also reads
+    /// `[replication]`. Run it from the app directory: the fleet root must
+    /// exist. Works when the app is stopped and when it runs. Needs the
+    /// `sqlite` build of the CLI.
+    ///
+    /// # Examples
+    ///
+    ///   autumn fleet list --open
+    ///   autumn fleet migrate --concurrency 4
+    ///   autumn fleet backup tenant:acme /backups/acme.db
+    ///   autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+    #[command(subcommand, verbatim_doc_comment)]
+    Fleet(FleetCommands),
     /// Live monitoring dashboard for a running Autumn application
     Monitor {
         /// URL of the running Autumn application
@@ -3386,6 +3402,137 @@ impl MigrateCommands {
             Self::New { .. } | Self::CheckCollisions => {
                 unreachable!("migrate new/check-collisions are dispatched before into_action")
             }
+        }
+    }
+}
+
+/// Subcommands of `autumn fleet` (issue #3232).
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+enum FleetCommands {
+    /// Show every database on disk: name, size and path.
+    List {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Also read each file: the identity row, the latest applied app
+        /// migration and the number of pending app migrations.
+        #[arg(long)]
+        open: bool,
+        /// Write JSON to stdout instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply pending migrations from `migrations/` to every database.
+    ///
+    /// Each database also gets the framework tables a fleet database gets at
+    /// boot. Plugin migrations are not applied: run the app once with
+    /// `AUTUMN_MIGRATE=1` for them. A failure on one database does not stop the
+    /// others. The command exits non-zero when one or more fail.
+    Migrate {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The number of databases to migrate at the same time.
+        #[arg(long, value_name = "N", default_value_t = 8,
+              value_parser = clap::value_parser!(u16).range(1..))]
+        concurrency: u16,
+        /// Migrate only this database (`tenant:<id>` or `slot:<nnnnn>`).
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+    },
+    /// Copy one database to a new file (`VACUUM INTO`). Writes can continue
+    /// during the copy.
+    Backup {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The database: `tenant:<id>` or `slot:<nnnnn>`.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// The path of the new file. It must not exist.
+        #[arg(value_name = "DEST")]
+        dest: std::path::PathBuf,
+    },
+    /// Remove one database file and its sidecars.
+    ///
+    /// Refused when another process has the file open.
+    Delete {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The database: `tenant:<id>` or `slot:<nnnnn>`.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Confirm the deletion. Required on every profile.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Rebuild one database from its `[replication]` replica.
+    ///
+    /// Verifies the chain before it replaces the file, as
+    /// `autumn db replica restore` does. Refused when another process has the
+    /// file open.
+    Restore {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The database: `tenant:<id>` or `slot:<nnnnn>`.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Restore to this RFC 3339 instant instead of the latest state.
+        #[arg(long, value_name = "RFC3339")]
+        timestamp: Option<String>,
+        /// Confirm the replacement. Required on every profile.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+impl FleetCommands {
+    /// Translate the parsed CLI shape into the `fleet` command.
+    fn into_command(self) -> fleet::FleetCommand {
+        match self {
+            Self::List {
+                profile,
+                open,
+                json,
+            } => fleet::FleetCommand::List {
+                profile,
+                open,
+                json,
+            },
+            Self::Migrate {
+                profile,
+                concurrency,
+                key,
+            } => fleet::FleetCommand::Migrate {
+                profile,
+                concurrency: usize::from(concurrency),
+                key,
+            },
+            Self::Backup { profile, key, dest } => {
+                fleet::FleetCommand::Backup { profile, key, dest }
+            }
+            Self::Delete {
+                profile,
+                key,
+                force,
+            } => fleet::FleetCommand::Delete {
+                profile,
+                key,
+                force,
+            },
+            Self::Restore {
+                profile,
+                key,
+                timestamp,
+                force,
+            } => fleet::FleetCommand::Restore {
+                profile,
+                key,
+                timestamp,
+                force,
+            },
         }
     }
 }
@@ -5243,6 +5390,7 @@ fn run_command(command: Commands) {
             }
         },
         Commands::Test { reset, cargo_args } => test_cmd::run(reset, &cargo_args),
+        Commands::Fleet(cmd) => fleet::run(&cmd.into_command()),
         Commands::Shard(cmd) => match cmd.command {
             ShardSubcommand::MoveSlot {
                 from,
@@ -5379,18 +5527,22 @@ fn run_command(command: Commands) {
                 );
                 wire_scaffold_plugins_into(&name, &plugins);
             } else {
+                let opts = new::GenerateOptions {
+                    with_i18n,
+                    with_seed,
+                    // --bundled-pg is a daemon flavor that keeps the database.
+                    with_daemon: daemon || bundled_pg,
+                    with_bundled_pg: bundled_pg,
+                    with_api: api,
+                };
+                // Before the preflight: it queries the network, and a
+                // contradictory request must fail first.
+                if let Err(err) = new::check_with_plugins(opts, with.len()) {
+                    eprintln!("Error: {err}");
+                    std::process::exit(1);
+                }
                 let plugins = resolve_scaffold_plugins(&with, Some(plugin::first_party_version()));
-                new::run(
-                    &name,
-                    new::GenerateOptions {
-                        with_i18n,
-                        with_seed,
-                        // --bundled-pg is a daemon flavor that keeps the database.
-                        with_daemon: daemon || bundled_pg,
-                        with_bundled_pg: bundled_pg,
-                        with_api: api,
-                    },
-                );
+                new::run(&name, opts);
                 wire_scaffold_plugins_into(&name, &plugins);
             }
         }
@@ -6428,8 +6580,10 @@ fn run_deprecations_check(package: Option<&str>, bin: Option<&str>) {
     routes::compile_binary(package, bin);
     let binary = routes::find_binary(package, bin);
 
-    let output = std::process::Command::new(&binary)
-        .env("AUTUMN_DUMP_ROUTES", "1")
+    let mut command = std::process::Command::new(&binary);
+    command.env(routes::DUMP_ENV, "1");
+    routes::clear_other_dump_modes(&mut command, routes::DUMP_ENV);
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()
@@ -7337,6 +7491,76 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// Parse `autumn fleet ...` into the `fleet` module's command.
+    fn fleet_command(args: &[&str]) -> fleet::FleetCommand {
+        let cli = Cli::try_parse_from(["autumn", "fleet"].iter().chain(args)).unwrap();
+        match cli.command {
+            Commands::Fleet(cmd) => cmd.into_command(),
+            _ => panic!("expected the fleet command"),
+        }
+    }
+
+    #[test]
+    fn fleet_subcommands_parse_into_fleet_commands() {
+        use fleet::FleetCommand;
+        assert_eq!(
+            fleet_command(&["list", "--open", "--json", "--profile", "prod"]),
+            FleetCommand::List {
+                profile: Some("prod".to_owned()),
+                open: true,
+                json: true
+            }
+        );
+        assert_eq!(
+            fleet_command(&["migrate"]),
+            FleetCommand::Migrate {
+                profile: None,
+                concurrency: 8,
+                key: None
+            }
+        );
+        assert_eq!(
+            fleet_command(&["migrate", "--concurrency", "2", "--key", "tenant:acme"]),
+            FleetCommand::Migrate {
+                profile: None,
+                concurrency: 2,
+                key: Some("tenant:acme".to_owned())
+            }
+        );
+        assert_eq!(
+            fleet_command(&["backup", "tenant:acme", "/backups/acme.db"]),
+            FleetCommand::Backup {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                dest: std::path::PathBuf::from("/backups/acme.db")
+            }
+        );
+        assert_eq!(
+            fleet_command(&["delete", "tenant:acme", "--force"]),
+            FleetCommand::Delete {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                force: true
+            }
+        );
+        assert_eq!(
+            fleet_command(&[
+                "restore",
+                "slot:00042",
+                "--timestamp",
+                "2026-10-01T12:00:00Z"
+            ]),
+            FleetCommand::Restore {
+                profile: None,
+                key: "slot:00042".to_owned(),
+                timestamp: Some("2026-10-01T12:00:00Z".to_owned()),
+                force: false
+            }
+        );
+        // Zero would migrate nothing at all.
+        assert!(Cli::try_parse_from(["autumn", "fleet", "migrate", "--concurrency", "0"]).is_err());
+    }
 
     #[test]
     fn parse_new_subcommand() {

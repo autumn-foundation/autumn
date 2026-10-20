@@ -625,6 +625,13 @@ harness = false
 name = "admission"
 harness = false
 
+# Criterion benches for recording through the app-metrics facade: a held,
+# labeled handle vs the per-call `counter(..).with_label(..)` idiom. The
+# allocation half is pinned by `tests/metrics_alloc_gate.rs`.
+[[bench]]
+name = "metrics_record"
+harness = false
+
 [[bench]]
 name = "form_render"
 harness = false
@@ -816,6 +823,49 @@ path = "tests/form_render_alloc_gate.rs"
 [[test]]
 name = "version_history_alloc_gate"
 path = "tests/version_history_alloc_gate.rs"
+
+# Allocation gate for recording through the app-metrics facade: a label set the
+# registry has already seen is found with a borrowed lookup, not a fresh owned
+# copy of every label per sample. Own binary for the same `allocation-counter`
+# global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "metrics_alloc_gate"
+path = "tests/metrics_alloc_gate.rs"
+
+# Allocation gate for trusted-proxy resolution: a request behind a proxy must
+# not copy its one-line `X-Forwarded-For` chain to read it (the addr, host and
+# scheme resolvers each re-read it in hop-count mode). Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "trusted_proxies_alloc_gate"
+path = "tests/trusted_proxies_alloc_gate.rs"
+
+# Allocation gate for the layers that carry a request's matched route and
+# request id (the access log, primary and fallback, and the log context): they
+# keep axum's shared `MatchedPath` and the `RequestId` itself, not a per-request
+# `String` copy. Own binary for the same `allocation-counter` global-allocator
+# reason as `config_alloc_gate` above.
+[[test]]
+name = "request_meta_alloc_gate"
+path = "tests/request_meta_alloc_gate.rs"
+
+# Allocation gate for recording a DB query sample: a query key the collector
+# already holds is found with a borrowed lookup, and `run_instrumented` composes
+# its `"{route} {verb}"` key on the stack instead of a `String` per query. Own
+# binary for the same `allocation-counter` global-allocator reason as
+# `config_alloc_gate` above.
+[[test]]
+name = "db_metrics_alloc_gate"
+path = "tests/db_metrics_alloc_gate.rs"
+
+# Allocation gate for the `#[throttle]` per-route check on a warm route: the
+# limiter registry and the per-client bucket map are probed by borrowed key, so
+# a request to a route that already has its limiter, from a client that already
+# has its bucket, copies neither key. Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "throttle_alloc_gate"
+path = "tests/throttle_alloc_gate.rs"
 
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
@@ -1222,6 +1272,15 @@ path = "tests/sqlite_transactional_url_pool.rs"
 name = "sqlite_fleet"
 path = "tests/sqlite_fleet.rs"
 
+# The fleet sweeper (issue 3234): an outbox row, a commit hook and a
+# derivation backfill in a closed fleet database are done without a request.
+# Its own binary: it declares a `#[derivation]`, which is process-global.
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]`. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_sweeper`.
+[[test]]
+name = "sqlite_fleet_sweeper"
+path = "tests/sqlite_fleet_sweeper.rs"
+
 # Sim-testing W4 SQLite DB lane (issue #1797): proves the job/scheduler drain
 # runs end-to-end against a fresh, migrated, in-process in-memory SQLite substrate
 # (`sim::substrate::SqliteSubstrate`) over the representative local scheduler
@@ -1287,6 +1346,13 @@ path = "tests/sim_idempotency_db.rs"
 [[test]]
 name = "sim_replicas"
 path = "tests/sim_replicas.rs"
+
+# Issue #3233: a partitioned old fleet owner, in virtual time. Runs in the
+# single-threaded multi-replica sim step.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_ownership`.
+[[test]]
+name = "sim_fleet_ownership"
+path = "tests/sim_fleet_ownership.rs"
 
 # Issue #3067: the same-seed trace check. Its own binary, because `tracing`
 # caches callsite interest for the whole process.

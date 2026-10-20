@@ -375,6 +375,8 @@ consumed; nothing is left on the function.
 | `hidden` | flag / bool | Exclude the route from the generated spec |
 | `mcp` | flag / bool | Expose this endpoint as an MCP tool (`mcp = false` force-excludes it). Requires the `mcp` feature and a `mount_mcp` call. |
 | `stream` | flag / bool | Mark an `Sse`-returning MCP tool as streaming (`#[api_doc(mcp, stream)]`). A streaming route has no JSON response schema, so without this flag an `mcp`-exposed `Sse` route is skipped as schema-less; `stream` exempts it from that gate and advertises it as a streaming tool. |
+| `task` | flag / bool | With `mcp`: the tool can return a task handle (MCP Tasks extension). See [the MCP guide](./mcp.md) §6. |
+| `core` | flag / bool | With `mcp`: a core tool. A client that defers tools loads it first. See [the MCP guide](./mcp.md#large-catalogs-core-tools-and-search). |
 
 - **Ordering is flexible — with one exception:** `#[api_doc]` works whether it
   sits *above* or *below* the built-in route macros. Rust expands attribute

@@ -2342,8 +2342,12 @@ pub async fn rotate_api_token(
 
 /// Private marker inserted into request extensions by [`RequireApiToken`] after
 /// a bearer token is successfully verified.
+///
+/// Crate-visible so the idempotency layer can scope its cache by the verified
+/// principal (see `idempotency::bearer_scope_for_parts`). Only
+/// [`RequireApiToken`] constructs it, so a client cannot forge one.
 #[derive(Clone)]
-struct ApiTokenPrincipal(String);
+pub(crate) struct ApiTokenPrincipal(pub(crate) String);
 
 /// Scopes granted to the authenticating service token, inserted into request
 /// extensions by [`RequireApiToken`] after a bearer token is verified.

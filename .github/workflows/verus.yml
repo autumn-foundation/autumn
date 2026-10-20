@@ -12,6 +12,7 @@ on:
     paths:
       - "verification/**"
       - "!verification/models/**"
+      - "!verification/tla/**"
       - "scripts/verify-verus.sh"
       - ".github/workflows/verus.yml"
   push:
@@ -19,6 +20,7 @@ on:
     paths:
       - "verification/**"
       - "!verification/models/**"
+      - "!verification/tla/**"
       - "scripts/verify-verus.sh"
       - ".github/workflows/verus.yml"
   schedule:

@@ -1436,15 +1436,17 @@ pub mod pg {
 
 // ── Hash helpers ─────────────────────────────────────────────────────────────
 
-/// FNV-1a 64-bit hash of a byte slice.
+/// FNV-1a 64-bit hash of `parts` laid end to end.
 ///
-/// Used for stable, deterministic percent-rollout bucket assignment.
-/// No external dependency — the algorithm is specified by the FNV standard.
-fn fnv1a_64(data: &[u8]) -> u64 {
+/// FNV-1a folds one byte at a time, so this is exactly the hash of the parts'
+/// concatenation, without building it. Used for stable, deterministic
+/// percent-rollout bucket assignment. No external dependency — the algorithm
+/// is specified by the FNV standard.
+fn fnv1a_64(parts: &[&[u8]]) -> u64 {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
     let mut hash = FNV_OFFSET;
-    for &byte in data {
+    for &byte in parts.iter().copied().flatten() {
         hash ^= u64(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
@@ -1462,8 +1464,9 @@ const fn u64(v: u8) -> u64 {
 /// than this value the actor is in the rollout cohort.
 #[must_use]
 pub fn rollout_bucket(flag_key: &str, actor_id: &str) -> u8 {
-    let key = format!("{flag_key}:{actor_id}");
-    let hash = fnv1a_64(key.as_bytes());
+    // The bucket of `"<flag_key>:<actor_id>"` (see the module docs), hashed
+    // part by part so a rollout check builds no joined key.
+    let hash = fnv1a_64(&[flag_key.as_bytes(), b":".as_slice(), actor_id.as_bytes()]);
     u8::try_from(hash % 100).unwrap_or(0)
 }
 
@@ -2086,6 +2089,92 @@ mod tests {
             let b = rollout_bucket("flag", &format!("actor:{i}"));
             assert!(b < 100, "bucket out of range: {b}");
         }
+    }
+
+    /// `fnv1a_64` and `rollout_bucket` as they were before the hash took
+    /// parts, verbatim: `format!` joins the key, then one slice is hashed.
+    fn joined_fnv1a_64(data: &[u8]) -> u64 {
+        const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+        const FNV_PRIME: u64 = 1_099_511_628_211;
+        let mut hash = FNV_OFFSET;
+        for &byte in data {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    fn joined_rollout_bucket(flag_key: &str, actor_id: &str) -> u8 {
+        let key = format!("{flag_key}:{actor_id}");
+        let hash = joined_fnv1a_64(key.as_bytes());
+        u8::try_from(hash % 100).unwrap_or(0)
+    }
+
+    #[test]
+    fn rollout_bucket_is_fnv1a_of_the_joined_key() {
+        // Hashing the parts must give the joined key's bucket bit for bit,
+        // or every partial rollout reshuffles its cohort.
+        let edge_cases = [
+            ("my_flag", "user:1"),
+            ("", ""),
+            ("f", ""),
+            ("", "a"),
+            (":", ":"),
+            ("a:b", "c:d"),
+            ("ab", "c:d"),
+            ("a:b:", ":c"),
+            ("ünï", "çødé"),
+            ("flag🚩", "用户:42"),
+            ("tab\tflag", "line\nactor"),
+        ];
+        for (flag, actor) in edge_cases {
+            assert_eq!(
+                rollout_bucket(flag, actor),
+                joined_rollout_bucket(flag, actor),
+                "{flag:?}/{actor:?}"
+            );
+        }
+        for flag in ["flag", "beta", "dark_mode", "checkout:v2"] {
+            for i in 0..1_000_u32 {
+                let actor = format!("actor:{i}");
+                assert_eq!(
+                    rollout_bucket(flag, &actor),
+                    joined_rollout_bucket(flag, &actor),
+                    "{flag:?}/{actor:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fnv1a_64_of_parts_equals_fnv1a_64_of_their_concatenation() {
+        // Every way of cutting a key into three (possibly empty) parts hashes
+        // like the uncut key.
+        for key in ["", ":", "my_flag:user:1", "ünï:çødé", "a::b"] {
+            let whole = joined_fnv1a_64(key.as_bytes());
+            let bytes = key.as_bytes();
+            for i in 0..=bytes.len() {
+                for j in i..=bytes.len() {
+                    let (head, rest) = bytes.split_at(i);
+                    let (middle, tail) = rest.split_at(j - i);
+                    assert_eq!(fnv1a_64(&[head, middle, tail]), whole, "{key:?} {i} {j}");
+                }
+            }
+            assert_eq!(fnv1a_64(&[bytes]), whole, "{key:?} in one part");
+        }
+        assert_eq!(fnv1a_64(&[]), joined_fnv1a_64(&[]), "no parts at all");
+    }
+
+    #[test]
+    fn rollout_bucket_known_fixtures() {
+        // FNV-1a 64-bit of "<flag>:<actor>" mod 100. A permanent contract:
+        // a change moves actors in and out of every partial rollout.
+        assert_eq!(rollout_bucket("my_flag", "user:1"), 62);
+        assert_eq!(rollout_bucket("beta", "user:42"), 28);
+        assert_eq!(rollout_bucket("dark_mode", "user:7"), 77);
+        assert_eq!(rollout_bucket("", ""), 89);
+        assert_eq!(rollout_bucket("a:b", "c:d"), 53);
+        assert_eq!(rollout_bucket("ünï", "çødé"), 63);
     }
 
     #[test]

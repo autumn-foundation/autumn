@@ -274,42 +274,44 @@ struct ChannelMetricCounters {
 }
 
 impl ChannelMetrics {
-    fn ensure_topic(&self, topic: &str) {
+    /// Apply `change` to `topic`'s counters, creating them on first sight.
+    ///
+    /// Probes with the borrowed name first. A topic stays in this map from
+    /// its first publish or subscribe until `gc` prunes it, so `entry` with an
+    /// owned key copied the topic name on every publish only to drop the copy
+    /// against the key already there.
+    fn update(&self, topic: &str, change: impl FnOnce(&mut ChannelMetricCounters)) {
         let mut counters = self
             .counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        counters.entry(topic.to_owned()).or_default();
+        if let Some(stats) = counters.get_mut(topic) {
+            change(stats);
+            return;
+        }
+        change(counters.entry(topic.to_owned()).or_default());
+    }
+
+    fn ensure_topic(&self, topic: &str) {
+        self.update(topic, |_| {});
     }
 
     fn record_publish(&self, topic: &str) {
-        let mut counters = self
-            .counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stats = counters.entry(topic.to_owned()).or_default();
-        stats.publishes = stats.publishes.saturating_add(1);
-        drop(counters);
+        self.update(topic, |stats| {
+            stats.publishes = stats.publishes.saturating_add(1);
+        });
     }
 
     fn record_dropped(&self, topic: &str, count: u64) {
-        let mut counters = self
-            .counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stats = counters.entry(topic.to_owned()).or_default();
-        stats.drops = stats.drops.saturating_add(count);
-        drop(counters);
+        self.update(topic, |stats| {
+            stats.drops = stats.drops.saturating_add(count);
+        });
     }
 
     fn record_lagged(&self, topic: &str, count: u64) {
-        let mut counters = self
-            .counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stats = counters.entry(topic.to_owned()).or_default();
-        stats.lags = stats.lags.saturating_add(count);
-        drop(counters);
+        self.update(topic, |stats| {
+            stats.lags = stats.lags.saturating_add(count);
+        });
     }
 
     fn snapshot(&self) -> HashMap<String, ChannelMetricCounters> {
@@ -967,15 +969,27 @@ struct RedisChannelsBackend {
 #[cfg(feature = "redis")]
 struct RedisPublishCommand {
     redis_channel: String,
-    envelope: RedisEnvelope,
+    /// The encoded [`RedisEnvelope`], ready to `PUBLISH`.
+    payload: String,
 }
 
+/// What one replica tells the others, as JSON.
+///
+/// Borrowed both ways. `publish` encodes it straight from its arguments, and
+/// the listener decodes `origin` and `topic` in place (it only compares
+/// them), so neither side copies a string just to encode or compare it.
+/// `serde_json` hands back an owned `Cow` only for a value that carried an
+/// escape. The wire form is unchanged: a `Cow<str>` encodes as the `String`
+/// it replaced, in the same field order.
 #[cfg(feature = "redis")]
 #[derive(serde::Deserialize, serde::Serialize)]
-struct RedisEnvelope {
-    origin: String,
-    topic: String,
-    payload: String,
+struct RedisEnvelope<'a> {
+    #[serde(borrow)]
+    origin: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    topic: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    payload: std::borrow::Cow<'a, str>,
 }
 
 /// Channel backend configuration error.
@@ -1070,12 +1084,8 @@ fn spawn_redis_publisher(
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 Some(command) = receiver.recv() => {
-                    let Ok(payload) = serde_json::to_string(&command.envelope) else {
-                        tracing::warn!("failed to serialize Redis channel envelope");
-                        continue;
-                    };
                     if let Err(error) = connection
-                        .publish::<_, _, usize>(&command.redis_channel, payload)
+                        .publish::<_, _, usize>(&command.redis_channel, command.payload)
                         .await
                     {
                         tracing::warn!(error = %error, channel = %command.redis_channel, "Redis channel publish failed");
@@ -1136,7 +1146,7 @@ fn spawn_redis_listener(
                                 continue;
                             }
                         };
-                        let envelope: RedisEnvelope = match serde_json::from_str(&payload) {
+                        let envelope: RedisEnvelope<'_> = match serde_json::from_str(&payload) {
                             Ok(envelope) => envelope,
                             Err(error) => {
                                 tracing::warn!(error = %error, "failed to parse Redis channel envelope");
@@ -1163,7 +1173,7 @@ fn deliver_redis_envelope(
     origin_id: &str,
     channel_prefix: &str,
     redis_channel: &str,
-    envelope: RedisEnvelope,
+    envelope: RedisEnvelope<'_>,
 ) {
     let Some(topic) = redis_channel_topic(channel_prefix, redis_channel) else {
         tracing::warn!(channel = %redis_channel, "Redis channel name did not match channel prefix");
@@ -1184,19 +1194,29 @@ fn deliver_redis_envelope(
         return;
     }
 
-    local.publish_local(topic, ChannelMessage(envelope.payload));
+    local.publish_local(topic, ChannelMessage(envelope.payload.into_owned()));
 }
 
 #[cfg(feature = "redis")]
 impl ChannelsBackend for RedisChannelsBackend {
     fn publish(&self, topic: &str, msg: ChannelMessage) -> Result<usize, ChannelPublishError> {
+        // Encoded here, from borrows. An owned envelope handed to the
+        // publisher task to encode later copied the origin id, the topic and
+        // the whole payload on every publish, each dropped once encoded.
+        let encoded = serde_json::to_string(&RedisEnvelope {
+            origin: std::borrow::Cow::Borrowed(self.origin_id.as_str()),
+            topic: std::borrow::Cow::Borrowed(topic),
+            payload: std::borrow::Cow::Borrowed(msg.as_str()),
+        });
+        let Ok(payload) = encoded else {
+            // Three strings always encode. Kept so a failure is still a log
+            // line and a local delivery, as when the task did the encoding.
+            tracing::warn!("failed to serialize Redis channel envelope");
+            return Ok(self.local.publish_local(topic, msg));
+        };
         let command = RedisPublishCommand {
             redis_channel: self.redis_channel(topic),
-            envelope: RedisEnvelope {
-                origin: self.origin_id.clone(),
-                topic: topic.to_owned(),
-                payload: msg.as_str().to_owned(),
-            },
+            payload,
         };
         self.publisher
             .try_send(command)
@@ -1704,6 +1724,34 @@ mod tests {
         assert_eq!(stats.lagged_count, 0);
     }
 
+    /// The borrowed probe in `ChannelMetrics::update` must land repeated
+    /// publishes on the one entry the first created, for delivered and
+    /// dropped publishes alike.
+    #[test]
+    fn repeated_publishes_accumulate_on_one_metrics_entry() {
+        let channels = Channels::new(16);
+        let _rx = channels.subscribe("metrics:hit");
+        for _ in 0..3 {
+            channels
+                .publish("metrics:hit", "one")
+                .expect("local publish never fails");
+        }
+        for _ in 0..2 {
+            channels
+                .publish("metrics:miss", "one")
+                .expect("local publish never fails");
+        }
+
+        let snap = channels.snapshot();
+        let hit = snap.get("metrics:hit").expect("topic should be tracked");
+        assert_eq!(hit.lifetime_publish_count, 3);
+        assert_eq!(hit.dropped_count, 0);
+        let miss = snap.get("metrics:miss").expect("topic should be tracked");
+        assert_eq!(miss.lifetime_publish_count, 0);
+        assert_eq!(miss.dropped_count, 2);
+        assert_eq!(snap.len(), 2);
+    }
+
     #[test]
     fn gc_prunes_metrics_for_removed_idle_topics() {
         let channels = Channels::new(16);
@@ -1734,9 +1782,9 @@ mod tests {
             &channel_prefix,
             "autumn:channels:public",
             RedisEnvelope {
-                origin: "remote-origin".to_owned(),
-                topic: "private".to_owned(),
-                payload: "secret".to_owned(),
+                origin: "remote-origin".into(),
+                topic: "private".into(),
+                payload: "secret".into(),
             },
         );
 
@@ -1760,9 +1808,9 @@ mod tests {
             &channel_prefix,
             "autumn:channels:public",
             RedisEnvelope {
-                origin: "remote-origin".to_owned(),
-                topic: "public".to_owned(),
-                payload: "hello".to_owned(),
+                origin: "remote-origin".into(),
+                topic: "public".into(),
+                payload: "hello".into(),
             },
         );
 
@@ -1778,6 +1826,32 @@ mod tests {
         assert_eq!(stats.dropped_count, 0);
     }
 
+    /// Replicas on either side of a rolling deploy must read each other:
+    /// the borrowed envelope keeps the owned one's bytes, and decodes the
+    /// fields the listener only compares without copying them.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_envelope_wire_form_is_unchanged_and_decodes_borrowed() {
+        let encoded = serde_json::to_string(&RedisEnvelope {
+            origin: "origin-1".into(),
+            topic: "feed".into(),
+            payload: "<li hx-swap-oob=\"true\">x</li>".into(),
+        })
+        .expect("three strings always encode");
+        assert_eq!(
+            encoded,
+            r#"{"origin":"origin-1","topic":"feed","payload":"<li hx-swap-oob=\"true\">x</li>"}"#
+        );
+
+        let decoded: RedisEnvelope<'_> = serde_json::from_str(&encoded).expect("decodes");
+        assert!(matches!(
+            decoded.origin,
+            std::borrow::Cow::Borrowed("origin-1")
+        ));
+        assert!(matches!(decoded.topic, std::borrow::Cow::Borrowed("feed")));
+        assert_eq!(decoded.payload, "<li hx-swap-oob=\"true\">x</li>");
+    }
+
     #[cfg(feature = "redis")]
     #[test]
     fn redis_publish_rejects_when_bounded_queue_is_full() {
@@ -1787,11 +1861,8 @@ mod tests {
         publisher
             .try_send(RedisPublishCommand {
                 redis_channel: "autumn:channels:queue".to_owned(),
-                envelope: RedisEnvelope {
-                    origin: "origin".to_owned(),
-                    topic: "queue".to_owned(),
-                    payload: "already queued".to_owned(),
-                },
+                payload: r#"{"origin":"origin","topic":"queue","payload":"already queued"}"#
+                    .to_owned(),
             })
             .expect("first command should fill the queue");
 
@@ -1811,6 +1882,32 @@ mod tests {
             rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    /// `publish` encodes the envelope itself, from its own origin id and
+    /// arguments, so read back exactly what it queued for `PUBLISH`.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_publish_queues_the_encoded_envelope() {
+        let (publisher, mut receiver) = tokio::sync::mpsc::channel(1);
+        let backend = RedisChannelsBackend {
+            local: LocalChannelsBackend::new(16),
+            publisher,
+            origin_id: "o".to_owned(),
+            key_prefix: "autumn:channels".to_owned(),
+        };
+
+        let delivered = backend
+            .publish("feed", ChannelMessage::from("<p a=\"b\">"))
+            .expect("an empty queue accepts the publish");
+        assert_eq!(delivered, 0, "nobody subscribed locally");
+
+        let command = receiver.try_recv().expect("publish queued a command");
+        assert_eq!(command.redis_channel, "autumn:channels:feed");
+        assert_eq!(
+            command.payload,
+            r#"{"origin":"o","topic":"feed","payload":"<p a=\"b\">"}"#
+        );
     }
 
     #[test]

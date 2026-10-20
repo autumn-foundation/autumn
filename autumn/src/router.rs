@@ -523,6 +523,8 @@ type McpPrepared = (
     Vec<crate::mcp::McpToolInfo>,
     Option<crate::mcp::McpEndpointLayer>,
     crate::mcp::McpTaskConfig,
+    Option<String>,
+    crate::mcp::McpCatalog,
 );
 
 /// Like [`try_build_router_inner`] but returns `Router<AppState>` before
@@ -665,7 +667,17 @@ fn build_router_pre_state(
         // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
         // reuse the same registered component schemas as the served spec.
         let tools = crate::mcp::derive_tools(&docs, rt.expose_all, ctx.openapi.as_ref());
-        Some((rt.mount_path, tools, rt.endpoint_layer, rt.tasks))
+        // Drop a tool with a meta-tool name before the AEO documents read
+        // the list, so they match the served catalog.
+        let tools = crate::mcp::drop_reserved_tools(tools, rt.catalog);
+        Some((
+            rt.mount_path,
+            tools,
+            rt.endpoint_layer,
+            rt.tasks,
+            rt.instructions,
+            rt.catalog,
+        ))
     } else {
         None
     };
@@ -938,7 +950,9 @@ fn build_router_pre_state(
     // it in *after* its own `custom_layers` reapplication.
     #[cfg(feature = "mcp")]
     let (router, deferred_mcp_router) =
-        if let Some((mount_path, tools, endpoint_layer, tasks)) = mcp_prepared {
+        if let Some((mount_path, tools, endpoint_layer, tasks, instructions, catalog)) =
+            mcp_prepared
+        {
             // The outermost `SecurityHeadersLayer` is applied after this clone, so
             // the dispatch snapshot would otherwise miss it. That layer also injects
             // `CspNonce` into request extensions, so a `tools/call` replay of a
@@ -990,6 +1004,8 @@ fn build_router_pre_state(
                 // one of the credentials in that binding.
                 session_cookie: config.session.cookie_name.clone(),
                 tasks,
+                instructions,
+                catalog,
             };
             let mut mcp_router =
                 crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -1636,7 +1652,7 @@ impl AeoMcpFacts for () {
 #[cfg(feature = "mcp")]
 impl AeoMcpFacts for McpPrepared {
     fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts) {
-        let (path, tools, endpoint_layer, _) = self;
+        let (path, tools, endpoint_layer, ..) = self;
         // A gated endpoint (`secure_mcp`) keeps its tool list private.
         let public_tools = endpoint_layer.is_none();
         let tools = if public_tools {
@@ -2693,8 +2709,9 @@ fn group_and_mount_routes(
         );
     }
     for route in route_list {
-        let selected_layer = idempotency_layers
-            .map(|layers| idempotency_layer_for_route(&route, layers, opaque_app_layers_present));
+        let selected_layer = idempotency_layers.and_then(|layers| {
+            idempotency_layer_for_route(&route, layers, opaque_app_layers_present)
+        });
         let mut handler = route.handler;
         if let Some(layer) = selected_layer {
             handler = handler.layer(layer.clone());
@@ -3329,17 +3346,23 @@ async fn locale_prefix_redirect_handler(
     axum::response::Redirect::permanent(&target)
 }
 
+/// The idempotency layer to mount on `route`, or `None` for a route that
+/// opted out with `idempotent = false` ([`RouteIdempotency::Off`]).
+///
+/// [`RouteIdempotency::Off`]: crate::route::RouteIdempotency::Off
 const fn idempotency_layer_for_route<'a>(
     route: &Route,
     layers: &'a BuiltIdempotencyLayers,
     opaque_app_layers_present: bool,
-) -> &'a IdempotencyLayer {
-    if opaque_app_layers_present {
-        &layers.manual
+) -> Option<&'a IdempotencyLayer> {
+    if matches!(route.idempotency, crate::route::RouteIdempotency::Off) {
+        None
+    } else if opaque_app_layers_present {
+        Some(&layers.manual)
     } else if route_uses_generated_replay_stop(route) {
-        &layers.route
+        Some(&layers.route)
     } else {
-        &layers.manual
+        Some(&layers.manual)
     }
 }
 
@@ -3369,6 +3392,21 @@ fn is_idempotency_transparent_app_layer(registered: &crate::app::CustomLayerRegi
             == std::any::TypeId::of::<crate::session::SessionLayer<crate::session::MemoryStore>>()
         || is_i18n_bundle_extension_layer(registered.type_id)
         || is_edge_fallthrough_sentinel_strip_layer(registered.type_id)
+        || is_require_api_token_layer(registered.type_id)
+}
+
+/// [`RequireApiToken`](crate::auth::RequireApiToken) registered directly via
+/// `AppBuilder::layer` or `static_gate`.
+///
+/// It rejects a missing or revoked token before the idempotency layer runs,
+/// and the principal it verifies is part of the idempotency storage key (the
+/// `bearer-principal` component), so two token principals never share a cache
+/// slot. That is the property the fail-closed path exists to provide, so
+/// forcing it here only turned every same-client retry into a `409`. Matched
+/// by `TypeId`: a `ServiceBuilder` stack that wraps it is a different type and
+/// stays opaque.
+fn is_require_api_token_layer(type_id: std::any::TypeId) -> bool {
+    type_id == std::any::TypeId::of::<crate::auth::RequireApiToken>()
 }
 
 /// The origin-only layer that strips the edge lane's internal fallthrough
@@ -3700,8 +3738,11 @@ fn mount_scoped_groups(
             // know whether that layer authorizes, audits, or resolves tenant
             // state from non-whitelisted headers/extensions, so cached hits
             // fail closed instead of replaying through a generated stop inside
-            // the scoped route.
-            let selected_layer = idempotency_layers.map(|layers| &layers.manual);
+            // the scoped route. A route that opted out with `idempotent =
+            // false` gets no layer here either.
+            let selected_layer = idempotency_layers
+                .filter(|_| !matches!(route.idempotency, crate::route::RouteIdempotency::Off))
+                .map(|layers| &layers.manual);
             let seo = route.seo;
             let mut handler = route.handler;
             if let Some(layer) = selected_layer {
@@ -5089,11 +5130,13 @@ where
                 .insert(crate::admission::InboundDeadline::At(at));
         }
 
-        // A deadline is active: now it's worth owning the path for the warn log.
+        // A deadline is active: keep the matched route for the warn log. It is
+        // the `Arc<str>` axum already holds, so this is a refcount bump, not a
+        // copy of the template.
         let matched_path = req
             .extensions()
             .get::<axum::extract::MatchedPath>()
-            .map(|p| p.as_str().to_owned());
+            .cloned();
         let request_id = req
             .extensions()
             .get::<crate::middleware::RequestId>()
@@ -5129,7 +5172,9 @@ where
                 response: Some(deadline_exceeded_response(
                     &self.settings,
                     duration,
-                    matched_path.as_deref(),
+                    matched_path
+                        .as_ref()
+                        .map(axum::extract::MatchedPath::as_str),
                     request_id.as_ref(),
                     cors_origin.as_ref(),
                     start,
@@ -5182,7 +5227,7 @@ pin_project_lite::pin_project! {
             inner: crate::deadline::Bounded<F>,
             settings: Arc<RequestTimeoutSettings>,
             duration: Duration,
-            matched_path: Option<String>,
+            matched_path: Option<axum::extract::MatchedPath>,
             request_id: Option<crate::middleware::RequestId>,
             cors_origin: Option<http::HeaderValue>,
             start: std::time::Instant,
@@ -5224,7 +5269,9 @@ where
                         response: Some(deadline_exceeded_response(
                             settings,
                             *duration,
-                            matched_path.as_deref(),
+                            matched_path
+                                .as_ref()
+                                .map(axum::extract::MatchedPath::as_str),
                             request_id.as_ref(),
                             cors_origin.as_ref(),
                             *start,
@@ -6146,8 +6193,12 @@ fn apply_middleware(
     // uncompressed bytes labeled as gzip. User layers (EtagLayer etc.) stay inner
     // to Compression, so ETags are computed on the uncompressed body.
     //
-    // The error page context layer must be inner to the exception filter, so
-    // `WantsHtml` is set on the response before the filter inspects it.
+    // The error page context layer must sit directly inner to the exception
+    // filter (adjacent in the tuple below), so `WantsHtml` is set on the
+    // response before the filter inspects it. It attaches its context only to
+    // responses that already carry `AutumnErrorInfo`, which is correct only
+    // while no layer between the two could turn a plain response into an
+    // error one.
     //
     // Full ingress layer order (outermost → innermost). The framework's outermost
     // `SecurityHeadersLayer` and the `static_gate` layers are applied by
@@ -6306,7 +6357,8 @@ fn apply_layers_in_registration_order(
 /// Shared by [`TrustedHostService`] and — through it — every ingress path, so
 /// the decision lives in exactly one place. Returns `None` for "let it
 /// through", which is the overwhelmingly common answer and costs no allocation
-/// at all: the host string is only owned on the branch that has to compare it.
+/// at all: the host is borrowed from the request unless it carries an ASCII
+/// uppercase letter (see [`normalize_trusted_host`]).
 fn trusted_host_rejection<B>(
     req: &Request<B>,
     policy: &TrustedHostPolicy,
@@ -6324,10 +6376,7 @@ fn trusted_host_rejection<B>(
         .and_then(|v| v.to_str().ok());
     let raw_host = authority.or(host_header);
     let parsed_host = raw_host.and_then(extract_host_without_port);
-    let host = parsed_host
-        .map(str::to_ascii_lowercase)
-        .map(|h| h.trim_end_matches('.').to_owned())
-        .filter(|h| !h.is_empty());
+    let host = parsed_host.and_then(normalize_trusted_host);
     let host_source_present = raw_host.is_some();
     if host.is_none() && !host_source_present && policy.allow_missing_host {
         return None;
@@ -6364,6 +6413,27 @@ fn trusted_host_rejection<B>(
         )
             .into_response(),
     )
+}
+
+/// Normalise a parsed host for trusted-host matching: strip trailing dots,
+/// then ASCII-lowercase. `None` when nothing is left.
+///
+/// Borrows when the host is already in that form — browsers send a lowercase,
+/// dot-free host, so that is the per-request case — and copies only a host
+/// that actually carries an ASCII uppercase letter. Lowercasing neither adds
+/// nor removes a `.`, so trimming first yields exactly the string that
+/// lowercasing first would, which is how the rules in
+/// [`TrustedHostPolicy::from_config`] are normalised.
+fn normalize_trusted_host(host: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    Some(if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    })
 }
 
 /// Tower [`Layer`](tower::Layer) enforcing [`TrustedHostPolicy`] on the ingress
@@ -8907,6 +8977,8 @@ mod tests {
             state: test_state(),
             session_cookie: "autumn.sid".to_owned(),
             tasks: crate::mcp::McpTaskConfig::default(),
+            instructions: None,
+            catalog: crate::mcp::McpCatalog::Full,
         };
         let mcp_router =
             crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);
@@ -11763,12 +11835,7 @@ enabled = true
         // OPTIONS too: the endpoint mounts its own CORS preflight there.
         for method in ["GET", "POST", "OPTIONS"] {
             let mut ctx = duplicate_test_ctx();
-            ctx.mcp = Some(crate::mcp::McpRuntime {
-                mount_path: "/agent-tools".to_owned(),
-                expose_all: false,
-                endpoint_layer: None,
-                tasks: crate::mcp::McpTaskConfig::default(),
-            });
+            ctx.mcp = Some(crate::mcp::McpRuntime::new("/agent-tools"));
             ctx.declared_routes = vec![declared_route(method, "/agent-tools", "evil-plugin")];
             let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
                 .expect_err("a declared route on the MCP path must be refused");
@@ -11789,12 +11856,7 @@ enabled = true
     async fn try_build_router_accepts_a_declared_delete_on_the_mcp_mount_path() {
         let config = AutumnConfig::default();
         let mut ctx = duplicate_test_ctx();
-        ctx.mcp = Some(crate::mcp::McpRuntime {
-            mount_path: "/agent-tools".to_owned(),
-            expose_all: false,
-            endpoint_layer: None,
-            tasks: crate::mcp::McpTaskConfig::default(),
-        });
+        ctx.mcp = Some(crate::mcp::McpRuntime::new("/agent-tools"));
         ctx.declared_routes = vec![declared_route("DELETE", "/agent-tools", "honest-plugin")];
         let _built = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect("a declared DELETE does not clash with the MCP verbs");
@@ -14906,6 +14968,76 @@ mod trusted_host_tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The per-request host is borrowed when it is already lowercase and
+    /// dot-free (what browsers send), and copied only to lowercase it. The
+    /// text compared is the same either way.
+    #[test]
+    fn normalize_trusted_host_borrows_an_already_normal_host() {
+        use std::borrow::Cow;
+
+        assert!(matches!(
+            normalize_trusted_host("example.com"),
+            Some(Cow::Borrowed("example.com"))
+        ));
+        assert!(matches!(
+            normalize_trusted_host("example.com."),
+            Some(Cow::Borrowed("example.com"))
+        ));
+        assert!(matches!(
+            normalize_trusted_host("::1"),
+            Some(Cow::Borrowed("::1"))
+        ));
+        assert!(matches!(
+            normalize_trusted_host("API.Example.COM"),
+            Some(Cow::Owned(_))
+        ));
+        assert_eq!(
+            normalize_trusted_host("API.Example.COM..").as_deref(),
+            Some("api.example.com")
+        );
+        assert!(normalize_trusted_host("...").is_none());
+        assert!(normalize_trusted_host("").is_none());
+    }
+
+    #[tokio::test]
+    async fn trusted_host_mixed_case_trailing_dot_matches_subdomain_rule() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec![".example.com".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "API.Example.COM.")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `hosts = ["*"]` still rejects a host that is nothing but dots: a host
+    /// source is present but normalises to nothing, so there is no host to
+    /// allow.
+    #[tokio::test]
+    async fn trusted_host_wildcard_still_rejects_dots_only_host() {
+        let mut cfg = AutumnConfig::default();
+        cfg.security.trusted_hosts.hosts = vec!["*".into()];
+        let router = build_router(vec![], &cfg, crate::state::AppState::for_test());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/nope")
+                    .header("host", "...")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn trusted_host_bypasses_custom_probe_path_only() {
         let mut cfg = AutumnConfig::default();
@@ -15079,6 +15211,120 @@ mod trusted_host_tests {
             Some("application/problem+json"),
             "timeout response must use Problem Details content type"
         );
+    }
+
+    /// `MakeWriter` collecting a scoped `fmt` subscriber's output, so a test
+    /// can assert on the rendered `autumn::timeout` warn.
+    #[derive(Clone)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut held) = self.0.lock() {
+                held.extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    impl LogBuf {
+        /// Install a plain-text `fmt` subscriber writing here, for this thread.
+        fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+            let buf = Self(Arc::default());
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .finish();
+            (buf, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// The timeout warn names the matched route template, never the raw path,
+    /// as a `&str` field (quoted in text output). The layer keeps the
+    /// `MatchedPath` itself until the deadline passes instead of a copy.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_warn_names_the_route_template() {
+        let (logs, _guard) = LogBuf::install();
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow/{id}",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "ok"
+            }),
+        );
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow/7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let request_id = response.headers()["x-request-id"].to_str().unwrap();
+
+        let out = logs.text();
+        assert!(out.contains("inbound request exceeded deadline"), "{out}");
+        assert!(out.contains(r#"route="/slow/{id}""#), "{out}");
+        assert!(
+            out.contains(&format!(r#"request_id="{request_id}""#)),
+            "{out}"
+        );
+        assert!(!out.contains("/slow/7"), "{out}");
+    }
+
+    /// A caller deadline of 0 answers before the handler runs, on the other
+    /// call site of the same warn: it too names the route template.
+    #[tokio::test(start_paused = true)]
+    async fn zero_caller_deadline_warn_names_the_route_template() {
+        let (logs, _guard) = LogBuf::install();
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+        config.server.timeouts.accept_deadline_header = true;
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> =
+            axum::Router::new().route("/slow/{id}", axum::routing::get(|| async { "ok" }));
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow/7")
+                    .header(crate::deadline::DEADLINE_HEADER, "0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let out = logs.text();
+        assert!(out.contains(r#"route="/slow/{id}""#), "{out}");
+        assert!(!out.contains("/slow/7"), "{out}");
     }
 
     /// In a fault scope, the timeout takes only the time left: a fault wait
@@ -16225,10 +16471,8 @@ mod trusted_host_tests {
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: Some(crate::mcp::McpRuntime {
-                mount_path: "/mcp".to_owned(),
                 expose_all: true,
-                endpoint_layer: None,
-                tasks: crate::mcp::McpTaskConfig::default(),
+                ..crate::mcp::McpRuntime::new("/mcp")
             }),
         };
 
@@ -16383,10 +16627,8 @@ mod trusted_host_tests {
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: Some(crate::mcp::McpRuntime {
-                mount_path: "/mcp".to_owned(),
                 expose_all: true,
-                endpoint_layer: None,
-                tasks: crate::mcp::McpTaskConfig::default(),
+                ..crate::mcp::McpRuntime::new("/mcp")
             }),
         };
         let (_tmp, dist) = build_empty_dist();

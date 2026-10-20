@@ -1273,9 +1273,17 @@ impl CustomDomainRegistry {
     }
 
     /// Is this hostname registered and serving?
+    ///
+    /// Same answer as `tenant_for_host(hostname).is_some()`, without copying
+    /// the tenant id out of the index only to drop it: this runs on the
+    /// trusted-host check for every request on a custom domain.
     #[must_use]
     pub fn is_servable(&self, hostname: &str) -> bool {
-        self.tenant_for_host(hostname).is_some()
+        normalize_hostname(hostname).is_ok_and(|host| {
+            read_lock(&self.index)
+                .get(&host)
+                .is_some_and(CustomDomain::is_servable)
+        })
     }
 
     /// Every record, sorted by hostname for a stable status listing.
@@ -2823,6 +2831,55 @@ mod tests {
             DomainStatus::Active,
             "re-registering must not reset a live domain"
         );
+    }
+
+    /// `is_servable` answers without copying the tenant id out, so pin that it
+    /// still gives exactly `tenant_for_host(..).is_some()`: only an `Active`
+    /// record serves, under any spelling the hostname normaliser folds.
+    #[tokio::test]
+    async fn is_servable_only_for_an_active_domain_in_any_spelling() {
+        let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
+        registry.load().await.unwrap();
+        registry
+            .register("app.clientco.com", "t1", 100)
+            .await
+            .unwrap();
+        assert!(
+            !registry.is_servable("app.clientco.com"),
+            "pending_dns must not serve"
+        );
+        assert!(registry.tenant_for_host("app.clientco.com").is_none());
+
+        registry
+            .record_active("app.clientco.com", 100, 200)
+            .await
+            .unwrap();
+        for spelling in [
+            "app.clientco.com",
+            "APP.ClientCo.com",
+            "app.clientco.com.",
+            "app.clientco.com:443",
+        ] {
+            assert!(registry.is_servable(spelling), "{spelling}");
+            assert_eq!(
+                registry.is_servable(spelling),
+                registry.tenant_for_host(spelling).is_some(),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            registry.tenant_for_host("APP.ClientCo.com").as_deref(),
+            Some("t1")
+        );
+
+        // Unregistered and unparseable names never serve.
+        assert!(!registry.is_servable("other.clientco.com"));
+        assert!(!registry.is_servable(""));
+        assert!(!registry.is_servable("*.clientco.com"));
+
+        // Nor does a removed one.
+        assert!(registry.remove("app.clientco.com").await.unwrap());
+        assert!(!registry.is_servable("app.clientco.com"));
     }
 
     #[tokio::test]

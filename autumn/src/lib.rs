@@ -1035,6 +1035,48 @@ pub mod __private {
     tokio::task_local! {
         pub static FACTORY_DEPTH: u32;
     }
+
+    /// Borrowed twin of [`crate::TransitionEffect`] for the `on_commit` job
+    /// payload.
+    ///
+    /// The `#[state_machine]` `on_commit` codegen (#1973) serializes this, so
+    /// firing an effect does not copy the literal model/field/state names into
+    /// owned `String`s only for `serde_json::to_value` to copy them again.
+    ///
+    /// Serializes to exactly the JSON `TransitionEffect` does (same field
+    /// names, same order), so the job still receives a `TransitionEffect`. The
+    /// `From` impl destructures `TransitionEffect` exhaustively: a field added
+    /// there fails to compile here until this twin carries it too.
+    #[derive(serde::Serialize)]
+    pub struct TransitionEffectRef<'a> {
+        pub model: &'a str,
+        pub field: &'a str,
+        pub record_id: &'a str,
+        pub from_state: &'a str,
+        pub to_state: &'a str,
+        pub idempotency_key: &'a str,
+    }
+
+    impl<'a> From<&'a crate::TransitionEffect> for TransitionEffectRef<'a> {
+        fn from(effect: &'a crate::TransitionEffect) -> Self {
+            let crate::TransitionEffect {
+                model,
+                field,
+                record_id,
+                from_state,
+                to_state,
+                idempotency_key,
+            } = effect;
+            Self {
+                model,
+                field,
+                record_id,
+                from_state,
+                to_state,
+                idempotency_key,
+            }
+        }
+    }
 }
 
 pub use crate::router::RouteVersionMetadata;

@@ -37,6 +37,11 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      posture_ack:
+        description: "Posture gate: acknowledge a widening. Give the digest and ceiling from the /ack-posture line."
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -69,12 +74,21 @@ jobs:
   # manifest. It then diffs the manifest against the one committed next to the
   # example. A change that widens the security surface fails here, such as a
   # route that more callers can reach, or a removed guard.
-  # fails here, with the same acknowledgment escape hatch the product ships.
+  # The gate has the same acknowledgment escape hatch as the product:
+  #   - pull request: a /ack-posture comment from a user with write access.
+  #   - workflow_dispatch: the posture_ack input.
+  #   - tag push: none. Acknowledge and merge the widening before the tag.
+  # A comment does not re-run this workflow. After you comment, re-run the
+  # job (Actions, Publish Gate, Re-run failed jobs) or push a commit.
   # See scripts/check-posture-gate.sh and docs/guide/posture-gate.md.
   # ---------------------------------------------------------------------------
   posture-gate:
     name: Security posture gate (examples)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # To read pull request comments and reviews for acknowledgments.
+      pull-requests: read
     steps:
       # Full history: the script resolves each example's *accepted* posture from
       # the base revision, so that refreshing a committed baseline in the same
@@ -84,7 +98,47 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
+      # Only comments from users with admin, write or maintain permission count.
+      # The job asks GitHub for the permission. It does not use author_association.
+      # Each comment goes to its own file, so one comment cannot change another.
+      # A GitHub API error leaves the directory empty: nothing is acknowledged.
+      # A comment does not re-run this workflow. After you comment, re-run the
+      # job (Actions, Publish Gate, Re-run failed jobs) or push a commit.
+      - name: Harvest acknowledgments from authorized reviewers
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          rm -rf "$RUNNER_TEMP/acks"
+          mkdir -p "$RUNNER_TEMP/acks"
+          authors_and_bodies() {
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/$1" \
+              --jq '.[] | select((.user.login // "") != "github-actions[bot]") | "\(.user.login // "")\t\((.body // "") | @base64)"' || true
+          }
+          n=0
+          {
+            authors_and_bodies "issues/${PR_NUMBER}/comments"
+            authors_and_bodies "pulls/${PR_NUMBER}/reviews"
+          } | while IFS=$'\t' read -r login body64; do
+            [ -n "$login" ] || continue
+            PERM=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${login}/permission" \
+                     --jq '.permission' 2>/dev/null || echo none)
+            case "$PERM" in
+              admin|write|maintain) ;;
+              *) continue ;;
+            esac
+            n=$((n + 1))
+            echo "acknowledgment accepted from ${login} (${PERM})"
+            printf '%s\n' "$body64" | base64 -d \
+              > "$RUNNER_TEMP/acks/$(printf '%06d' "$n").md"
+          done
       - name: Run the posture gate over the example apps
+        env:
+          # Each variable is empty when its source does not apply. The script ignores empty values.
+          AUTUMN_POSTURE_ACK: ${{ inputs.posture_ack }}
+          AUTUMN_POSTURE_ACK_DIR: ${{ github.event_name == 'pull_request' && format('{0}/acks', runner.temp) || '' }}
         run: ./scripts/check-posture-gate.sh
 
   # ---------------------------------------------------------------------------
@@ -241,7 +295,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-semver-checks tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.20
+        uses: taiki-e/install-action@v2.87.28
         with:
           tool: cargo-semver-checks
       - name: Check public API SemVer compatibility
@@ -298,7 +352,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.28
         with:
           tool: cargo-deny@0.20.2
       - name: Dependency advisory gate

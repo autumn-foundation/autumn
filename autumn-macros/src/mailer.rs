@@ -250,17 +250,27 @@ pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // When the mailer opts into list_unsubscribe, tag every built message
         // with the scope so the runtime emits RFC 8058 headers and applies
         // suppression at send time.
+        //
+        // The template method itself is rewritten (above) to tag its `Mail`
+        // with this same scope, and every method these helpers wrap passed the
+        // same `returns_mail` + `&self` test, so the tag is normally already
+        // there: re-tag only when it is not, rather than dropping and
+        // re-allocating the identical `String` on every send.
         let (bind_send, bind_later) = if let Some(scope) = &list_unsubscribe {
             (
                 quote! {
                     let mut mail = self.#original #method_generic_call ( #( #arg_names, )* );
-                    mail.list_unsubscribe =
-                        ::core::option::Option::Some(::std::string::String::from(#scope));
+                    if mail.list_unsubscribe.as_deref() != ::core::option::Option::Some(#scope) {
+                        mail.list_unsubscribe =
+                            ::core::option::Option::Some(::std::string::String::from(#scope));
+                    }
                 },
                 quote! {
                     let mut mail = self.#original #method_generic_call ( #( #arg_names_later, )* );
-                    mail.list_unsubscribe =
-                        ::core::option::Option::Some(::std::string::String::from(#scope));
+                    if mail.list_unsubscribe.as_deref() != ::core::option::Option::Some(#scope) {
+                        mail.list_unsubscribe =
+                            ::core::option::Option::Some(::std::string::String::from(#scope));
+                    }
                 },
             )
         } else {
@@ -612,6 +622,52 @@ mod tests {
             rendered.contains("__autumn_list_mail"),
             "template method body must tag its returned Mail: {rendered}"
         );
+    }
+
+    #[test]
+    fn list_unsubscribe_helpers_only_retag_an_untagged_mail() {
+        let out = mailer_macro(
+            quote! { list_unsubscribe = "weekly_digest" },
+            quote! {
+                impl DigestMailer {
+                    fn digest(&self, to: String) -> Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        // The wrapped template tags unconditionally, once...
+        assert_eq!(
+            rendered
+                .matches("__autumn_list_mail . list_unsubscribe =")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        // ...so send_* / deliver_later_* re-tag only behind a guard, instead of
+        // re-allocating the identical scope `String` on every send.
+        assert_eq!(
+            rendered
+                .matches(
+                    "if mail . list_unsubscribe . as_deref () != :: core :: option :: Option :: Some (\"weekly_digest\")"
+                )
+                .count(),
+            2,
+            "{rendered}"
+        );
+        // The tag itself is unchanged wherever it is still written: the wrapper
+        // plus the two guarded helper fallbacks.
+        assert_eq!(
+            rendered
+                .matches(
+                    "list_unsubscribe = :: core :: option :: Option :: Some (:: std :: string :: String :: from (\"weekly_digest\"))"
+                )
+                .count(),
+            3,
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("let mut mail =").count(), 2, "{rendered}");
     }
 
     #[test]
