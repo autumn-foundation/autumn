@@ -1300,9 +1300,9 @@ struct SweptDataset {
 
 // ── SQLite sweep (issue #2553) ───────────────────────────────────────────
 
-/// The database clock in epoch milliseconds. Every `SQLite` time column the
-/// sweeps read is written from the database or app clock; reading `now` from
-/// the database keeps the cutoff on the same clock as the Postgres sweep.
+/// The database clock in epoch milliseconds. Like the Postgres sweep, the
+/// cutoff is read on the database side. The job runtime's own prune uses the
+/// app clock, so the two differ only under a simulated clock.
 #[cfg(any(test, all(feature = "db", feature = "sqlite")))]
 const SQLITE_NOW_MS: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
 
@@ -1550,7 +1550,12 @@ async fn resolve_sqlite_cutoff(
             )
         })?;
     let ms = row.cutoff_ms.ok_or_else(too_wide)?;
-    let at = DateTime::<Utc>::from_timestamp_millis(ms).ok_or_else(too_wide)?;
+    // A text column holds whole seconds. Report the instant that is applied.
+    let at = match clock {
+        SqliteClock::Millis => DateTime::<Utc>::from_timestamp_millis(ms),
+        SqliteClock::Text => DateTime::<Utc>::from_timestamp(ms.div_euclid(1000), 0),
+    }
+    .ok_or_else(too_wide)?;
     let cutoff = match clock {
         SqliteClock::Millis => SqliteCutoff::Millis(ms),
         SqliteClock::Text => SqliteCutoff::Text(at.format("%Y-%m-%d %H:%M:%S").to_string()),
@@ -2200,6 +2205,44 @@ mod tests {
         assert_eq!(failure.eligible, Some(5_000_000));
         assert_eq!(failure.removed, 500);
         assert_eq!(sweep_failed(0, "no pool".to_owned()).eligible, None);
+    }
+
+    #[test]
+    fn sqlite_predicates_use_one_cutoff_and_the_same_statuses_as_postgres() {
+        for dataset in RETENTION_DATASETS {
+            let sqlite = stale_row_predicate_sqlite(dataset);
+            let pg = stale_row_predicate(dataset);
+            assert_eq!(
+                sqlite.as_ref().map(|(table, ..)| *table),
+                pg.map(|(table, _)| table)
+                    .filter(|_| dataset != RetentionDataset::JobTracking),
+                "{dataset}: same table set, job_tracking is TTL-only on SQLite"
+            );
+            if let Some((_, predicate, _)) = sqlite {
+                assert!(predicate.contains("?1"), "{dataset}: {predicate}");
+                assert!(
+                    !predicate.contains("$1") && !predicate.contains("?2"),
+                    "{predicate}"
+                );
+                if let Some((_, pg_predicate)) = pg {
+                    assert_eq!(
+                        statuses_in(&predicate),
+                        statuses_in(pg_predicate),
+                        "{dataset}"
+                    );
+                    assert_eq!(states_in(&predicate), states_in(pg_predicate), "{dataset}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_job_history_keeps_a_live_ttl_dedup_hold() {
+        let (_, predicate, clock) =
+            stale_row_predicate_sqlite(RetentionDataset::JobHistory).expect("sweepable");
+        assert_eq!(clock, SqliteClock::Millis);
+        assert!(predicate.contains("unique_ttl_ms"), "{predicate}");
+        assert!(predicate.contains("finished_at IS NOT NULL"), "{predicate}");
     }
 
     #[test]

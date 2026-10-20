@@ -274,7 +274,7 @@ async fn a_dry_run_counts_without_deleting_and_has_the_postgres_report_shape() {
 }
 
 #[tokio::test]
-async fn the_cutoff_is_the_database_clock_minus_the_window() {
+async fn the_report_cutoff_is_the_window_before_now() {
     let fx = start().await;
     insert_job(&fx.pool, "old", "completed", 90).await;
     let state = state_with(&fx.pool, config_with_windows());

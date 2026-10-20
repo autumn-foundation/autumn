@@ -2580,6 +2580,9 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 /// An unparsable URL never claims a match (the guard errs toward "different",
 /// leaving the profile guard as the enforcement).
 fn same_database_in(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if let (Some(a), Some(b)) = (sqlite::database_file(a), sqlite::database_file(b)) {
+        return a == b;
+    }
     match (database_endpoint(a, env), database_endpoint(b, env)) {
         (Some((ends_a, name_a)), Some((ends_b, name_b))) => {
             name_a == name_b
@@ -11094,10 +11097,18 @@ mod tests {
             "postgres://h.example.com/app",
             &|_| None
         ));
-        // The same non-Postgres URL is not a source overwrite.
-        assert!(!same_database_in("sqlite:///app", "sqlite:///app", &|_| {
-            None
-        }));
+        // One SQLite file reached by two spellings is a source overwrite.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.db");
+        std::fs::write(&file, b"").unwrap();
+        let url = format!("sqlite://{}", file.display());
+        let detour = format!(
+            "sqlite://{}/../{}/app.db",
+            dir.path().display(),
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        assert!(same_database_in(&url, &detour, &|_| None));
+        assert!(!same_database_in(&url, "sqlite:///other/app.db", &|_| None));
     }
 
     #[test]

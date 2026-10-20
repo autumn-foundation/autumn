@@ -830,12 +830,23 @@ What is different:
 - **Hashing.** SQLite has no `md5`. The scrub registers `autumn_sha256` on its
   connection. `--dry-run` prints SQL that calls it, so plain `sqlite3` cannot
   run the printed script. Use the printed SQL for audit only. Do not run it.
+- **Compaction is checked.** If a reader blocks the WAL checkpoint, the scrub
+  reports an error. Stop the app, or run `PRAGMA wal_checkpoint(TRUNCATE)`
+  yourself, before you share the file.
+- **Schema text is not rewritten.** The scrub changes row data only. A literal in
+  an index `WHERE`, a `CHECK`, a `DEFAULT` or a trigger stays in the schema.
+  Triggers on tables the run writes are reported, as on Postgres. Review them.
 - **Foreign keys are on.** A purge that would orphan a row rolls back.
 - **Extra refusals.** A `CHECK` column cannot get a made-up value, so it is
   refused. Autumn reads the `CHECK` clauses from the `CREATE TABLE` text. A
   virtual table (for example FTS5) is refused, because its shadow tables hold
   copies of row text. `--sample` is refused. A delete trigger on a purged
   table is refused.
+- **Logical types are `TEXT`.** Autumn stores a UUID, a decimal and JSON as
+  `TEXT` on SQLite, so `auto` treats them as text and writes a redaction string.
+  Declare the right strategy for such a column: `uuid`, `zero`, `epoch` or
+  `json`. For a declared type that `auto` cannot read as a number or a date,
+  `auto` refuses.
 - **Type rules.** SQLite does not enforce column types or lengths. `varchar(n)`
   limits do not apply. `date`, `datetime` and
   `numeric` columns use `epoch` and `zero`.

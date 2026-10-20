@@ -38,6 +38,16 @@ diesel::define_sql_function! {
     fn autumn_sha256(value: Text) -> Text;
 }
 
+/// The file a `SQLite` URL names, with symlinks and `..` resolved. `None` for a
+/// URL that is not `SQLite`, or is in-memory.
+pub(super) fn database_file(url: &str) -> Option<PathBuf> {
+    if !is_sqlite_url(url) {
+        return None;
+    }
+    let path = sqlite_snapshot::database_path(url).ok()?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
 /// Whether a resolved target URL names a `SQLite` database.
 fn is_sqlite_url(url: &str) -> bool {
     matches!(
@@ -160,12 +170,19 @@ pub(super) fn auto_strategy(column: &Column) -> Result<Strategy, ScrubError> {
         | ColumnType::Bool
         | ColumnType::Decimal { .. } => Strategy::Zero,
         ColumnType::Timestamp | ColumnType::TimestampTz => Strategy::Epoch,
-        // A NUMERIC-affinity declared type (`DATE`, `BOOLEAN`, `DECIMAL`, …).
+        // A NUMERIC-affinity declared type. Guess only for a type that is
+        // plainly a date, a time or a number. `UUID` and `JSON` land here too,
+        // and a made-up `0` in them reads back as garbage.
         ColumnType::Opaque { pg_type } => {
             if opaque_epoch(pg_type).is_some() {
                 Strategy::Epoch
-            } else {
+            } else if is_plainly_numeric(pg_type) {
                 Strategy::Zero
+            } else {
+                return Err(ScrubError::NoAutoStrategy {
+                    column: column.name.clone(),
+                    detail: format!("declared type {pg_type:?}"),
+                });
             }
         }
         other => {
@@ -175,6 +192,14 @@ pub(super) fn auto_strategy(column: &Column) -> Result<Strategy, ScrubError> {
             });
         }
     })
+}
+
+/// Whether a declared type is plainly a number or a boolean.
+fn is_plainly_numeric(decl: &str) -> bool {
+    let decl = decl.to_ascii_lowercase();
+    ["numeric", "decimal", "number", "bool", "money"]
+        .iter()
+        .any(|word| decl.contains(word))
 }
 
 /// The epoch literal for a date/time-like declared type.
@@ -229,7 +254,12 @@ pub(super) fn replacement_expr(
         }
         Strategy::Null => "NULL".to_owned(),
         Strategy::Uuid => {
-            require_type(column, strategy, matches!(column.ty, ColumnType::Uuid))?;
+            // SQLite stores a UUID as `TEXT`, so a declared `TEXT` column is fine.
+            require_type(
+                column,
+                strategy,
+                matches!(column.ty, ColumnType::Uuid | ColumnType::Text),
+            )?;
             format!(
                 "substr({token}, 1, 8) || '-' || substr({token}, 9, 4) || '-' || \
                  substr({token}, 13, 4) || '-' || substr({token}, 17, 4) || '-' || \
@@ -257,11 +287,16 @@ pub(super) fn replacement_expr(
             | ColumnType::Float32
             | ColumnType::Float64
             | ColumnType::Decimal { .. }
+            // Explicit only: `auto` never picks `zero` for text. SQLite keeps
+            // a decimal as `TEXT`, and `0` converts to `'0'` there.
+            | ColumnType::Text
             | ColumnType::Opaque { .. } => "0".to_owned(),
             _ => return Err(mismatch()),
         },
         Strategy::Epoch => match &column.ty {
-            ColumnType::Timestamp | ColumnType::TimestampTz => "'1970-01-01 00:00:00'".to_owned(),
+            ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Text => {
+                "'1970-01-01 00:00:00'".to_owned()
+            }
             ColumnType::Opaque { pg_type } => {
                 opaque_epoch(pg_type).ok_or_else(mismatch)?.to_owned()
             }
@@ -766,6 +801,7 @@ fn rewrite_encrypted_column(
     } else {
         Mode::Randomized
     };
+    let total = rows.len();
     let mut updated = 0;
     for row in rows {
         let plaintext = encrypted_plaintext(rewrite.shape, &row.token);
@@ -785,6 +821,16 @@ fn rewrite_encrypted_column(
         .bind::<Text, _>(envelope)
         .bind::<Text, _>(row.row_key)
         .execute(conn)?;
+    }
+    // A row the key did not match would keep its old ciphertext.
+    if updated != total {
+        return Err(diesel::result::Error::QueryBuilderError(
+            format!(
+                "re-encrypted {updated} of {total} rows in {table}.{}. Nothing was written.",
+                rewrite.column
+            )
+            .into(),
+        ));
     }
     Ok(updated)
 }
@@ -876,17 +922,44 @@ fn apply(
     Ok(counts)
 }
 
-/// Remove the pre-scrub bytes from the file: rebuild the planner statistics
-/// (`sqlite_stat4` keeps sample index keys), rewrite the file, truncate the WAL.
-fn compact(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
-    let stat4: CountRow = sql_query(
-        "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat4'",
-    )
-    .get_result(conn)?;
-    if stat4.n > 0 {
-        conn.batch_execute("ANALYZE;")?;
+#[derive(QueryableByName)]
+struct Checkpoint {
+    #[diesel(sql_type = Integer)]
+    busy: i32,
+    #[diesel(sql_type = Integer)]
+    log: i32,
+    #[diesel(sql_type = Integer)]
+    checkpointed: i32,
+}
+
+/// Remove the pre-scrub bytes from the file: drop the planner samples
+/// (`sqlite_stat3` and `sqlite_stat4` keep index keys), rewrite the file, and
+/// truncate the WAL. A checkpoint that a reader blocks is an error, because the
+/// WAL would still hold the old pages.
+fn compact(conn: &mut SqliteConnection) -> Result<(), String> {
+    let db = |e: diesel::result::Error| e.to_string();
+    for table in ["sqlite_stat3", "sqlite_stat4"] {
+        let found: CountRow = sql_query(format!(
+            "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+        ))
+        .get_result(conn)
+        .map_err(db)?;
+        if found.n > 0 {
+            conn.batch_execute(&format!("DELETE FROM {table};"))
+                .map_err(db)?;
+        }
     }
-    conn.batch_execute("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+    conn.batch_execute("VACUUM;").map_err(db)?;
+    let rows: Vec<Checkpoint> = sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .load(conn)
+        .map_err(db)?;
+    // A database that is not in WAL mode returns -1 for both counts.
+    match rows.first() {
+        Some(row) if row.busy != 0 || (row.log >= 0 && row.log != row.checkpointed) => {
+            Err("a reader blocked the WAL checkpoint, so the WAL may hold old pages".to_owned())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Name what changed between two probes.
@@ -1236,8 +1309,35 @@ mod tests {
         );
         assert_eq!(auto_strategy(&date).expect("auto"), Strategy::Epoch);
         assert_eq!(auto_strategy(&numeric).expect("auto"), Strategy::Zero);
+        // `auto` never guesses for a type it cannot read as a number or a date.
+        let uuid = column(
+            "ref",
+            ColumnType::Opaque {
+                pg_type: "UUID".to_owned(),
+            },
+        );
+        assert!(matches!(
+            auto_strategy(&uuid),
+            Err(ScrubError::NoAutoStrategy { .. })
+        ));
         let blob = column("raw", ColumnType::Bytes);
         assert!(replacement_expr(Strategy::Zero, &blob, "t").is_err());
+    }
+
+    #[test]
+    fn a_text_column_can_take_an_explicit_uuid_zero_or_epoch() {
+        let text = column("external_ref", ColumnType::Text);
+        let uuid = replacement_expr(Strategy::Uuid, &text, "tok").expect("uuid");
+        assert!(uuid.contains("substr(tok, 1, 8)"), "{uuid}");
+        assert_eq!(
+            replacement_expr(Strategy::Zero, &text, "t").expect("zero"),
+            "0"
+        );
+        assert_eq!(
+            replacement_expr(Strategy::Epoch, &text, "t").expect("epoch"),
+            "'1970-01-01 00:00:00'"
+        );
+        assert_eq!(auto_strategy(&text).expect("auto"), Strategy::Redact);
     }
 
     #[test]
@@ -1328,5 +1428,66 @@ mod tests {
             .expect("fts5");
         let probed = probe(&mut conn, &super::super::ScrubConfig::default()).expect("probe");
         assert_eq!(probed.virtual_tables, ["docs"]);
+    }
+
+    #[test]
+    fn mixed_backends_and_sample_are_refused_before_any_write() {
+        let sqlite = ("control".to_owned(), "sqlite://app.db".to_owned());
+        let pg = ("shard:a".to_owned(), "postgres://u@h/db".to_owned());
+        let args = ScrubArgs::default();
+        assert!(!check_targets(&args, std::slice::from_ref(&pg)).expect("pg only"));
+        assert!(check_targets(&args, std::slice::from_ref(&sqlite)).expect("sqlite only"));
+        assert!(matches!(
+            check_targets(&args, &[sqlite.clone(), pg]),
+            Err(ScrubError::MixedBackends)
+        ));
+        let sampled = ScrubArgs {
+            sample: vec!["users=1".to_owned()],
+            ..ScrubArgs::default()
+        };
+        assert!(matches!(
+            check_targets(&sampled, &[sqlite]),
+            Err(ScrubError::UnsupportedOnSqlite { .. })
+        ));
+    }
+
+    #[test]
+    fn a_schema_change_after_the_plan_rolls_the_run_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        let url = format!("sqlite://{}", path.display());
+        let mut conn = SqliteConnection::establish(&path.to_string_lossy()).expect("open");
+        conn.batch_execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT); \
+             INSERT INTO users (email) VALUES ('keep@me.example');",
+        )
+        .expect("seed");
+        let config = super::super::ScrubConfig::default();
+        let planned = probe(&mut conn, &config).expect("probe").facts;
+        // A column appears after the plan was made.
+        conn.batch_execute("ALTER TABLE users ADD COLUMN ssn TEXT;")
+            .expect("alter");
+        let mut plan = ScrubPlan::default();
+        plan.tables.push(super::super::TablePlan {
+            table: "users".to_owned(),
+            columns: Vec::new(),
+            sql: Some("UPDATE \"users\" SET \"email\" = 'gone'".to_owned()),
+            row_key: "CAST(rowid AS TEXT)".to_owned(),
+            encrypted: Vec::new(),
+        });
+        let result = apply("control", &url, &plan, &[], &planned, &config);
+        assert!(
+            matches!(&result, Err(ScrubError::SchemaChanged { entries }) if entries.iter().any(|e| e.contains("ssn"))),
+            "{result:?}"
+        );
+        #[derive(QueryableByName)]
+        struct One {
+            #[diesel(sql_type = Text)]
+            v: String,
+        }
+        let kept: One = sql_query("SELECT email AS v FROM users")
+            .get_result(&mut conn)
+            .expect("read");
+        assert_eq!(kept.v, "keep@me.example", "nothing was written");
     }
 }
