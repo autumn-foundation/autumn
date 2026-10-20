@@ -119,6 +119,7 @@ mod sqlite {
                 create_on_demand: None,
                 idle_close_secs: 0,
                 restore_missing: false,
+                ownership: None,
             }
         }
 

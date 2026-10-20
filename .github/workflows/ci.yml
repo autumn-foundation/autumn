@@ -2296,6 +2296,11 @@ jobs:
           # rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet_sweeper
+          # Issue #3233: slot ownership driven by its renew loop in virtual
+          # time. Single-threaded, like its CI step. Same features, so no
+          # rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sim_fleet_ownership -- --test-threads=1
           # Issue #3231: the SQLite commit-hook worker loop (stop token, claim
           # heartbeat guard). No other lane measures it, so Codecov reads those
           # lines as uncovered. Same features, so no rebuild.
@@ -2699,7 +2704,8 @@ jobs:
             --test sim_outbox_crash \
             --test sqlite_outbox_writers
       - name: Run the multi-replica sim suites (issue #3067)
-        # Several replicas on one sim clock and one SQLite database. Single
+        # Several replicas on one sim clock and one SQLite database, and the
+        # partitioned fleet owner of issue #3233. Single
         # threaded, like the `sim_` lane of the `test` job: `sim_fleet_trace`
         # compares two traces byte for byte, and `tracing` caches callsite
         # interest for the whole process.
@@ -2707,6 +2713,7 @@ jobs:
           cargo test -p autumn-web --features "sqlite,test-support" \
             --test sim_replicas \
             --test sim_fleet_trace \
+            --test sim_fleet_ownership \
             -- --test-threads=1
       - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
         # `sim_chaos_mail` and `sim_outbox_mail` (#3062) need the `mail`

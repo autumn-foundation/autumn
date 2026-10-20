@@ -178,6 +178,7 @@ fn fleet_with(dir: &FsPath, max_open: usize, migrations: EmbeddedMigrations) -> 
         create_on_demand: Some(true),
         idle_close_secs: 0,
         restore_missing: false,
+        ownership: None,
     })
     .min_residency(Duration::ZERO)
     .migrations("app", migrations)

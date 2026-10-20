@@ -6366,6 +6366,7 @@ impl AppBuilder {
         if let Some(FleetRuntime {
             maintenance,
             sweeper,
+            ownership,
         }) = fleet_maintenance.take()
         {
             let flush_budget = || {
@@ -6396,12 +6397,21 @@ impl AppBuilder {
             fleet_shutdown.cancel();
             if tokio::time::timeout(wait, maintenance).await.is_ok() {
                 tracing::info!("shutdown: SQLite fleet databases closed");
+                // Only after the close: the last frames ship under the epoch.
+                if let Some(ownership) = ownership {
+                    ownership.finish().await;
+                }
             } else {
                 tracing::warn!(
                     timeout_secs = wait.as_secs(),
                     "shutdown: SQLite fleet databases did not all close within the shutdown \
                      budget; a replicated fleet's last frames may not be offsite"
                 );
+                // Renewals stop, so the ranges lapse. No release: a database
+                // may still be open.
+                if let Some(ownership) = ownership {
+                    drop(ownership.abandon());
+                }
             }
         }
 
@@ -8632,6 +8642,9 @@ impl AppBuilder {
         #[cfg(feature = "sqlite")]
         if let Some(runtime) = fleet_maintenance {
             let _ = runtime.maintenance.await;
+            if let Some(ownership) = runtime.ownership {
+                ownership.finish().await;
+            }
         }
         run_shutdown_hooks(&shutdown_hooks).await;
         // If the generated `pg.stop()` hook errored/timed out it keeps the
@@ -13585,6 +13598,105 @@ struct FleetRuntime {
     maintenance: tokio::task::JoinHandle<()>,
     /// The pending-work sweeper loop, when one runs.
     sweeper: Option<tokio::task::JoinHandle<()>>,
+    /// Slot ownership (issue #3233), when configured.
+    ownership: Option<FleetOwnershipRuntime>,
+}
+
+/// The ownership loop of a fleet. It renews while the databases close, then
+/// [`finish`](Self::finish) releases the ranges.
+#[cfg(feature = "sqlite")]
+struct FleetOwnershipRuntime {
+    fleet: crate::db::fleet::DatabaseFleet,
+    stop: tokio_util::sync::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "sqlite")]
+impl FleetOwnershipRuntime {
+    /// Stop renewing, then release the ranges so the next owner can claim at
+    /// once. Call it after the fleet closed its databases. Another process
+    /// on the volume, or unshipped frames, keep the ranges: they lapse.
+    async fn finish(self) {
+        self.stop.cancel();
+        let _ = self.handle.await;
+        if self.fleet.release_ownership().await {
+            tracing::info!("shutdown: fleet slot ranges released");
+        }
+    }
+
+    /// Stop renewing without a release: the fleet did not close within the
+    /// shutdown budget, so databases may still be open. The ranges lapse.
+    /// The loop ends within a renew interval; the caller need not wait.
+    fn abandon(self) -> tokio::task::JoinHandle<()> {
+        self.stop.cancel();
+        self.handle
+    }
+}
+
+/// Claim this host's slot ranges and install them on the fleet (issue #3233):
+/// the ownership table on the control database, one first claim, the renew
+/// loop and the `fleet:ownership` indicator. `None` without
+/// `[database.fleet.ownership]`.
+#[cfg(feature = "sqlite")]
+async fn start_fleet_ownership(
+    state: &AppState,
+    fleet: &crate::db::fleet::DatabaseFleet,
+) -> Result<Option<FleetOwnershipRuntime>, String> {
+    use crate::db::fleet_ownership::{
+        FleetOwnership, OWNERSHIP_INDICATOR, OwnerId, SlotRange, SqlSlotOwnership,
+    };
+    let Some(config) = state.config().database.fleet.and_then(|f| f.ownership) else {
+        return Ok(None);
+    };
+    let control = state
+        .pool()
+        .cloned()
+        .ok_or("fleet ownership needs a control database")?;
+    let store = SqlSlotOwnership::new(control, state.clock_arc());
+    store.ensure_schema().await.map_err(|e| e.to_string())?;
+    let ranges = config
+        .ranges()?
+        .into_iter()
+        .map(|(start, end)| SlotRange::new(start, end))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let owner = OwnerId::new(config.owner.as_str()).map_err(|e| e.to_string())?;
+    let ownership = Arc::new(
+        FleetOwnership::new(
+            Arc::new(store),
+            owner,
+            ranges,
+            std::time::Duration::from_secs(config.lease_secs),
+        )
+        .map_err(|e| e.to_string())?,
+    );
+    // Claim before the first open. A range another host holds waits for its
+    // lease; the loop claims it then.
+    let report = fleet
+        .start_ownership(Arc::clone(&ownership))
+        .await
+        .map_err(|e| e.to_string())?;
+    tracing::info!(
+        owner = %ownership.owner(),
+        claimed = report.claimed.len(),
+        waiting = report.waiting.len(),
+        failed = report.failed.len(),
+        "fleet slot ownership installed"
+    );
+    if let Err(e) = state.health_indicator_registry.register(
+        OWNERSHIP_INDICATOR,
+        crate::actuator::IndicatorGroup::HealthOnly,
+        ownership.indicator(),
+    ) {
+        tracing::warn!("{e}");
+    }
+    let stop = tokio_util::sync::CancellationToken::new();
+    let handle = fleet.spawn_ownership(stop.clone());
+    Ok(Some(FleetOwnershipRuntime {
+        fleet: fleet.clone(),
+        stop,
+        handle,
+    }))
 }
 
 /// Start the per-process work of a `[database.fleet]` (ADR 0019): a commit-hook
@@ -13611,6 +13723,16 @@ async fn start_fleet_runtime(
     sweep: Option<tokio_util::sync::CancellationToken>,
 ) -> Option<FleetRuntime> {
     let fleet = state.shards()?.fleet()?.clone();
+    // Fatal: a host that cannot tell which slots it owns must not serve.
+    let ownership = match start_fleet_ownership(state, &fleet).await {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            tracing::error!(%error, "SQLite fleet slot ownership could not start");
+            eprintln!("SQLite fleet slot ownership could not start: {error}");
+            exit_stop_managed_pg();
+            std::process::exit(1);
+        }
+    };
     fleet.add_lifecycle(Arc::new(FleetCommitHookWorkers {
         #[cfg(feature = "ws")]
         channels: state.channels().clone(),
@@ -13636,6 +13758,7 @@ async fn start_fleet_runtime(
     Some(FleetRuntime {
         maintenance: fleet.spawn_maintenance(shutdown),
         sweeper,
+        ownership,
     })
 }
 
@@ -13658,6 +13781,18 @@ fn start_fleet_replication(
         .fleet
         .as_ref()
         .is_some_and(|f| f.restore_missing);
+    if restore_missing
+        && config
+            .database
+            .fleet
+            .as_ref()
+            .is_some_and(|f| f.ownership.is_none())
+    {
+        tracing::warn!(
+            "database.fleet.restore_missing is on without [database.fleet.ownership]: nothing \
+             fences the previous owner, so two hosts can write one database and diverge"
+        );
+    }
     let replication = Arc::new(
         crate::db::fleet_replication::FleetReplication::new(
             Arc::clone(runtime.replicator.destination()),
@@ -15304,6 +15439,7 @@ mod fleet_boot_tests {
             create_on_demand: None,
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         });
         config
             .database
@@ -15347,6 +15483,7 @@ mod fleet_boot_tests {
             create_on_demand: None,
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         });
         let resolved = format!("sqlite://{}", root.join("control.db").display());
         let Err(err) = crate::db::fleet::build_for_app(
@@ -15407,6 +15544,7 @@ mod fleet_boot_tests {
             create_on_demand: None,
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         });
         let all = Arc::new(vec![
             ("framework", crate::migrate::FRAMEWORK_MIGRATIONS),
@@ -15454,6 +15592,7 @@ mod fleet_boot_tests {
             create_on_demand: None,
             idle_close_secs: 0,
             restore_missing: false,
+            ownership: None,
         });
         let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
         let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {
@@ -15516,6 +15655,82 @@ mod fleet_boot_tests {
                 .is_none(),
             "no fleet, no runtime"
         );
+    }
+
+    /// `[database.fleet.ownership]` (issue #3233): boot claims the ranges on
+    /// the control database before the first open, registers
+    /// `fleet:ownership`, opens under the epoch, and releases at shutdown.
+    #[tokio::test]
+    async fn the_fleet_runtime_claims_and_releases_slot_ownership() {
+        use crate::db::fleet_ownership::{SlotOwnershipStore as _, SqlSlotOwnership};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut config, fleet, state) = booted(tmp.path());
+        if let Some(fleet_config) = config.database.fleet.as_mut() {
+            fleet_config.ownership = Some(crate::config::FleetOwnershipConfig {
+                owner: "host-a".to_owned(),
+                slots: vec![crate::config::SlotSpec::Range("0-16383".to_owned())],
+                lease_secs: 30,
+            });
+        }
+        state.insert_extension(config);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let runtime = start_fleet_runtime(&state, shutdown.clone(), None)
+            .await
+            .expect("the app has a fleet");
+        assert!(fleet.ownership().is_some());
+        assert!(
+            state
+                .health_indicator_registry()
+                .contains(crate::db::fleet_ownership::OWNERSHIP_INDICATOR)
+        );
+        let db = fleet.open_for("acme").await.unwrap();
+        assert_eq!(db.epoch().map(crate::lock::FencingToken::get), Some(1));
+        drop(db);
+
+        shutdown.cancel();
+        runtime.maintenance.await.unwrap();
+        runtime.ownership.expect("ownership runs").finish().await;
+        let store = SqlSlotOwnership::new(state.pool().cloned().unwrap(), state.clock_arc());
+        let rows = store.rows().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].lease_expires_ms <= state.clock().now().timestamp_millis(),
+            "released at shutdown"
+        );
+    }
+
+    /// The fleet did not close within the shutdown budget: renewals stop, but
+    /// nothing is released while databases may still be open.
+    #[tokio::test]
+    async fn a_fleet_that_did_not_close_stops_renewing_without_a_release() {
+        use crate::db::fleet_ownership::{SlotOwnershipStore as _, SqlSlotOwnership};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut config, _fleet, state) = booted(tmp.path());
+        if let Some(fleet_config) = config.database.fleet.as_mut() {
+            fleet_config.ownership = Some(crate::config::FleetOwnershipConfig {
+                owner: "host-a".to_owned(),
+                slots: vec![crate::config::SlotSpec::Range("0-16383".to_owned())],
+                lease_secs: 30,
+            });
+        }
+        state.insert_extension(config);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let runtime = start_fleet_runtime(&state, shutdown.clone(), None)
+            .await
+            .expect("the app has a fleet");
+        let renewals = runtime.ownership.expect("ownership runs").abandon();
+        tokio::time::timeout(std::time::Duration::from_secs(5), renewals)
+            .await
+            .expect("the renew loop stops")
+            .unwrap();
+        let store = SqlSlotOwnership::new(state.pool().cloned().unwrap(), state.clock_arc());
+        let rows = store.rows().await.unwrap();
+        assert!(
+            rows[0].lease_expires_ms > state.clock().now().timestamp_millis(),
+            "not released: the leases lapse"
+        );
+        shutdown.cancel();
+        runtime.maintenance.await.unwrap();
     }
 
     /// `[replication]` on a fleet app: the fleet replicates next to the control

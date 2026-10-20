@@ -197,8 +197,7 @@ destination as the control database:
 - health reports the databases this process has open but does not own under
   `unowned`.
 
-Taking over a slot range needs the old owner stopped first (a fencing epoch is
-roadmap item 2).
+Section 7 fences the old owner when another host takes over a slot range.
 
 ### 6. Background work: the fleet sweeper
 
@@ -264,6 +263,76 @@ The sweeper opens and closes databases through the normal fleet paths, so
 the rules of #3231 (workers stop before the pool closes) and #3230 (one
 replicator per database across processes) hold for its opens too.
 
+### 7. Slot ownership: epochs and fencing (issue #3233)
+
+`restore_missing` lets a host with an empty volume take over a range. Without
+fencing, the old owner can still write and ship, and the two copies diverge.
+`[database.fleet.ownership]` adds a per-range ownership epoch. The open path
+and the replication path both check it.
+
+- **Table.** `_autumn_fleet_slot_owners(range_start, range_end, owner_id,
+  epoch, lease_expires_at)` on the control database, and a one-row epoch
+  counter. Ranges use the slot hash of `sharding.rs` and `cell_router.rs`.
+  Rows never overlap.
+- **Decisions.** `OwnershipTable` is a pure state machine. A store loads the
+  rows, applies one decision and writes the result in one `BEGIN IMMEDIATE`
+  transaction. So when two processes race a claim, one wins.
+  - Claim: the range is free or each lease on it ended, or it is the
+    claimer's own row with the same bounds. A live row of another shape
+    refuses the claim, also for its own owner: an old process of that owner
+    can still serve the rest of the row. A new epoch is above the counter
+    and above the newest epoch a replicator found (`claim_above`). The own
+    row with the same bounds keeps its epoch (a restart, or a second process
+    on the volume).
+  - Renew: same owner and epoch, else the range is lost.
+  - Release: the lease ends now. The epoch stays. Only the last process on
+    the volume releases (a shared OS lock on the root tells), and only when
+    nothing is unshipped.
+- **Open path.** `DatabaseFleet::open`, `provision` and `open_background`
+  check the slot before anything touches the disk. If the host does not own
+  it: `FleetError::NotOwner`, `421`. So `restore_missing` runs only for an
+  owned key. Each `FleetDatabase` carries its epoch. After an open, the fleet
+  reads the epoch again; a database of another epoch is fenced, not served.
+- **Stale files.** Each file records the newest epoch it was opened under
+  (`_autumn_fleet_epoch`). A host can get a range back after another host
+  held it. Its files on disk are then older than the replica. So an open under
+  a newer epoch than the file's lists `<root>/epochs/`. If the replica holds a
+  newer epoch than the file, the file is restored from the replica first.
+- **Lose.** A lost range closes its open databases without a worker settle.
+  The close still waits for connections in use. The sweeper and the fan-outs
+  skip slots this host does not own.
+- **Local lease.** A holder serves until it sent its last renew plus
+  `ttl - ttl/3`, on its monotonic clock. That is before the lease in the
+  table ends. The ownership loop closes lapsed ranges before it renews, and
+  while a renew hangs. Clock skew plus the longest request must be less than
+  `ttl/3`.
+- **Replication.** A replicator ships under its database's epoch. It writes
+  `<root>/epochs/<epoch>` and, before the snapshot upload,
+  `generations/<id>/epoch-<epoch>`. A restore and the retention sweep order
+  generations by (epoch, time). The sweep never removes a generation without
+  `snapshot.json` that is newer than the floor (an upload in progress). A
+  replicator with no epoch records the newest epoch at the destination, so
+  turning ownership off does not order new generations below old ones. The
+  replicator lists `<root>/epochs/` at each new generation and every 60 s. A
+  newer epoch stops it (`ReplicationError::Fenced`), and the host loses the
+  range. A replica with no markers is epoch 0, so old replicas restore as
+  before.
+- **One replicator per database (#3230).** The epoch is the election token
+  across hosts: only the owner of the current epoch opens the database. An
+  old replicator can still ship for up to 60 s, into its old epoch's
+  generation; the restore order makes that harmless. The lock file still
+  elects one process inside the host. A parked replicator that reopens under
+  a new epoch starts a new generation.
+
+This mirrors the `FencingToken` of `lock.rs` (#3053), CloudKit's incarnation
+counter and Notion's logical-shard moves. The model and its proofs are in
+`verification/fleet_slot_ownership.rs`.
+
+All hosts must use one ownership table. The built-in store is the control
+database, a local SQLite file, so it fences the processes of one host only.
+Hosts on different machines need a `SlotOwnershipStore` on a store they all
+reach.
+
 ## Consequences
 
 ### Positive
@@ -307,11 +376,8 @@ replicator per database across processes) hold for its opens too.
 1. **CLI.** `autumn fleet list | migrate | backup | delete | restore`
    ([#3232](https://github.com/autumn-foundation/autumn/issues/3232)). See
    [Operating the fleet](../guide/sqlite-fleet.md#operating-the-fleet).
-2. **Slot ownership and fencing.** A control-table epoch per slot range, so a
-   host that takes over a range fences the old owner before
-   `restore_missing` serves it (CloudKit's incarnation counter, Notion's
-   logical-shard moves). This joins `cell_router.rs` (tenant → cell by the
-   same slot hash) to the fleet.
+2. **Slot ownership and fencing.** Done: see section 7
+   ([#3233](https://github.com/autumn-foundation/autumn/issues/3233)).
 3. **Fleet sweeper.** Done: see section 6
    ([#3234](https://github.com/autumn-foundation/autumn/issues/3234)).
 4. **Replica lifecycle.** Delete a database's replica with it; verify
@@ -348,6 +414,14 @@ replicator per database across processes) hold for its opens too.
   database closes, hooks drained without a request, a derivation added in a
   migration backfilled in a closed tenant, `max_open` and leases respected,
   the `fleet:sweeper` health indicator.
+- `autumn/src/db/fleet_ownership.rs` tests: the state machine (claim, renew,
+  lapse, release, re-shape) and a proptest of its invariants; two hosts
+  racing a claim on one store; the open path's `421`; an old owner closed
+  after it lost the epoch; a fenced replicator; fan-out of owned slots only.
+- `autumn/src/replication/restore.rs` tests: a restore takes the newest
+  epoch's generation before the newest time.
+- `autumn/tests/sim_fleet_ownership.rs`: a partitioned old owner in virtual
+  time stops serving before the new owner claims.
 - `autumn/tests/sqlite_fleet.rs`: `ShardedDb`, a `#[repository(tenant_scoped,
   sharded)]` repository, `CrossShard` and `each_shard` against a tenant fleet
   and a slot fleet over HTTP; `400` / `404` / `409` paths; `db:fleet` health.

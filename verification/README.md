@@ -46,6 +46,32 @@ It proves that tokens are unique and strictly increasing per lock name, and
 that a stale write is rejected. It does not prove that holders never overlap;
 the fencing token makes overlap safe.
 
+## Fleet slot ownership
+
+`fleet_slot_ownership.rs` models the slot-ownership table of a SQLite fleet
+(`OwnershipTable` in `autumn/src/db/fleet_ownership.rs`, issue #3233). Verify
+it with:
+
+```sh
+verus verification/fleet_slot_ownership.rs
+```
+
+It proves these properties:
+
+- Epochs are unique and strictly increase. A slot's epoch never goes down.
+- A live lease blocks a claim of another owner. A live row of another shape
+  blocks a claim of its own owner too.
+- A claim after a fence gets an epoch above the epoch the replicator saw.
+- After a new grant, the old owner cannot renew, release or write with any
+  epoch it held.
+- A restore never selects a generation of an older epoch, and a fenced
+  replicator stops.
+
+It does not prove that two hosts never serve at once. That depends on the
+clock bound in the guide. The epoch makes a late write of the old owner
+harmless to the replicas. The proptest `the_table_keeps_its_invariants`
+checks the same rules on the runtime table.
+
 ## Billing plan gate
 
 `billing_gate.rs` models the plan gate selection in

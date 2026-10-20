@@ -112,6 +112,7 @@ GATED_MODULES=(
   # The SQLite database fleet (ADR 0019): sqlite-only modules, so their
   # enforcing clippy lane is the sqlite one.
   autumn/src/db/fleet.rs:sqlite
+  autumn/src/db/fleet_ownership.rs:sqlite
   autumn/src/db/fleet_replication.rs:sqlite
   autumn/src/db/fleet_sweeper.rs:sqlite
   # The ratified W3 identifier sites. They carry no off-seam production call at
