@@ -4086,6 +4086,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let trait_name_lit = trait_name.to_string();
         let pg_name_lit = pg_name.to_string();
         let model_name_lit = config.model_name.to_string();
+        let crate_version = autumn_macros_support::graph::crate_version();
         quote! {
             ::autumn_web::reexports::inventory::submit! {
                 ::autumn_web::graph::RepositoryGraphDescriptor {
@@ -4095,6 +4096,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     table: #table_name,
                     api: #graph_api_path,
                     module_path: ::core::module_path!(),
+                    crate_version: #crate_version,
                     file: ::core::file!(),
                     line: ::core::line!(),
                 }
@@ -29864,7 +29866,10 @@ mod tests {
             // Raised from 80_000 (#2364): each write descriptor gained a
             // `cascades_into` field, and each repository one name const.
             // Understood and intended: about 400 bytes.
-            ("plain", quote! { Post }, 81_000),
+            // Raised from 81_000 (#2520): the graph descriptor gained a
+            // `crate_version` field, an `option_env!` match of about 170
+            // bytes. Understood and intended.
+            ("plain", quote! { Post }, 82_000),
             ("soft_delete", quote! { Post, soft_delete }, 89_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
             // Raised from 95_000 (#2451): each repository publishes its

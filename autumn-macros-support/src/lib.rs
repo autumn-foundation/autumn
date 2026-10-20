@@ -12,5 +12,6 @@
 
 pub mod cascade;
 pub mod crate_path;
+pub mod graph;
 pub mod naming;
 pub mod schema;
