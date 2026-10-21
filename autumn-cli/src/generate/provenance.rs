@@ -119,8 +119,29 @@ struct Entry {
     /// this same engine, and `autumn destroy auth` must not delete them.
     invocation: String,
     /// See [`Scope`]. Absent in manifests from 0.8.0 and from unclaimed plans.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_scope"
+    )]
     scope: Option<Scope>,
+}
+
+/// Read a `scope`, and read a value this CLI does not know as no scope.
+///
+/// A strict parse would fail the whole manifest on one unknown value (from a
+/// newer CLI, or a hand edit). `load` reads a failed parse as empty, and the
+/// next `save` would then drop every other entry.
+fn lenient_scope<'de, D>(deserializer: D) -> Result<Option<Scope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<toml::Value>::deserialize(deserializer)?;
+    Ok(match value.as_ref().and_then(toml::Value::as_str) {
+        Some("owned") => Some(Scope::Owned),
+        Some("shared") => Some(Scope::Shared),
+        _ => None,
+    })
 }
 
 /// The on-disk shape of [`MANIFEST_PATH`].
@@ -339,6 +360,9 @@ impl Provenance {
     }
 
     /// Record `digest` as the content `invocation` wrote to `path`.
+    ///
+    /// `scope` is `None` for an unclaimed writer. `destroy` never sweeps such
+    /// an entry.
     ///
     /// A path outside `root` cannot be keyed and is dropped: the manifest
     /// describes one project, and destroy would never look it up.
@@ -871,6 +895,26 @@ mod tests {
                 digest: "1",
                 scope: None
             }]
+        );
+    }
+
+    #[test]
+    fn an_unknown_scope_reads_as_none_and_keeps_the_other_entries() {
+        let dir = tmp();
+        std::fs::create_dir_all(dir.path().join(".autumn")).unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_PATH),
+            "[files.\"a.rs\"]\ndigest = \"1\"\ninvocation = \"x\"\nscope = \"Owned\"\n\n\
+             [files.\"b.rs\"]\ndigest = \"2\"\ninvocation = \"x\"\nscope = 7\n\n\
+             [files.\"c.rs\"]\ndigest = \"3\"\ninvocation = \"x\"\nscope = \"owned\"\n",
+        )
+        .unwrap();
+        let p = Provenance::load(dir.path());
+        let mut seen: Vec<_> = p.recorded_by("x").map(|r| (r.key, r.scope)).collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![("a.rs", None), ("b.rs", None), ("c.rs", Some(Scope::Owned))]
         );
     }
 

@@ -597,7 +597,7 @@ pub struct Plan {
     released_features: Vec<ReleasedFeature>,
     /// Whether this plan is the sole resource of its invocation (issue
     /// #2557). Set by [`Plan::claim_sole_resource`].
-    pub(super) sole_resource: bool,
+    sole_resource: bool,
 }
 
 /// An `autumn-web` feature a regenerate run no longer needs.
@@ -636,7 +636,7 @@ impl Plan {
     /// return `false` and leave the plan unclaimed.
     ///
     /// Call it only from a caller that applies one plan in its process (the
-    /// CLI dispatcher). Never from a caller that applies many.
+    /// CLI dispatcher). Do not call it from a caller that applies many plans.
     pub fn claim_sole_resource(&mut self) -> bool {
         static CLAIMED: AtomicBool = AtomicBool::new(false);
         self.claim_with(&CLAIMED)
@@ -851,8 +851,8 @@ impl Plan {
         result
     }
 
-    /// Write every action, collecting `(path, digest)` for each file this plan
-    /// owns. Split out of [`Self::execute`] so provenance is recorded on the
+    /// Write every action, collecting `(path, digest, scope)` for each file
+    /// this plan creates. Split out of [`Self::execute`] so provenance is recorded on the
     /// error path too.
     fn write_actions(&self, written: &mut Vec<Written>) -> Result<(), GenerateError> {
         for action in &self.actions {
@@ -1003,8 +1003,8 @@ impl Plan {
     /// this invocation wrote that the plan no longer names (issue #2557). See
     /// `sweep::plan_sweep`.
     ///
-    /// Honours `--dry-run` (prints a `Removed:`/`Reverted:` plan, touches
-    /// nothing) exactly like [`Plan::execute`].
+    /// Honours `--dry-run` (prints `Would remove`/`Would revert` lines,
+    /// touches nothing) exactly like [`Plan::execute`].
     ///
     /// # Errors
     /// Returns [`GenerateError::Diverged`] when any targeted file's content
@@ -1103,7 +1103,21 @@ impl Plan {
         removed: &mut Removed,
     ) -> Result<(), GenerateError> {
         for path in &plan.files_to_remove {
-            fs::remove_file(path)?;
+            let swept = plan.swept.contains(path);
+            // A swept path comes from the manifest. Check it again just
+            // before the delete, in case a directory became a symlink.
+            if swept && !sweep::still_sweepable(&self.project_root, path) {
+                eprintln!(
+                    "Warning: {} changed during destroy; leaving it in place.",
+                    relative_display(path, &self.project_root)
+                );
+                continue;
+            }
+            match fs::remove_file(path) {
+                // Two manifest spellings of one file: the first removal won.
+                Err(e) if swept && e.kind() == std::io::ErrorKind::NotFound => continue,
+                other => other?,
+            }
             removed.files.push(path.clone());
             println!(
                 "  Removed {}{}",
@@ -1224,11 +1238,13 @@ impl Plan {
         // #2557). Only a claimed plan sweeps. A swept file joins
         // `files_to_remove` first, so every scan below treats it as leaving.
         let sweep = if self.sole_resource {
+            let revert_targets: Vec<&Path> = self.reverts.iter().map(Revert::path).collect();
             sweep::plan_sweep(
                 &self.project_root,
                 &recorded,
                 &self.invocation,
                 &self.actions,
+                &revert_targets,
             )
         } else {
             sweep::Sweep::default()
@@ -1426,8 +1442,8 @@ impl Plan {
     }
 }
 
-/// One file [`Plan::execute`] wrote: path, digest, and its scope if the plan
-/// is claimed.
+/// One file [`Plan::execute`] wrote: path, digest, scope.
+/// [`Plan::record_provenance`] keeps the scope only for a claimed plan.
 type Written = (PathBuf, String, provenance::Scope);
 
 /// What a real [`Plan::revert`] actually deleted — the plan minus whatever a
@@ -4207,7 +4223,7 @@ mod tests {
 
     #[test]
     fn an_unclaimed_destroy_never_sweeps() {
-        // The shape of the nine "destroying one of two resources" tests: two
+        // The shape of the "destroying one of two resources" tests: two
         // resources from one process share one argv.
         let tmp = tempfile::TempDir::new().unwrap();
         let mut first = Plan::new(tmp.path());
@@ -4281,6 +4297,7 @@ mod tests {
             v1.execute(Flags::default()).unwrap();
 
             let mut v2 = sole(Plan::new(tmp.path()));
+            v2.create(tmp.path().join("src/new.rs"), "// v2\n");
             v2.push_revert(Revert::CargoDeps {
                 path: cargo.clone(),
                 names: vec!["foo-crate".to_owned()],

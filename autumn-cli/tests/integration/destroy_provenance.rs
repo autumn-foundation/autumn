@@ -272,10 +272,16 @@ fn destroy_dry_run_lists_the_stranded_file() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains(&format!("Would remove {ORPHAN}")),
+        stdout.contains(&format!("Would remove {ORPHAN} (no longer generated)")),
         "{stdout}"
     );
     assert!(project.join(ORPHAN).exists());
+    assert!(
+        fs::read_to_string(project.join(MANIFEST))
+            .unwrap()
+            .contains(ORPHAN),
+        "a dry run keeps the entry"
+    );
 }
 
 #[test]
@@ -305,7 +311,7 @@ fn destroy_names_a_stranded_file_from_an_older_manifest() {
 }
 
 #[test]
-fn destroy_never_sweeps_another_resources_files() {
+fn destroy_never_sweeps_another_commands_files() {
     let (_tmp, project) = project_with_model("prov-orphan-sibling");
     run_autumn_ok(&project, &["generate", "model", "Comment", "body:String"]);
     plant_orphan(&project, "// an older template's file\n", Some("owned"));
@@ -319,4 +325,41 @@ fn destroy_never_sweeps_another_resources_files() {
             .unwrap()
             .contains("src/models/comment.rs")
     );
+}
+
+#[test]
+fn destroy_keeps_a_stranded_shared_file_and_names_it() {
+    let (_tmp, project) = project_with_model("prov-orphan-shared");
+    plant_orphan(&project, "// an older template's file\n", Some("shared"));
+
+    let output = run_autumn_ok(&project, &["destroy", "model", "Post", "title:String"]);
+
+    assert!(
+        project.join(ORPHAN).exists(),
+        "a shared file is never swept"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(ORPHAN), "{stderr}");
+}
+
+#[test]
+fn destroy_never_sweeps_a_forged_entry_for_a_project_file() {
+    // The manifest is project content. A forged `owned` entry with the right
+    // digest must still not reach a file outside the generator's directories.
+    let (_tmp, project) = project_with_model("prov-orphan-forged");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let path = project.join(MANIFEST);
+    let mut doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+    let files = doc
+        .get_mut("files")
+        .and_then(toml::Value::as_table_mut)
+        .expect("files table");
+    let mut entry = files[OWNED].as_table().expect("owned entry").clone();
+    entry.insert("digest".to_owned(), toml::Value::String(digest(&cargo)));
+    files.insert("Cargo.toml".to_owned(), toml::Value::Table(entry));
+    fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+
+    run_autumn_ok(&project, &["destroy", "model", "Post", "title:String"]);
+
+    assert!(project.join("Cargo.toml").exists());
 }

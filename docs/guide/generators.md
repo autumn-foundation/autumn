@@ -2236,14 +2236,20 @@ left in its directory; otherwise it warns and leaves it in place.
 A newer CLI can rename or drop a file that an older template made. The current
 plan does not name the old file, but the manifest does. `destroy` sweeps it:
 
-- It deletes the file when the digest still matches, and prints
+- It deletes the file when the digest still matches and the current templates
+  create a file in the same directory. It prints
   `Removed <path> (no longer generated)`.
 - It keeps the file and names it in a warning when you edited the file, when
-  other resources can share it, or when the manifest entry is from Autumn
-  0.8.0 (that entry does not say which resource owns the file). `--force` does
-  not change this.
-- It never sweeps a migration, `Cargo.toml`, `src/main.rs`, or a path through
-  a symlink.
+  other resources can share it, when a `mod` line still declares it, when the
+  templates create nothing in its directory, or when the manifest entry is from
+  Autumn 0.8.0 (that entry does not say which resource owns the file).
+  `--force` does not change this.
+- It never sweeps a migration, a project file such as `Cargo.toml` or
+  `src/main.rs`, a path with a dot segment (`.env`, `.git/`), a file under
+  `target/`, or a path through a symlink.
+
+The manifest decides what the sweep can delete, so review changes to
+`.autumn/generated.toml` as you review code.
 
 `--dry-run` lists the files the sweep would delete.
 

@@ -17,7 +17,7 @@ use super::emit::{Action, split_migration_dir_name};
 use super::provenance::{self, MANIFEST_PATH, Provenance, Recorded, Scope};
 
 /// Files the sweep never deletes, lowercase. Generators edit them in place
-/// and never own them, so an `owned` entry for one is not to be trusted.
+/// and never own them, so the sweep does not trust an `owned` entry for one.
 const PROTECTED_FILES: &[&str] = &[
     "autumn.toml",
     "build.rs",
@@ -26,9 +26,6 @@ const PROTECTED_FILES: &[&str] = &[
     "src/lib.rs",
     "src/main.rs",
 ];
-
-/// Top-level directories the sweep never enters, lowercase.
-const PROTECTED_DIRS: &[&str] = &[".autumn", ".git", "target"];
 
 /// What `revert` does with the swept entries.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -43,126 +40,254 @@ pub(super) struct Sweep {
 
 /// Find the entries `invocation` wrote that no action in `actions` names.
 ///
-/// Delete an `owned` file only when its digest still matches. Keep every
-/// other file, with a warning that names it. `--force` has no effect here:
-/// these paths come from the manifest, not from the plan.
+/// Delete an `owned` file only when its digest still matches and the plan
+/// creates a file in the same directory. Keep every other file, with a
+/// warning that names it. `--force` has no effect here: these paths come
+/// from the manifest, not from the plan.
 pub(super) fn plan_sweep(
     project_root: &Path,
     recorded: &Provenance,
     invocation: &str,
     actions: &[Action],
+    revert_targets: &[&Path],
 ) -> Sweep {
-    let named = named_keys(project_root, actions);
-    let suffixes = planned_migration_suffixes(&named);
+    let mut planned = Planned::new(project_root, actions);
+    // A revert can rewrite or delete its target. Leave that file to it.
+    for path in revert_targets {
+        if let Some(key) = provenance::key(project_root, path) {
+            planned
+                .folded
+                .push((key.to_ascii_lowercase(), path.to_path_buf()));
+            planned.keys.insert(key);
+        }
+    }
     let mut sweep = Sweep::default();
     for entry in recorded.recorded_by(invocation) {
-        sweep_one(project_root, entry, &named, &suffixes, &mut sweep);
+        sweep_one(project_root, entry, &planned, &mut sweep);
     }
     sweep
 }
 
+/// What the plan names, in the forms the sweep compares against.
+struct Planned {
+    /// Every key, exactly as spelled.
+    keys: HashSet<String>,
+    /// Every key in lowercase, with its path.
+    folded: Vec<(String, PathBuf)>,
+    /// The parent directory key of each `Create`/`CreateBytes`, exact case.
+    owned_dirs: HashSet<String>,
+    /// The suffix of each migration directory, lowercase.
+    migration_suffixes: HashSet<String>,
+}
+
+impl Planned {
+    fn new(project_root: &Path, actions: &[Action]) -> Self {
+        let mut planned = Self {
+            keys: HashSet::new(),
+            folded: Vec::new(),
+            owned_dirs: HashSet::new(),
+            migration_suffixes: HashSet::new(),
+        };
+        for action in actions {
+            let Some(key) = provenance::key(project_root, action.path()) else {
+                continue;
+            };
+            let lower = key.to_ascii_lowercase();
+            if matches!(action, Action::Create { .. } | Action::CreateBytes { .. }) {
+                planned.owned_dirs.insert(parent_key(&key).to_owned());
+            }
+            if let ["migrations", dir, _] = lower.split('/').collect::<Vec<_>>().as_slice() {
+                planned.migration_suffixes.insert(migration_suffix(dir));
+            }
+            planned.folded.push((lower, action.path().to_path_buf()));
+            planned.keys.insert(key);
+        }
+        planned
+    }
+
+    /// Whether the plan handles the file at `key`.
+    ///
+    /// An exact match does. A match that differs only in ASCII case does when
+    /// both paths reach one file, as on a case-insensitive file system. On a
+    /// case-sensitive one they are two files, and the old one is an orphan.
+    fn names(&self, key: &str, path: &Path) -> bool {
+        if self.keys.contains(key) {
+            return true;
+        }
+        let lower = key.to_ascii_lowercase();
+        self.folded
+            .iter()
+            .any(|(k, planned)| *k == lower && same_file(path, planned))
+    }
+}
+
+/// The directory part of a key, or `""` for a top-level file.
+fn parent_key(key: &str) -> &str {
+    key.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Whether `a` and `b` are one file on disk.
+///
+/// On Unix this compares device and inode. Elsewhere it compares the
+/// canonical paths, which ignore case only where the file system does.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
 /// Decide what to do with one entry.
-fn sweep_one(
-    project_root: &Path,
-    entry: Recorded<'_>,
-    named: &HashSet<String>,
-    suffixes: &HashSet<String>,
-    sweep: &mut Sweep,
-) {
+fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep: &mut Sweep) {
     let Some(parts) = plain_parts(entry.key) else {
         sweep.warnings.push(format!(
-            "{:?} in {MANIFEST_PATH} is not a plain project path; destroy ignores it.",
+            "{:?} in {MANIFEST_PATH} is not a plain project path. autumn destroy does not \
+             use it.",
             entry.key
         ));
         return;
     };
-    let lower = entry.key.to_ascii_lowercase();
-    // On a case-insensitive file system the two spellings are one file.
-    if named.contains(&lower) {
-        return;
-    }
     let shown = entry.key;
-    if lower.starts_with("migrations/") {
-        // The plan matches migrations by suffix, not by timestamp. Only the
-        // applied-migration guard of that pass may remove one.
-        let planned = parts.len() == 3 && suffixes.contains(&migration_suffix(parts[1]));
-        if !planned {
-            sweep.warnings.push(format!(
-                "{shown}: the current templates do not make this migration file. \
-                 destroy never sweeps migrations. Remove it by hand if no database uses it."
-            ));
-        }
-        return;
-    }
-    if PROTECTED_FILES.contains(&lower.as_str())
-        || PROTECTED_DIRS.iter().any(|dir| {
-            lower
-                .strip_prefix(dir)
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
-    {
-        sweep
-            .warnings
-            .push(format!("{shown}: destroy never sweeps this file."));
-        return;
-    }
+    let lower = shown.to_ascii_lowercase();
     let path = parts
         .iter()
         .fold(project_root.to_path_buf(), |p, part| p.join(part));
-    match inspect(project_root, &parts) {
-        Inspect::Missing => {
-            sweep.forget.push(path);
-            return;
+    if planned.names(shown, &path) {
+        return;
+    }
+    let found = inspect(project_root, &parts);
+    if matches!(found, Inspect::Missing) {
+        // Dropping the entry of a missing file deletes nothing.
+        sweep.forget.push(path);
+        return;
+    }
+    let warn = |sweep: &mut Sweep, why: &str| sweep.warnings.push(format!("{shown}: {why}"));
+    if lower.starts_with("migrations/") {
+        // The plan matches migrations by suffix, not by timestamp. Only the
+        // applied-migration guard of that pass may remove one.
+        let matched = parts.len() == 3
+            && planned
+                .migration_suffixes
+                .contains(&migration_suffix(parts[1]));
+        if !matched {
+            warn(
+                sweep,
+                "the current templates do not make this migration file. autumn destroy \
+                 never sweeps migrations. Remove it by hand if no database uses it.",
+            );
         }
-        Inspect::Refused(reason) => {
-            sweep.warnings.push(format!(
-                "{shown}: destroy does not sweep this file, because {reason}."
-            ));
-            return;
-        }
-        Inspect::File => {}
+        return;
+    }
+    // A dot segment (`.env`, `.git/`, `.autumn/`) or `target/` is never a
+    // generator's own output to sweep, whatever the manifest says.
+    if PROTECTED_FILES.contains(&lower.as_str())
+        || parts.iter().any(|part| part.starts_with('.'))
+        || parts[0].eq_ignore_ascii_case("target")
+    {
+        warn(sweep, "autumn destroy never sweeps this file.");
+        return;
+    }
+    if let Inspect::Refused(reason) = found {
+        warn(
+            sweep,
+            &format!("autumn destroy does not sweep this file, because {reason}."),
+        );
+        return;
     }
     match entry.scope {
-        None => sweep.warnings.push(format!(
-            "{shown}: an older autumn recorded this file for this command, and the \
-             current templates do not make it. destroy cannot prove that only this \
-             resource uses it, so it keeps the file. Delete it by hand if nothing uses it."
-        )),
-        Some(Scope::Shared) => sweep.warnings.push(format!(
-            "{shown}: this command made this shared file, and the current templates do \
-             not make it. Other resources can use it, so destroy keeps it. Delete it by \
-             hand if nothing uses it."
-        )),
-        Some(Scope::Owned) if untouched(&path, entry.digest) => sweep.remove.push(path),
-        Some(Scope::Owned) => sweep.warnings.push(format!(
-            "{shown}: the current templates do not make this file, and it changed after \
-             generate wrote it. destroy keeps it. Delete it by hand if you do not need it."
-        )),
+        None => warn(
+            sweep,
+            "an older Autumn CLI recorded this file for this command, and the current \
+             templates do not make it. autumn destroy cannot prove that only this resource \
+             uses it, so it keeps the file. Delete it by hand if nothing uses it.",
+        ),
+        Some(Scope::Shared) => warn(
+            sweep,
+            "this command made this shared file, and the current templates do not make it. \
+             Other resources can use it, so autumn destroy keeps it. Delete it by hand if \
+             nothing uses it.",
+        ),
+        // The manifest is project content, so a forged entry can name any
+        // file and its digest. Delete only in a directory where the current
+        // templates also create a file. Then a forged entry cannot reach a
+        // file outside the generator's own directories.
+        Some(Scope::Owned) if !planned.owned_dirs.contains(parent_key(shown)) => warn(
+            sweep,
+            "the current templates do not make this file, and they create no file in its \
+             directory. autumn destroy keeps it. Delete it by hand if you do not need it.",
+        ),
+        Some(Scope::Owned) if !untouched(&path, entry.digest) => warn(
+            sweep,
+            "the current templates do not make this file, and it changed after generate \
+             wrote it. autumn destroy keeps it. Delete it by hand if you do not need it.",
+        ),
+        // The reverts come from the current templates, so they do not remove
+        // the `mod` line an older template added for this file. Deleting a
+        // file that a `mod` line still declares stops the build.
+        Some(Scope::Owned) if declared_module(project_root, &parts) => warn(
+            sweep,
+            "the current templates do not make this file, but a `mod` line still declares \
+             it. autumn destroy keeps it. Remove the `mod` line and the file by hand if you \
+             do not need them.",
+        ),
+        Some(Scope::Owned) => sweep.remove.push(path),
     }
 }
 
-/// The keys of every path the plan names, lowercase.
-fn named_keys(project_root: &Path, actions: &[Action]) -> HashSet<String> {
-    actions
+/// Whether a `mod <stem>;` line declares the Rust file at `parts`.
+///
+/// Reads the files that can declare it: `<dir>/mod.rs` and `<dir>.rs`, and
+/// `src/main.rs` and `src/lib.rs` for a file directly in `src/`. Errs on the
+/// side of "declared": any `mod <stem>` followed by `;` or `{` counts.
+fn declared_module(project_root: &Path, parts: &[&str]) -> bool {
+    let Some((file, dirs)) = parts.split_last() else {
+        return false;
+    };
+    let Some(stem) = file.strip_suffix(".rs") else {
+        return false;
+    };
+    let dir = dirs
         .iter()
-        .filter_map(|a| provenance::key(project_root, a.path()))
-        .map(|k| k.to_ascii_lowercase())
-        .collect()
+        .fold(project_root.to_path_buf(), |p, part| p.join(part));
+    let mut declarers = vec![dir.join("mod.rs")];
+    if let Some(name) = dir.file_name() {
+        let mut sibling = name.to_os_string();
+        sibling.push(".rs");
+        declarers.push(dir.with_file_name(sibling));
+    }
+    if dirs == ["src"] {
+        declarers.push(dir.join("main.rs"));
+        declarers.push(dir.join("lib.rs"));
+    }
+    declarers
+        .iter()
+        .any(|declarer| fs::read_to_string(declarer).is_ok_and(|text| declares(&text, stem)))
 }
 
-/// The suffix of each migration directory the plan names.
-fn planned_migration_suffixes(named: &HashSet<String>) -> HashSet<String> {
-    named
-        .iter()
-        .filter_map(|key| {
-            let mut parts = key.split('/');
-            (parts.next() == Some("migrations"))
-                .then(|| parts.next())
-                .flatten()
-                .filter(|_| parts.next().is_some())
-                .map(migration_suffix)
-        })
-        .collect()
+/// Whether `text` holds `mod <stem>` followed by `;` or `{`.
+fn declares(text: &str, stem: &str) -> bool {
+    text.match_indices("mod ").any(|(at, _)| {
+        let before_ok = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let rest = text[at + 4..].trim_start();
+        before_ok
+            && rest
+                .strip_prefix(stem)
+                .is_some_and(|tail| tail.trim_start().starts_with([';', '{']))
+    })
 }
 
 /// The suffix of a migration directory name, lowercase.
@@ -173,14 +298,16 @@ fn migration_suffix(dir: &str) -> String {
 /// The segments of `key`, when every one is a plain file name.
 ///
 /// Refuses an empty segment, `.`, `..`, a backslash, a colon (a Windows drive
-/// or stream), and a NUL. A key that passes cannot leave the project.
+/// or stream), a NUL, a `~` (a Windows short name), and a trailing dot or
+/// space (Windows drops them). A key that passes cannot leave the project.
 fn plain_parts(key: &str) -> Option<Vec<&str>> {
     let parts: Vec<&str> = key.split('/').collect();
     let plain = |part: &&str| {
         !part.is_empty()
             && *part != "."
             && *part != ".."
-            && !part.contains(['\\', ':', '\0'])
+            && !part.contains(['\\', ':', '\0', '~'])
+            && !part.ends_with(['.', ' '])
             && matches!(
                 Path::new(part).components().collect::<Vec<_>>().as_slice(),
                 [std::path::Component::Normal(_)]
@@ -202,15 +329,22 @@ enum Inspect {
 /// Walk to the entry one segment at a time, without following a symlink.
 ///
 /// A symlinked directory on the way could point outside the project, and a
-/// symlinked file is not the file `generate` wrote.
+/// symlinked file is not the file `generate` wrote. Each segment must also be
+/// the exact name on disk: a case-insensitive or Windows file system can
+/// resolve another spelling to the same file, which would let one file pass
+/// a check under one name and go under another.
 fn inspect(project_root: &Path, parts: &[&str]) -> Inspect {
     let mut cursor = project_root.to_path_buf();
     for (i, part) in parts.iter().enumerate() {
+        let parent = cursor.clone();
         cursor.push(part);
         let last = i + 1 == parts.len();
         match fs::symlink_metadata(&cursor) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Inspect::Missing,
             Err(e) => return Inspect::Refused(format!("it cannot be read ({e})")),
+            Ok(_) if !has_exact_entry(&parent, part) => {
+                return Inspect::Refused("its name on disk is spelled differently".to_owned());
+            }
             Ok(m) if m.file_type().is_symlink() => {
                 return Inspect::Refused("it is reached through a symlink".to_owned());
             }
@@ -221,6 +355,26 @@ fn inspect(project_root: &Path, parts: &[&str]) -> Inspect {
         }
     }
     Inspect::File
+}
+
+/// Whether `dir` holds an entry named exactly `name`, byte for byte.
+fn has_exact_entry(dir: &Path, name: &str) -> bool {
+    fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == std::ffi::OsStr::new(name))
+    })
+}
+
+/// Whether `path` is still a regular file reached through no symlink.
+///
+/// `revert` calls this again just before it deletes a swept file, so a
+/// directory swapped for a symlink after the plan was made is not followed.
+pub(super) fn still_sweepable(project_root: &Path, path: &Path) -> bool {
+    provenance::key(project_root, path).is_some_and(|key| {
+        plain_parts(&key)
+            .is_some_and(|parts| matches!(inspect(project_root, &parts), Inspect::File))
+    })
 }
 
 /// Whether the file still holds what `generate` wrote.
@@ -285,7 +439,7 @@ mod tests {
             Some(Scope::Owned),
         );
 
-        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/new.rs")]);
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/new.rs")], &[]);
 
         assert_eq!(sweep.remove, vec![old]);
         assert!(sweep.warnings.is_empty(), "{:?}", sweep.warnings);
@@ -299,7 +453,8 @@ mod tests {
         let old = generated(root, &mut p, "src/old.rs", "a\nb\n", ME, Some(Scope::Owned));
         fs::write(&old, "a\r\nb\r\n").unwrap();
 
-        assert_eq!(plan_sweep(root, &p, ME, &[]).remove, vec![old]);
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/new.rs")], &[]);
+        assert_eq!(sweep.remove, vec![old]);
     }
 
     #[test]
@@ -319,7 +474,8 @@ mod tests {
             Some(Scope::Owned),
         );
 
-        assert_eq!(plan_sweep(root, &p, ME, &[]).remove, vec![old]);
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "static/new.png")], &[]);
+        assert_eq!(sweep.remove, vec![old]);
     }
 
     #[test]
@@ -337,7 +493,7 @@ mod tests {
         );
         fs::write(&old, "// mine\n").unwrap();
 
-        let sweep = plan_sweep(root, &p, ME, &[]);
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/new.rs")], &[]);
 
         assert!(sweep.remove.is_empty());
         assert_eq!(sweep.warnings.len(), 1);
@@ -362,7 +518,7 @@ mod tests {
             Some(Scope::Shared),
         );
 
-        let sweep = plan_sweep(root, &p, ME, &[]);
+        let sweep = plan_sweep(root, &p, ME, &[], &[]);
 
         assert!(sweep.remove.is_empty());
         assert_eq!(sweep.warnings.len(), 1);
@@ -377,7 +533,7 @@ mod tests {
         let mut p = Provenance::default();
         generated(root, &mut p, "src/old.rs", "// v1\n", ME, None);
 
-        let sweep = plan_sweep(root, &p, ME, &[]);
+        let sweep = plan_sweep(root, &p, ME, &[], &[]);
 
         assert!(sweep.remove.is_empty());
         assert_eq!(sweep.warnings.len(), 1);
@@ -398,7 +554,7 @@ mod tests {
             Some(Scope::Owned),
         );
 
-        assert_eq!(plan_sweep(root, &p, ME, &[]), Sweep::default());
+        assert_eq!(plan_sweep(root, &p, ME, &[], &[]), Sweep::default());
     }
 
     #[test]
@@ -416,27 +572,88 @@ mod tests {
             },
         ];
 
-        assert_eq!(plan_sweep(root, &p, ME, &actions), Sweep::default());
+        assert_eq!(plan_sweep(root, &p, ME, &actions, &[]), Sweep::default());
     }
 
     #[test]
-    fn the_plan_check_ignores_ascii_case() {
-        // On a case-insensitive file system both spellings are one file.
+    fn a_case_only_match_that_is_one_file_is_left_to_the_plan() {
+        // On a case-insensitive file system both spellings reach one file.
+        // A hard link gives the same shape on any host.
         let dir = tmp();
         let root = dir.path();
         let mut p = Provenance::default();
-        generated(
+        let old = generated(
             root,
             &mut p,
-            "src/Models/Post.rs",
+            "src/models/Post.rs",
             "x",
             ME,
             Some(Scope::Owned),
         );
+        let new = root.join("src/models/post.rs");
+        if !new.exists() && fs::hard_link(&old, &new).is_err() {
+            return; // no hard links on this file system; nothing to test.
+        }
 
-        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/models/post.rs")]);
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/models/post.rs")], &[]);
 
         assert_eq!(sweep, Sweep::default());
+    }
+
+    #[test]
+    fn a_case_only_rename_on_a_case_sensitive_host_is_swept() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = generated(
+            root,
+            &mut p,
+            "src/models/Post.rs",
+            "x",
+            ME,
+            Some(Scope::Owned),
+        );
+        if root.join("src/models/post.rs").exists() {
+            return; // a case-insensitive file system: one file, not two.
+        }
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/models/post.rs")], &[]);
+
+        assert_eq!(sweep.remove, vec![old]);
+    }
+
+    #[test]
+    fn an_orphan_outside_every_planned_directory_is_kept() {
+        // A forged entry can name any file and its digest. Without a planned
+        // file next to it, the sweep must not delete it.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let readme = generated(root, &mut p, "README.md", "# app\n", ME, Some(Scope::Owned));
+        let other = generated(root, &mut p, "src/other/x.rs", "x", ME, Some(Scope::Owned));
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/widgets/new.rs")], &[]);
+
+        assert!(sweep.remove.is_empty(), "{:?}", sweep.remove);
+        assert_eq!(sweep.warnings.len(), 2, "{:?}", sweep.warnings);
+        assert!(readme.exists() && other.exists());
+    }
+
+    #[test]
+    fn a_modify_target_does_not_make_its_directory_sweepable() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        generated(root, &mut p, "src/notes.rs", "x", ME, Some(Scope::Owned));
+        let actions = [Action::Modify {
+            path: root.join("src/routes.rs"),
+            contents: String::new(),
+        }];
+
+        let sweep = plan_sweep(root, &p, ME, &actions, &[]);
+
+        assert!(sweep.remove.is_empty());
+        assert_eq!(sweep.warnings.len(), 1);
     }
 
     #[test]
@@ -447,7 +664,7 @@ mod tests {
         let old = generated(root, &mut p, "src/old.rs", "x", ME, Some(Scope::Owned));
         fs::remove_file(&old).unwrap();
 
-        let sweep = plan_sweep(root, &p, ME, &[]);
+        let sweep = plan_sweep(root, &p, ME, &[], &[]);
 
         assert_eq!(sweep.forget, vec![old]);
         assert!(sweep.remove.is_empty());
@@ -472,7 +689,7 @@ mod tests {
             "migrations/20261021000000_create_posts/up.sql",
         )];
 
-        assert_eq!(plan_sweep(root, &p, ME, &actions), Sweep::default());
+        assert_eq!(plan_sweep(root, &p, ME, &actions, &[]), Sweep::default());
     }
 
     #[test]
@@ -490,7 +707,7 @@ mod tests {
             Some(Scope::Owned),
         );
 
-        let sweep = plan_sweep(root, &p, ME, &[]);
+        let sweep = plan_sweep(root, &p, ME, &[], &[]);
 
         assert!(sweep.remove.is_empty());
         assert_eq!(sweep.warnings.len(), 1);
@@ -502,20 +719,81 @@ mod tests {
     }
 
     #[test]
-    fn a_protected_project_file_is_never_swept() {
+    fn an_orphan_migration_beside_another_planned_migration_is_never_swept() {
         let dir = tmp();
         let root = dir.path();
+        let mut p = Provenance::default();
+        let old = generated(
+            root,
+            &mut p,
+            "migrations/20260101000000_create_widgets/up.sql",
+            "x",
+            ME,
+            Some(Scope::Owned),
+        );
+        let actions = [create(
+            root,
+            "migrations/20261021000000_create_posts/up.sql",
+        )];
+
+        let sweep = plan_sweep(root, &p, ME, &actions, &[]);
+
+        assert!(sweep.remove.is_empty());
+        assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn a_nested_migration_file_is_never_swept() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        generated(
+            root,
+            &mut p,
+            "migrations/20260101000000_create_posts/data/seed.sql",
+            "x",
+            ME,
+            Some(Scope::Owned),
+        );
+        let actions = [create(
+            root,
+            "migrations/20261021000000_create_posts/up.sql",
+        )];
+
+        let sweep = plan_sweep(root, &p, ME, &actions, &[]);
+
+        assert!(sweep.remove.is_empty());
+        assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
+    }
+
+    #[test]
+    fn a_protected_project_file_is_never_swept() {
         for rel in [
             "src/main.rs",
             "Cargo.toml",
+            "CARGO.TOML",
+            "Cargo.lock",
+            "build.rs",
             "src/lib.rs",
             "autumn.toml",
             ".git/config",
+            ".env",
+            ".autumn/generated.toml",
+            "src/.hidden/x.rs",
+            "target/debug/x",
         ] {
+            let dir = tmp();
+            let root = dir.path();
             let mut p = Provenance::default();
             let path = generated(root, &mut p, rel, "x", ME, Some(Scope::Owned));
+            // A planned file next to it, so only the protection can stop it.
+            let sibling = match parent_key(rel) {
+                "" => "planned.rs".to_owned(),
+                dir => format!("{dir}/planned.rs"),
+            };
 
-            let sweep = plan_sweep(root, &p, ME, &[]);
+            let sweep = plan_sweep(root, &p, ME, &[create(root, &sibling)], &[]);
 
             assert!(sweep.remove.is_empty(), "{rel} must not be swept");
             assert_eq!(sweep.warnings.len(), 1, "{rel}: {:?}", sweep.warnings);
@@ -560,11 +838,14 @@ mod tests {
             "src\\..\\..\\victim.rs",
             "",
             "src//a.rs",
+            "src/./a.rs",
+            "src/a\0b.rs",
         ] {
             let p = crafted(&root, key);
-            let sweep = plan_sweep(&root, &p, ME, &[]);
+            let sweep = plan_sweep(&root, &p, ME, &[create(&root, "src/new.rs")], &[]);
             assert!(sweep.remove.is_empty(), "{key:?} must be refused");
             assert!(sweep.forget.is_empty(), "{key:?} must not be forgotten");
+            assert_eq!(sweep.warnings.len(), 1, "{key:?}: {:?}", sweep.warnings);
         }
         assert!(victim.exists());
     }
@@ -581,7 +862,7 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, root.join("src")).unwrap();
 
         let p = crafted(&root, "src/victim.rs");
-        let sweep = plan_sweep(&root, &p, ME, &[]);
+        let sweep = plan_sweep(&root, &p, ME, &[create(&root, "src/new.rs")], &[]);
 
         assert!(sweep.remove.is_empty());
         assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
@@ -599,7 +880,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, root.join("src/old.rs")).unwrap();
 
         let p = crafted(&root, "src/old.rs");
-        let sweep = plan_sweep(&root, &p, ME, &[]);
+        let sweep = plan_sweep(&root, &p, ME, &[create(&root, "src/new.rs")], &[]);
 
         assert!(sweep.remove.is_empty());
         assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
@@ -612,10 +893,155 @@ mod tests {
         fs::create_dir_all(root.join("src/old.rs")).unwrap();
         let p = crafted(root, "src/old.rs");
 
-        let sweep = plan_sweep(root, &p, ME, &[]);
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/new.rs")], &[]);
 
         assert!(sweep.remove.is_empty());
         assert!(sweep.forget.is_empty());
         assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
+    }
+
+    #[test]
+    fn an_orphan_a_mod_line_still_declares_is_kept() {
+        // v1 wrote `src/jobs/foo.rs` and `pub mod foo;`. v2 names `foo_job.rs`,
+        // so its revert misses `pub mod foo;`. Deleting `foo.rs` would stop
+        // the build.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = generated(root, &mut p, "src/jobs/foo.rs", "x", ME, Some(Scope::Owned));
+        fs::write(root.join("src/jobs/mod.rs"), "pub mod bar;\npub mod foo;\n").unwrap();
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/jobs/foo_job.rs")], &[]);
+
+        assert!(sweep.remove.is_empty());
+        assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
+        assert!(sweep.warnings[0].contains("mod"), "{:?}", sweep.warnings);
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn an_orphan_declared_in_main_rs_is_kept() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        generated(root, &mut p, "src/helpers.rs", "x", ME, Some(Scope::Owned));
+        fs::write(root.join("src/main.rs"), "mod helpers;\nfn main() {}\n").unwrap();
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/new.rs")], &[]);
+
+        assert!(sweep.remove.is_empty());
+    }
+
+    #[test]
+    fn an_orphan_declared_in_a_sibling_module_file_is_kept() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        generated(root, &mut p, "src/jobs/foo.rs", "x", ME, Some(Scope::Owned));
+        fs::write(root.join("src/jobs.rs"), "pub mod foo {}\n").unwrap();
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/jobs/new.rs")], &[]);
+
+        assert!(sweep.remove.is_empty());
+    }
+
+    #[test]
+    fn declares_matches_only_the_whole_module_name() {
+        assert!(declares("pub mod foo;", "foo"));
+        assert!(declares("mod foo ;", "foo"));
+        assert!(declares("pub(crate) mod foo {", "foo"));
+        assert!(!declares("pub mod foo_bar;", "foo"));
+        assert!(!declares("pub mod barfoo;", "foo"));
+        assert!(!declares("pub mod bar;", "foo"));
+        assert!(!declares("// a mod for foo\n", "foo"));
+    }
+
+    #[test]
+    fn a_revert_target_is_left_to_the_revert() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let target = generated(
+            root,
+            &mut p,
+            "src/jobs/list.rs",
+            "x",
+            ME,
+            Some(Scope::Owned),
+        );
+
+        let sweep = plan_sweep(
+            root,
+            &p,
+            ME,
+            &[create(root, "src/jobs/new.rs")],
+            &[target.as_path()],
+        );
+
+        assert_eq!(sweep, Sweep::default());
+    }
+
+    #[test]
+    fn a_missing_migration_or_protected_entry_is_forgotten() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let migration = generated(
+            root,
+            &mut p,
+            "migrations/20260101000000_create_widgets/up.sql",
+            "x",
+            ME,
+            Some(Scope::Owned),
+        );
+        let dotfile = generated(root, &mut p, ".env.example", "x", ME, Some(Scope::Owned));
+        fs::remove_file(&migration).unwrap();
+        fs::remove_file(&dotfile).unwrap();
+
+        let mut sweep = plan_sweep(root, &p, ME, &[], &[]);
+        sweep.forget.sort();
+
+        assert_eq!(sweep.forget, vec![dotfile, migration]);
+        assert!(sweep.warnings.is_empty(), "{:?}", sweep.warnings);
+    }
+
+    #[test]
+    fn windows_aliases_are_not_plain_parts() {
+        for key in ["Cargo.toml.", "src/main.rs ", "PROGRA~1/x.rs", "src/a.rs."] {
+            assert!(plain_parts(key).is_none(), "{key:?}");
+        }
+        assert_eq!(plain_parts("src/a.rs"), Some(vec!["src", "a.rs"]));
+    }
+
+    #[test]
+    fn a_differently_spelled_name_is_refused_where_it_resolves() {
+        // Only a case-insensitive file system resolves `SRC/old.rs` to
+        // `src/old.rs`. There, the exact-name check must refuse it.
+        let dir = tmp();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/old.rs"), "x").unwrap();
+        if !root.join("SRC/old.rs").exists() {
+            return; // case-sensitive: the alias is simply missing.
+        }
+        let p = crafted(root, "SRC/old.rs");
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "SRC/new.rs")], &[]);
+
+        assert!(sweep.remove.is_empty());
+        assert!(root.join("src/old.rs").exists());
+    }
+
+    #[test]
+    fn still_sweepable_rechecks_the_path() {
+        let dir = tmp();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/old.rs");
+        fs::write(&file, "x").unwrap();
+        assert!(still_sweepable(root, &file));
+        fs::remove_file(&file).unwrap();
+        assert!(!still_sweepable(root, &file));
+        assert!(!still_sweepable(root, &root.join("../x.rs")));
     }
 }
