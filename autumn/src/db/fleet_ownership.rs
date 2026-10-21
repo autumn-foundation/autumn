@@ -376,11 +376,12 @@ impl OwnershipTable {
             .iter_mut()
             .find(|row| row.range == range && row.owner == *owner && row.epoch.get() > floor)
         {
-            row.lease_expires_ms = lease_expires_ms;
+            // Never earlier: a call that timed out may land after a newer one.
+            row.lease_expires_ms = row.lease_expires_ms.max(lease_expires_ms);
             return Ok(Grant {
                 range,
                 epoch: row.epoch,
-                lease_expires_ms,
+                lease_expires_ms: row.lease_expires_ms,
                 fresh: false,
             });
         }
@@ -424,7 +425,8 @@ impl OwnershipTable {
         let row = self
             .held_mut(range, owner, epoch)
             .ok_or(OwnershipError::Lost { range })?;
-        row.lease_expires_ms = lease_end(now_ms, ttl);
+        // Never earlier: a call that timed out may land after a newer one.
+        row.lease_expires_ms = row.lease_expires_ms.max(lease_end(now_ms, ttl));
         Ok(Grant {
             range,
             epoch,
@@ -1265,6 +1267,30 @@ mod tests {
                 .renew(range(0, 98), &owner("a"), grant.epoch, 40_000, TTL)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_late_renew_does_not_shorten_a_newer_lease() {
+        let mut table = OwnershipTable::new();
+        let grant = table.claim(range(0, 99), &owner("a"), 0, TTL).unwrap();
+        table
+            .renew(range(0, 99), &owner("a"), grant.epoch, 40_000, TTL)
+            .unwrap();
+        // An older call, sent at 10 s, lands after the one sent at 40 s.
+        let late = table
+            .renew(range(0, 99), &owner("a"), grant.epoch, 10_000, TTL)
+            .unwrap();
+        assert_eq!(late.lease_expires_ms, 70_000);
+        assert_eq!(table.rows()[0].lease_expires_ms, 70_000);
+    }
+
+    #[test]
+    fn a_late_reclaim_does_not_shorten_a_newer_lease() {
+        let mut table = OwnershipTable::new();
+        table.claim(range(0, 99), &owner("a"), 40_000, TTL).unwrap();
+        let late = table.claim(range(0, 99), &owner("a"), 10_000, TTL).unwrap();
+        assert_eq!(late.lease_expires_ms, 70_000);
+        assert_eq!(table.rows()[0].lease_expires_ms, 70_000);
     }
 
     #[test]
