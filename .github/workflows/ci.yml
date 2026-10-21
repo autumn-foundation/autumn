@@ -2484,6 +2484,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::auth:: \
             | tee "$RUNNER_TEMP/cli-generate-auth-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-auth-cov.log"
+          # Issue #2557: same gap for the `destroy` orphan sweep and the
+          # provenance manifest it reads and writes. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::sweep:: \
+            generate::provenance:: generate::emit:: \
+            | tee "$RUNNER_TEMP/cli-generate-sweep-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-sweep-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
