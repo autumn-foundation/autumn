@@ -2240,7 +2240,7 @@ plan does not name the old file, but the manifest does. `destroy` sweeps it:
   create a file in the same directory. It prints
   `Removed <path> (no longer generated)`.
 - It keeps the file and names it in a warning when you edited the file, when
-  other resources can share it, when a `mod` line still declares it, when the
+  other resources can share it, when other Rust code still names it, when the
   templates create nothing in its directory, or when the manifest entry is from
   Autumn 0.8.0 (that entry does not say which resource owns the file).
   `--force` does not change this.

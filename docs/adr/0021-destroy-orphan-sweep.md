@@ -45,7 +45,9 @@ Reverse brainstorm (how can the sweep delete the wrong file?):
   segment, `target/` and the project files are protected. An owned file is
   deleted only in a directory where the current plan also creates a file.
 - A renamed module whose `pub mod foo;` line stays (the reverts come from the
-  current templates). → A `.rs` file that a `mod` line declares is kept.
+  current templates). → A `.rs` file that any other Rust file still names
+  (its module name as a whole word, or its file name) is kept. No parser:
+  comments, attributes and macros can stand between `mod` and the name.
 - Another spelling of one file (case, Windows aliases). → Each segment must be
   the exact name on disk. A case-only match counts as the plan's own file
   only when both paths reach one file.
@@ -80,7 +82,7 @@ Six hats:
    - other migration, protected file, unsafe path: warn and keep.
    - `shared` or no scope: warn and keep.
    - `owned`: delete when the digest matches, the plan creates a file in the
-     same directory, and no `mod` line declares it. Otherwise warn and keep.
+     same directory, and no other Rust file names it. Otherwise warn and keep.
 4. When `destroy` refuses (diverged files, no `--force`), the sweep removes
    nothing. `--dry-run` lists the sweep. Before it changes anything,
    `destroy` checks each swept file again. If one changed, it refuses, because
@@ -94,7 +96,7 @@ Six hats:
   deletion.
 - The manifest cannot be authenticated. A forged `owned` entry can still
   name an unedited file in a directory where the plan creates files, and
-  that no `mod` line declares. `destroy` prints each swept file as
+  that no other Rust file names. `destroy` prints each swept file as
   `Removed <path> (no longer generated)`, and git can restore it. Review
   changes to `.autumn/generated.toml` like code.
 - Tests that build many plans in one process do not sweep. A sweep test sets

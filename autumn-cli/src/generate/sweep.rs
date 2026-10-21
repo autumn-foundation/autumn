@@ -246,13 +246,18 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
         ),
         // The reverts come from the current templates, so they do not remove
         // the `mod` line an older template added for this file. Deleting a
-        // file that a `mod` line still declares stops the build.
-        Some(Scope::Owned) if declared_module(project_root, &parts) => warn(
-            sweep,
-            "the current templates do not make this file, but a `mod` line still declares \
-             it. autumn destroy keeps it. Remove the `mod` line and the file by hand if you \
-             do not need them.",
-        ),
+        // file that other code still names can stop the build.
+        Some(Scope::Owned)
+            if path.extension().is_some_and(|e| e == "rs")
+                && still_named(project_root, &path, &parts) =>
+        {
+            warn(
+                sweep,
+                "the current templates do not make this file, but other Rust code still \
+                 names it. autumn destroy keeps it. Remove the references and the file by \
+                 hand if you do not need them.",
+            );
+        }
         Some(Scope::Owned) => {
             sweep.digests.insert(path.clone(), entry.digest.to_owned());
             sweep.remove.push(path);
@@ -260,14 +265,16 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
     }
 }
 
-/// Whether a `mod` item can still load the Rust file at `parts`.
+/// Whether any other Rust file in the project still names the Rust file at
+/// `parts`.
 ///
-/// Reads every Rust file in the project, because a parent module can be
-/// inline in any of them (`mod jobs { mod foo; }` in `src/main.rs`). Any
-/// `mod <stem>` counts, and so does a `#[path]` that names the file. This
-/// errs on the side of "declared": a module of the same name elsewhere, or a
-/// comment that looks like one, also keeps the file.
-fn declared_module(project_root: &Path, parts: &[&str]) -> bool {
+/// No parser: Rust lets a comment, an attribute, a raw string or a macro
+/// stand between `mod` and the name, and a parent module can be inline in
+/// any file. So any whole-word mention of the module name counts, and so does
+/// the file name anywhere (a `#[path]`, an `include!`). This errs on the side
+/// of "still used": a same-named item elsewhere also keeps the file, which
+/// costs a warning, never a broken build.
+fn still_named(project_root: &Path, path: &Path, parts: &[&str]) -> bool {
     let Some((file, dirs)) = parts.split_last() else {
         return false;
     };
@@ -280,31 +287,25 @@ fn declared_module(project_root: &Path, parts: &[&str]) -> bool {
         ("mod", Some(dir)) => *dir,
         _ => stem,
     };
-    any_rust_file(project_root, |text| {
-        declares(text, stem) || names_path(text, file)
+    any_rust_file(project_root, path, |text| {
+        mentions(text, stem) || text.contains(file)
     })
 }
 
-/// Whether `text` holds `mod`, whitespace, `<stem>` (or `r#<stem>`), then
-/// `;` or `{`. Any Rust whitespace counts, newlines too.
-fn declares(text: &str, stem: &str) -> bool {
+/// Whether `text` holds `word` with no identifier character on either side.
+fn mentions(text: &str, word: &str) -> bool {
     let ident = |c: char| c.is_alphanumeric() || c == '_';
-    text.match_indices("mod").any(|(at, _)| {
-        let before_ok = text[..at].chars().next_back().is_none_or(|c| !ident(c));
-        let rest = &text[at + 3..];
-        let name = rest.trim_start();
-        let spaced = name.len() < rest.len();
-        let name = name.strip_prefix("r#").unwrap_or(name);
-        before_ok
-            && spaced
-            && name
-                .strip_prefix(stem)
-                .is_some_and(|tail| tail.trim_start().starts_with([';', '{']))
+    text.match_indices(word).any(|(at, _)| {
+        text[..at].chars().next_back().is_none_or(|c| !ident(c))
+            && text[at + word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !ident(c))
     })
 }
 
-/// Whether any Rust file in the project satisfies `test`.
-fn any_rust_file(project_root: &Path, test: impl Fn(&str) -> bool) -> bool {
+/// Whether any Rust file in the project other than `skip` satisfies `test`.
+fn any_rust_file(project_root: &Path, skip: &Path, test: impl Fn(&str) -> bool) -> bool {
     let mut pending = vec![project_root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -323,6 +324,7 @@ fn any_rust_file(project_root: &Path, test: impl Fn(&str) -> bool) -> bool {
                 }
             } else if kind.is_file()
                 && name.ends_with(".rs")
+                && entry.path() != skip
                 && fs::read_to_string(entry.path()).is_ok_and(|text| test(&text))
             {
                 return true;
@@ -330,30 +332,6 @@ fn any_rust_file(project_root: &Path, test: impl Fn(&str) -> bool) -> bool {
         }
     }
     false
-}
-
-/// Whether `text` holds `path`, `=`, and a string literal (plain or raw) that
-/// ends in `file`.
-fn names_path(text: &str, file: &str) -> bool {
-    text.match_indices("path").any(|(at, _)| {
-        let Some(rest) = text[at + 4..].trim_start().strip_prefix('=') else {
-            return false;
-        };
-        // A plain `"…"` or a raw `r"…"` / `r#"…"#` literal.
-        let rest = rest.trim_start();
-        let rest = rest
-            .strip_prefix('r')
-            .map_or(rest, |raw| raw.trim_start_matches('#'));
-        let Some(literal) = rest.strip_prefix('"') else {
-            return false;
-        };
-        literal.split('"').next().is_some_and(|value| {
-            value
-                .rsplit(['/', '\\'])
-                .next()
-                .is_some_and(|last| last == file)
-        })
-    })
 }
 
 /// The suffix of a migration directory name, lowercase.
@@ -989,7 +967,11 @@ mod tests {
 
         assert!(sweep.remove.is_empty());
         assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
-        assert!(sweep.warnings[0].contains("mod"), "{:?}", sweep.warnings);
+        assert!(
+            sweep.warnings[0].contains("still names it"),
+            "{:?}",
+            sweep.warnings
+        );
         assert!(old.exists());
     }
 
@@ -1059,18 +1041,35 @@ mod tests {
     }
 
     #[test]
-    fn declares_matches_only_the_whole_module_name() {
-        assert!(declares("pub mod foo;", "foo"));
-        assert!(declares("mod foo ;", "foo"));
-        assert!(declares("pub(crate) mod foo {", "foo"));
-        assert!(!declares("pub mod foo_bar;", "foo"));
-        assert!(!declares("pub mod barfoo;", "foo"));
-        assert!(!declares("pub mod bar;", "foo"));
-        assert!(!declares("// a mod for foo\n", "foo"));
-        assert!(declares("mod\tfoo;", "foo"));
-        assert!(declares("pub mod\nfoo\n;", "foo"));
-        assert!(declares("mod r#foo;", "foo"));
-        assert!(!declares("modfoo;", "foo"));
+    fn mentions_matches_only_the_whole_word() {
+        assert!(mentions("pub mod foo;", "foo"));
+        assert!(mentions("mod /* generated */ foo;", "foo"));
+        assert!(mentions("mod\tfoo;", "foo"));
+        assert!(mentions("mod r#foo;", "foo"));
+        assert!(mentions("foo", "foo"));
+        assert!(!mentions("pub mod foo_bar;", "foo"));
+        assert!(!mentions("pub mod barfoo;", "foo"));
+        assert!(!mentions("pub mod bar;", "foo"));
+    }
+
+    #[test]
+    fn an_orphan_that_names_only_itself_is_swept() {
+        // The orphan's own text is not a reference to it.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = generated(
+            root,
+            &mut p,
+            "src/jobs/foo.rs",
+            "pub fn foo() {}\n",
+            ME,
+            Some(Scope::Owned),
+        );
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/jobs/new.rs")], &[]);
+
+        assert_eq!(sweep.remove, vec![old]);
     }
 
     #[test]
@@ -1092,15 +1091,22 @@ mod tests {
     }
 
     #[test]
-    fn names_path_matches_only_the_file_name() {
-        assert!(names_path("#[path = \"jobs/foo.rs\"]", "foo.rs"));
-        assert!(names_path("#[path=\"foo.rs\"]", "foo.rs"));
-        assert!(names_path("#[path = \"a\\\\foo.rs\"]", "foo.rs"));
-        assert!(!names_path("#[path = \"jobs/foo.rs.bak\"]", "foo.rs"));
-        assert!(!names_path("#[path = \"jobs/barfoo.rs\"]", "foo.rs"));
-        assert!(!names_path("let path = 3;", "foo.rs"));
-        assert!(names_path("#[path = r\"jobs/foo.rs\"]", "foo.rs"));
-        assert!(names_path("#[path = r#\"foo.rs\"#]", "foo.rs"));
+    fn an_orphan_named_through_a_raw_path_or_a_comment_is_kept() {
+        for main in [
+            "#[path = r\"jobs/foo.rs\"]\nmod bar;\nfn main() {}\n",
+            "mod jobs { mod /* generated */ foo; }\nfn main() {}\n",
+        ] {
+            let dir = tmp();
+            let root = dir.path();
+            let mut p = Provenance::default();
+            let old = generated(root, &mut p, "src/jobs/foo.rs", "x", ME, Some(Scope::Owned));
+            fs::write(root.join("src/main.rs"), main).unwrap();
+
+            let sweep = plan_sweep(root, &p, ME, &[create(root, "src/jobs/new.rs")], &[]);
+
+            assert!(sweep.remove.is_empty(), "{main}: {:?}", sweep.remove);
+            assert!(old.exists());
+        }
     }
 
     #[test]
