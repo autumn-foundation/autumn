@@ -835,7 +835,10 @@ fn ci_job<'a>(ci: &'a str, name: &str) -> &'a str {
 #[test]
 fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
     let root = workspace_root();
-    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    // A Windows checkout can turn LF into CRLF.
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
     let sweep = ci_job(&ci, "test-docker");
     assert!(
         !sweep.contains("--test deploy_e2e"),
