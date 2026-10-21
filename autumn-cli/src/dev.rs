@@ -707,7 +707,8 @@ impl DevReloadState {
 /// package-cache lock and slow the build itself — and the watch loop then polls
 /// for the result without blocking. A verdict that has not arrived by this
 /// deadline is dropped, its auditor process is killed, and the dev loop says
-/// nothing. The process is never killed before the deadline.
+/// nothing. The process is not killed before the deadline, except when the
+/// dev session ends.
 const DEPENDENCY_AUDIT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Startup lines for an evaluation that may not have finished in time.

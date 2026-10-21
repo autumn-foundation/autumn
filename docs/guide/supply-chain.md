@@ -552,11 +552,12 @@ A third difference has no line, because doctor cannot see it. Only cargo-deny
 knows the `deny.toml` schema. Doctor checks that the file is valid TOML. If
 cargo-deny is not installed, doctor does not check the schema: `yanked =
 "bogus"` is valid TOML, so doctor passes and CI rejects it. Without cargo-deny,
-the line says `not evaluated or validated`. Install cargo-deny to close the gap.
+the doctor line says `not evaluated` and that doctor cannot check `deny.toml`. Install cargo-deny to close the gap.
 
-When a doctor or dev audit passes its deadline (30 seconds), the `cargo-deny`
-process and its children are killed, so they cannot hold Cargo's package-cache
-lock. A finished audit is never killed.
+When a doctor or dev audit reaches its deadline (30 seconds), Autumn kills the
+`cargo-deny` process. On Unix, it also kills the processes that `cargo-deny`
+started, so they cannot hold Cargo's package-cache lock. On Windows, only
+`cargo-deny` itself is killed. A finished audit is never killed.
 
 Uncommenting a section widens both sides at once. The generated workflow
 derives its check list from the file:

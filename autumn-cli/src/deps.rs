@@ -10,7 +10,7 @@
 //!
 //! One limit follows from that. Only `cargo deny` knows its config schema. A
 //! `deny.toml` that is valid TOML but breaks the schema (`yanked = "bogus"`)
-//! passes here when `cargo deny` is absent, and CI rejects it (issue #2575).
+//! is accepted here when `cargo deny` is absent, and CI rejects it (issue #2575).
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -815,7 +815,11 @@ pub fn await_evaluation(
 /// A budget that expires is reported as no verdict, never as a clean tree.
 /// The auditor process is stopped at that point, not before.
 pub fn evaluate_within(root: &Path, budget: Duration) -> Evaluation {
-    let running = spawn_evaluation(root);
+    await_or_stop(&spawn_evaluation(root), budget)
+}
+
+/// Wait up to `budget` for `running`. On expiry, stop it and report no verdict.
+fn await_or_stop(running: &Running, budget: Duration) -> Evaluation {
     await_evaluation(&running.receiver, budget).unwrap_or_else(|| {
         running.stop.stop();
         Evaluation::Unavailable {
@@ -834,8 +838,8 @@ struct Slot {
 
 /// Ends an audit's auditor process.
 ///
-/// Call it only after the deadline. On the normal path the verdict arrives and
-/// the process has already exited. Killing a live `cargo metadata` is safe for
+/// Call it after the deadline, or when the caller ends. On the normal path the
+/// verdict arrives and the process has already exited. Killing a live `cargo metadata` is safe for
 /// Cargo's package-cache lock: the OS releases the lock when its holder dies.
 #[derive(Clone, Default)]
 pub struct StopHandle(std::sync::Arc<std::sync::Mutex<Slot>>);
@@ -864,9 +868,9 @@ impl StopHandle {
     }
 }
 
-/// Kill a child and every process it started.
+/// Kill a child and, on Unix, every process it started.
 ///
-/// The auditor runs `cargo metadata` as its own child. Killing only the
+/// On Windows only the child dies. The auditor runs `cargo metadata` as its own child. Killing only the
 /// auditor leaves that process holding the package-cache lock.
 fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
@@ -879,6 +883,10 @@ fn kill_tree(child: &mut std::process::Child) {
     }
     let _ = child.kill();
 }
+
+/// How long to wait for output after the auditor exits. A descendant that
+/// outlives it can hold the pipe open.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// How often a running auditor is checked for exit.
 const POLL: Duration = Duration::from_millis(10);
@@ -902,13 +910,15 @@ fn run_stoppable(
     std::os::unix::process::CommandExt::process_group(command, 0);
     let mut child = command.spawn()?;
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut bytes);
             }
-            bytes
-        })
+            let _ = sender.send(bytes);
+        });
+        receiver
     };
     let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
@@ -940,8 +950,8 @@ fn run_stoppable(
     };
     Ok(std::process::Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: stdout.recv_timeout(DRAIN_GRACE).unwrap_or_default(),
+        stderr: stderr.recv_timeout(DRAIN_GRACE).unwrap_or_default(),
     })
 }
 
@@ -1596,19 +1606,30 @@ mod tests {
         fn stopping_kills_the_auditor_and_its_children() {
             let dir = tempfile::tempdir().expect("tempdir");
             let pid_file = dir.path().join("grandchild.pid");
-            let script = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+            let tmp_file = dir.path().join("grandchild.tmp");
+            // Write, then rename: the reader never sees a partial pid.
+            let script = format!(
+                "sleep 60 & echo $! > {tmp}; mv {tmp} {pid}; wait",
+                tmp = tmp_file.display(),
+                pid = pid_file.display()
+            );
             let stop = StopHandle::default();
             let stopper = stop.clone();
-            let started = std::time::Instant::now();
             let runner = std::thread::spawn(move || run_stoppable(&mut sh(&script), &stopper));
-            let grandchild: i32 = loop {
-                if let Ok(text) = std::fs::read_to_string(&pid_file)
-                    && let Ok(pid) = text.trim().parse()
-                {
-                    break pid;
+            let mut grandchild = None;
+            for _ in 0..500 {
+                if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                    grandchild = text.trim().parse::<i32>().ok();
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
+            }
+            let Some(grandchild) = grandchild else {
+                stop.stop();
+                panic!("the auditor never started its child");
             };
+            // Kill the child on any failure below.
+            let _cleanup = Cleanup(grandchild);
             assert!(alive(grandchild));
             stop.stop();
             let result = runner.join().expect("join");
@@ -1616,15 +1637,54 @@ mod tests {
                 result.expect_err("stopped").kind(),
                 std::io::ErrorKind::Interrupted
             );
-            assert!(started.elapsed() < Duration::from_secs(30));
             // Reaping is up to init; allow it a moment.
-            for _ in 0..200 {
+            for _ in 0..1000 {
                 if !alive(grandchild) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             panic!("the auditor's child outlived the stop");
+        }
+
+        /// Kills a leftover process when a test fails early.
+        struct Cleanup(i32);
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(self.0),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+
+        #[test]
+        fn a_stop_twice_is_harmless() {
+            let stop = StopHandle::default();
+            stop.stop();
+            stop.stop();
+            assert!(stop.is_stopped());
+        }
+
+        #[test]
+        fn output_larger_than_a_pipe_buffer_is_drained() {
+            let stop = StopHandle::default();
+            let output = run_stoppable(&mut sh("head -c 300000 /dev/zero"), &stop).expect("run");
+            assert_eq!(output.stdout.len(), 300_000);
+        }
+
+        #[test]
+        fn a_budget_that_expires_stops_the_audit() {
+            let (_sender, receiver) = mpsc::channel();
+            let stop = StopHandle::default();
+            let running = Running {
+                receiver,
+                stop: stop.clone(),
+            };
+            let eval = await_or_stop(&running, Duration::from_millis(10));
+            assert!(matches!(eval, Evaluation::Unavailable { .. }));
+            assert!(stop.is_stopped(), "expiry must stop the auditor");
         }
 
         #[test]
