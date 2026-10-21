@@ -184,8 +184,8 @@ pub enum IntrospectError {
     Query(String),
     /// The `SQLite` database file could not be opened. Carries only the parsed
     /// file path (a `SQLite` DSN carries no credentials), never the raw URL.
-    #[cfg(feature = "sqlite")]
     #[error("could not open the SQLite database at {path} — is the file present and readable?")]
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     ConnectionSqlite {
         /// The resolved `SQLite` file path (`:memory:` for an in-memory target).
         path: String,
@@ -1439,9 +1439,10 @@ fn serial_kind_for(
 // SQLite introspection (`autumn schema pull` on the sqlite backend-flip)
 // ===========================================================================
 //
-// Compiled only under the `sqlite` cargo feature (the backend-flip that must never
-// be co-built with the default Postgres backend — see `autumn-cli/Cargo.toml`), so
-// the default (Postgres) build references no `SqliteConnection` here. It lifts a
+// Compiled in every build: diesel's SQLite backend is always in the CLI graph (the
+// workspace `diesel` pin), and `autumn db scrub` reads SQLite targets from the
+// default binary. `autumn schema pull` on SQLite still needs the `sqlite` cargo
+// feature. It lifts a
 // live SQLite database into the SAME `autumn_schema_core` snapshot IR as
 // [`introspect_postgres`], reading the SQLite catalog through `sqlite_master` and
 // the table-valued `pragma_*` functions in a constant number of batched queries
@@ -1494,7 +1495,6 @@ fn serial_kind_for(
 /// target [`diesel::SqliteConnection::establish`] expects, mirroring autumn-web's
 /// own `normalize_sqlite_target` (kept in lock-step so the pull connects to the same
 /// file `schema migrate` does). An empty or `:memory:` target stays `:memory:`.
-#[cfg(feature = "sqlite")]
 pub fn sqlite_target(url: &str) -> String {
     if url.starts_with("file:") {
         return url.to_owned();
@@ -1522,7 +1522,6 @@ pub fn sqlite_target(url: &str) -> String {
 /// stripped (handling `file:p`, `file:/p`, `file://host/p`, `file:///p`), the `?query`
 /// separator honored, and the path percent-decoded — then existence-checked like a
 /// bare path.
-#[cfg(feature = "sqlite")]
 pub fn sqlite_existence_check_path(target: &str) -> Option<String> {
     if target.is_empty() || target == ":memory:" {
         return None;
@@ -1551,7 +1550,7 @@ pub fn sqlite_existence_check_path(target: &str) -> Option<String> {
     Some(decoded)
 }
 
-#[cfg(all(test, feature = "sqlite"))]
+#[cfg(test)]
 mod target_tests {
     use super::sqlite_existence_check_path;
 
@@ -1617,7 +1616,7 @@ mod target_tests {
 /// Returns [`IntrospectError::ConnectionSqlite`] if the database file cannot be
 /// opened, or [`IntrospectError::Query`] if a catalog query/PRAGMA fails. Neither
 /// leaks the database URL.
-#[cfg(feature = "sqlite")]
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
     use diesel::{Connection as _, SqliteConnection};
 
@@ -1644,7 +1643,6 @@ pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
 /// # Errors
 ///
 /// Returns [`IntrospectError::Query`] if a catalog query or PRAGMA fails.
-#[cfg(feature = "sqlite")]
 pub fn introspect_sqlite_conn(
     conn: &mut diesel::SqliteConnection,
 ) -> Result<Vec<Table>, IntrospectError> {
@@ -1653,7 +1651,6 @@ pub fn introspect_sqlite_conn(
 
 /// `SQLite` catalog probes + IR assembly. All row DTOs and helpers live here so the
 /// default (Postgres) build never compiles a `SqliteConnection` reference.
-#[cfg(feature = "sqlite")]
 mod sqlite {
     use std::collections::BTreeMap;
 
@@ -2048,7 +2045,7 @@ mod sqlite {
     }
 
     /// Normalize a raw `SQLite` `dflt_value` into a [`ColumnDefault`]. Recovers the
-    /// Autumn `Timestamp` convention default (`CURRENT_TIMESTAMP` → [`Now`]) and
+    /// Autumn `Timestamp` convention default (`CURRENT_TIMESTAMP` → `Now`) and
     /// preserves anything else verbatim.
     ///
     /// `pragma_table_info.dflt_value` reports the literal keyword `NULL` (bareword,
@@ -2310,9 +2307,9 @@ mod sqlite {
     /// rebuild / `DropTable` rollback would produce illegal DDL. Instead a
     /// **single-column** inline `col TEXT UNIQUE` is folded into the column's
     /// `unique = true` flag: a matching `#[unique]` model is recognized as already
-    /// satisfied ([`baseline_unique_index_covers`], no `AddIndex` / no guard refusal),
+    /// satisfied (`baseline_unique_index_covers`, no `AddIndex` / no guard refusal),
     /// and the emitter renders it as inline `UNIQUE` on a rebuild/rollback
-    /// ([`render_create_table_body`]) so uniqueness is preserved. A **composite**
+    /// (`render_create_table_body`) so uniqueness is preserved. A **composite**
     /// table-level `UNIQUE(a, b)` has no single-column flag and no recreatable IR form,
     /// so it is skipped entirely (DEFERRED, #1975 — a rare brownfield shape; the live
     /// constraint is untouched).

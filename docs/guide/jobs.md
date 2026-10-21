@@ -420,8 +420,8 @@ directly; work another process enqueued is seen within
 `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
 to cut idle wakeups.
 
-Terminal rows are pruned by the runtime, not by `autumn db retention`, whose
-sweep is Postgres-only. Set `retention.job_history` to bound the table; leave it
+The runtime prunes terminal rows. `autumn db retention` also sweeps them
+(#2553). Set `retention.job_history` to bound the table; leave it
 unset and history is kept forever, exactly as on Postgres.
 
 The runtime creates the table and its indexes at start, because framework

@@ -114,15 +114,14 @@ ignore = [
     # exploit here, and no safe upgrade (the author recommends `web-time`).
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2026-0381 — `webpki-roots` 0.26.11 bundles a distrusted root.
-    # https://rustsec.org/advisories/RUSTSEC-2026-0381
+    # RUSTSEC-2026-0381 — `webpki-roots` bundles a root that allows distrusted
+    # emSign intermediates. https://rustsec.org/advisories/RUSTSEC-2026-0381
     #
-    # Present for the same reason as `instant`. The embedded-Postgres crate
-    # uses `sqlx` only for CREATE/DROP DATABASE against the local server it
-    # starts, so no remote certificate is checked against this root store. No
-    # 0.26.x fix exists. A fixed release needs a newer Rust than autumn-web's
-    # minimum. Remove this waiver when that minimum rises.
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core in the managed-pg-bundled embedded-Postgres stack; used only for local CREATE/DROP DATABASE, no remote TLS trust; no 0.26.x fix; review-by 2026-11-17" },
+    # Present for the same reason: webpki-roots 0.26.11 arrives through
+    # sqlx-core 0.8.6 under (build) postgresql_embedded. No patched 0.26.x
+    # exists. That sqlx talks to a local embedded Postgres, so it trusts no
+    # public CA chain. Review-by: 2026-11-20.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 under the build-time managed-pg-bundled stack; no patched 0.26.x; local embedded Postgres only; review-by 2026-11-20" },
     # <<< autumn:bundled-pg-waiver
 ]
 

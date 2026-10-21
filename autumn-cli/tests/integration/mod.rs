@@ -7,6 +7,7 @@ mod db;
 mod db_backup_sqlite;
 mod db_pull;
 mod db_scrub;
+mod db_scrub_sqlite;
 mod dependency_audit;
 mod dependency_dev_loop;
 mod deploy;
