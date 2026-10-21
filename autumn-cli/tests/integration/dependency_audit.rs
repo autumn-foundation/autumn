@@ -341,6 +341,11 @@ fn the_scaffold_waives_only_what_its_own_flavor_can_hit() {
         "the managed-pg-bundled waiver has no business in an app that never \
          enables that feature"
     );
+    assert!(
+        !read_project_file(&plain, "deny.toml").contains("RUSTSEC-2026-0381"),
+        "the webpki-roots waiver has no business in an app that never \
+         enables managed-pg-bundled"
+    );
 }
 
 #[test]
@@ -694,6 +699,11 @@ fn the_scaffold_policy_covers_the_bundled_postgres_flavor() {
     assert!(
         deny.contains("RUSTSEC-2024-0384"),
         "`--bundled-pg` pulls `instant` (RUSTSEC-2024-0384) through \
+         managed-pg-bundled; without a waiver that app's first CI run is red:\n{deny}"
+    );
+    assert!(
+        deny.contains("RUSTSEC-2026-0381"),
+        "`--bundled-pg` pulls `webpki-roots` 0.26 (RUSTSEC-2026-0381) through \
          managed-pg-bundled; without a waiver that app's first CI run is red:\n{deny}"
     );
 }
