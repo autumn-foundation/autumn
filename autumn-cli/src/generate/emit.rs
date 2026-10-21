@@ -1117,17 +1117,13 @@ impl Plan {
         for path in &plan.files_to_remove {
             let expected = plan.swept.get(path);
             let swept = expected.is_some();
-            // A swept path comes from the manifest. Check it again just
-            // before the delete: a directory can have become a symlink, or
-            // an edit can have been saved since the plan was made.
+            // Check a swept path once more just before its delete. A change
+            // since the check above makes the reverts below wrong for it, so
+            // stop here and apply none of them.
             if expected
                 .is_some_and(|digest| !sweep::still_sweepable(&self.project_root, path, digest))
             {
-                eprintln!(
-                    "Warning: {} changed during destroy; leaving it in place.",
-                    relative_display(path, &self.project_root)
-                );
-                continue;
+                return Err(GenerateError::Diverged(vec![path.clone()]));
             }
             match fs::remove_file(path) {
                 // Two manifest spellings of one file: the first removal won.

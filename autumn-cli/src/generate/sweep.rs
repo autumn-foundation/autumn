@@ -262,35 +262,21 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
 
 /// Whether a `mod` item can still load the Rust file at `parts`.
 ///
-/// Reads the files that can declare it by name: `<dir>/mod.rs` and
-/// `<dir>.rs`, and `src/main.rs` and `src/lib.rs` for a file directly in
-/// `src/`. Also reads every Rust file in the project for a `#[path]` that
-/// names the file. Errs on the side of "declared": a comment that looks like
-/// a declaration counts too.
+/// Reads every Rust file in the project, because a parent module can be
+/// inline in any of them (`mod jobs { mod foo; }` in `src/main.rs`). Any
+/// `mod <stem>` counts, and so does a `#[path]` that names the file. This
+/// errs on the side of "declared": a module of the same name elsewhere, or a
+/// comment that looks like one, also keeps the file.
 fn declared_module(project_root: &Path, parts: &[&str]) -> bool {
-    let Some((file, dirs)) = parts.split_last() else {
+    let Some(file) = parts.last() else {
         return false;
     };
     let Some(stem) = file.strip_suffix(".rs") else {
         return false;
     };
-    let dir = dirs
-        .iter()
-        .fold(project_root.to_path_buf(), |p, part| p.join(part));
-    let mut declarers = vec![dir.join("mod.rs")];
-    if let Some(name) = dir.file_name() {
-        let mut sibling = name.to_os_string();
-        sibling.push(".rs");
-        declarers.push(dir.with_file_name(sibling));
-    }
-    if dirs == ["src"] {
-        declarers.push(dir.join("main.rs"));
-        declarers.push(dir.join("lib.rs"));
-    }
-    declarers
-        .iter()
-        .any(|declarer| fs::read_to_string(declarer).is_ok_and(|text| declares(&text, stem)))
-        || path_attribute_names(project_root, file)
+    any_rust_file(project_root, |text| {
+        declares(text, stem) || names_path(text, file)
+    })
 }
 
 /// Whether `text` holds `mod`, whitespace, `<stem>` (or `r#<stem>`), then
@@ -311,9 +297,8 @@ fn declares(text: &str, stem: &str) -> bool {
     })
 }
 
-/// Whether any Rust file in the project has a `path = "…"` whose last
-/// segment is `file` — the form of a `#[path]` attribute on a `mod` item.
-fn path_attribute_names(project_root: &Path, file: &str) -> bool {
+/// Whether any Rust file in the project satisfies `test`.
+fn any_rust_file(project_root: &Path, test: impl Fn(&str) -> bool) -> bool {
     let mut pending = vec![project_root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -332,7 +317,7 @@ fn path_attribute_names(project_root: &Path, file: &str) -> bool {
                 }
             } else if kind.is_file()
                 && name.ends_with(".rs")
-                && fs::read_to_string(entry.path()).is_ok_and(|text| names_path(&text, file))
+                && fs::read_to_string(entry.path()).is_ok_and(|text| test(&text))
             {
                 return true;
             }
@@ -1020,6 +1005,24 @@ mod tests {
         let sweep = plan_sweep(root, &p, ME, &[create(root, "src/jobs/new.rs")], &[]);
 
         assert!(sweep.remove.is_empty());
+    }
+
+    #[test]
+    fn an_orphan_an_inline_parent_module_declares_is_kept() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = generated(root, &mut p, "src/jobs/foo.rs", "x", ME, Some(Scope::Owned));
+        fs::write(
+            root.join("src/main.rs"),
+            "mod jobs {\n    pub mod foo;\n}\nfn main() {}\n",
+        )
+        .unwrap();
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/jobs/new.rs")], &[]);
+
+        assert!(sweep.remove.is_empty(), "{:?}", sweep.remove);
+        assert!(old.exists());
     }
 
     #[test]
