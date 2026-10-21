@@ -809,22 +809,35 @@ pub fn evaluate_within(root: &Path, budget: Duration) -> Evaluation {
 
 /// The directory holding the app's policy file, searching upward from `start`.
 ///
-/// The CI gate runs at the repository root, so the outermost policy up to the
-/// `.git` boundary wins over a workspace member's own. A developer inside a
-/// member gets the same graph and rules as CI.
+/// The CI gate runs at the repository root, so the outermost policy wins over
+/// a workspace member's own. The search stops at the `.git` folder or at a
+/// `[workspace]` root, whose graph an outer policy does not cover. With
+/// neither boundary, the nearest policy wins: a stray file higher up is not
+/// part of the app.
 pub fn find_policy_root(start: &Path) -> Option<PathBuf> {
     let start = start.canonicalize().ok()?;
-    let mut found = None;
+    let mut nearest = None;
+    let mut outermost = None;
+    let mut bounded = false;
     for dir in start.ancestors() {
         if dir.join(POLICY_FILE).is_file() {
-            found = Some(dir.to_path_buf());
+            nearest.get_or_insert_with(|| dir.to_path_buf());
+            outermost = Some(dir.to_path_buf());
         }
-        // The repository root bounds the search.
-        if dir.join(".git").exists() {
+        if dir.join(".git").exists() || is_workspace_root(dir) {
+            bounded = true;
             break;
         }
     }
-    found
+    if bounded { outermost } else { nearest }
+}
+
+/// Whether `dir` holds a `Cargo.toml` with a `[workspace]` table.
+fn is_workspace_root(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|manifest| manifest.parse::<toml::Table>().ok())
+        .is_some_and(|manifest| manifest.contains_key("workspace"))
 }
 
 /// Evaluate the dependency policy for the app rooted at `root`.
@@ -1709,6 +1722,52 @@ mod tests {
         assert_eq!(
             find_policy_root(&repo).map(|found| found.canonicalize().expect("canonical")),
             Some(repo.canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn without_a_repository_root_the_nearest_policy_wins() {
+        // No `.git` bounds the walk, so an outer policy may be a stray file.
+        let outer = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outer.path().join(POLICY_FILE), "[bans]\n").expect("outer policy");
+        let app = outer.path().join("app");
+        std::fs::create_dir_all(&app).expect("app");
+        std::fs::write(app.join(POLICY_FILE), "[advisories]\n").expect("policy");
+        assert_eq!(
+            find_policy_root(&app).map(|found| found.canonicalize().expect("canonical")),
+            Some(app.canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn the_outermost_of_three_policies_wins() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git");
+        let member = root.path().join("crates").join("app");
+        std::fs::create_dir_all(&member).expect("member");
+        for dir in [root.path(), &root.path().join("crates"), &member] {
+            std::fs::write(dir.join(POLICY_FILE), "[advisories]\n").expect("policy");
+        }
+        assert_eq!(
+            find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
+            Some(root.path().canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn a_nested_workspace_keeps_its_own_policy() {
+        // A nested workspace has its own lockfile and graph. The outer policy
+        // does not cover it.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git");
+        std::fs::write(root.path().join(POLICY_FILE), "[bans]\n").expect("policy");
+        let nested = root.path().join("examples").join("flock");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::write(nested.join(POLICY_FILE), "[advisories]\n").expect("nested policy");
+        std::fs::write(nested.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("manifest");
+        assert_eq!(
+            find_policy_root(&nested).map(|found| found.canonicalize().expect("canonical")),
+            Some(nested.canonicalize().expect("canonical"))
         );
     }
 
