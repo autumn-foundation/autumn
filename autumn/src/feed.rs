@@ -265,42 +265,42 @@ impl Feed {
         let mut s = String::new();
         s.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         s.push_str("<feed xmlns=\"http://www.w3.org/2005/Atom\">\n");
-        writeln!(s, "  <title>{}</title>", escape(&self.title)).unwrap();
-        writeln!(s, "  <id>{}</id>", escape(&self.self_link)).unwrap();
-        writeln!(s, "  <link href=\"{}\"/>", escape(&self.site_link)).unwrap();
-        writeln!(
-            s,
-            "  <link href=\"{}\" rel=\"self\" type=\"application/atom+xml\"/>",
-            escape(&self.self_link)
-        )
-        .unwrap();
+        push_escaped(&mut s, "  <title>", &self.title, "</title>\n");
+        push_escaped(&mut s, "  <id>", &self.self_link, "</id>\n");
+        push_escaped(&mut s, "  <link href=\"", &self.site_link, "\"/>\n");
+        push_escaped(
+            &mut s,
+            "  <link href=\"",
+            &self.self_link,
+            "\" rel=\"self\" type=\"application/atom+xml\"/>\n",
+        );
         writeln!(s, "  <updated>{}</updated>", rfc3339(updated)).unwrap();
         // Atom requires a feed-level author unless every entry has one; default
         // to the feed title so the feed is always valid.
         let author = self.author.as_deref().unwrap_or(&self.title);
         s.push_str("  <author>\n");
-        writeln!(s, "    <name>{}</name>", escape(author)).unwrap();
+        push_escaped(&mut s, "    <name>", author, "</name>\n");
         s.push_str("  </author>\n");
         for e in &self.entries {
             s.push_str("  <entry>\n");
-            writeln!(s, "    <title>{}</title>", escape(&e.title)).unwrap();
-            writeln!(s, "    <id>{}</id>", escape(&e.id)).unwrap();
-            writeln!(s, "    <link href=\"{}\"/>", escape(&e.link)).unwrap();
+            push_escaped(&mut s, "    <title>", &e.title, "</title>\n");
+            push_escaped(&mut s, "    <id>", &e.id, "</id>\n");
+            push_escaped(&mut s, "    <link href=\"", &e.link, "\"/>\n");
             let entry_updated = e.updated.or(e.published).unwrap_or(updated);
             writeln!(s, "    <updated>{}</updated>", rfc3339(entry_updated)).unwrap();
             if let Some(published) = e.published {
                 writeln!(s, "    <published>{}</published>", rfc3339(published)).unwrap();
             }
             if let Some(summary) = &e.summary {
-                writeln!(s, "    <summary>{}</summary>", escape(summary)).unwrap();
+                push_escaped(&mut s, "    <summary>", summary, "</summary>\n");
             }
             if let Some(content) = &e.content {
-                writeln!(
-                    s,
-                    "    <content type=\"html\">{}</content>",
-                    escape(content)
-                )
-                .unwrap();
+                push_escaped(
+                    &mut s,
+                    "    <content type=\"html\">",
+                    content,
+                    "</content>\n",
+                );
             }
             s.push_str("  </entry>\n");
         }
@@ -315,32 +315,32 @@ impl Feed {
         s.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         s.push_str("<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n");
         s.push_str("  <channel>\n");
-        writeln!(s, "    <title>{}</title>", escape(&self.title)).unwrap();
-        writeln!(s, "    <link>{}</link>", escape(&self.site_link)).unwrap();
-        writeln!(s, "    <description>{}</description>", escape(description)).unwrap();
+        push_escaped(&mut s, "    <title>", &self.title, "</title>\n");
+        push_escaped(&mut s, "    <link>", &self.site_link, "</link>\n");
+        push_escaped(&mut s, "    <description>", description, "</description>\n");
         if let Some(author) = &self.author {
-            writeln!(s, "    <dc:creator>{}</dc:creator>", escape(author)).unwrap();
+            push_escaped(&mut s, "    <dc:creator>", author, "</dc:creator>\n");
         }
-        writeln!(
-            s,
-            "    <atom:link href=\"{}\" rel=\"self\" type=\"application/rss+xml\"/>",
-            escape(&self.self_link)
-        )
-        .unwrap();
+        push_escaped(
+            &mut s,
+            "    <atom:link href=\"",
+            &self.self_link,
+            "\" rel=\"self\" type=\"application/rss+xml\"/>\n",
+        );
         writeln!(s, "    <lastBuildDate>{}</lastBuildDate>", rfc2822(updated)).unwrap();
         for e in &self.entries {
             s.push_str("    <item>\n");
-            writeln!(s, "      <title>{}</title>", escape(&e.title)).unwrap();
-            writeln!(s, "      <link>{}</link>", escape(&e.link)).unwrap();
-            writeln!(
-                s,
-                "      <guid isPermaLink=\"false\">{}</guid>",
-                escape(&e.id)
-            )
-            .unwrap();
+            push_escaped(&mut s, "      <title>", &e.title, "</title>\n");
+            push_escaped(&mut s, "      <link>", &e.link, "</link>\n");
+            push_escaped(
+                &mut s,
+                "      <guid isPermaLink=\"false\">",
+                &e.id,
+                "</guid>\n",
+            );
             let body = e.content.as_deref().or(e.summary.as_deref());
             if let Some(body) = body {
-                writeln!(s, "      <description>{}</description>", escape(body)).unwrap();
+                push_escaped(&mut s, "      <description>", body, "</description>\n");
             }
             if let Some(published) = e.published.or(e.updated) {
                 writeln!(s, "      <pubDate>{}</pubDate>", rfc2822(published)).unwrap();
@@ -449,18 +449,19 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// Scans bytes against a lookup table rather than decoding every `char`: in
 /// valid UTF-8 every special ASCII byte is its own character, and the only
 /// non-ASCII characters outside the XML 1.0 `Char` set are `U+FFFE`/`U+FFFF`
-/// (`EF BF BE` / `EF BF BF`). Input with nothing to change is returned with
-/// one allocation and one memcpy.
-fn escape(s: &str) -> String {
+/// (`EF BF BE` / `EF BF BF`). Input with nothing to change is appended with
+/// one memcpy and no allocation of its own.
+fn escape_into(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() && !NEEDS_ATTENTION[bytes[i] as usize] {
         i += 1;
     }
     if i == bytes.len() {
-        return s.to_owned();
+        out.push_str(s);
+        return;
     }
-    let mut out = String::with_capacity(s.len());
+    out.reserve(s.len());
     // Copy maximal runs of bytes that pass through unchanged with one
     // `push_str` each, flushing only around a dropped or escaped character.
     let mut run_start = 0;
@@ -488,6 +489,21 @@ fn escape(s: &str) -> String {
         run_start = i;
     }
     out.push_str(&s[run_start..]);
+}
+
+/// Append `prefix`, the escaped `text`, then `suffix` to `out`. Escaping in
+/// place avoids a temporary `String` per text field.
+fn push_escaped(out: &mut String, prefix: &str, text: &str, suffix: &str) {
+    out.push_str(prefix);
+    escape_into(out, text);
+    out.push_str(suffix);
+}
+
+/// Owned form of [`escape_into`] (test oracle).
+#[cfg(test)]
+fn escape(s: &str) -> String {
+    let mut out = String::new();
+    escape_into(&mut out, s);
     out
 }
 

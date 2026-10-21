@@ -4169,6 +4169,28 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeClientIp {{
     }}
 }}
 
+/// Stamp `locked_at` when the failure count reaches the threshold.
+///
+/// The UPDATE needs `failed_attempts >= threshold` and `locked_at IS NULL`.
+/// So only one concurrent caller changes the row, and a reset by a good login
+/// is never undone (#2500). The clock is read here, just before the write,
+/// so a slow caller cannot save an old time (#2531).
+///
+/// Returns `true` only when this call set the lock. Log only on `true`.
+async fn stamp_lockout(db: &mut Db, id: i64, threshold: i32) -> AutumnResult<bool> {{
+    let locked_rows = diesel::update(
+        {table}::table
+            .find(id)
+            .filter({table}::failed_attempts.ge(threshold))
+            .filter({table}::locked_at.is_null()),
+    )
+    .set({table}::locked_at.eq(Some(chrono::Utc::now().naive_utc())))
+    .execute(&mut **db)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+    Ok(locked_rows > 0)
+}}
+
 /// `POST /login` — verify credentials and start a session.
 ///
 /// Non-enumerating: returns the same error for unknown email, wrong password,
@@ -4272,35 +4294,15 @@ pub async fn login(
                 }};
 
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    // Account transitions into the locked state — stamp locked_at,
-                    // but only if the row still shows an over-threshold, not-yet-locked
-                    // state at write time. `current_locked_at` above is a stale
-                    // in-memory read from before the password check; without a
-                    // fresh DB-level guard, a concurrent *successful* login could
-                    // reset failed_attempts/locked_at between our increment and this
-                    // write, and this UPDATE would silently re-lock an account that
-                    // just logged in successfully (#2500). Filtering on the row's
-                    // current failed_attempts and locked_at makes the write a no-op
-                    // in that case instead of clobbering the reset. Propagate errors:
-                    // if this write fails the account is not locked despite the
-                    // counter crossing the threshold, which would allow a successful
-                    // login to slip through.
-                    let locked_rows = diesel::update(
-                        {table}::table
-                            .find({snake_name}.id)
-                            .filter({table}::failed_attempts.ge(lockout_cfg.threshold))
-                            .filter({table}::locked_at.is_null()),
-                    )
-                        .set({table}::locked_at.eq(Some(now)))
-                        .execute(&mut *db)
-                        .await
-                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+                    // The account reaches the threshold. `current_locked_at` is an
+                    // old read, so the helper checks the row again in the database.
+                    // Propagate errors: a failed write leaves the account unlocked.
+                    let newly_locked =
+                        stamp_lockout(&mut db, {snake_name}.id, lockout_cfg.threshold).await?;
 
-                    // Only emit lockout telemetry when this request's write actually
-                    // applied the lock — a concurrent successful login winning the
-                    // race above means the account never ends up locked, so it must
-                    // not be reported as such.
-                    if locked_rows > 0 {{
+                    // Log only when this call set the lock. A concurrent call or a
+                    // good login can win the race, and then nothing is logged.
+                    if newly_locked {{
                         // Truncate to a coarse IP prefix (IPv4 /24, IPv6 /64) so
                         // the telemetry event enables incident response without
                         // logging a precise user identifier.
@@ -5354,20 +5356,8 @@ pub async fn reauth(
                     1i32
                 }};
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    // See the login handler's matching guard (#2500): filter on the
-                    // row's current failed_attempts/locked_at rather than writing
-                    // unconditionally, so a concurrent successful reauth that already
-                    // reset the counter cannot be silently re-locked.
-                    diesel::update(
-                        {table}::table
-                            .find({snake_name}.id)
-                            .filter({table}::failed_attempts.ge(lockout_cfg.threshold))
-                            .filter({table}::locked_at.is_null()),
-                    )
-                        .set({table}::locked_at.eq(Some(now)))
-                        .execute(&mut *db)
-                        .await
-                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+                    // Same guarded stamp as `login` (#2500, #2531). This path does not log.
+                    stamp_lockout(&mut db, {snake_name}.id, lockout_cfg.threshold).await?;
                 }}
                 session.remove("reauth_pw_ok").await;
                 return Ok(reauth_form_err(&form.return_to));
@@ -7716,7 +7706,8 @@ credential-stuffing attacks that rotate source IPs to bypass IP-rate limiting.
 
 1. Each failed login increments `failed_attempts` on the account row.
 2. When `failed_attempts` reaches `threshold`, `locked_at` is stamped with the
-   current time and a structured telemetry event fires (see below).
+   current time and a structured telemetry event fires (see below). Only the
+   request that sets `locked_at` logs, so each lock logs once.
 3. While the account is locked (`locked_at + cooloff_secs > now`), every login
    attempt — correct password or not — returns the same `422 Invalid email or
    password` response as a wrong-password attempt (non-enumerating).
@@ -17787,72 +17778,52 @@ mod tests {
         );
     }
 
-    /// #2500: the lock-stamping `UPDATE ... SET locked_at = now()` must never be
-    /// unconditional. A concurrent successful login can reset `failed_attempts`
-    /// to 0 and clear `locked_at` in the gap between the failed request's own
-    /// increment and its lock stamp; without a fresh DB-level guard the stamp
-    /// re-locks the account out from under the login that already succeeded.
-    /// Both the `login` and `reauth` handlers duplicate this block, so both
-    /// must carry the guard.
+    /// #2500, #2531: one helper stamps the lock. Login and reauth both call it.
+    /// The stamp is a guarded UPDATE: it needs `failed_attempts >= threshold`
+    /// and `locked_at IS NULL`. The clock is read inside the helper, just
+    /// before the write, never at the start of the request.
     #[test]
-    fn routes_file_guards_lock_stamp_against_concurrent_reset() {
+    fn routes_file_stamps_lock_once_through_one_guarded_helper() {
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
 
-        let guarded_stamp_occurrences = routes
-            .matches("failed_attempts.ge(lockout_cfg.threshold)")
-            .count();
         assert_eq!(
-            guarded_stamp_occurrences, 2,
-            "both the login and reauth lock-stamp UPDATEs must filter on \
-             failed_attempts.ge(lockout_cfg.threshold) so a concurrent successful \
-             login's reset cannot be clobbered by a stale-threshold re-lock \
-             (found {guarded_stamp_occurrences}): {routes}"
+            routes.matches("async fn stamp_lockout(").count(),
+            1,
+            "expected one `stamp_lockout` helper: {routes}"
         );
-
-        // `locked_at.is_null()` also appears, unrelated, in the pre-existing
-        // success-path reset guard (`locked_at.is_null().or(locked_at.le(...)))`),
-        // so a bare substring count can't tell the lock-stamp guard apart from
-        // that unrelated clause and would stay green even if the lock-stamp
-        // UPDATE's own `.filter(locked_at.is_null())` were dropped. Anchor on
-        // `locked_at.eq(Some(now))` instead — the lock-stamp `.set(...)` call,
-        // which appears exactly once per handler (login, reauth) — and require
-        // both guard filters to appear immediately before each one.
-        let stamp_occurrences = routes.matches("locked_at.eq(Some(now))").count();
         assert_eq!(
-            stamp_occurrences, 2,
-            "expected exactly one lock-stamp UPDATE in each of login and reauth \
-             (found {stamp_occurrences}): {routes}"
+            routes.matches("stamp_lockout(&mut db").count(),
+            2,
+            "login and reauth must both call `stamp_lockout`: {routes}"
         );
-        let mut search_from = 0;
-        for i in 0..stamp_occurrences {
-            let stamp_at = routes[search_from..]
-                .find("locked_at.eq(Some(now))")
-                .map(|pos| search_from + pos)
-                .unwrap();
-            let window_start = stamp_at.saturating_sub(400);
-            let preceding = &routes[window_start..stamp_at];
-            assert!(
-                preceding.contains("failed_attempts.ge(lockout_cfg.threshold)")
-                    && preceding.contains("locked_at.is_null()"),
-                "lock-stamp UPDATE #{} must be guarded by both \
-                 failed_attempts.ge(lockout_cfg.threshold) and locked_at.is_null() \
-                 immediately before the `locked_at.eq(Some(now))` write, so it never \
-                 re-stamps (and extends the cool-off of) an account another request \
-                 already locked, nor clobbers a concurrent successful reset: {routes}",
-                i + 1
-            );
-            search_from = stamp_at + "locked_at.eq(Some(now))".len();
-        }
+        assert!(
+            !routes.contains("locked_at.eq(Some(now))"),
+            "no handler may stamp `locked_at` with its request-start `now`: {routes}"
+        );
+        let stamp_at = routes
+            .find("locked_at.eq(Some(")
+            .expect("helper must stamp locked_at");
+        assert_eq!(routes.matches("locked_at.eq(Some(").count(), 1, "{routes}");
+        let preceding = routes
+            .get(stamp_at.saturating_sub(500)..stamp_at)
+            .unwrap_or_default();
+        assert!(
+            preceding.contains("failed_attempts.ge(threshold)")
+                && preceding.contains("locked_at.is_null()"),
+            "stamp must be guarded by failed_attempts and locked_at IS NULL: {routes}"
+        );
+        let following = routes.get(stamp_at..stamp_at + 120).unwrap_or_default();
+        assert!(
+            following.contains("chrono::Utc::now().naive_utc()"),
+            "stamp must read the clock inside the helper, at write time: {routes}"
+        );
     }
 
-    /// #2500: the `account_locked` telemetry event must only fire when this
-    /// request's own write actually applied the lock. If a concurrent
-    /// successful login won the race (see the guard tested above), the
-    /// lock-stamp UPDATE affects zero rows and no lock ever took effect, so
-    /// logging `account_locked` would be a false positive.
+    /// #2500, #2531: `account_locked` logs once per lock. Only the call whose
+    /// UPDATE changed a row may log. Concurrent calls get `false`.
     #[test]
     fn routes_file_gates_lockout_telemetry_on_rows_actually_locked() {
         let tmp = project_with_main();
@@ -17860,18 +17831,27 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
 
-        let login_block_start = routes
-            .find("Failed to lock account")
-            .expect("login handler must attempt to lock the account");
-        let telemetry_start = routes[login_block_start..]
-            .find("account_locked")
-            .expect("account_locked telemetry must follow the lock-stamp UPDATE");
-        let between = &routes[login_block_start..login_block_start + telemetry_start];
+        let helper = routes
+            .find("async fn stamp_lockout(")
+            .expect("helper must exist");
+        let body_end = routes[helper..]
+            .find("\n}\n")
+            .map_or(routes.len(), |e| helper + e);
+        let helper_body = &routes[helper..body_end];
         assert!(
-            between.contains("locked_rows") && between.contains("if locked_rows > 0"),
-            "telemetry must be gated behind a check that the lock-stamp UPDATE \
-             actually affected a row (`if locked_rows > 0`), not fired \
-             unconditionally after attempting the write: {routes}"
+            helper_body.contains("Ok(locked_rows > 0)") && !helper_body.contains("account_locked"),
+            "helper must return whether it changed a row and must not log: {helper_body}"
+        );
+        let call = routes
+            .find("stamp_lockout(&mut db")
+            .expect("login must call the helper");
+        let telemetry = routes[call..]
+            .find("account_locked")
+            .expect("telemetry must follow the helper call");
+        let between = &routes[call..call + telemetry];
+        assert!(
+            between.contains("if newly_locked"),
+            "telemetry must sit behind `if newly_locked`: {between}"
         );
     }
 

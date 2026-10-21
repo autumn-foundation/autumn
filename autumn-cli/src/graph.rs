@@ -29,7 +29,9 @@
 
 use std::process::Command;
 
-use autumn_web::graph::manifest::{ArchitectureGraph, Completeness, parse_manifest_dump};
+use autumn_web::graph::manifest::{
+    ArchitectureGraph, Completeness, DeclaredMount, parse_manifest_dump,
+};
 use autumn_web::graph::query;
 
 use crate::routes;
@@ -165,6 +167,39 @@ fn completeness_changes(committed: &Completeness, current: &Completeness) -> Vec
         &committed.unmodelled_mounted_routes,
         &current.unmodelled_mounted_routes,
     );
+    for mount in &current.declared_mounts {
+        let key = |m: &&DeclaredMount| m.method == mount.method && m.path == mount.path;
+        match committed.declared_mounts.iter().find(key) {
+            None => lines.push(format!(
+                "  + declared mount {} {} (auth {})",
+                mount.method,
+                mount.path,
+                mount.auth.label()
+            )),
+            Some(before) if before.auth != mount.auth => lines.push(format!(
+                "  ~ declared mount {} {}: auth {} -> {}",
+                mount.method,
+                mount.path,
+                before.auth.label(),
+                mount.auth.label()
+            )),
+            Some(_) => {}
+        }
+    }
+    for mount in &committed.declared_mounts {
+        if !current
+            .declared_mounts
+            .iter()
+            .any(|m| m.method == mount.method && m.path == mount.path)
+        {
+            lines.push(format!(
+                "  - declared mount {} {} (auth {})",
+                mount.method,
+                mount.path,
+                mount.auth.label()
+            ));
+        }
+    }
     lines
 }
 
@@ -174,6 +209,27 @@ const fn symbol_or_declared(symbol: &str) -> &str {
         "declared"
     } else {
         symbol
+    }
+}
+
+/// Name each secondary mount a route gained or lost.
+fn also_mounted_changes(
+    before: &autumn_web::graph::manifest::GraphNode,
+    after: &autumn_web::graph::manifest::GraphNode,
+    lines: &mut Vec<String>,
+) {
+    let paths = |n: &autumn_web::graph::manifest::GraphNode| -> Vec<String> {
+        n.route
+            .as_ref()
+            .map(|r| r.also_mounted_at.clone())
+            .unwrap_or_default()
+    };
+    let (old, new) = (paths(before), paths(after));
+    for path in new.iter().filter(|p| !old.contains(p)) {
+        lines.push(format!("      + also mounted at {path}"));
+    }
+    for path in old.iter().filter(|p| !new.contains(p)) {
+        lines.push(format!("      - also mounted at {path}"));
     }
 }
 
@@ -209,6 +265,7 @@ pub fn format_drift(committed: &ArchitectureGraph, current: &ArchitectureGraph) 
                 if before.label() != node.label() {
                     lines.push(format!("      {} -> {}", before.label(), node.label()));
                 }
+                also_mounted_changes(before, node, &mut lines);
                 let (before_auth, after_auth) = (
                     before.route.as_ref().and_then(|r| r.auth.as_ref()),
                     node.route.as_ref().and_then(|r| r.auth.as_ref()),
@@ -513,6 +570,7 @@ mod tests {
         module_path: "app::models",
         file: "src/models.rs",
         line: 1,
+        crate_version: "0.1.0",
     }];
 
     const REPOSITORIES: &[RepositoryGraphDescriptor] = &[RepositoryGraphDescriptor {
@@ -524,6 +582,7 @@ mod tests {
         module_path: "app::repositories",
         file: "src/repositories.rs",
         line: 1,
+        crate_version: "0.1.0",
     }];
 
     const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
@@ -534,6 +593,7 @@ mod tests {
         static_route: false,
         file: "src/routes/posts.rs",
         line: 1,
+        crate_version: "0.1.0",
         signature_symbols: &["PgPostRepository"],
         body_symbols: &[],
         sql_symbols: &[],
@@ -546,9 +606,13 @@ mod tests {
         module_path: "app::jobs",
         schedule: "",
         mutating: true,
+        mutating_symbols: &[],
         file: "src/jobs.rs",
         line: 1,
+        crate_version: "0.1.0",
         signature_symbols: &[],
+        signature_bindings: &[],
+        dot_mutation_receivers: &[],
         body_symbols: &["posts"],
         sql_symbols: &[],
     }];
@@ -667,6 +731,7 @@ mod tests {
             module_path: "app::live".to_owned(),
             auth: autumn_web::graph::RouteAuth::default(),
             repository_api: None,
+            auth_declared: false,
         };
         let after = build(&[mounted], 0, ROUTES, MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("a new opaque mount is drift");
@@ -690,6 +755,72 @@ mod tests {
         assert!(format_drift(&before, &after).is_none());
     }
 
+    fn with_also_mounted(paths: &[&str]) -> ArchitectureGraph {
+        let mut g = graph();
+        let route = g
+            .nodes
+            .iter_mut()
+            .find_map(|n| n.route.as_mut())
+            .expect("a route node");
+        route.also_mounted_at = paths.iter().map(|p| (*p).to_owned()).collect();
+        g
+    }
+
+    fn with_declared_mounts(mounts: &[(&str, &str, bool)]) -> ArchitectureGraph {
+        let mut g = graph();
+        g.completeness.declared_mounts = mounts
+            .iter()
+            .map(
+                |(method, path, secured)| autumn_web::graph::manifest::DeclaredMount {
+                    method: (*method).to_owned(),
+                    path: (*path).to_owned(),
+                    auth: autumn_web::graph::RouteAuth {
+                        secured: *secured,
+                        public: !*secured,
+                        ..autumn_web::graph::RouteAuth::default()
+                    },
+                },
+            )
+            .collect();
+        g
+    }
+
+    #[test]
+    fn a_flipped_declared_mount_auth_is_named_in_the_drift_report() {
+        let before = with_declared_mounts(&[("GET", "/admin/p", true)]);
+        let after = with_declared_mounts(&[("GET", "/admin/p", false)]);
+        let drift = format_drift(&before, &after).expect("an auth flip is drift");
+        assert!(drift.contains("declared mount GET /admin/p"), "{drift}");
+        assert!(drift.contains("auth "), "{drift}");
+        assert!(!drift.contains("does not name"), "{drift}");
+    }
+
+    #[test]
+    fn added_and_removed_declared_mounts_are_named_in_the_drift_report() {
+        let before = with_declared_mounts(&[("GET", "/old", true)]);
+        let after = with_declared_mounts(&[("GET", "/new", true)]);
+        let drift = format_drift(&before, &after).expect("a moved mount is drift");
+        assert!(drift.contains("+ declared mount GET /new"), "{drift}");
+        assert!(drift.contains("- declared mount GET /old"), "{drift}");
+    }
+
+    #[test]
+    fn a_changed_secondary_mount_is_named_in_the_drift_report() {
+        let before = with_also_mounted(&["/old"]);
+        let after = with_also_mounted(&["/new"]);
+        let drift = format_drift(&before, &after).expect("a moved secondary mount is drift");
+        assert!(drift.contains("      + also mounted at /new"), "{drift}");
+        assert!(drift.contains("      - also mounted at /old"), "{drift}");
+        assert!(!drift.contains("does not name"), "{drift}");
+    }
+
+    #[test]
+    fn an_unchanged_secondary_mount_is_not_named() {
+        let before = with_also_mounted(&["/same"]);
+        let after = with_also_mounted(&["/same"]);
+        assert!(format_drift(&before, &after).is_none());
+    }
+
     #[test]
     fn a_changed_auth_posture_is_named_in_the_drift_report() {
         let mounted = |secured: bool| autumn_web::graph::MountedRoute {
@@ -702,6 +833,7 @@ mod tests {
                 ..autumn_web::graph::RouteAuth::default()
             },
             repository_api: None,
+            auth_declared: false,
         };
         let before = build(&[mounted(true)], 0, ROUTES, MODELS, REPOSITORIES, JOBS);
         let after = build(&[mounted(false)], 0, ROUTES, MODELS, REPOSITORIES, JOBS);

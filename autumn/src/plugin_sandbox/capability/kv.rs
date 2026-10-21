@@ -110,6 +110,30 @@ pub fn namespaced_key(plugin: &str, tenant: Option<&str>, key: &str) -> String {
     )
 }
 
+/// Check a `kv-set` value against `kv_value_bytes`, without copying it.
+///
+/// Run before the per-capability quota is charged.
+///
+/// # Errors
+///
+/// The denial to answer with.
+pub(super) fn validate(
+    runtime: &CapabilityRuntime,
+    call: &CapabilityCall,
+) -> Result<(), CallResult> {
+    if let CapabilityCall::KvSet { id, value, .. } = call {
+        let ceiling = runtime.quotas().kv_value_bytes as usize;
+        if value.weight() > ceiling {
+            return Err(CallResult::denied(
+                *id,
+                DenialReason::QuotaExceeded,
+                format!("a kv value may hold at most {ceiling} bytes"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Answer one `kv-*` call. Capability, scope and quota are already checked.
 pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &str) -> CallResult {
     let id = call.id();

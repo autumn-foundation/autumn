@@ -91,3 +91,9 @@ Item 9 adds an attack surface. A programmatic handle is sufficient.
 The tick model found a bug. A cron task that waited in the cost gate past its
 window could claim a pruned tick row and run the occurrence twice.
 `execute_cron_task` now checks the window after the wait.
+
+## Follow-up
+
+Item 2 came back later: `docs/adr/0020-tla-plus-protocol-specs.md` adds TLA+
+specs of the three protocols and of the fleet slot ownership, checked with TLC
+in their own workflow, so the workspace build still needs no Java.
