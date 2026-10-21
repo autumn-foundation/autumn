@@ -1366,6 +1366,24 @@ fn stale_row_predicate_sqlite(
     }
 }
 
+/// The index that serves a dataset's cutoff scan, created if it is missing.
+/// `autumn_jobs` already has `idx_autumn_jobs_status_finished`.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+const fn sqlite_sweep_index(dataset: RetentionDataset) -> Option<&'static str> {
+    match dataset {
+        RetentionDataset::CommitHooks => Some(
+            "CREATE INDEX IF NOT EXISTS idx_autumn_commit_hooks_finished \
+             ON autumn_repository_commit_hooks (finished_at) \
+             WHERE status IN ('completed', 'failed', 'after_hook_failed')",
+        ),
+        RetentionDataset::ExperimentAssignments => Some(
+            "CREATE INDEX IF NOT EXISTS idx_autumn_exp_assignments_assigned_at \
+             ON autumn_experiment_assignments (assigned_at)",
+        ),
+        _ => None,
+    }
+}
+
 /// The resolved cutoff, in the form the dataset's column stores.
 #[cfg(all(feature = "db", feature = "sqlite"))]
 enum SqliteCutoff {
@@ -1397,6 +1415,8 @@ struct SqliteCount {
 /// `DELETE` repeats the predicate so a row revived mid-sweep survives, and a
 /// failure reports what earlier batches already removed.
 #[cfg(all(feature = "db", feature = "sqlite"))]
+// One pass: look, resolve, count, index, delete in batches, recount.
+#[allow(clippy::too_many_lines)]
 async fn sweep_sqlite(
     pool: &diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     dataset: RetentionDataset,
@@ -1448,6 +1468,23 @@ async fn sweep_sqlite(
             removed: 0,
             truncated: false,
         }));
+    }
+
+    // The same indexes the Postgres migration adds. The SQLite migration for
+    // them is a no-op shim that existing files have already applied, so the
+    // sweep creates them. Without one, every batch rescans the table.
+    if let Some(index) = sqlite_sweep_index(dataset) {
+        diesel::sql_query(index)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                sweep_failed_at(
+                    cutoff_at,
+                    0,
+                    Some(eligible),
+                    format!("retention could not create the sweep index on {table}: {e}"),
+                )
+            })?;
     }
 
     let mut removed: u64 = 0;
@@ -2272,6 +2309,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_sqlite_sweep_has_an_index_or_one_already_exists() {
+        for dataset in RETENTION_DATASETS {
+            let Some(index) = sqlite_sweep_index(dataset) else {
+                continue;
+            };
+            let (table, ..) = stale_row_predicate_sqlite(dataset).expect("a sweep");
+            assert!(index.contains(table), "{dataset}: {index}");
+            assert!(index.contains("IF NOT EXISTS"), "{index}");
+        }
+        assert!(sqlite_sweep_index(RetentionDataset::CommitHooks).is_some());
+        assert!(sqlite_sweep_index(RetentionDataset::ExperimentAssignments).is_some());
     }
 
     #[test]

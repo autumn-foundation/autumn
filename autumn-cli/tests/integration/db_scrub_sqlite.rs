@@ -628,3 +628,25 @@ fn a_blob_primary_key_with_invalid_utf8_scrubs() {
         2
     );
 }
+
+#[test]
+fn keys_of_different_storage_classes_get_distinct_tokens() {
+    let toml = format!(
+        "{SCRUB_TOML}\n[tables.mixed]\nsafe = [\"id\"]\n\n[tables.mixed.pii]\nemail = \"email\"\n"
+    );
+    let project = project(&toml);
+    let db = project.path().join("app.db");
+    // A typeless key column keeps each value's own storage class.
+    open(&db)
+        .batch_execute(
+            "CREATE TABLE mixed (id PRIMARY KEY, email TEXT UNIQUE); \
+             INSERT INTO mixed VALUES (x'6162', 'a@real-corp.example'), ('6162', 'b@real-corp.example');",
+        )
+        .expect("mixed");
+    let (out, _, code) = run(project.path(), "dev", &["db", "scrub"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM mixed"),
+        2
+    );
+}

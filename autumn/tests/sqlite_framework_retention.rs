@@ -468,3 +468,26 @@ async fn an_older_jobs_table_is_skipped_not_swept_and_not_failed() {
         1
     );
 }
+
+#[tokio::test]
+async fn a_real_sweep_creates_the_cutoff_index_and_a_dry_run_does_not() {
+    let fx = start().await;
+    insert_hook(&fx.pool, "old", "completed", 90).await;
+    let state = state_with(&fx.pool, config_with_windows());
+    let index =
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'idx_autumn_commit_hooks_finished'";
+
+    run_retention(&state, &options(Some("commit_hooks"), true))
+        .await
+        .expect("dry run");
+    assert_eq!(
+        count(&fx.pool, index).await,
+        0,
+        "a dry run writes no schema"
+    );
+
+    run_retention(&state, &options(Some("commit_hooks"), false))
+        .await
+        .expect("sweep");
+    assert_eq!(count(&fx.pool, index).await, 1);
+}
