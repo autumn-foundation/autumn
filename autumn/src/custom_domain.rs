@@ -684,9 +684,10 @@ pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
     /// The ledger needs no domain record. An order for an offboarded domain
     /// still counts after a restart. Called once at boot.
     ///
-    /// Override this and [`append_attempt`](Self::append_attempt) together or
-    /// not at all. The defaults keep nothing, so offboarded orders are lost on
-    /// restart. A ledger is for one process. Replicas do not share it.
+    /// Override this, [`append_attempt`](Self::append_attempt) and
+    /// [`merge_attempts`](Self::merge_attempts) together or not at all. The
+    /// defaults keep nothing, so offboarded orders are lost on restart. A
+    /// ledger is for one process. Replicas do not share it.
     fn load_attempts(&self) -> StoreFuture<'_, io::Result<Vec<i64>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
