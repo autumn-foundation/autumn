@@ -15,8 +15,9 @@ comes from introspecting the live database, not from a config file, so a column
 added yesterday cannot be missing from it. A column that is neither
 PII-classified nor explicitly declared safe aborts the scrub.
 
-> **Postgres only.** Scrubbing targets the same databases `autumn migrate`
-> resolves — the control database plus every configured shard.
+> Scrubbing targets the same databases `autumn migrate` resolves — the control
+> database plus every configured shard. A target is Postgres or [SQLite](#sqlite).
+> One run cannot mix the two.
 
 ---
 
@@ -792,9 +793,71 @@ apply-time error.
 
 ---
 
+## SQLite
+
+A `sqlite://` target scrubs with the same command and the same rules:
+
+```sh
+autumn db scrub --check              # classify only
+autumn db scrub --dry-run            # print the SQL
+autumn db scrub                      # rewrite app.db in place
+autumn db scrub --artifact backups/dev/20261020T101500Z   # restore a .sqlite backup, then scrub
+```
+
+What stays the same:
+
+- the classification and `scrub.toml`
+- `#[encrypted]` columns and GDPR anonymize registrations
+- `[framework] purge`
+- the production guard (`--force`) and `--output`
+- the refusals. An unclassified column aborts the scrub.
+
+ Nothing prints a resolved URL. SQLite has no password. Output shows the
+file path only.
+
+What is different:
+
+- **No external tools.** The scrub runs in the `autumn` binary.
+- **One transaction per file.** `BEGIN IMMEDIATE` takes the write lock, so no
+  writer can add a row mid-scrub. A schema change since the plan was made
+  rolls the run back.
+- **No old bytes.** `secure_delete` is on. After the commit, `VACUUM` rewrites
+  the file and the WAL is truncated. The scrub rebuilds the planner statistics
+  first, because `sqlite_stat4` keeps sample index keys. A scrubbed file does
+  not hold the old values in free pages, indexes or the WAL. `VACUUM` needs free
+  disk space about the size of the file. If compaction fails, the scrub has
+  committed but old values may remain. The error says so.
+- **Hashing.** SQLite has no `md5`. The scrub registers `autumn_sha256` on its
+  connection. `--dry-run` prints SQL that calls it, so plain `sqlite3` cannot
+  run the printed script. Use the printed SQL for audit only. Do not run it.
+- **Compaction is checked.** If a reader blocks the WAL checkpoint, the scrub
+  reports an error. Stop the app, or run `PRAGMA wal_checkpoint(TRUNCATE)`
+  yourself, before you share the file.
+- **Schema text is not rewritten.** The scrub changes row data only. A literal in
+  an index `WHERE`, a `CHECK`, a `DEFAULT` or a trigger stays in the schema.
+  Triggers on tables the run writes are reported, as on Postgres. Review them.
+- **Foreign keys are on.** A purge that would orphan a row rolls back.
+- **Extra refusals.** A `CHECK` column cannot get a made-up value, so it is
+  refused. Autumn reads the `CHECK` clauses from the `CREATE TABLE` text. A
+  virtual table (for example FTS5) is refused, because its shadow tables hold
+  copies of row text. `--sample` is refused. A delete trigger on a purged
+  table is refused.
+- **Logical types are `TEXT`.** Autumn stores a UUID, a decimal and JSON as
+  `TEXT` on SQLite, so `auto` treats them as text and writes a redaction string.
+  Declare the right strategy for such a column: `uuid`, `zero`, `epoch` or
+  `json`. For a declared type that `auto` cannot read as a number or a date,
+  `auto` refuses.
+- **Type rules.** SQLite does not enforce column types or lengths. `varchar(n)`
+  limits do not apply. `date`, `datetime` and
+  `numeric` columns use `epoch` and `zero`.
+- **Mixed topologies.** A control database on Postgres and a shard on SQLite
+  is refused before any write.
+
+---
+
 ## Limits
 
-- **Postgres only**, and the `public` schema only. A database with base tables
+- **On Postgres, the `public` schema only.** A database with base tables
   in another non-system schema is **refused** rather than reported clean over a
   universe the classifier never looked at — and a schema holding only a
   *materialized view* counts, since it keeps its own copy of whatever it
