@@ -180,7 +180,7 @@ choose one. Name the correct copy with a helper attribute. The derive path
 selects the macro. The attribute selects the crate for the generated code:
 
 ```rust
-#[derive(web_new::OpenApiSchema)]
+#[derive(web_new::openapi::OpenApiSchema)]
 #[openapi_schema(crate = "web_new")]
 struct SearchParams { q: String }
 ```
