@@ -210,6 +210,23 @@ impl RetentionDataset {
         }
     }
 
+    /// The table that holds this dataset's records for `config`, or `None`
+    /// when they live elsewhere.
+    ///
+    /// `job_history` and `job_tracking` follow `jobs.backend`. Under Redis or
+    /// the in-memory queue, their records are not in the framework table. A
+    /// sweep or a table-keyed legal hold cannot reach them there.
+    #[must_use]
+    pub fn table_for(self, config: &AutumnConfig) -> Option<&'static str> {
+        // The `sqlite` runtime keeps both tables in the app's own file.
+        if matches!(self, Self::JobHistory | Self::JobTracking)
+            && !matches!(config.jobs.backend.as_str(), "postgres" | "sqlite")
+        {
+            return None;
+        }
+        self.table()
+    }
+
     /// How this dataset's window is enforced *for a given configuration*.
     ///
     /// Only `job_tracking` varies: tracked-job records live wherever
@@ -501,6 +518,32 @@ pub struct RetentionRunOptions<'a> {
     pub dataset: Option<&'a str>,
 }
 
+/// Which datasets one run covers.
+///
+/// The scheduler splits the work by where the data lives. Shared data must
+/// be swept once per tick. Per-process data must be swept on every replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetentionScope {
+    /// Every dataset. The CLI uses this.
+    #[default]
+    All,
+    /// Datasets in shared stores (one run per fleet tick).
+    Shared,
+    /// Datasets in this process's local files (one run per replica).
+    PerReplica,
+}
+
+impl RetentionScope {
+    const fn covers(self, enforcement: RetentionEnforcement) -> bool {
+        let per_replica = matches!(enforcement, RetentionEnforcement::ArchiveRewrite);
+        match self {
+            Self::All => true,
+            Self::Shared => !per_replica,
+            Self::PerReplica => per_replica,
+        }
+    }
+}
+
 // ── Engine ───────────────────────────────────────────────────────────────
 
 /// Run the retention policy over every configured dataset (or the one named
@@ -527,10 +570,26 @@ pub async fn run_retention(
     state: &AppState,
     options: &RetentionRunOptions<'_>,
 ) -> AutumnResult<Vec<RetentionDatasetReport>> {
+    run_retention_for(state, options, RetentionScope::All).await
+}
+
+/// Like [`run_retention`], limited to the datasets in `scope`.
+///
+/// # Errors
+///
+/// Same as [`run_retention`].
+pub async fn run_retention_for(
+    state: &AppState,
+    options: &RetentionRunOptions<'_>,
+    scope: RetentionScope,
+) -> AutumnResult<Vec<RetentionDatasetReport>> {
     let datasets = resolve_datasets(options.dataset)?;
     let config = state.config_arc();
     let mut reports = Vec::with_capacity(datasets.len());
-    for dataset in datasets {
+    for dataset in datasets
+        .into_iter()
+        .filter(|dataset| scope.covers(dataset.enforcement()))
+    {
         let mut report = run_one_dataset(state, &config, dataset, options.dry_run).await;
         audit_sweep(state, &mut report).await;
         reports.push(report);
@@ -600,11 +659,33 @@ async fn run_one_dataset(
         return report;
     };
 
+    // The sweep deletes from a table. Off Postgres, job history is not in it.
+    // Say so, so a zero is not read as "already clean".
+    if dataset == RetentionDataset::JobHistory && dataset.table_for(config).is_none() {
+        report.skipped = Some(format!(
+            "NOT enforced: jobs.backend = {:?} keeps finished jobs outside autumn_jobs, \
+             so this sweep cannot reach them",
+            config.jobs.backend
+        ));
+        report.duration_ms = elapsed_ms(started);
+        return report;
+    }
+
     // A legal hold outranks the window: check it before doing any counting,
     // so a held dataset never even reads the rows it must not delete.
     let registry = state.extension::<GdprRegistry>();
     if let Some(reason) = legal_hold_for(dataset, registry.as_deref()) {
-        report.skipped = Some(format!("legal hold: {reason}"));
+        report.skipped = Some(if dataset.table_for(config).is_some() {
+            format!("legal hold: {reason}")
+        } else {
+            // The hold names a table that does not hold these records. The
+            // record TTL still applies, so the hold does not protect them.
+            format!(
+                "legal hold: {reason}. NOT preserved: jobs.backend = {:?} stores these \
+                 records outside the held table, and the window shortens their TTL",
+                config.jobs.backend
+            )
+        });
         report.duration_ms = elapsed_ms(started);
         return report;
     }
@@ -1309,6 +1390,34 @@ async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
     );
 }
 
+// ── Purge guard ──────────────────────────────────────────────────────────
+
+/// Why an on-demand purge must stop, if it must.
+///
+/// The app checks this with the profile its own config loader resolved. The
+/// CLI also checks, as a fast pre-flight, but it only knows the profile name
+/// it passes in. A custom loader can pick another one. `profile` is that
+/// resolved name. `force` is the operator's `--force`.
+#[must_use]
+pub fn purge_refusal(profile: Option<&str>, force: bool) -> Option<String> {
+    if force {
+        return None;
+    }
+    let name = profile.map(str::trim);
+    if name.is_some_and(|name| {
+        ["dev", "development", "test"]
+            .iter()
+            .any(|safe| name.eq_ignore_ascii_case(safe))
+    }) {
+        return None;
+    }
+    Some(format!(
+        "refusing to purge framework data: the app resolved the {} profile. The configured \
+         [retention] policy already runs inside the app. Re-run with --force to purge now",
+        name.map_or_else(|| "an unknown".to_owned(), |name| format!("{name:?}"))
+    ))
+}
+
 // ── Scheduled task (AC #2) ───────────────────────────────────────────────
 
 /// Turn dataset errors into one task error.
@@ -1335,8 +1444,20 @@ fn fail_on_dataset_errors(reports: &[RetentionDatasetReport]) -> AutumnResult<()
     )))
 }
 
-/// The recurring in-process sweep, or `None` when no dataset declares a
-/// window.
+/// Name of the per-replica archive sweep task.
+pub const RETENTION_ARCHIVE_TASK_NAME: &str = "autumn-retention-archive-sweep";
+
+/// Whether any configured window needs the shared (fleet) sweep.
+fn shared_window_configured(config: &RetentionConfig) -> bool {
+    config.windows().iter().any(|(key, window)| {
+        window.is_some()
+            && RetentionDataset::from_key(key)
+                .is_none_or(|dataset| RetentionScope::Shared.covers(dataset.enforcement()))
+    })
+}
+
+/// The recurring in-process sweep of shared data, or `None` when no such
+/// dataset declares a window.
 ///
 /// Returning `None` is what makes AC #1's "leaving a dataset unset preserves
 /// today's behavior exactly" structural rather than a promise each sweeper
@@ -1344,10 +1465,11 @@ fn fail_on_dataset_errors(reports: &[RetentionDatasetReport]) -> AutumnResult<()
 /// loop is spawned, and no query is ever issued.
 ///
 /// Registered as a [`TaskCoordination::Fleet`] task so a multi-replica
-/// deployment runs the sweep once per tick, not once per replica.
+/// deployment runs the sweep once per tick, not once per replica. The audit
+/// archive is not in it: see [`framework_archive_retention_task`].
 #[must_use]
 pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
-    if !config.any_window_configured() {
+    if !shared_window_configured(config) {
         return None;
     }
     Some(TaskInfo {
@@ -1356,7 +1478,49 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
         coordination: TaskCoordination::Fleet,
         handler: |state| {
             Box::pin(async move {
-                let reports = run_retention(&state, &RetentionRunOptions::default()).await?;
+                let reports = run_retention_for(
+                    &state,
+                    &RetentionRunOptions::default(),
+                    RetentionScope::Shared,
+                )
+                .await?;
+                fail_on_dataset_errors(&reports)
+            })
+        },
+    })
+}
+
+/// Every scheduled retention task the config needs: the fleet sweep, the
+/// per-replica archive sweep, both, or none.
+#[must_use]
+pub fn framework_retention_tasks(config: &RetentionConfig) -> Vec<TaskInfo> {
+    framework_retention_task(config)
+        .into_iter()
+        .chain(framework_archive_retention_task(config))
+        .collect()
+}
+
+/// The recurring sweep of the local audit archive, or `None` when
+/// `retention.audit_archives` is unset.
+///
+/// The archive is a file on this replica's disk. A fleet-coordinated task
+/// would purge one replica's file and leave the others to grow. This task
+/// uses [`TaskCoordination::PerReplica`], so every replica purges its own.
+#[must_use]
+pub fn framework_archive_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
+    config.audit_archives.as_ref()?;
+    Some(TaskInfo {
+        name: RETENTION_ARCHIVE_TASK_NAME.to_owned(),
+        schedule: Schedule::FixedDelay(config.sweep_interval_duration()),
+        coordination: TaskCoordination::PerReplica,
+        handler: |state| {
+            Box::pin(async move {
+                let reports = run_retention_for(
+                    &state,
+                    &RetentionRunOptions::default(),
+                    RetentionScope::PerReplica,
+                )
+                .await?;
                 fail_on_dataset_errors(&reports)
             })
         },
@@ -1493,6 +1657,136 @@ mod tests {
         report.dry_run = true;
         audit_sweep(&state, &mut report).await;
         assert_eq!(report.error, None);
+    }
+
+    fn config_with_backend(backend: &str) -> AutumnConfig {
+        let mut config = AutumnConfig::default();
+        config.jobs.backend = backend.to_owned();
+        config.retention.job_history = Some("90d".to_owned());
+        config.retention.job_tracking = Some("7d".to_owned());
+        config
+    }
+
+    #[tokio::test]
+    async fn job_history_is_not_enforced_on_a_redis_or_local_jobs_backend() {
+        for backend in ["redis", "local"] {
+            let config = config_with_backend(backend);
+            let report = run_one_dataset(
+                &AppState::for_test(),
+                &config,
+                RetentionDataset::JobHistory,
+                false,
+            )
+            .await;
+            let skipped = report.skipped.expect("the sweep cannot reach these jobs");
+            assert!(skipped.contains("NOT enforced"), "{backend}: {skipped}");
+            assert!(skipped.contains(backend), "{backend}: {skipped}");
+            assert_eq!(report.rows_removed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn job_history_is_not_reported_unenforced_on_postgres_or_sqlite() {
+        for backend in ["postgres", "sqlite"] {
+            let config = config_with_backend(backend);
+            let report = run_one_dataset(
+                &AppState::for_test(),
+                &config,
+                RetentionDataset::JobHistory,
+                true,
+            )
+            .await;
+            let skipped = report.skipped.unwrap_or_default();
+            assert!(!skipped.contains("NOT enforced"), "{backend}: {skipped}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legal_hold_is_not_claimed_for_records_outside_the_held_table() {
+        let state = AppState::for_test();
+        let registry = GdprRegistry::new().register(crate::gdpr::ModelRegistration::retain(
+            "autumn_job_tracking",
+            "litigation",
+        ));
+        state.insert_extension(registry);
+
+        let redis = config_with_backend("redis");
+        let report = run_one_dataset(&state, &redis, RetentionDataset::JobTracking, true).await;
+        let skipped = report.skipped.expect("held");
+        assert!(skipped.starts_with("legal hold:"), "{skipped}");
+        assert!(skipped.contains("NOT preserved"), "{skipped}");
+
+        let postgres = config_with_backend("postgres");
+        let report = run_one_dataset(&state, &postgres, RetentionDataset::JobTracking, true).await;
+        let skipped = report.skipped.expect("held");
+        assert!(!skipped.contains("NOT preserved"), "{skipped}");
+    }
+
+    #[test]
+    fn only_jobs_datasets_depend_on_the_jobs_backend() {
+        let postgres = config_with_backend("postgres");
+        let redis = config_with_backend("redis");
+        let sensitive: Vec<&str> = RETENTION_DATASETS
+            .iter()
+            .filter(|dataset| dataset.table_for(&postgres) != dataset.table_for(&redis))
+            .map(|dataset| dataset.key())
+            .collect();
+        assert_eq!(sensitive, ["job_history", "job_tracking"]);
+    }
+
+    #[tokio::test]
+    async fn the_shared_scope_leaves_the_archive_to_each_replica() {
+        let state = AppState::for_test();
+        let options = RetentionRunOptions::default();
+        let shared = run_retention_for(&state, &options, RetentionScope::Shared)
+            .await
+            .expect("run");
+        let local = run_retention_for(&state, &options, RetentionScope::PerReplica)
+            .await
+            .expect("run");
+        assert!(shared.iter().all(|r| r.dataset != "audit_archives"));
+        assert_eq!(
+            local.iter().map(|r| r.dataset.as_str()).collect::<Vec<_>>(),
+            ["audit_archives"]
+        );
+        let all = run_retention(&state, &options).await.expect("run");
+        assert_eq!(all.len(), shared.len() + local.len());
+    }
+
+    #[test]
+    fn purge_is_refused_unless_the_app_resolved_a_dev_or_test_profile() {
+        for profile in [Some("dev"), Some("development"), Some("test"), Some("Dev")] {
+            assert_eq!(purge_refusal(profile, false), None, "{profile:?}");
+        }
+        for profile in [Some("prod"), Some("production"), Some("staging"), None] {
+            let refusal = purge_refusal(profile, false).expect("must refuse");
+            assert!(refusal.contains("--force"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn force_lifts_the_purge_refusal() {
+        assert_eq!(purge_refusal(Some("prod"), true), None);
+        assert_eq!(purge_refusal(None, true), None);
+    }
+
+    #[test]
+    fn the_task_list_follows_the_configured_windows() {
+        let names = |config: &RetentionConfig| {
+            framework_retention_tasks(config)
+                .into_iter()
+                .map(|task| task.name)
+                .collect::<Vec<_>>()
+        };
+        let mut config = RetentionConfig::default();
+        assert!(names(&config).is_empty());
+        config.audit_archives = Some("400d".to_owned());
+        assert_eq!(names(&config), [RETENTION_ARCHIVE_TASK_NAME]);
+        config.job_history = Some("90d".to_owned());
+        assert_eq!(
+            names(&config),
+            [RETENTION_SWEEP_TASK_NAME, RETENTION_ARCHIVE_TASK_NAME]
+        );
     }
 
     #[test]

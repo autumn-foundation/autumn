@@ -297,7 +297,7 @@ jobs:
       # Issue #1924: the only machine proof that a SQLite-configured scaffold —
       # Uuid, decimal, enum, DateTime, Attachment and json fields — compiles.
       # `cargo check` (not --all-targets): the smoke test is still Postgres-only
-      # until the SQLite TestDb lands with #1905.
+      # until the SQLite smoke harness is done (#2555).
       - name: generated_sqlite_scaffold_cargo_checks
         run: |
           set -euo pipefail

@@ -5,7 +5,7 @@
 //! carries:
 //!
 //! ```text
-//! PluginJob { plugin, job_type, tenant, payload }
+//! PluginJob { plugin, artifact_sha256, job_type, tenant, payload }
 //!             ─┬────  ─┬──────  ─┬────
 //!              │       │         └─ the tenant that was active when it was enqueued
 //!              │       └─ one of `[grants].job_types`, checked at enqueue
@@ -19,7 +19,8 @@
 //! rule a runner has to remember, because there is nowhere in the record for a
 //! different plugin or tenant to be written.
 //!
-//! A runner reconstructs the sandbox from `plugin`, builds
+//! A runner reconstructs the sandbox from `plugin`, refuses the job unless
+//! `artifact_sha256` is the installed artifact's, builds
 //! [`CapabilityServices`](super::CapabilityServices) bound to `tenant`, and runs
 //! the plugin's job entry point. It cannot widen the grant, because the grant
 //! comes from the manifest the operator approved and not from the job.
@@ -36,6 +37,13 @@ use super::{
 pub struct PluginJob {
     /// The plugin whose grants and quotas the run executes under.
     pub plugin: String,
+    /// The sealed digest of the artifact that enqueued the job.
+    ///
+    /// A runner MUST refuse a job whose digest is not the installed artifact's.
+    /// The name alone resolves whatever is installed *now*, and an upgrade may
+    /// have gained hosts, tables or quotas the operator never approved for this
+    /// job. Refusing is the safe direction: drain the queue before an upgrade.
+    pub artifact_sha256: String,
     /// One of the plugin's declared job types.
     pub job_type: String,
     /// The tenant that was active at enqueue, and that the run binds to.
@@ -54,10 +62,29 @@ pub struct PluginJob {
 pub trait JobSink: Send + Sync + 'static {
     /// Enqueue `job`, returning the id assigned to it.
     ///
+    /// The id MUST be 1..=[`MAX_JOB_ID_BYTES`](super::MAX_JOB_ID_BYTES) bytes.
+    /// It goes back to the guest after the job is queued, so a longer one cannot
+    /// be reported as a failure; the host answers `ResultRejected` instead.
+    ///
     /// # Errors
     ///
     /// One line for the guest and the audit ledger.
     fn enqueue(&self, job: PluginJob) -> Result<String, String>;
+}
+
+/// Check a `job-enqueue` payload, without copying it.
+///
+/// Run before the per-capability quota is charged.
+///
+/// # Errors
+///
+/// The denial to answer with.
+pub(super) fn validate(call: &CapabilityCall) -> Result<(), CallResult> {
+    match call {
+        CapabilityCall::JobEnqueue { id, payload, .. } => check_row(payload)
+            .map_err(|detail| CallResult::denied(*id, DenialReason::Malformed, detail)),
+        _ => Ok(()),
+    }
 }
 
 /// Answer one `job-enqueue`. Capability, scope and quota are already checked.
@@ -82,11 +109,25 @@ pub(super) fn perform(
     }
     let job = PluginJob {
         plugin: runtime.plugin.clone(),
+        artifact_sha256: runtime.artifact_sha256.clone(),
         job_type: job_type.to_owned(),
         tenant: runtime.tenant().map(str::to_owned),
         payload: payload.clone(),
     };
     match sink.enqueue(job) {
+        // The job is queued. The guest cannot hold the id, so the host answers
+        // `ResultRejected`. The audit ledger counts it as an enqueue.
+        Ok(job_id) if job_id.is_empty() || job_id.len() > super::MAX_JOB_ID_BYTES => {
+            CallResult::denied(
+                id,
+                DenialReason::ResultRejected,
+                format!(
+                    "the job was queued, but the queue assigned an id outside 1..={} bytes; do \
+                     not retry",
+                    super::MAX_JOB_ID_BYTES
+                ),
+            )
+        }
         Ok(job_id) => CallResult::Ok {
             id,
             value: CallValue::JobId { job_id },

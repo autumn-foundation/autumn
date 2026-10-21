@@ -2984,11 +2984,32 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - With `[replication]` on, each open database ships its WAL under
   `fleet/tenant/<id>` / `fleet/slot/<n>` (health `replication:fleet`);
   `restore_missing = true` serves a missing database from its replica on a
-  fresh volume — only once the old host stopped writing. A replicated fleet
-  root is served by one process (one replicator per database).
+  fresh volume. A replicated fleet root is served by one process (one
+  replicator per database).
+- Failover: turn on `[database.fleet.ownership]` (`owner` unique per volume,
+  `slots = ["0-8191"]`, `lease_secs = 30`) with `restore_missing`. A host
+  serves only the slot ranges it claims; an unowned slot is `421`
+  (`FleetError::NotOwner`), and `restore_missing` runs only for an owned key.
+  Each claim gets an epoch: a restore selects the newest epoch, and an old
+  owner's replicator stops. A host that gets a range back restores files
+  older than the replica before it serves them. Health: `fleet:ownership`. The built-in table is
+  on the control database, so it fences the processes of one host only;
+  hosts on different machines implement `SlotOwnershipStore`
+  (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
+  `docs/guide/sqlite-fleet.md`.
 - The control database lives outside `root` (validation refuses it inside).
-- Outbox rows and derivation backfill stay on the control database.
-- Tests: `TestApp::new().with_db(control).with_fleet(fleet)`.
+- Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
+  databases, also closed ones (issue #3234). Write outbox rows in a
+  transaction on the tenant connection: the write records the database in
+  `_autumn_fleet_pending` on the control database. A worker-role process
+  (the fleet sweeper) opens each listed database, never past `max_open`,
+  does the work, then closes it. Outbox handlers of a tenant fleet run in
+  the tenant's scope. Health: `fleet:sweeper` (`backlog`,
+  `oldest_pending_secs`). Do not enqueue on a fleet database inside a
+  control-database write transaction: the write fails.
+- Tests: `TestApp::new().with_db(control).with_fleet(fleet)`; call
+  `FleetSweeper::install(client.state())` (`autumn_web::db::fleet_sweeper`)
+  before the first request, then `sweep_once()` to run a pass.
 - Out of band (stopped or live app), with the `sqlite` CLI build:
   `autumn fleet list --open`, `migrate [--key K]`, `backup <key> <dest>`,
   `delete <key> --force`, `restore <key> [--timestamp T] --force`. Keys are
@@ -3542,6 +3563,7 @@ autumn graph show                # the application architecture graph the macros
 autumn graph touches posts       # which routes and jobs reach a model, table, or repository — transitively, so a handler that only takes `PgPostRepository` is included
 autumn graph impact Post         # what a change to a model would affect: the repositories over it, and every route and job reaching it directly or through one
 autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
+# `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own

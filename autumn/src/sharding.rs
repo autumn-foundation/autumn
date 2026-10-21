@@ -2103,7 +2103,11 @@ impl Shards {
             return Vec::new();
         };
         let keys = match fleet.list().await {
-            Ok(keys) => keys,
+            // A file of a slot another host owns is a stale copy (issue #3233).
+            Ok(keys) => keys
+                .into_iter()
+                .filter(|key| fleet.owns(key))
+                .collect::<Vec<_>>(),
             Err(error) => return vec![(ShardId(usize::MAX), Err(error.into()))],
         };
         futures::stream::iter(keys)

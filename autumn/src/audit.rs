@@ -368,6 +368,29 @@ impl JsonlFileAuditSink {
     }
 }
 
+/// Split an archive into the lines to keep and a count of stale ones.
+///
+/// A line that does not decode as an [`AuditEvent`] is kept, never counted
+/// as stale.
+fn keep_entries_since(existing: &str, cutoff: DateTime<Utc>) -> (String, u64) {
+    let mut kept = String::with_capacity(existing.len());
+    let mut removed: u64 = 0;
+    for line in existing.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let stale =
+            serde_json::from_str::<AuditEvent>(line).is_ok_and(|event| event.timestamp < cutoff);
+        if stale {
+            removed = removed.saturating_add(1);
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    (kept, removed)
+}
+
 impl AuditSink for JsonlFileAuditSink {
     fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_> {
         Box::pin(async move {
@@ -399,9 +422,15 @@ impl AuditSink for JsonlFileAuditSink {
     /// Reads the archive, filters it into a sibling temp file, `fsync`s that
     /// file, then atomically renames it over the archive — so a crash
     /// mid-purge leaves the original intact rather than a truncated archive.
-    /// The temp file inherits the archive's permissions before the rename, so
-    /// a hardened archive (`chmod 600` on a file carrying `actor_id` and
-    /// `ip_address`) does not come back world-readable.
+    /// The temp file inherits the archive's permissions and owner before the
+    /// rename, so a hardened archive (`chmod 600` on a file carrying
+    /// `actor_id` and `ip_address`) does not come back world-readable or
+    /// re-owned. If the owner cannot be kept, the purge fails and the
+    /// archive stays as it was.
+    ///
+    /// A symlinked archive path is resolved first, so the purge rewrites the
+    /// real file and the link stays a link. The temp file sits beside the
+    /// real file, so that directory must be writable.
     ///
     /// A line that does not decode as an [`AuditEvent`] is **kept**: a
     /// retention sweep must never be the thing that silently discards a
@@ -425,10 +454,25 @@ impl AuditSink for JsonlFileAuditSink {
     fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeFuture<'_> {
         Box::pin(async move {
             let _guard = self.write_lock.lock().await;
-            let existing = match tokio::fs::read_to_string(&self.path).await {
-                Ok(contents) => contents,
+            // Resolve the link once, then read and rewrite that one file.
+            // `rename` replaces a symlink, not its target, so a link (for
+            // example one managed by logrotate) would be swapped for a
+            // regular file and the old entries would stay.
+            let target = match tokio::fs::canonicalize(&self.path).await {
+                Ok(target) => target,
                 // No archive yet is a successful no-op, not a failure: the
                 // sink creates the file lazily on first write.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(AuditPurgeOutcome::purged(0));
+                }
+                Err(error) => {
+                    return Err(AuditError::new(format!(
+                        "failed to resolve audit log path for purge: {error}"
+                    )));
+                }
+            };
+            let existing = match tokio::fs::read_to_string(&target).await {
+                Ok(contents) => contents,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(AuditPurgeOutcome::purged(0));
                 }
@@ -439,21 +483,7 @@ impl AuditSink for JsonlFileAuditSink {
                 }
             };
 
-            let mut kept = String::with_capacity(existing.len());
-            let mut removed: u64 = 0;
-            for line in existing.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let stale = serde_json::from_str::<AuditEvent>(line)
-                    .is_ok_and(|event| event.timestamp < cutoff);
-                if stale {
-                    removed = removed.saturating_add(1);
-                } else {
-                    kept.push_str(line);
-                    kept.push('\n');
-                }
-            }
+            let (kept, removed) = keep_entries_since(&existing, cutoff);
 
             if dry_run || removed == 0 {
                 return Ok(AuditPurgeOutcome::purged(removed));
@@ -469,9 +499,9 @@ impl AuditSink for JsonlFileAuditSink {
                 clippy::disallowed_methods,
                 reason = "real nanoseconds keep the temp name unique on the real filesystem; a paused virtual clock repeats them"
             )]
-            let temp_path = self.path.with_file_name(format!(
+            let temp_path = target.with_file_name(format!(
                 "{}.{}.{}.autumn-retention.tmp",
-                self.path.file_name().map_or_else(
+                target.file_name().map_or_else(
                     || "audit".to_owned(),
                     |name| name.to_string_lossy().into_owned()
                 ),
@@ -480,9 +510,16 @@ impl AuditSink for JsonlFileAuditSink {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |since| since.as_nanos()),
             ));
-            let mut temp = tokio::fs::File::create(&temp_path).await.map_err(|error| {
-                AuditError::new(format!("failed to create audit purge temp file: {error}"))
-            })?;
+            // `create_new` fails on an existing path, so a planted symlink at
+            // the temp name is never followed.
+            let mut temp = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await
+                .map_err(|error| {
+                    AuditError::new(format!("failed to create audit purge temp file: {error}"))
+                })?;
             // Every failure after the file exists must remove it. Each sweep
             // picks a fresh name, so leaking one per failed run would
             // accumulate partial archives next to the archive itself —
@@ -507,13 +544,34 @@ impl AuditSink for JsonlFileAuditSink {
             // stale entries, which is strictly better than widening access to
             // every entry that remains.
             let metadata = cleanup_on_error!(
-                tokio::fs::metadata(&self.path).await,
+                tokio::fs::metadata(&target).await,
                 "failed to read audit log permissions before purge"
             );
             cleanup_on_error!(
                 tokio::fs::set_permissions(&temp_path, metadata.permissions()).await,
                 "failed to preserve audit log permissions on the purge temp file"
             );
+            // Keep the owner too. A mode that names other principals is not
+            // the same mode. If the process cannot give the file back to its
+            // owner, refuse: stale entries are better than a silently
+            // re-owned audit log.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let (uid, gid) = (metadata.uid(), metadata.gid());
+                let own = cleanup_on_error!(
+                    temp.metadata().await,
+                    "failed to read the purge temp file owner"
+                );
+                // Skip when the owner already matches: an unprivileged
+                // process cannot `chown` even to its own ids in some setups.
+                if (own.uid(), own.gid()) != (uid, gid) {
+                    cleanup_on_error!(
+                        std::os::unix::fs::chown(&temp_path, Some(uid), Some(gid)),
+                        "failed to preserve audit log owner on the purge temp file"
+                    );
+                }
+            }
             cleanup_on_error!(
                 temp.write_all(kept.as_bytes()).await,
                 "failed to write audit purge temp file"
@@ -524,7 +582,7 @@ impl AuditSink for JsonlFileAuditSink {
             );
             drop(temp);
             cleanup_on_error!(
-                tokio::fs::rename(&temp_path, &self.path).await,
+                tokio::fs::rename(&temp_path, &target).await,
                 "failed to replace audit log file"
             );
             Ok(AuditPurgeOutcome::purged(removed))
@@ -689,6 +747,89 @@ mod tests {
         let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
         assert_eq!(lines.len(), 1, "only the recent entry survives: {content}");
         assert!(lines[0].contains("session-1"), "{content}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonl_sink_purge_rewrites_the_symlink_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("real.log");
+        let link = tmp.path().join("audit.log");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let recent = Utc::now() - chrono::Duration::days(1);
+        let sink = archive_with_timestamps(&link, &[old, recent]).await;
+
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let outcome = sink.purge_before(cutoff, false).await.expect("purge");
+
+        assert_eq!(outcome.entries_removed, 1);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the link must stay a link"
+        );
+        let content = std::fs::read_to_string(&target).expect("read target");
+        assert_eq!(content.lines().count(), 1, "{content}");
+        assert!(!content.contains("session-0"), "{content}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonl_sink_purge_keeps_the_file_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("audit.log");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let recent = Utc::now() - chrono::Duration::days(1);
+        let sink = archive_with_timestamps(&path, &[old, recent]).await;
+        let (uid, gid) = (12_345, 54_321);
+        if std::os::unix::fs::chown(&path, Some(uid), Some(gid)).is_err() {
+            return; // Not root: the process cannot give a file away.
+        }
+
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        sink.purge_before(cutoff, false).await.expect("purge");
+
+        let meta = std::fs::metadata(&path).expect("metadata");
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+    }
+
+    #[tokio::test]
+    async fn jsonl_sink_purge_reports_an_unreadable_archive() {
+        // A directory resolves but cannot be read as a file.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sink = JsonlFileAuditSink::new(tmp.path());
+        let error = sink
+            .purge_before(Utc::now(), false)
+            .await
+            .expect_err("a directory is not an archive");
+        assert!(
+            error.message().contains("failed to read audit log file"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_sink_purge_of_a_missing_archive_is_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sink = JsonlFileAuditSink::new(tmp.path().join("absent.log"));
+        let outcome = sink.purge_before(Utc::now(), false).await.expect("no-op");
+        assert_eq!(outcome.entries_removed, 0);
+    }
+
+    #[test]
+    fn keep_entries_since_keeps_undecodable_lines() {
+        let old = Utc::now() - chrono::Duration::days(400);
+        let mut event = AuditEvent::new("a", "x", "t", None, AuditStatus::Success);
+        event.timestamp = old;
+        let stale = serde_json::to_string(&event).expect("json");
+        let input = format!("{stale}\nnot json\n\n");
+        let (kept, removed) = keep_entries_since(&input, Utc::now());
+        assert_eq!((kept.as_str(), removed), ("not json\n", 1));
     }
 
     #[tokio::test]

@@ -296,11 +296,12 @@ impl SandboxedPlugin {
     /// Returns [`SandboxPluginError::Load`] if the module does not compile or
     /// imports something the sandbox does not provide.
     pub fn from_artifact(artifact: &SandboxArtifact) -> Result<Self, SandboxPluginError> {
-        let mut plugin = Self::new(SandboxHost::load(artifact)?);
         // The whole container, not just the module: the grant an operator
         // reviewed is in the manifest, and the module digest does not move when
         // that does. See `SandboxArtifact::artifact_digest`.
-        plugin.artifact_sha256 = Some(artifact.artifact_digest()?);
+        let digest = artifact.artifact_digest()?;
+        let mut plugin = Self::new(SandboxHost::load(artifact)?);
+        plugin.artifact_sha256 = Some(digest);
         Ok(plugin)
     }
 

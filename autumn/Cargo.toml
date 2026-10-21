@@ -1272,6 +1272,15 @@ path = "tests/sqlite_transactional_url_pool.rs"
 name = "sqlite_fleet"
 path = "tests/sqlite_fleet.rs"
 
+# The fleet sweeper (issue 3234): an outbox row, a commit hook and a
+# derivation backfill in a closed fleet database are done without a request.
+# Its own binary: it declares a `#[derivation]`, which is process-global.
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]`. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_sweeper`.
+[[test]]
+name = "sqlite_fleet_sweeper"
+path = "tests/sqlite_fleet_sweeper.rs"
+
 # Sim-testing W4 SQLite DB lane (issue #1797): proves the job/scheduler drain
 # runs end-to-end against a fresh, migrated, in-process in-memory SQLite substrate
 # (`sim::substrate::SqliteSubstrate`) over the representative local scheduler
@@ -1337,6 +1346,13 @@ path = "tests/sim_idempotency_db.rs"
 [[test]]
 name = "sim_replicas"
 path = "tests/sim_replicas.rs"
+
+# Issue #3233: a partitioned old fleet owner, in virtual time. Runs in the
+# single-threaded multi-replica sim step.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_ownership`.
+[[test]]
+name = "sim_fleet_ownership"
+path = "tests/sim_fleet_ownership.rs"
 
 # Issue #3067: the same-seed trace check. Its own binary, because `tracing`
 # caches callsite interest for the whole process.
@@ -1544,3 +1560,10 @@ workspace = true
 [[test]]
 name = "tls_client_auth_metrics"
 path = "tests/tls_client_auth_metrics.rs"
+
+# Query-string decode workload for profilers: `from_query_str`, the function
+# behind every `Query<T>` extraction. Asserts nothing beyond output shape — see
+# the file header for the exact commands.
+[[bench]]
+name = "query_decode"
+harness = false

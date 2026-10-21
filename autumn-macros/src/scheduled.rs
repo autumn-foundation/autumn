@@ -147,11 +147,14 @@ pub fn scheduled_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // The schedule is carried as the literal the author wrote (`every = "15m"`
     // or the cron expression), not the parsed `Schedule`: the graph reports the
     // declaration, and a parsed value would need the runtime type to render.
-    let graph_schedule = attrs
-        .every
-        .clone()
-        .or_else(|| attrs.cron.clone())
-        .unwrap_or_default();
+    // A cron with a timezone reads `<cron> (<tz>)`. A fixed delay has no zone.
+    let graph_schedule = attrs.every.clone().unwrap_or_else(|| {
+        let cron = attrs.cron.clone().unwrap_or_default();
+        match attrs.tz.as_deref() {
+            Some(tz) => format!("{cron} ({tz})"),
+            None => cron,
+        }
+    });
     let graph_descriptor = crate::graph::emit_job_descriptor(
         &input_fn,
         &quote! { #task_name_str },
@@ -206,5 +209,34 @@ mod tests {
         .to_string();
         assert!(out.contains("mark_deferrable"), "{out}");
         assert!(out.contains("WorkKind :: Task"), "{out}");
+    }
+
+    fn graph_schedule_of(attr: TokenStream) -> String {
+        scheduled_macro(
+            attr,
+            quote! { async fn sweep(state: AppState) -> AutumnResult<()> { Ok(()) } },
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn graph_schedule_names_the_cron_timezone() {
+        let out = graph_schedule_of(quote! { cron = "0 3 * * *", tz = "America/New_York" });
+        assert!(
+            out.contains(r#"schedule : "0 3 * * * (America/New_York)""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn graph_schedule_without_a_timezone_is_the_bare_cron() {
+        let out = graph_schedule_of(quote! { cron = "0 3 * * *" });
+        assert!(out.contains(r#"schedule : "0 3 * * *""#), "{out}");
+    }
+
+    #[test]
+    fn graph_schedule_ignores_tz_for_a_fixed_delay() {
+        let out = graph_schedule_of(quote! { every = "15m", tz = "UTC" });
+        assert!(out.contains(r#"schedule : "15m""#), "{out}");
     }
 }

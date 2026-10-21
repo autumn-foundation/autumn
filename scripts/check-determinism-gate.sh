@@ -112,7 +112,9 @@ GATED_MODULES=(
   # The SQLite database fleet (ADR 0019): sqlite-only modules, so their
   # enforcing clippy lane is the sqlite one.
   autumn/src/db/fleet.rs:sqlite
+  autumn/src/db/fleet_ownership.rs:sqlite
   autumn/src/db/fleet_replication.rs:sqlite
+  autumn/src/db/fleet_sweeper.rs:sqlite
   # The ratified W3 identifier sites. They carry no off-seam production call at
   # all — every id they mint already comes from the injected `Entropy` — so
   # gating them costs nothing and is what makes the `Uuid::new_v4` clause of the

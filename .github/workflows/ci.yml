@@ -1612,7 +1612,9 @@ jobs:
         # PR #1985. The prior step ran in ~25 min against the old 45-minute
         # budget, and these are typical single-Postgres-container tests
         # (seconds to low minutes each), so +30 min is a conservative margin.
-        timeout-minutes: 75
+        # 75 -> 90 (#3347): on trunk-dev the step took 73m21s, and a PR run
+        # hit the 75-minute limit in the `examples/cms` tests with no failure.
+        timeout-minutes: 90
         env:
           # `feature_flags_pg_integration` below builds with `managed-pg-bundled`,
           # which compiles `postgresql_embedded`; its build script downloads
@@ -2290,6 +2292,15 @@ jobs:
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #3234: the fleet sweeper end to end. Same features, so no
+          # rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_fleet_sweeper
+          # Issue #3233: slot ownership driven by its renew loop in virtual
+          # time. Single-threaded, like its CI step. Same features, so no
+          # rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sim_fleet_ownership -- --test-threads=1
           # Issue #3231: the SQLite commit-hook worker loop (stop token, claim
           # heartbeat guard). No other lane measures it, so Codecov reads those
           # lines as uncovered. Same features, so no rebuild.
@@ -2457,12 +2468,22 @@ jobs:
             tests::fleet_subcommands db::replica:: \
             | tee "$RUNNER_TEMP/cli-fleet-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
-          # Same gap for the `--totp` reauth templates in `generate::auth`: a
-          # change to their markup reads as 0% patch coverage. Check the count.
+          # Issue #2555: same gap for the SQLite scaffold-warning test. Check the
+          # count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- \
-            generate::auth::tests::totp_reauth \
-            | tee "$RUNNER_TEMP/cli-totp-reauth-cov.log"
-          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-totp-reauth-cov.log"
+            generate::scaffold::tests::scaffold_on_sqlite_app_warning \
+            | tee "$RUNNER_TEMP/cli-scaffold-sqlite-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scaffold-sqlite-cov.log"
+          # Issue #2396: same gap for `db::retention::` (the force env and the
+          # purge pre-flight). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::retention:: \
+            | tee "$RUNNER_TEMP/cli-retention-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-retention-cov.log"
+          # Issue #2531: same gap for `generate::auth::` (the generated auth
+          # routes and their tests). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::auth:: \
+            | tee "$RUNNER_TEMP/cli-generate-auth-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-auth-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2662,6 +2683,7 @@ jobs:
             --test sqlite_read_only_tx \
             --test sqlite_transactional_url_pool \
             --test sqlite_fleet \
+            --test sqlite_fleet_sweeper \
             --test sqlite_version_history \
             --test sqlite_ledger \
             --test sqlite_ledger_out_of_band \
@@ -2693,7 +2715,8 @@ jobs:
             --test sim_outbox_crash \
             --test sqlite_outbox_writers
       - name: Run the multi-replica sim suites (issue #3067)
-        # Several replicas on one sim clock and one SQLite database. Single
+        # Several replicas on one sim clock and one SQLite database, and the
+        # partitioned fleet owner of issue #3233. Single
         # threaded, like the `sim_` lane of the `test` job: `sim_fleet_trace`
         # compares two traces byte for byte, and `tracing` caches callsite
         # interest for the whole process.
@@ -2701,6 +2724,7 @@ jobs:
           cargo test -p autumn-web --features "sqlite,test-support" \
             --test sim_replicas \
             --test sim_fleet_trace \
+            --test sim_fleet_ownership \
             -- --test-threads=1
       - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
         # `sim_chaos_mail` and `sim_outbox_mail` (#3062) need the `mail`
@@ -2950,7 +2974,11 @@ jobs:
             || { echo "::error::no fleet unit test ran"; exit 1; }
       - name: Fleet integration tests
         shell: bash
-        run: cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
+        # `sqlite_fleet_sweeper` (#3234) finds a fleet by the file path SQLite
+        # reports, which Windows spells differently.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_sweeper
 
   windows-tier1:
     name: Windows Tier 1 journey

@@ -31,14 +31,18 @@ const RETENTION_MODE_ENV: &str = "AUTUMN_DB_RETENTION";
 /// The env var carrying `--dataset`.
 const RETENTION_DATASET_ENV: &str = "AUTUMN_DB_RETENTION_DATASET";
 
+/// The env var carrying `--force`. The app checks its own profile with it.
+const RETENTION_FORCE_ENV: &str = "AUTUMN_DB_RETENTION_FORCE";
+
 /// Every env var in this command's internal one-shot protocol.
 ///
 /// `AUTUMN_RETENTION_DRY_RUN` predates this command (`autumn retention`, see
 /// `crate::retention`) but is listed here because it selects the same family
 /// of pre-server modes and must be cleared with the rest.
-const RETENTION_ONE_SHOT_ENV: [&str; 3] = [
+const RETENTION_ONE_SHOT_ENV: [&str; 4] = [
     RETENTION_MODE_ENV,
     RETENTION_DATASET_ENV,
+    RETENTION_FORCE_ENV,
     "AUTUMN_RETENTION_DRY_RUN",
 ];
 
@@ -145,6 +149,7 @@ pub fn run(opts: &RetentionOptions<'_>) {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     apply_dataset_env(&mut command, opts.dataset);
+    apply_force_env(&mut command, opts.force);
     crate::task::apply_managed_pg_env(&mut command, opts.package);
 
     let output = command.output().unwrap_or_else(|error| {
@@ -249,6 +254,17 @@ fn clear_competing_one_shot_env(command: &mut Command) {
         "AUTUMN_RETENTION_DRY_RUN",
     ] {
         command.env_remove(var);
+    }
+}
+
+/// Set or clear `AUTUMN_DB_RETENTION_FORCE` on `command`.
+///
+/// Always set or removed, so an inherited value cannot force a purge.
+fn apply_force_env(command: &mut Command, force: bool) {
+    if force {
+        command.env(RETENTION_FORCE_ENV, "1");
+    } else {
+        command.env_remove(RETENTION_FORCE_ENV);
     }
 }
 
@@ -500,6 +516,21 @@ mod tests {
     #[test]
     fn extract_report_json_returns_none_without_a_framed_line() {
         assert_eq!(extract_report_json("just some logs\n"), None);
+    }
+
+    #[test]
+    fn apply_force_env_sets_or_removes_the_variable() {
+        let env_of = |force| {
+            let mut command = Command::new("true");
+            command.env(RETENTION_FORCE_ENV, "leftover");
+            apply_force_env(&mut command, force);
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(RETENTION_FORCE_ENV))
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(env_of(true).as_deref(), Some("1"));
+        assert_eq!(env_of(false), None, "an inherited value must be removed");
     }
 
     #[test]

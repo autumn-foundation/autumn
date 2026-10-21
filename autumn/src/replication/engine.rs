@@ -104,6 +104,10 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 /// otherwise expire the entire history in one sweep.
 const MIN_KEPT_GENERATIONS: usize = 2;
 
+/// How often a replicator with an ownership epoch reads the destination's
+/// epochs between generations (issue #3233). Each read is one `list`.
+pub const FENCE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Everything the replication loop needs, already resolved from config.
 #[derive(Debug, Clone)]
 pub struct ReplicationSettings {
@@ -164,6 +168,14 @@ pub enum ReplicationError {
     },
     /// `SQLite` refused an operation.
     Sqlite(SqliteError),
+    /// A newer ownership epoch writes to this replica (issue #3233). This
+    /// replicator ships nothing more.
+    Fenced {
+        /// The epoch of this replicator.
+        epoch: u64,
+        /// The newest epoch at the destination.
+        newest: u64,
+    },
 }
 
 impl fmt::Display for ReplicationError {
@@ -190,6 +202,11 @@ impl fmt::Display for ReplicationError {
             Self::Destination(e) => write!(f, "{e}"),
             Self::Io { op, detail } => write!(f, "replication {op} failed: {detail}"),
             Self::Sqlite(e) => write!(f, "{e}"),
+            Self::Fenced { epoch, newest } => write!(
+                f,
+                "replication stopped: epoch {newest} owns this replica now, and this \
+                 replicator has epoch {epoch}"
+            ),
         }
     }
 }
@@ -315,6 +332,12 @@ pub struct Replicator {
     /// The injected wall clock. Every artifact timestamp is read from here at
     /// the moment that artifact's contents are fenced, never earlier.
     clock: Arc<dyn ClockSource>,
+    /// The ownership epoch this replicator ships under (issue #3233).
+    epoch: Option<u64>,
+    /// When the destination's epochs were last read.
+    fence_checked_at: Option<DateTime<Utc>>,
+    /// The newer epoch that stopped this replicator.
+    fenced_by: Option<u64>,
 }
 
 impl fmt::Debug for Replicator {
@@ -344,7 +367,95 @@ impl Replicator {
             state: None,
             verifying: Arc::new(AtomicBool::new(false)),
             clock: Arc::new(SystemClock),
+            epoch: None,
+            fence_checked_at: None,
+            fenced_by: None,
         }
+    }
+
+    /// Ship under an ownership epoch (issue #3233). Each generation then
+    /// records the epoch, and the replicator stops (with
+    /// [`ReplicationError::Fenced`]) once the destination shows a newer one.
+    #[must_use]
+    pub fn with_epoch(mut self, epoch: Option<u64>) -> Self {
+        self.set_epoch(epoch);
+        self
+    }
+
+    /// Change the epoch. A new epoch starts a new generation on the next
+    /// tick.
+    pub fn set_epoch(&mut self, epoch: Option<u64>) {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.state = None;
+            self.fence_checked_at = None;
+            self.fenced_by = None;
+        }
+    }
+
+    /// The newer epoch that stopped this replicator, if one did.
+    #[must_use]
+    pub const fn fenced_by(&self) -> Option<u64> {
+        self.fenced_by
+    }
+
+    /// Read the destination's epochs. A newer one than ours stops this
+    /// replicator for good.
+    fn check_fence(&mut self) -> Result<(), ReplicationError> {
+        let Some(epoch) = self.epoch else {
+            return Ok(());
+        };
+        if let Some(newest) = self.fenced_by {
+            return Err(ReplicationError::Fenced { epoch, newest });
+        }
+        let root = self.settings.root.clone();
+        let newest = self
+            .destination
+            .list(&segment::epochs_prefix(&root))?
+            .iter()
+            .filter_map(|key| segment::parse_epoch_marker_key(&root, key))
+            .max();
+        self.fence_checked_at = Some(self.clock.now());
+        match newest {
+            Some(newest) if newest > epoch => {
+                self.fenced_by = Some(newest);
+                Err(ReplicationError::Fenced { epoch, newest })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The epoch to record on a new generation. With no epoch of its own, a
+    /// replicator takes the newest epoch at the destination: ownership was
+    /// turned off, and the new generations must still order after the
+    /// fenced ones.
+    fn generation_epoch(&self) -> Result<Option<u64>, ReplicationError> {
+        if self.epoch.is_some() {
+            return Ok(self.epoch);
+        }
+        let root = &self.settings.root;
+        Ok(self
+            .destination
+            .list(&segment::epochs_prefix(root))?
+            .iter()
+            .filter_map(|key| segment::parse_epoch_marker_key(root, key))
+            .max())
+    }
+
+    /// Whether the periodic fence check is due.
+    fn fence_check_due(&self) -> bool {
+        if self.fenced_by.is_some() {
+            return true;
+        }
+        self.epoch.is_some()
+            && self.fence_checked_at.is_none_or(|at| {
+                self.clock
+                    .now()
+                    .signed_duration_since(at)
+                    .to_std()
+                    // A clock that stepped back checks now.
+                    .map_or(true, |age| age >= FENCE_CHECK_INTERVAL)
+            })
     }
 
     /// Read time from `clock` instead of the system clock.
@@ -441,6 +552,10 @@ impl Replicator {
             return Err(ReplicationError::DatabaseMissing {
                 path: db.display().to_string(),
             });
+        }
+        // A new generation checks in `start_generation`.
+        if self.state.is_some() && self.fence_check_due() {
+            self.check_fence()?;
         }
         self.ensure_connection(&db)?;
 
@@ -780,6 +895,14 @@ impl Replicator {
     }
 
     fn start_generation(&mut self, db: &Path) -> Result<(), ReplicationError> {
+        // Before the checkpoint: a fenced replicator leaves the WAL alone.
+        self.check_fence()?;
+        if let Some(epoch) = self.epoch {
+            self.destination.put(
+                &segment::epoch_marker_key(&self.settings.root, epoch),
+                b"{}",
+            )?;
+        }
         if let Some(conn) = self.connection.as_mut() {
             let outcome = sqlite::checkpoint_truncate(conn, db)?;
             if let CheckpointOutcome::Busy { wal_bytes } = outcome {
@@ -813,6 +936,16 @@ impl Replicator {
             .timestamp_millis()
             .max(floor_ms.map_or(i64::MIN, |ms| ms.saturating_add(1)));
         let id = segment::generation_id(created_ms, rand::random::<u64>());
+
+        // Before the upload: a retention sweep of another replicator orders
+        // generations by epoch, and must not take this one for epoch 0 while
+        // its snapshot uploads.
+        if let Some(epoch) = self.generation_epoch()? {
+            self.destination.put(
+                &segment::generation_epoch_key(&self.settings.root, &id, epoch),
+                b"{}",
+            )?;
+        }
 
         let staging = staging_path(db);
         let (sha256, uncompressed_len) = gzip_file(db, &staging)?;
@@ -1018,53 +1151,14 @@ impl Replicator {
             .list(&segment::generations_prefix(&self.settings.root))?;
 
         let open_generation = self.state.as_ref().map(|state| state.id.clone());
-        let mut generations: BTreeMap<(i64, String), Vec<String>> = BTreeMap::new();
-        let mut complete: Vec<(i64, String)> = Vec::new();
-        for key in keys {
-            let Some(id) = segment::generation_of_key(&self.settings.root, &key) else {
-                continue;
-            };
-            let Some(info) = segment::parse_generation_id(&id) else {
-                continue;
-            };
-            if key.ends_with(segment::SNAPSHOT_META_OBJECT) {
-                complete.push((info.created_ms, id.clone()));
-            }
-            generations
-                .entry((info.created_ms, id))
-                .or_default()
-                .push(key);
-        }
-        complete.sort_unstable();
-
-        // The newest complete generation at or before the cutoff is the floor of
-        // the retention window; everything strictly older than it is droppable.
-        let Some(floor) = complete
-            .iter()
-            .rev()
-            .find(|(ms, _)| *ms <= cutoff_ms)
-            .cloned()
-        else {
-            return Ok(0);
-        };
-        // Keep the newest few complete generations unconditionally. A clock that
-        // steps forward past the retention window would otherwise expire the
-        // whole history in one sweep and leave nothing to restore from.
-        let keep_newest: std::collections::BTreeSet<(i64, String)> = complete
-            .iter()
-            .rev()
-            .take(MIN_KEPT_GENERATIONS)
-            .cloned()
-            .collect();
-
+        let droppable = prunable(
+            &self.settings.root,
+            keys,
+            cutoff_ms,
+            open_generation.as_deref(),
+        );
         let mut pruned: u64 = 0;
-        for ((ms, id), keys) in &generations {
-            if (*ms, id.clone()) >= floor
-                || keep_newest.contains(&(*ms, id.clone()))
-                || open_generation.as_ref() == Some(id)
-            {
-                continue;
-            }
+        for (id, keys) in &droppable {
             // Delete the commit marker FIRST: a prune interrupted halfway then
             // leaves an *uncommitted* generation, which restore ignores, rather
             // than a complete-looking generation with no segments.
@@ -1090,6 +1184,69 @@ impl Replicator {
         }
         Ok(pruned)
     }
+}
+
+/// The generations a retention sweep at `cutoff_ms` removes, with their keys.
+///
+/// Ordered as a restore orders them: epoch, then time (issue #3233). The floor
+/// is the generation a restore to the cutoff picks. A generation is removed
+/// when it orders before the floor, is not one of the
+/// [`MIN_KEPT_GENERATIONS`] newest complete ones, and is not `open`. A
+/// generation with no `snapshot.json` that is newer in time than the floor
+/// is never removed: it can be another replicator's upload in progress, whose
+/// epoch marker is not there yet.
+fn prunable(
+    root: &str,
+    keys: Vec<String>,
+    cutoff_ms: i64,
+    open: Option<&str>,
+) -> Vec<(String, Vec<String>)> {
+    let epochs = restore::generation_epochs(root, &keys);
+    let mut generations: BTreeMap<(u64, i64, String), Vec<String>> = BTreeMap::new();
+    let mut complete: Vec<(u64, i64, String)> = Vec::new();
+    for key in keys {
+        let Some(id) = segment::generation_of_key(root, &key) else {
+            continue;
+        };
+        let Some(info) = segment::parse_generation_id(&id) else {
+            continue;
+        };
+        let epoch = epochs.get(&id).copied().unwrap_or(0);
+        if key.ends_with(segment::SNAPSHOT_META_OBJECT) {
+            complete.push((epoch, info.created_ms, id.clone()));
+        }
+        generations
+            .entry((epoch, info.created_ms, id))
+            .or_default()
+            .push(key);
+    }
+    complete.sort_unstable();
+    let Some(floor) = complete
+        .iter()
+        .rev()
+        .find(|(_, ms, _)| *ms <= cutoff_ms)
+        .cloned()
+    else {
+        return Vec::new();
+    };
+    // Keep the newest few complete generations unconditionally. A clock that
+    // steps forward past the retention window would otherwise expire the
+    // whole history in one sweep and leave nothing to restore from.
+    let keep_newest: std::collections::BTreeSet<&(u64, i64, String)> =
+        complete.iter().rev().take(MIN_KEPT_GENERATIONS).collect();
+    let is_complete: std::collections::BTreeSet<&str> =
+        complete.iter().map(|(_, _, id)| id.as_str()).collect();
+    generations
+        .into_iter()
+        .filter(|(order, _)| {
+            let (_, ms, id) = order;
+            *order < floor
+                && !keep_newest.contains(order)
+                && open != Some(id.as_str())
+                && (is_complete.contains(id.as_str()) || *ms <= floor.1)
+        })
+        .map(|((_, _, id), keys)| (id, keys))
+        .collect()
 }
 
 /// Clears the "verification in flight" flag when dropped, panic or not.
@@ -1267,6 +1424,72 @@ fn sleep_or_cancelled(shutdown: &tokio_util::sync::CancellationToken, total: Dur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keys(id: &str, epoch: Option<u64>, complete: bool) -> Vec<String> {
+        let mut keys = vec![segment::snapshot_key("r", id)];
+        if let Some(epoch) = epoch {
+            keys.push(segment::generation_epoch_key("r", id, epoch));
+        }
+        if complete {
+            keys.push(segment::snapshot_meta_key("r", id));
+        }
+        keys
+    }
+
+    fn pruned(all: &[Vec<String>], cutoff_ms: i64, open: Option<&str>) -> Vec<String> {
+        let mut ids: Vec<String> = prunable("r", all.concat(), cutoff_ms, open)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn retention_orders_by_epoch_then_time() {
+        let id = segment::generation_id;
+        let (old, stale, owner) = (id(1_000, 1), id(5_000, 2), id(2_000, 3));
+        let (newest, kept) = (id(6_000, 4), id(7_000, 5));
+        let all = vec![
+            keys(&old, Some(1), true),
+            keys(&stale, Some(1), true),
+            keys(&owner, Some(2), true),
+            keys(&newest, Some(2), true),
+            keys(&kept, Some(2), true),
+        ];
+        // A restore to 5_500 picks `owner` (epoch 2): the stale epoch-1
+        // generation, newer in time, orders below it and goes.
+        assert_eq!(pruned(&all, 5_500, None), vec![old, stale]);
+    }
+
+    #[test]
+    fn retention_keeps_an_upload_in_progress_newer_than_the_floor() {
+        let id = segment::generation_id;
+        let (floor, uploading) = (id(1_000, 1), id(9_000, 2));
+        let (later, latest) = (id(10_000, 3), id(11_000, 4));
+        let all = vec![
+            keys(&floor, Some(1), true),
+            // Another replicator's snapshot, before its markers.
+            keys(&uploading, None, false),
+            keys(&later, Some(1), true),
+            keys(&latest, Some(1), true),
+        ];
+        assert!(pruned(&all, 5_000, None).is_empty());
+        // Without epochs the old rules hold: older than the floor goes.
+        let (old, mid) = (id(1_000, 1), id(2_000, 2));
+        let (recent, newest) = (id(9_000, 3), id(9_500, 4));
+        let all = vec![
+            keys(&old, None, true),
+            keys(&mid, None, true),
+            keys(&recent, None, true),
+            keys(&newest, None, true),
+        ];
+        assert_eq!(pruned(&all, 5_000, None), vec![old.clone()]);
+        assert!(
+            pruned(&all, 5_000, Some(&old)).is_empty(),
+            "the open generation stays"
+        );
+    }
 
     #[test]
     fn staging_path_sits_next_to_the_database() {
