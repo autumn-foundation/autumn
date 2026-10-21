@@ -28,6 +28,25 @@ struct DerivedArgs {
     b: Option<i32>,
 }
 
+// Issue #2565: the `crate = "..."` helper attribute must compile through the
+// real macro. `autumn_web` is also the default, so this test proves only that
+// the helper attribute is registered and parsed. Unit tests in `autumn-macros`
+// prove that the name changes the generated paths.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[openapi_schema(crate = "autumn_web")]
+struct OverriddenArgs {
+    a: String,
+}
+
+#[test]
+fn crate_override_helper_still_derives_the_schema() {
+    assert_eq!(OverriddenArgs::schema_name(), "OverriddenArgs");
+    assert_eq!(
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<OverriddenArgs>()),
+        Some(OverriddenArgs::schema())
+    );
+}
+
 // A plain struct WITHOUT the derive — the pre-#1972 behaviour (placeholder).
 #[derive(Serialize, Deserialize)]
 struct PlainArgs {

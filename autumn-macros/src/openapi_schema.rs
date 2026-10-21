@@ -20,12 +20,86 @@
 //! consult, so a referenced type resolves to its real schema with no manual
 //! registration.
 
-use proc_macro::TokenStream;
+use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, parse_macro_input};
+use syn::{Data, DeriveInput, Fields};
 
+/// Name of the derive helper attribute.
+const HELPER: &str = "openapi_schema";
+
+/// Entry point for the derive.
+///
+/// Reads `#[openapi_schema(crate = "...")]` and builds the generated paths from
+/// that crate name. A derive cannot take arguments, so a helper attribute
+/// carries the override (issue #2565). The derive does not output the item, so
+/// the helper attribute needs no removal.
 pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+    let input = match syn::parse2::<DeriveInput>(input) {
+        Ok(input) => input,
+        Err(e) => return e.to_compile_error(),
+    };
+    if let Err(err) = reject_misplaced_helper(&input) {
+        return err;
+    }
+    let crate_override = match helper_crate_override(&input.attrs) {
+        Ok(name) => name,
+        Err(err) => return err,
+    };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(expand(&input))
+}
+
+/// Read the `crate = "..."` value from the `#[openapi_schema(...)]` attributes.
+///
+/// Fails on a bare attribute, an unknown argument, a bad value, or a second
+/// override. A typo must not silently fall back to automatic resolution.
+fn helper_crate_override(attrs: &[syn::Attribute]) -> Result<Option<String>, TokenStream> {
+    let mut found: Option<String> = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident(HELPER)) {
+        let syn::Meta::List(list) = &attr.meta else {
+            return Err(helper_error(attr));
+        };
+        let (name, rest) =
+            autumn_macros_support::crate_path::extract_crate_override(list.tokens.clone())?;
+        if name.is_none() || !rest.is_empty() || found.is_some() {
+            return Err(helper_error(attr));
+        }
+        found = name;
+    }
+    Ok(found)
+}
+
+/// Refuse the helper on a field or variant. Only the container is read, so
+/// any other place would be ignored without a warning.
+fn reject_misplaced_helper(input: &DeriveInput) -> Result<(), TokenStream> {
+    let nested: Vec<&syn::Attribute> = match &input.data {
+        Data::Struct(d) => d.fields.iter().flat_map(|f| &f.attrs).collect(),
+        Data::Enum(d) => d
+            .variants
+            .iter()
+            .flat_map(|v| v.attrs.iter().chain(v.fields.iter().flat_map(|f| &f.attrs)))
+            .collect(),
+        Data::Union(d) => d.fields.named.iter().flat_map(|f| &f.attrs).collect(),
+    };
+    if let Some(attr) = nested.iter().find(|a| a.path().is_ident(HELPER)) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[openapi_schema]` is valid on the struct or enum only",
+        )
+        .to_compile_error());
+    }
+    Ok(())
+}
+
+fn helper_error(attr: &syn::Attribute) -> TokenStream {
+    syn::Error::new_spanned(
+        attr,
+        "expected one `#[openapi_schema(crate = \"...\")]` attribute",
+    )
+    .to_compile_error()
+}
+
+fn expand(input: &DeriveInput) -> TokenStream {
     let name = &input.ident;
 
     // The emitted impl uses the bare type name for both `schema_name()` and the
@@ -38,15 +112,14 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
             &input.generics,
             "#[derive(OpenApiSchema)] does not support generic types",
         )
-        .to_compile_error()
-        .into();
+        .to_compile_error();
     }
 
     let schema_body = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(named) => {
-                if let Err(e) = reject_undescribable_struct(&input, named) {
-                    return e.to_compile_error().into();
+                if let Err(e) = reject_undescribable_struct(input, named) {
+                    return e.to_compile_error();
                 }
                 // The emitters expect `&[&&Field]` (they were written against
                 // the `Vec<&&Field>` the model macro collects); build that
@@ -116,24 +189,22 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
             }
             _ => {
                 return syn::Error::new_spanned(
-                    &input,
+                    input,
                     "#[derive(OpenApiSchema)] is only supported on structs with named fields",
                 )
-                .to_compile_error()
-                .into();
+                .to_compile_error();
             }
         },
-        Data::Enum(data) => match enum_schema_body(&input, data) {
+        Data::Enum(data) => match enum_schema_body(input, data) {
             Ok(body) => body,
-            Err(e) => return e.to_compile_error().into(),
+            Err(e) => return e.to_compile_error(),
         },
         Data::Union(_) => {
             return syn::Error::new_spanned(
-                &input,
+                input,
                 "#[derive(OpenApiSchema)] is only supported on structs and enums",
             )
-            .to_compile_error()
-            .into();
+            .to_compile_error();
         }
     };
 
@@ -157,7 +228,6 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
             }
         }
     }
-    .into()
 }
 
 /// Emit the `schema()` body for a unit-variant enum: the closed string set
@@ -625,6 +695,161 @@ fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::
 mod tests {
     use super::*;
     use syn::parse_quote;
+
+    fn derive_str(input: TokenStream) -> String {
+        derive_openapi_schema(input).to_string()
+    }
+
+    /// The helper attribute roots the generated code at the named crate.
+    #[test]
+    fn crate_override_roots_the_impl_and_inventory_at_the_named_crate() {
+        let out = derive_str(quote! {
+            #[openapi_schema(crate = "web_new")]
+            struct Params { q: String }
+        });
+        assert!(
+            out.contains(":: web_new :: openapi :: OpenApiSchema"),
+            "{out}"
+        );
+        assert!(
+            out.contains(":: web_new :: openapi :: DerivedSchemaDescriptor"),
+            "{out}"
+        );
+        assert!(!out.contains(":: autumn_web"), "leaked default path: {out}");
+    }
+
+    /// Enums take the same override.
+    #[test]
+    fn crate_override_applies_to_enums() {
+        let out = derive_str(quote! {
+            #[openapi_schema(crate = "web_new")]
+            enum Status { Open, Closed }
+        });
+        assert!(
+            out.contains(":: web_new :: openapi :: OpenApiSchema"),
+            "{out}"
+        );
+        assert!(!out.contains(":: autumn_web"), "{out}");
+    }
+
+    /// No helper attribute: automatic resolution (the default in unit tests).
+    #[test]
+    fn no_override_keeps_the_default_root() {
+        let out = derive_str(quote! { struct Params { q: String } });
+        assert!(
+            out.contains(":: autumn_web :: openapi :: OpenApiSchema"),
+            "{out}"
+        );
+    }
+
+    /// An override must not leak into the next expansion.
+    #[test]
+    fn crate_override_does_not_leak_to_the_next_expansion() {
+        let _ = derive_str(quote! {
+            #[openapi_schema(crate = "web_new")]
+            struct A { q: String }
+        });
+        assert_eq!(
+            autumn_macros_support::crate_path::current_target(),
+            "autumn_web"
+        );
+    }
+
+    fn err_of(input: TokenStream) -> String {
+        let out = derive_str(input);
+        assert!(out.contains("compile_error"), "expected an error: {out}");
+        out
+    }
+
+    /// The helper-attribute error, not some other error.
+    fn helper_err_of(input: TokenStream) {
+        let out = err_of(input);
+        assert!(out.contains("expected one"), "{out}");
+    }
+
+    #[test]
+    fn a_non_string_override_is_refused() {
+        err_of(quote! {
+            #[openapi_schema(crate = web_new)]
+            struct A { q: String }
+        });
+    }
+
+    #[test]
+    fn an_invalid_identifier_override_is_refused() {
+        err_of(quote! {
+            #[openapi_schema(crate = "not an ident")]
+            struct A { q: String }
+        });
+    }
+
+    /// Only `crate` is known. A typo must fail, not be dropped.
+    #[test]
+    fn an_unknown_helper_argument_is_refused() {
+        helper_err_of(quote! {
+            #[openapi_schema(krate = "web_new")]
+            struct A { q: String }
+        });
+    }
+
+    #[test]
+    fn an_extra_argument_after_the_override_is_refused() {
+        helper_err_of(quote! {
+            #[openapi_schema(crate = "a", foo)]
+            struct A { q: String }
+        });
+    }
+
+    #[test]
+    fn a_crate_key_without_a_value_is_refused() {
+        err_of(quote! {
+            #[openapi_schema(crate)]
+            struct A { q: String }
+        });
+    }
+
+    /// A valid override does not hide the usual shape errors.
+    #[test]
+    fn an_override_on_a_tuple_struct_still_fails_for_the_shape() {
+        let out = err_of(quote! {
+            #[openapi_schema(crate = "web_new")]
+            struct A(String);
+        });
+        assert!(out.contains("named fields"), "{out}");
+    }
+
+    #[test]
+    fn the_helper_on_a_field_is_refused() {
+        let out = err_of(quote! {
+            struct A { #[openapi_schema(crate = "web_new")] q: String }
+        });
+        assert!(out.contains("struct or enum only"), "{out}");
+    }
+
+    #[test]
+    fn the_helper_on_a_variant_is_refused() {
+        let out = err_of(quote! {
+            enum A { #[openapi_schema(crate = "web_new")] Open }
+        });
+        assert!(out.contains("struct or enum only"), "{out}");
+    }
+
+    #[test]
+    fn a_bare_helper_attribute_is_refused() {
+        helper_err_of(quote! {
+            #[openapi_schema]
+            struct A { q: String }
+        });
+    }
+
+    #[test]
+    fn a_duplicate_override_is_refused() {
+        helper_err_of(quote! {
+            #[openapi_schema(crate = "a")]
+            #[openapi_schema(crate = "b")]
+            struct A { q: String }
+        });
+    }
 
     /// Run the struct audit over a fixture, returning the rejection message.
     fn audit(input: &DeriveInput) -> Result<(), String> {
