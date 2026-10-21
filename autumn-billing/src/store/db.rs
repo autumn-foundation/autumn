@@ -419,6 +419,88 @@ fn stale_cutoff(now: DateTime<Utc>, stale_after: Duration) -> Option<NaiveDateTi
         .map(to_naive)
 }
 
+/// Tries before `upsert_subscription` gives up on concurrent writers.
+const SUBSCRIPTION_WRITE_ATTEMPTS: usize = 8;
+
+impl DbBillingStore {
+    /// One guarded subscription write. `None` means a concurrent writer won
+    /// the row between the read and the write, so the caller reads again.
+    ///
+    /// The write is a compare-and-set on the row it read, and an insert
+    /// that loses the unique key. The guard and the tie check always run
+    /// against the row that is in the database at write time.
+    async fn try_upsert_subscription(
+        &self,
+        upsert: SubscriptionUpsert,
+    ) -> Result<Option<Write<SubscriptionRow>>, BillingError> {
+        let mut conn = self.conn().await?;
+        let result = conn
+            .transaction(
+                async move |conn| -> Result<Option<Write<SubscriptionRow>>, TxError> {
+                    let existing: Option<SubscriptionRow> = billing_subscriptions::table
+                        .filter(
+                            billing_subscriptions::provider_subscription_id
+                                .eq(upsert.provider_subscription_id.as_str()),
+                        )
+                        .select(SubscriptionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(current) = existing else {
+                        let row =
+                            SubscriptionRow::from_upsert(upsert.new_id.clone(), upsert.now, upsert);
+                        diesel::insert_into(billing_subscriptions::table)
+                            .values(&row)
+                            .execute(conn)
+                            .await?;
+                        return Ok(Some(Write::Applied(row)));
+                    };
+                    let current_status = SubscriptionStatus::parse(&current.status)
+                        .ok_or_else(|| bad_stored("subscription status", &current.status))?;
+                    match guard_subscription(
+                        to_utc(current.last_event_at),
+                        current_status,
+                        upsert.occurred_at,
+                        upsert.status,
+                        upsert.authoritative,
+                        upsert.check_ties,
+                    ) {
+                        Guard::Apply => {}
+                        Guard::Unchanged => return Ok(Some(Write::Unchanged(current))),
+                        Guard::Stale => return Ok(Some(Write::Stale(current))),
+                        Guard::Tie => return Ok(Some(Write::Tie(current))),
+                    }
+                    let mut row = SubscriptionRow::from_upsert(
+                        current.id.clone(),
+                        to_utc(current.created_at),
+                        upsert,
+                    );
+                    // A snapshot without these fields keeps the stored values.
+                    row.provider_price_id = row.provider_price_id.or(current.provider_price_id);
+                    row.plan_id = row.plan_id.or(current.plan_id);
+                    row.current_period_end = row.current_period_end.or(current.current_period_end);
+                    let changed = diesel::update(
+                        billing_subscriptions::table
+                            .find(&row.id)
+                            .filter(billing_subscriptions::status.eq(&current.status))
+                            .filter(billing_subscriptions::last_event_at.eq(current.last_event_at))
+                            .filter(billing_subscriptions::updated_at.eq(current.updated_at)),
+                    )
+                    .set(&row)
+                    .execute(conn)
+                    .await?;
+                    Ok((changed == 1).then_some(Write::Applied(row)))
+                },
+            )
+            .await;
+        match result {
+            // The insert lost the unique key to a concurrent writer.
+            Err(TxError::Db(err)) if is_unique_violation(&err) => Ok(None),
+            other => other.map_err(|err| err.into_billing("upsert_subscription")),
+        }
+    }
+}
+
 impl BillingStore for DbBillingStore {
     fn claim_event<'a>(
         &'a self,
@@ -746,65 +828,14 @@ impl BillingStore for DbBillingStore {
         upsert: SubscriptionUpsert,
     ) -> StoreFuture<'_, Write<Subscription>> {
         Box::pin(async move {
-            let mut conn = self.conn().await?;
-            let write: Write<SubscriptionRow> = conn
-                .transaction(
-                    async move |conn| -> Result<Write<SubscriptionRow>, TxError> {
-                        let existing: Option<SubscriptionRow> = billing_subscriptions::table
-                            .filter(
-                                billing_subscriptions::provider_subscription_id
-                                    .eq(upsert.provider_subscription_id.as_str()),
-                            )
-                            .select(SubscriptionRow::as_select())
-                            .first(conn)
-                            .await
-                            .optional()?;
-                        let Some(current) = existing else {
-                            let row = SubscriptionRow::from_upsert(
-                                upsert.new_id.clone(),
-                                upsert.now,
-                                upsert,
-                            );
-                            diesel::insert_into(billing_subscriptions::table)
-                                .values(&row)
-                                .execute(conn)
-                                .await?;
-                            return Ok(Write::Applied(row));
-                        };
-                        let current_status = SubscriptionStatus::parse(&current.status)
-                            .ok_or_else(|| bad_stored("subscription status", &current.status))?;
-                        match guard_subscription(
-                            to_utc(current.last_event_at),
-                            current_status.rank(),
-                            current_status.is_terminal(),
-                            upsert.occurred_at,
-                            upsert.status.rank(),
-                            upsert.authoritative,
-                        ) {
-                            Guard::Apply => {}
-                            Guard::Unchanged => return Ok(Write::Unchanged(current)),
-                            Guard::Stale => return Ok(Write::Stale(current)),
-                        }
-                        let mut row = SubscriptionRow::from_upsert(
-                            current.id.clone(),
-                            to_utc(current.created_at),
-                            upsert,
-                        );
-                        // A snapshot without these fields keeps the stored values.
-                        row.provider_price_id = row.provider_price_id.or(current.provider_price_id);
-                        row.plan_id = row.plan_id.or(current.plan_id);
-                        row.current_period_end =
-                            row.current_period_end.or(current.current_period_end);
-                        diesel::update(billing_subscriptions::table.find(&row.id))
-                            .set(&row)
-                            .execute(conn)
-                            .await?;
-                        Ok(Write::Applied(row))
-                    },
-                )
-                .await
-                .map_err(|err| err.into_billing("upsert_subscription"))?;
-            write.try_map(SubscriptionRow::into_model)
+            for _ in 0..SUBSCRIPTION_WRITE_ATTEMPTS {
+                if let Some(write) = self.try_upsert_subscription(upsert.clone()).await? {
+                    return write.try_map(SubscriptionRow::into_model);
+                }
+            }
+            Err(BillingError::store(
+                "upsert_subscription: too many concurrent writers",
+            ))
         })
     }
 
@@ -934,7 +965,7 @@ impl BillingStore for DbBillingStore {
                     ) {
                         Guard::Apply => {}
                         Guard::Unchanged => return Ok(Write::Unchanged(current)),
-                        Guard::Stale => return Ok(Write::Stale(current)),
+                        Guard::Stale | Guard::Tie => return Ok(Write::Stale(current)),
                     }
                     // `None` keeps the stored link.
                     let subscription_id =

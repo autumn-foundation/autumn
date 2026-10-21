@@ -62,6 +62,9 @@ ignore = [
     # (build) postgresql_embedded -> autumn-web. Not a runtime vulnerability and no
     # safe upgrade (author recommends web-time). Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive via postgresql_embedded (managed-pg-bundled feature); no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — webpki-roots 0.26.11 via sqlx-core under the
+    # managed-pg-bundled stack. Kept identical to deny.toml; see the rationale there.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 under build-time postgresql_embedded; no patched 0.26.x; workspace copy fixed at 1.0.10; local embedded Postgres only; review-by 2026-11-20" },
     # RUSTSEC-2026-0253 — `lru`'s `LruCache::pop()` is not panic-safe. Kept
     # identical to deny.toml on purpose (see the note above the ignore list);
     # the full rationale lives there. Short version: the workspace's own `lru` is

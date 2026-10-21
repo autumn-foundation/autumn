@@ -1281,6 +1281,7 @@ impl DatabaseFleet {
                 let changed = ownership.changed().notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
+                let started = tokio::time::Instant::now();
                 // Close a lapsed range first: the store may hang (a real
                 // partition), and the local lease must still end on time.
                 let _ = fleet.fence_unowned();
@@ -1315,7 +1316,7 @@ impl DatabaseFleet {
                     return;
                 }
                 let _ = fleet.fence_unowned();
-                let wake = ownership.next_wake();
+                let wake = ownership.next_wake_since(started);
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep_until(wake) => {}
