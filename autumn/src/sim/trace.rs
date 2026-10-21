@@ -117,15 +117,18 @@ pub async fn capture_targets<F: std::future::Future>(
         start: tokio::time::Instant::now(),
     });
     let _live = Live::new(&state);
-    let mut future = Some(Box::pin(future));
+    let mut running = Running {
+        future: Some(Box::pin(future)),
+        state: &state,
+    };
     let output = std::future::poll_fn(|cx| {
         let _polling = Polling::new(&state);
-        let Some(running) = future.as_mut() else {
+        let Some(future) = running.future.as_mut() else {
             unreachable!("capture polled after it ended");
         };
-        let output = std::task::ready!(running.as_mut().poll(cx));
+        let output = std::task::ready!(future.as_mut().poll(cx));
         // Drop it here: events from its `Drop` belong to this capture.
-        future = None;
+        running.future = None;
         std::task::Poll::Ready(output)
     })
     .await;
@@ -141,6 +144,22 @@ pub async fn capture_targets<F: std::future::Future>(
         }
     }
     (output, Trace { lines })
+}
+
+/// The future of a capture. The drop, also on a cancel or a panic, selects
+/// the capture first, so events from the future's own `Drop` stay in it.
+struct Running<'a, F> {
+    future: Option<std::pin::Pin<Box<F>>>,
+    state: &'a Arc<Capture>,
+}
+
+impl<F> Drop for Running<'_, F> {
+    fn drop(&mut self) {
+        if self.future.is_some() {
+            let _polling = Polling::new(self.state);
+            self.future = None;
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -424,6 +443,31 @@ mod tests {
         })
         .await;
         assert!(outer.is_empty(), "{outer:?}");
+    }
+
+    /// A capture that is cancelled while a newer one is live drops its future
+    /// in its own state. The newer trace gets none of its events.
+    #[tokio::test(start_paused = true)]
+    async fn sim_trace_cancelled_capture_does_not_leak_into_a_newer_one() {
+        struct Noisy;
+        impl std::future::Future for Noisy {
+            type Output = ();
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for Noisy {
+            fn drop(&mut self) {
+                tracing::info!(target: "autumn_web::x", "dropped");
+            }
+        }
+        let mut older = Box::pin(capture(Noisy));
+        assert!(futures::poll!(older.as_mut()).is_pending());
+        let ((), newer) = capture(async { drop(older) }).await;
+        assert!(newer.is_empty(), "{newer:?}");
     }
 
     /// Tasks the captured future spawns are recorded too.
