@@ -172,6 +172,21 @@ will not accept. None of them fails the build:
 > Treat catch-all routes as undocumentable — `#[api_doc(hidden)]` if the noise
 > matters.
 
+### Two copies of `autumn-web`
+
+The derive finds the `autumn-web` crate name by itself, even if you rename the
+dependency. If one crate holds two copies of `autumn-web`, the derive cannot
+choose one. Name the correct copy with a helper attribute. The derive path
+selects the macro. The attribute selects the crate for the generated code:
+
+```rust
+#[derive(web_new::openapi::OpenApiSchema)]
+#[openapi_schema(crate = "web_new")]
+struct SearchParams { q: String }
+```
+
+Only `crate` is a valid argument. Any other argument is a compile error.
+
 ### A worked example
 
 ```rust

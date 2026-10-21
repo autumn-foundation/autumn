@@ -255,15 +255,16 @@ impl BillingStore for MemoryBillingStore {
             if let Some(current) = existing {
                 match guard_subscription(
                     current.last_event_at,
-                    current.status.rank(),
-                    current.status.is_terminal(),
+                    current.status,
                     upsert.occurred_at,
-                    upsert.status.rank(),
+                    upsert.status,
                     upsert.authoritative,
+                    upsert.check_ties,
                 ) {
                     Guard::Apply => {}
                     Guard::Unchanged => return Write::Unchanged(current),
                     Guard::Stale => return Write::Stale(current),
+                    Guard::Tie => return Write::Tie(current),
                 }
                 // A snapshot without these fields keeps the stored values.
                 let row = Subscription {
@@ -369,7 +370,7 @@ impl BillingStore for MemoryBillingStore {
                 ) {
                     Guard::Apply => {}
                     Guard::Unchanged => return Write::Unchanged(current),
-                    Guard::Stale => return Write::Stale(current),
+                    Guard::Stale | Guard::Tie => return Write::Stale(current),
                 }
                 let row = Invoice {
                     id: current.id.clone(),
@@ -588,6 +589,7 @@ mod tests {
             cancel_at_period_end: false,
             occurred_at: at(occurred),
             authoritative: false,
+            check_ties: false,
             now: at(1000),
         }
     }

@@ -490,6 +490,10 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// inferred shape could confidently advertise a contract the handler does not
 /// accept. Write the impl by hand and register it for that case.
 ///
+/// **Two copies of `autumn-web`**: use `#[openapi_schema(crate = "name")]` to
+/// name the copy that the generated code must use. A derive cannot take
+/// arguments, so a helper attribute carries the override.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -509,11 +513,9 @@ pub fn story(input: TokenStream) -> TokenStream {
 ///     InProgress,
 /// }
 /// ```
-#[proc_macro_derive(OpenApiSchema)]
+#[proc_macro_derive(OpenApiSchema, attributes(openapi_schema))]
 pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
-    let _guard = autumn_macros_support::crate_path::set_target(None);
-    autumn_macros_support::crate_path::finalize(openapi_schema::derive_openapi_schema(input).into())
-        .into()
+    openapi_schema::derive_openapi_schema(input.into()).into()
 }
 
 /// Declare a scheduled background task.

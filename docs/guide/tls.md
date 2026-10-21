@@ -748,6 +748,10 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 (`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
 `ingress_ipv6` instead; set both kinds if you accept both.
 
+The hourly budget survives a restart. Autumn keeps a ledger of recent orders
+in `store_dir` (`attempts.ledger`, `0600`). An order for an offboarded domain
+still counts. One process owns the ledger. Replicas do not share it.
+
 `resolvers` are the recursive resolvers autumn asks for each domain's
 ownership TXT record. The server must reach them on UDP/53.
 
