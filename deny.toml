@@ -54,6 +54,15 @@ unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
+    # RUSTSEC-2026-0381 — webpki-roots bundles root certificates that trust
+    # distrusted emSign intermediates. FIXED, not ignored, for webpki-roots
+    # 1.0.x (bumped to 1.0.10 in the lockfile). This entry covers only
+    # webpki-roots 0.26.11, which sqlx-core 0.8.6 pins through
+    # postgresql_embedded, a build-time dependency that downloads a test
+    # Postgres. The advisory's only fix is `>=1.0.10`, so no patched 0.26.x
+    # exists. Autumn's own TLS clients use the 1.0.x line. Review-by:
+    # 2026-11-04, or when sqlx moves to webpki-roots 1.x.
+    { id = "RUSTSEC-2026-0381", reason = "only webpki-roots 0.26.11 via sqlx-core 0.8.6 under postgresql_embedded (build-time); 1.0.x fixed in lockfile; review-by 2026-11-04" },
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
     # No patched rsa release exists (advisory: "no safe upgrade available").
     # Ingress: rsa 0.9.10 -> jsonwebtoken -> autumn-web, i.e. only the RSA-family
