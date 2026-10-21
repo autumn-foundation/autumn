@@ -528,6 +528,73 @@ pub(crate) fn from_line<T: serde::de::DeserializeOwned>(line: &str) -> Result<T,
     Ok(serde_json::from_str(line)?)
 }
 
+/// The most JSON values a legal guest frame holds.
+///
+/// A fragment of [`MAX_NODES`](super::capability::render::MAX_NODES) nodes with
+/// the most attributes holds about 55,000. A larger count cannot be legal.
+pub(crate) const MAX_FRAME_VALUES: usize = 65_536;
+
+/// The deepest JSON nesting a legal guest frame has.
+///
+/// A fragment at its depth limit nests about 21 levels.
+pub(crate) const MAX_FRAME_DEPTH: usize = 32;
+
+/// Count a line's values and nesting without allocating.
+///
+/// A serde derive on an internally tagged enum copies the whole frame into a
+/// buffer before any `deserialize_with` limit runs. This scan refuses a frame
+/// that no legal guest sends, before that copy exists.
+fn check_frame_shape(line: &str) -> Result<(), WireError> {
+    let (mut depth, mut values) = (0_usize, 0_usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for byte in line.bytes() {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                values = values.saturating_add(1);
+                if depth > MAX_FRAME_DEPTH {
+                    return Err(shape_error(format!(
+                        "a frame nests deeper than {MAX_FRAME_DEPTH} levels"
+                    )));
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b',' => values = values.saturating_add(1),
+            _ => {}
+        }
+        if values > MAX_FRAME_VALUES {
+            return Err(shape_error(format!(
+                "a frame holds more than {MAX_FRAME_VALUES} values"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn shape_error(message: String) -> WireError {
+    WireError::Json(serde::de::Error::custom(message))
+}
+
+/// Parse one line a guest wrote. See [`check_frame_shape`].
+///
+/// # Errors
+///
+/// As [`from_line`], and when the line is more complex than any legal frame.
+pub(crate) fn from_guest_line(line: &str) -> Result<GuestFrame, WireError> {
+    check_frame_shape(line)?;
+    from_line(line)
+}
+
 mod body_b64 {
     use super::BASE64;
     use base64::Engine as _;
@@ -1554,6 +1621,57 @@ mod tests {
         let frame: GuestFrame =
             from_line(r#"{"op":"error","detail":"no handler"}"#).expect("parses");
         assert!(matches!(frame, GuestFrame::Error { .. }), "{frame:?}");
+    }
+
+    fn guest_err(line: &str) -> String {
+        from_guest_line(line)
+            .expect_err("the frame must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn a_frame_with_too_many_values_is_refused_before_it_is_parsed() {
+        let nodes = vec![r#"{"node":"text","text":""}"#; 100_000].join(",");
+        let message = guest_err(&format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#));
+        assert!(message.contains("values"), "{message}");
+
+        let columns = (0..100_000)
+            .map(|i| format!(r#""c{i}":1"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let message = guest_err(&format!(
+            r#"{{"op":"call","call":"job-enqueue","id":1,"job_type":"x","payload":{{{columns}}}}}"#
+        ));
+        assert!(message.contains("values"), "{message}");
+
+        let headers = vec![r#"["",""]"#; 100_000].join(",");
+        let message = guest_err(&format!(
+            r#"{{"op":"call","call":"http-fetch","id":1,"method":"GET","url":"http://a/","headers":[{headers}]}}"#
+        ));
+        assert!(message.contains("values"), "{message}");
+    }
+
+    #[test]
+    fn a_frame_nested_deeper_than_any_legal_frame_is_refused() {
+        let deep = format!("{}{}", "[".repeat(40), "]".repeat(40));
+        let message = guest_err(&format!(r#"{{"op":"fragment","nodes":{deep}}}"#));
+        assert!(message.contains("deep"), "{message}");
+    }
+
+    #[test]
+    fn the_largest_legal_fragment_still_parses() {
+        let attributes = vec![r#"["a","b"]"#; 32].join(",");
+        let node = format!(r#"{{"node":"element","tag":"p","attributes":[{attributes}]}}"#);
+        let nodes = vec![node; 512].join(",");
+        let line = format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#);
+        assert!(from_guest_line(&line).is_ok());
+    }
+
+    #[test]
+    fn structure_characters_inside_a_string_are_not_counted() {
+        let text = r#",[{\"\\"#.repeat(50_000);
+        let line = format!(r#"{{"op":"error","detail":"{text}"}}"#);
+        assert!(from_guest_line(&line).is_ok());
     }
 
     #[test]
