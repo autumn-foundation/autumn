@@ -851,7 +851,9 @@ Semantics:
 - Operator actions respect uniqueness: canceling an enqueued job (including
   one parked behind a concurrency slot) releases its key immediately, and
   retrying a failed unique job re-takes the key — or fails with a clear
-  conflict error when an equivalent job is already pending or running.
+  conflict error when an equivalent job is already pending or running. A
+  retried `pending`-window job gets its key back at once, so an equal enqueue
+  stays deduplicated while the retry waits.
 - On Redis, pending/running unique locks carry a 24-hour crash backstop TTL
   that is refreshed every time the job is claimed, retried, or recovered, so
   only a job left completely untouched for a full day can lose its lock.

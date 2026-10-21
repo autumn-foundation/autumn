@@ -12697,12 +12697,12 @@ struct PgPayloadRow {
     payload: String,
 }
 
-#[cfg(feature = "db")]
 /// Operator retry of a failed row.
 ///
 /// A claim moved a `pending`-window key to `pending_unique_key`. This UPDATE
 /// moves it back, unless a live duplicate holds the key. Thus, an equal enqueue
-/// stays deduplicated while the retry waits. Same rule as `pg_nack_failure`.
+/// stays deduplicated while the retry waits. This follows `pg_nack_failure`.
+#[cfg(feature = "db")]
 const PG_RETRY_FAILED_SQL: &str = "UPDATE autumn_jobs \
      SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
          started_at = NULL, finished_at = NULL, \
@@ -12818,10 +12818,8 @@ impl PgJobAdminBackend {
             .await
             .optional()
             .map_err(|e| {
-                // The retried row keeps its unique_key, so re-enqueueing while an
-                // equivalent job is already in flight trips the partial unique
-                // index — surface that as an operator-actionable conflict rather
-                // than silently dropping uniqueness for the retried job.
+                // A live twin trips the partial unique index. Report it as a
+                // conflict. Do not drop uniqueness.
                 if e.to_string().contains("idx_autumn_jobs_unique_inflight") {
                     AutumnError::bad_request_msg(
                         "an equivalent unique job is already pending or running; \
