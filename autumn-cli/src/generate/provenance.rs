@@ -118,6 +118,9 @@ struct Entry {
     /// claiming another's output — `autumn new --starter` writes files through
     /// this same engine, and `autumn destroy auth` must not delete them.
     invocation: String,
+    /// See [`Scope`]. Absent in manifests from 0.8.0 and from unclaimed plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<Scope>,
 }
 
 /// The on-disk shape of [`MANIFEST_PATH`].
@@ -325,8 +328,14 @@ impl Provenance {
 
     /// Every entry `invocation` wrote, for the orphan sweep (issue #2557).
     pub fn recorded_by<'a>(&'a self, invocation: &'a str) -> impl Iterator<Item = Recorded<'a>> {
-        let _ = invocation;
-        std::iter::empty()
+        self.entries
+            .iter()
+            .filter(move |(_, e)| e.invocation == invocation)
+            .map(|(key, e)| Recorded {
+                key,
+                digest: &e.digest,
+                scope: e.scope,
+            })
     }
 
     /// Record `digest` as the content `invocation` wrote to `path`.
@@ -341,7 +350,6 @@ impl Provenance {
         invocation: &str,
         scope: Option<Scope>,
     ) {
-        let _ = scope;
         if let Some(k) = key(root, path) {
             // Keyed by path, so the newest writer replaces the previous one:
             // a file has exactly one owner, and the manifest cannot grow an
@@ -351,6 +359,7 @@ impl Provenance {
                 Entry {
                     digest,
                     invocation: invocation.to_owned(),
+                    scope,
                 },
             );
         }
@@ -462,7 +471,7 @@ fn refuse_symlink(root: &Path, path: &Path) -> std::io::Result<()> {
 /// project. Rejecting anything but [`Component::Normal`] keeps every key
 /// project-relative, and joining the parts spells a key the same way on Windows
 /// as on Unix without rewriting a separator a filename may legitimately hold.
-fn key(root: &Path, path: &Path) -> Option<String> {
+pub(super) fn key(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
     let mut parts = Vec::new();
     for component in relative.components() {

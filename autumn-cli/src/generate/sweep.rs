@@ -9,12 +9,28 @@
 //! The paths come from the manifest, which is project content. Every check
 //! here treats them as untrusted. See `docs/adr/0021-destroy-orphan-sweep.md`.
 
+use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::emit::Action;
-use super::provenance::Provenance;
+use super::emit::{Action, split_migration_dir_name};
+use super::provenance::{self, MANIFEST_PATH, Provenance, Recorded, Scope};
 
-/// What the sweep wants `revert` to do.
+/// Files the sweep never deletes, lowercase. Generators edit them in place
+/// and never own them, so an `owned` entry for one is not to be trusted.
+const PROTECTED_FILES: &[&str] = &[
+    "autumn.toml",
+    "build.rs",
+    "cargo.lock",
+    "cargo.toml",
+    "src/lib.rs",
+    "src/main.rs",
+];
+
+/// Top-level directories the sweep never enters, lowercase.
+const PROTECTED_DIRS: &[&str] = &[".autumn", ".git", "target"];
+
+/// What `revert` does with the swept entries.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Sweep {
     /// Untouched owned files to delete.
@@ -26,14 +42,196 @@ pub(super) struct Sweep {
 }
 
 /// Find the entries `invocation` wrote that no action in `actions` names.
+///
+/// Delete an `owned` file only when its digest still matches. Keep every
+/// other file, with a warning that names it. `--force` has no effect here:
+/// these paths come from the manifest, not from the plan.
 pub(super) fn plan_sweep(
     project_root: &Path,
     recorded: &Provenance,
     invocation: &str,
     actions: &[Action],
 ) -> Sweep {
-    let _ = (project_root, recorded, invocation, actions);
-    Sweep::default()
+    let named = named_keys(project_root, actions);
+    let suffixes = planned_migration_suffixes(&named);
+    let mut sweep = Sweep::default();
+    for entry in recorded.recorded_by(invocation) {
+        sweep_one(project_root, entry, &named, &suffixes, &mut sweep);
+    }
+    sweep
+}
+
+/// Decide what to do with one entry.
+fn sweep_one(
+    project_root: &Path,
+    entry: Recorded<'_>,
+    named: &HashSet<String>,
+    suffixes: &HashSet<String>,
+    sweep: &mut Sweep,
+) {
+    let Some(parts) = plain_parts(entry.key) else {
+        sweep.warnings.push(format!(
+            "{:?} in {MANIFEST_PATH} is not a plain project path; destroy ignores it.",
+            entry.key
+        ));
+        return;
+    };
+    let lower = entry.key.to_ascii_lowercase();
+    // On a case-insensitive file system the two spellings are one file.
+    if named.contains(&lower) {
+        return;
+    }
+    let shown = entry.key;
+    if lower.starts_with("migrations/") {
+        // The plan matches migrations by suffix, not by timestamp. Only the
+        // applied-migration guard of that pass may remove one.
+        let planned = parts.len() == 3 && suffixes.contains(&migration_suffix(parts[1]));
+        if !planned {
+            sweep.warnings.push(format!(
+                "{shown}: the current templates do not make this migration file. \
+                 destroy never sweeps migrations. Remove it by hand if no database uses it."
+            ));
+        }
+        return;
+    }
+    if PROTECTED_FILES.contains(&lower.as_str())
+        || PROTECTED_DIRS.iter().any(|dir| {
+            lower
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+    {
+        sweep
+            .warnings
+            .push(format!("{shown}: destroy never sweeps this file."));
+        return;
+    }
+    let path = parts
+        .iter()
+        .fold(project_root.to_path_buf(), |p, part| p.join(part));
+    match inspect(project_root, &parts) {
+        Inspect::Missing => {
+            sweep.forget.push(path);
+            return;
+        }
+        Inspect::Refused(reason) => {
+            sweep.warnings.push(format!(
+                "{shown}: destroy does not sweep this file, because {reason}."
+            ));
+            return;
+        }
+        Inspect::File => {}
+    }
+    match entry.scope {
+        None => sweep.warnings.push(format!(
+            "{shown}: an older autumn recorded this file for this command, and the \
+             current templates do not make it. destroy cannot prove that only this \
+             resource uses it, so it keeps the file. Delete it by hand if nothing uses it."
+        )),
+        Some(Scope::Shared) => sweep.warnings.push(format!(
+            "{shown}: this command made this shared file, and the current templates do \
+             not make it. Other resources can use it, so destroy keeps it. Delete it by \
+             hand if nothing uses it."
+        )),
+        Some(Scope::Owned) if untouched(&path, entry.digest) => sweep.remove.push(path),
+        Some(Scope::Owned) => sweep.warnings.push(format!(
+            "{shown}: the current templates do not make this file, and it changed after \
+             generate wrote it. destroy keeps it. Delete it by hand if you do not need it."
+        )),
+    }
+}
+
+/// The keys of every path the plan names, lowercase.
+fn named_keys(project_root: &Path, actions: &[Action]) -> HashSet<String> {
+    actions
+        .iter()
+        .filter_map(|a| provenance::key(project_root, a.path()))
+        .map(|k| k.to_ascii_lowercase())
+        .collect()
+}
+
+/// The suffix of each migration directory the plan names.
+fn planned_migration_suffixes(named: &HashSet<String>) -> HashSet<String> {
+    named
+        .iter()
+        .filter_map(|key| {
+            let mut parts = key.split('/');
+            (parts.next() == Some("migrations"))
+                .then(|| parts.next())
+                .flatten()
+                .filter(|_| parts.next().is_some())
+                .map(migration_suffix)
+        })
+        .collect()
+}
+
+/// The suffix of a migration directory name, lowercase.
+fn migration_suffix(dir: &str) -> String {
+    split_migration_dir_name(dir).1.to_ascii_lowercase()
+}
+
+/// The segments of `key`, when every one is a plain file name.
+///
+/// Refuses an empty segment, `.`, `..`, a backslash, a colon (a Windows drive
+/// or stream), and a NUL. A key that passes cannot leave the project.
+fn plain_parts(key: &str) -> Option<Vec<&str>> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let plain = |part: &&str| {
+        !part.is_empty()
+            && *part != "."
+            && *part != ".."
+            && !part.contains(['\\', ':', '\0'])
+            && matches!(
+                Path::new(part).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            )
+    };
+    parts.iter().all(plain).then_some(parts)
+}
+
+/// What is on disk at an entry's path.
+enum Inspect {
+    /// A regular file, reached through no symlink.
+    File,
+    /// Nothing.
+    Missing,
+    /// Something the sweep must not touch.
+    Refused(String),
+}
+
+/// Walk to the entry one segment at a time, without following a symlink.
+///
+/// A symlinked directory on the way could point outside the project, and a
+/// symlinked file is not the file `generate` wrote.
+fn inspect(project_root: &Path, parts: &[&str]) -> Inspect {
+    let mut cursor = project_root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        cursor.push(part);
+        let last = i + 1 == parts.len();
+        match fs::symlink_metadata(&cursor) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Inspect::Missing,
+            Err(e) => return Inspect::Refused(format!("it cannot be read ({e})")),
+            Ok(m) if m.file_type().is_symlink() => {
+                return Inspect::Refused("it is reached through a symlink".to_owned());
+            }
+            Ok(m) if last && !m.is_file() => {
+                return Inspect::Refused("it is not a regular file".to_owned());
+            }
+            Ok(_) => {}
+        }
+    }
+    Inspect::File
+}
+
+/// Whether the file still holds what `generate` wrote.
+///
+/// The entry does not say text or bytes, so both digests are tried. The text
+/// digest ignores line endings, so a CRLF checkout is not an edit.
+fn untouched(path: &Path, digest: &str) -> bool {
+    fs::read(path).is_ok_and(|bytes| {
+        provenance::bytes_digest(&bytes) == digest
+            || std::str::from_utf8(&bytes).is_ok_and(|text| provenance::text_digest(text) == digest)
+    })
 }
 
 #[cfg(test)]

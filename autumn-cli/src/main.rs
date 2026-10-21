@@ -6819,13 +6819,27 @@ fn apply_plan(
     flags: generate::Flags,
     mode: ApplyMode,
 ) {
-    let result = plan.and_then(|p| match mode {
-        ApplyMode::Generate => p.execute(flags),
-        ApplyMode::Destroy => p.revert(flags),
-    });
+    let result = plan.and_then(|p| run_plan(p, flags, mode));
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Execute or revert `plan`, as the sole resource of this invocation.
+///
+/// Each `generate`/`destroy` process applies one plan, so the claim is true
+/// here. It lets `destroy` sweep files the templates no longer name (issue
+/// #2557).
+fn run_plan(
+    mut plan: generate::emit::Plan,
+    flags: generate::Flags,
+    mode: ApplyMode,
+) -> Result<(), generate::GenerateError> {
+    plan.claim_sole_resource();
+    match mode {
+        ApplyMode::Generate => plan.execute(flags),
+        ApplyMode::Destroy => plan.revert(flags),
     }
 }
 
@@ -7120,10 +7134,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                     |url| generate::tauri::plan_tauri_thin_client(&project_root, url),
                 )
             });
-            let result = plan.and_then(|p| match mode {
-                ApplyMode::Generate => p.execute(flags),
-                ApplyMode::Destroy => p.revert(flags),
-            });
+            let result = plan.and_then(|p| run_plan(p, flags, mode));
             match result {
                 Ok(()) => {
                     if mode == ApplyMode::Generate && !dry_run {
@@ -7164,10 +7175,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             };
             let plan =
                 guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root, opts));
-            let result = plan.and_then(|p| match mode {
-                ApplyMode::Generate => p.execute(flags),
-                ApplyMode::Destroy => p.revert(flags),
-            });
+            let result = plan.and_then(|p| run_plan(p, flags, mode));
             match result {
                 Ok(()) => {
                     if mode == ApplyMode::Generate && !dry_run {
@@ -7433,10 +7441,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 plan_flags,
             ) {
                 Ok(plugin_plan) => {
-                    let result = match mode {
-                        ApplyMode::Generate => plugin_plan.plan.execute(flags),
-                        ApplyMode::Destroy => plugin_plan.plan.revert(flags),
-                    };
+                    let result = run_plan(plugin_plan.plan, flags, mode);
                     match result {
                         Ok(()) => {
                             if mode == ApplyMode::Generate && !dry_run {
