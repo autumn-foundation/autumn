@@ -1744,11 +1744,24 @@ mod tests {
         (stuck, a, clock)
     }
 
+    /// The epoch a refresh claimed `range` at. Claims run at the same time, so
+    /// the epoch order between ranges is not fixed.
+    fn epoch_in(report: &RefreshReport, range: SlotRange) -> FencingToken {
+        report
+            .claimed
+            .iter()
+            .find(|(claimed, _)| *claimed == range)
+            .map(|(_, epoch)| *epoch)
+            .expect("the range was claimed")
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_stuck_renewal_on_one_range_does_not_lapse_the_other() {
         let dir = tempfile::tempdir().unwrap();
         let (stuck, a, clock) = two_ranges_one_stuck(dir.path()).await;
-        assert_eq!(a.refresh().await.claimed.len(), 2);
+        let first = a.refresh().await;
+        assert_eq!(first.claimed.len(), 2);
+        let live = epoch_in(&first, range(10, 19));
         stuck.stuck.lock().unwrap().push(range(0, 9));
 
         // Three cycles: more than one local lease.
@@ -1762,7 +1775,7 @@ mod tests {
         }
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, range(0, 9));
-        assert_eq!(a.epoch_for(15), Some(token(2)), "the live range serves");
+        assert_eq!(a.epoch_for(15), Some(live), "the live range serves");
         assert_eq!(a.epoch_for(3), None, "the stuck range lapsed");
         assert!(a.unsettled(), "a timed out call may still land");
 
@@ -2002,17 +2015,21 @@ mod tests {
             TTL,
         )
         .unwrap();
-        a.refresh().await;
+        let first = a.refresh().await;
+        let (low, high) = (
+            epoch_in(&first, range(0, 9)),
+            epoch_in(&first, range(10, 19)),
+        );
         let a = Arc::new(a);
         let health = a.indicator().check().await;
         assert_eq!(health.status, crate::actuator::HealthStatus::Up);
         assert_eq!(health.details["owner"], "a");
         assert_eq!(health.details["held"][0]["range"], "0-9");
         assert_eq!(health.details["held"][0]["serving"], true);
-        assert!(!a.lose(3, token(1)), "the same epoch is not newer");
+        assert!(!a.lose(3, low), "the same epoch is not newer");
         assert!(a.lose(3, token(9)));
         assert_eq!(a.epoch_for(3), None);
-        assert_eq!(a.held(), vec![(range(10, 19), token(2))]);
+        assert_eq!(a.held(), vec![(range(10, 19), high)]);
         a.release_all().await;
         assert!(a.held().is_empty());
         // A store it cannot reach turns the indicator down.
@@ -2066,13 +2083,15 @@ mod tests {
         let shared = Arc::new(store(dir.path(), &clock).await);
         let a =
             FleetOwnership::new(shared, owner("a"), vec![range(0, 9), range(10, 19)], TTL).unwrap();
-        assert_eq!(a.refresh().await.claimed.len(), 2);
+        let first = a.refresh().await;
+        assert_eq!(first.claimed.len(), 2);
+        let live = epoch_in(&first, range(10, 19));
         assert!(a.lose(3, token(9)));
         let report = a.refresh().await;
         assert_eq!(report.renewed, vec![range(10, 19)]);
         assert!(report.lost.is_empty());
         assert_eq!(report.claimed, vec![(range(0, 9), token(10))]);
-        assert_eq!(a.epoch_for(15), Some(token(2)));
+        assert_eq!(a.epoch_for(15), Some(live));
     }
 
     #[tokio::test]
