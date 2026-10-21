@@ -480,6 +480,9 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+// Unix only: the shared credentials fixture provisions keys with a shell script
+// as the editor, which Windows cannot launch.
+#[cfg(unix)]
 #[test]
 fn an_encrypted_column_is_resealed() {
     let project = project(SCRUB_TOML);
