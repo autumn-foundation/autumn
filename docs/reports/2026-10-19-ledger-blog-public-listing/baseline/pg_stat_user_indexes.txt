@@ -1,0 +1,8 @@
+    indexrelname     | idx_scan 
+---------------------+----------
+ posts_slug_key      |        0
+ idx_posts_slug      |      300
+ idx_posts_published |        6
+ posts_pkey          |        0
+(4 rows)
+
