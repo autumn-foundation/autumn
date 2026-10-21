@@ -4797,12 +4797,14 @@ impl TestDb {
 
     /// Empty `table` and restart its id sequence (`TRUNCATE … RESTART IDENTITY`).
     ///
+    /// `table` must match `[A-Za-z0-9_]+`. Schema-qualified names are not allowed.
+    ///
     /// # Panics
     ///
     /// Panics if `table` is not a plain identifier, or if the SQL fails.
     pub async fn reset_table(&self, table: &str) {
         assert_plain_identifier(table);
-        self.execute_sql(&format!("TRUNCATE {table} RESTART IDENTITY"))
+        self.execute_sql(&format!("TRUNCATE \"{table}\" RESTART IDENTITY"))
             .await;
     }
 }
@@ -4849,6 +4851,9 @@ impl TestDb {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        // A file from a crashed run can share this name (the process id is
+        // reused). Remove it so the database starts empty.
+        remove_sqlite_files(&path);
         let url = format!("sqlite://{}", path.display());
         let config = crate::config::DatabaseConfig {
             primary_url: Some(url.clone()),
@@ -4868,8 +4873,9 @@ impl TestDb {
 
     /// Get a shared `TestDb`, created on first use.
     ///
-    /// The database is created once per test binary. Its file is removed when
-    /// the process exits normally; a crash can leave it in the temp directory.
+    /// The database is created once per test binary. Rust never drops a
+    /// static, so its file stays in the temp directory. Use [`TestDb::new`] when
+    /// the file must be removed.
     pub async fn shared() -> &'static Self {
         use std::sync::OnceLock;
         use tokio::sync::OnceCell;
@@ -4907,13 +4913,15 @@ impl TestDb {
     /// Empty `table` and restart its id counter.
     ///
     /// `SQLite` has no `TRUNCATE`. This deletes every row, then clears the
-    /// `AUTOINCREMENT` counter in `sqlite_sequence`.
+    /// `AUTOINCREMENT` counter in `sqlite_sequence`. `table` must match
+    /// `[A-Za-z0-9_]+`.
     ///
     /// # Panics
     ///
     /// Panics if `table` is not a plain identifier, or if the SQL fails.
     pub async fn reset_table(&self, table: &str) {
         use diesel_async::RunQueryDsl as _;
+        use diesel_async::SimpleAsyncConnection as _;
 
         #[derive(diesel::QueryableByName)]
         struct Found {
@@ -4922,21 +4930,24 @@ impl TestDb {
         }
 
         assert_plain_identifier(table);
-        self.execute_sql(&format!("DELETE FROM {table}")).await;
-        // `sqlite_sequence` exists only after the first AUTOINCREMENT table.
+        // One connection for all steps, so no other writer slips in between.
         let mut conn = self.pool.get().await.expect("failed to get connection");
+        conn.batch_execute(&format!("DELETE FROM \"{table}\""))
+            .await
+            .unwrap_or_else(|e| panic!("failed to empty {table}: {e}"));
+        // `sqlite_sequence` exists only after the first AUTOINCREMENT table.
         let found = diesel::sql_query(
             "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'sqlite_sequence'",
         )
         .get_result::<Found>(&mut *conn)
         .await
         .expect("failed to probe sqlite_sequence");
-        drop(conn);
         if found.n > 0 {
-            self.execute_sql(&format!(
+            conn.batch_execute(&format!(
                 "DELETE FROM sqlite_sequence WHERE name = '{table}'"
             ))
-            .await;
+            .await
+            .unwrap_or_else(|e| panic!("failed to reset the id counter of {table}: {e}"));
         }
     }
 }
@@ -4945,11 +4956,17 @@ impl TestDb {
 impl Drop for TestDb {
     fn drop(&mut self) {
         self.pool.close();
-        for suffix in ["", "-wal", "-shm"] {
-            let mut name = self.path.clone().into_os_string();
-            name.push(suffix);
-            let _ = std::fs::remove_file(name);
-        }
+        remove_sqlite_files(&self.path);
+    }
+}
+
+/// Remove a `SQLite` database file and its `-wal` and `-shm` files.
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+fn remove_sqlite_files(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(name);
     }
 }
 

@@ -87,3 +87,51 @@ async fn dropping_a_database_removes_its_file() {
     drop(db);
     assert!(!std::path::Path::new(&path).exists());
 }
+
+#[tokio::test]
+async fn reset_table_works_when_no_table_uses_autoincrement() {
+    let db = TestDb::new().await;
+    db.execute_sql("CREATE TABLE td_plain (id INTEGER PRIMARY KEY, v TEXT)")
+        .await;
+    db.execute_sql("INSERT INTO td_plain (v) VALUES ('a')")
+        .await;
+    db.reset_table("td_plain").await;
+    assert_eq!(count(&db, "td_plain").await, 0);
+}
+
+#[tokio::test]
+async fn reset_table_leaves_other_tables_counters_alone() {
+    let db = TestDb::new().await;
+    db.execute_sql("CREATE TABLE td_a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .await;
+    db.execute_sql("CREATE TABLE td_b (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .await;
+    db.execute_sql("INSERT INTO td_a (v) VALUES ('a'), ('b')")
+        .await;
+    db.execute_sql("INSERT INTO td_b (v) VALUES ('a'), ('b')")
+        .await;
+    db.reset_table("td_a").await;
+    db.execute_sql("DELETE FROM td_b").await;
+    db.execute_sql("INSERT INTO td_b (v) VALUES ('c')").await;
+    let mut conn = db.pool().get().await.expect("connection");
+    let id = diesel::sql_query("SELECT id AS n FROM td_b")
+        .get_result::<Count>(&mut *conn)
+        .await
+        .expect("id")
+        .n;
+    assert_eq!(id, 3, "the counter of td_b continues");
+}
+
+#[tokio::test]
+#[should_panic(expected = "plain identifier")]
+async fn reset_table_rejects_sql_in_the_name() {
+    let db = TestDb::new().await;
+    db.reset_table("t; DROP TABLE x").await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "plain identifier")]
+async fn reset_table_rejects_an_empty_name() {
+    let db = TestDb::new().await;
+    db.reset_table("").await;
+}

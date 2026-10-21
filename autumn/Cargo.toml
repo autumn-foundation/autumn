@@ -530,6 +530,8 @@ nix = { version = "0.31.2", features = ["resource", "time"] }
 # cannot lift a forbid (E0453). The crate installs its `#[global_allocator]` on
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
+# The SQLite UUID default shared with the generator (tests/sqlite_uuid_primary_key.rs).
+autumn-schema-core = { path = "../autumn-schema-core" }
 # Criterion benches (issue #3068, `benches/admission.rs`). No plots: only the
 # statistics and the `cargo bench` harness.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
@@ -541,7 +543,6 @@ diesel = { version = "2", features = ["chrono", "postgres"] }
 # `serde`, so the in-repo test target needs the feature here. Test-only — the
 # sqlite `cargo build` / `clippy --lib` lanes never build dev-dependencies.
 rust_decimal = { workspace = true, features = ["db-diesel2-postgres"] }
-autumn-schema-core = { path = "../autumn-schema-core" }
 filetime = "0.2"
 futures.workspace = true
 http.workspace = true

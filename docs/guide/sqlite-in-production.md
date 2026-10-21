@@ -183,8 +183,8 @@ published support contract**. Available **today**:
 - **Backend-aware app dependencies (#1924)** — a SQLite app's `Cargo.toml` gets
   diesel on its `sqlite` feature with the bundled `libsqlite3-sys`, no `pq-sys`,
   and `autumn-web`'s `sqlite` feature, so the generated code actually compiles.
-- **UUID primary keys (#2555)** — `--id uuid` generates a `TEXT` key that the
-  database fills in. See [UUID primary keys](#uuid-primary-keys-on-sqlite).
+- **UUID primary keys (#2555)** — `--id uuid` makes a `TEXT` key. The database
+  sets its value. See [UUID primary keys](#uuid-primary-keys-on-sqlite).
 - **Generate-time rejections**, each naming its tracking issue:
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
@@ -776,15 +776,18 @@ unhyphenated, uppercase), and such a row loads correctly but will not match a
 id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4))) || '-' || ...)
 ```
 
-The default builds a random version-4 UUID as canonical lowercase text. The
-database generates the id, as on Postgres. `NOT NULL` is required: SQLite lets a
+The default makes a random version-4 UUID in lowercase text. The database makes
+the id, as on Postgres. `NOT NULL` is required: SQLite lets a
 `TEXT PRIMARY KEY` hold `NULL` unless the column forbids it. The model field is
 `pub id: SqliteUuid`, and the schema type is `Text`.
 
-`--id uuid` has the same limits on both backends. `#[repository]`,
-`--searchable`, `generate scaffold` and `comments:commentable` need an `i64` key.
+A table that you wrote by hand as `TEXT PRIMARY KEY` has no such default. The
+schema tools expect the default for a `SqliteUuid` key, so `autumn schema diff`
+reports it as drift on that table. Add the default in a migration to clear it.
 
-Additional generator shapes are refused on SQLite:
+On both backends, a UUID key cannot be used with `#[repository]`,
+`--searchable`, `generate scaffold` or `comments:commentable`. These need an
+`i64` key.
 > **`generate auth` / `generate mailer` now generate on SQLite (#1927 / #1908).**
 > Historically refused at generate time, both now scaffold SQLite-dialect
 > migrations on a SQLite app (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
@@ -853,14 +856,13 @@ database. Its API is the same as the Postgres `TestDb`:
 | Call | Effect |
 | --- | --- |
 | `TestDb::new().await` | A new database. Its file is removed on drop. |
-| `TestDb::shared().await` | One database for the test binary. |
+| `TestDb::shared().await` | One database for the test binary. Its file is not removed. |
 | `db.pool()` | The connection pool. Pass it to `TestApp::with_db`. |
 | `db.execute_sql(sql).await` | Run SQL. A statement list is allowed. |
 | `db.reset_table("t").await` | Delete all rows and restart the id counter. |
 
-Use `TestDb::new()` when tests run in parallel and share table names. Each call
-gives a test its own database. `reset_table` is the portable form of
-`TRUNCATE … RESTART IDENTITY`: SQLite has no `TRUNCATE`, so it runs `DELETE` and
+Use `TestDb::new()` for parallel tests that use the same table names. Each call
+makes a new database. SQLite has no `TRUNCATE`. `reset_table` runs `DELETE`, then
 clears the row in `sqlite_sequence`.
 
 ### Migration mechanics on SQLite

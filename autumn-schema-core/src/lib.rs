@@ -658,8 +658,7 @@ macro_rules! sqlite_uuid_pk_sql {
 /// `SQLite` has no `gen_random_uuid()`. This builds the same value from
 /// `randomblob`. It sets the version nibble to `4` and the variant nibble to one
 /// of `8`, `9`, `a`, `b`. Put it in parentheses to use it as a column `DEFAULT`.
-/// It uses `random() & 3`, not `abs(random())`, because `abs` of the smallest
-/// `i64` is an overflow error.
+/// It uses `random() & 3`. `abs(random())` can overflow for the smallest `i64`.
 pub const SQLITE_UUID_V4_SQL: &str = sqlite_uuid_v4_sql!();
 
 /// The Rust type of a `SQLite` UUID key: `autumn-web`'s `TEXT`-backed newtype.

@@ -12492,6 +12492,18 @@ const fn smoke_db_ctor(backend: DatabaseBackend) -> &'static str {
     }
 }
 
+/// The statement that empties the table under test.
+///
+/// Postgres keeps its `TRUNCATE`. `SQLite` has none, so it calls `reset_table`.
+fn smoke_reset_call(backend: DatabaseBackend, plural: &str) -> String {
+    match backend {
+        DatabaseBackend::Postgres => {
+            format!("db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;")
+        }
+        DatabaseBackend::Sqlite => format!("db.reset_table(\"{plural}\").await;"),
+    }
+}
+
 /// The SQL expression that casts the `id` column to text.
 const fn smoke_id_to_text(backend: DatabaseBackend) -> &'static str {
     match backend {
@@ -12516,6 +12528,7 @@ fn render_index_smoke_test(
     id_schema_type: &str,
     setup_calls: &str,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
     let db_ctor = smoke_db_ctor(backend);
     let db_label = smoke_db_label(backend);
     let ignore_attr = smoke_ignore_attr(backend);
@@ -12566,7 +12579,7 @@ fn render_index_smoke_test(
          async fn {plural}_index_renders_scaffolded_rows() {{\n\
          let db = TestDb::{db_ctor}().await;\n\
          {setup_calls}\
-         db.reset_table(\"{plural}\").await;\n\
+         {reset_call}\n\
          \n\
          let client: TestClient = TestApp::new().routes(routes![index]).with_db(db.pool()).build();\n\
          \n\
@@ -12591,6 +12604,7 @@ fn render_api_smoke_test(
     fields: &[Field],
     defaults: &BTreeMap<String, String>,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
     let db_ctor = smoke_db_ctor(backend);
     let db_label = smoke_db_label(backend);
     let ignore_attr = smoke_ignore_attr(backend);
@@ -12658,7 +12672,7 @@ fn render_api_smoke_test(
          async fn {plural}_api_list_paginates_against_a_real_database() {{\n\
          let db = TestDb::{db_ctor}().await;\n\
          {setup_calls}\
-         db.reset_table(\"{plural}\").await;\n\
+         {reset_call}\n\
          // Seed 25 rows -- more than one page at size = 2, and more than the\n\
          // default page size (20). Every required (NOT NULL, no DEFAULT) column\n\
          // gets a valid, per-row-varying sample value, so this works for an\n\
@@ -14940,6 +14954,7 @@ fn render_enum_rejection_smoke_test(
     setup_calls: &str,
     api: bool,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
     let db_ctor = smoke_db_ctor(backend);
     let ignore_attr = smoke_ignore_attr(backend);
     // `setup_calls` is shared with, and identical to, the base index/api smoke test's own
@@ -15007,7 +15022,7 @@ fn render_enum_rejection_smoke_test(
              async fn {plural}_rejects_out_of_set_{field_name}() {{\n\
              \x20\x20\x20\x20let db = TestDb::{db_ctor}().await;\n\
              {setup_calls}\
-             \x20\x20\x20\x20db.reset_table(\"{plural}\").await;\n\
+             \x20\x20\x20\x20{reset_call}\n\
              \n\
              {request_boundary_check}\
              \n\
@@ -15204,6 +15219,7 @@ fn render_unique_violation_smoke_test(
     setup_calls: &str,
     api: bool,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
     let db_ctor = smoke_db_ctor(backend);
     let db_label = smoke_db_label(backend);
     let ignore_attr = smoke_ignore_attr(backend);
@@ -15291,7 +15307,7 @@ fn render_unique_violation_smoke_test(
                  \x20\x20\x20\x20Ok(autumn_web::reexports::http::StatusCode::OK.into_response())\n\
                  }}\n\
                  \n\
-                 \x20\x20\x20\x20db.reset_table(\"{plural}\").await;\n\
+                 \x20\x20\x20\x20{reset_call}\n\
                  \x20\x20\x20\x20let client: TestClient = TestApp::new().routes(routes![create]).with_db(db.pool()).build();\n\
                  \n\
                  \x20\x20\x20\x20client.post(\"/{plural}\").send().await.assert_status(200);\n\
@@ -15308,7 +15324,7 @@ fn render_unique_violation_smoke_test(
              async fn {plural}_rejects_duplicate_{field_name}() {{\n\
              \x20\x20\x20\x20let db = TestDb::{db_ctor}().await;\n\
              {setup_calls}\
-             \x20\x20\x20\x20db.reset_table(\"{plural}\").await;\n\
+             \x20\x20\x20\x20{reset_call}\n\
              \n\
              \x20\x20\x20\x20let mut conn = db.pool().get().await.expect(\"failed to get db connection\");\n\
              \x20\x20\x20\x20diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await.expect(\"first insert must succeed\");\n\
@@ -19224,7 +19240,10 @@ async fn main() {
             .expect("smoke test is planned");
         assert!(test.contains("#[ignore = \"requires Docker"), "{test}");
         assert!(test.contains("TestDb::shared().await"), "{test}");
-        assert!(test.contains("db.reset_table(\"posts\")"), "{test}");
+        assert!(
+            test.contains("db.execute_sql(\"TRUNCATE posts RESTART IDENTITY\")"),
+            "{test}"
+        );
         assert!(test.contains("BIGSERIAL PRIMARY KEY"), "{test}");
     }
 
