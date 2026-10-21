@@ -102,6 +102,15 @@ ignore = [
     # default. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), or whenever the MSRV floor rises far enough
     # to take an aws-sdk-s3 that resolves a fixed `lru`.
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — webpki-roots bundles the distrusted emSign ECC Root
+    # CA - G3. FIXED for the 1.x copy Autumn controls (1.0.9 -> 1.0.10, the
+    # advisory's fixed release). This entry covers only the SECOND copy,
+    # webpki-roots 0.26.11, which arrives through sqlx-core 0.8.6 ->
+    # postgresql_embedded (the managed-pg features). The advisory's only fix is
+    # `>=1.0.10`; there is no patched 0.26.x, and sqlx 0.8 pins the 0.26 line.
+    # The fix needs a postgresql_embedded/sqlx release on webpki-roots 1.x.
+    # Review-by: 2026-11-04 (or when such a release ships).
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 -> postgresql_embedded (managed-pg); no patched 0.26.x; the 1.x copy is fixed at 1.0.10; needs a sqlx/postgresql_embedded bump; review-by 2026-11-04" },
 ]
 
 [licenses]
