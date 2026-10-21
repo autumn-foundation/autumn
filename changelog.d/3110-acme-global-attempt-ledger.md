@@ -5,7 +5,7 @@
 
 ### Changed
 
-- **acme:** `CustomDomainStore` has two new methods, `load_attempts` and
-  `append_attempt`. Their defaults keep nothing. `MemoryCustomDomainStore` and
+- **acme:** `CustomDomainStore` has three new methods: `load_attempts`,
+  `append_attempt` and `merge_attempts`. Their defaults keep nothing. `MemoryCustomDomainStore` and
   `FsCustomDomainStore` implement them. `CustomDomainTask::hydrate_limiter` is
-  now `async`.
+  now `async`. [no-plugin]
