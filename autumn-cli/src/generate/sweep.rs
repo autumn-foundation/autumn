@@ -268,11 +268,17 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
 /// errs on the side of "declared": a module of the same name elsewhere, or a
 /// comment that looks like one, also keeps the file.
 fn declared_module(project_root: &Path, parts: &[&str]) -> bool {
-    let Some(file) = parts.last() else {
+    let Some((file, dirs)) = parts.split_last() else {
         return false;
     };
     let Some(stem) = file.strip_suffix(".rs") else {
         return false;
+    };
+    // `mod teams;` loads `src/teams/mod.rs`: the module takes the directory's
+    // name, not `mod`.
+    let stem = match (stem, dirs.last()) {
+        ("mod", Some(dir)) => *dir,
+        _ => stem,
     };
     any_rust_file(project_root, |text| {
         declares(text, stem) || names_path(text, file)
@@ -1026,6 +1032,27 @@ mod tests {
         .unwrap();
 
         let sweep = plan_sweep(root, &p, ME, &[create(root, "src/jobs/new.rs")], &[]);
+
+        assert!(sweep.remove.is_empty(), "{:?}", sweep.remove);
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn an_orphan_mod_rs_its_directory_module_declares_is_kept() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = generated(
+            root,
+            &mut p,
+            "src/teams/mod.rs",
+            "x",
+            ME,
+            Some(Scope::Owned),
+        );
+        fs::write(root.join("src/main.rs"), "mod teams;\nfn main() {}\n").unwrap();
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/teams/new.rs")], &[]);
 
         assert!(sweep.remove.is_empty(), "{:?}", sweep.remove);
         assert!(old.exists());
