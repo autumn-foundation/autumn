@@ -349,7 +349,7 @@ impl RedisCache {
         let _ = self.try_redis_set(key, bytes, ttl);
     }
 
-    /// `SET` or `PSETEX`, with the failure kept.
+    /// `SET` or `PSETEX`, with the failure kept. A reserved key is refused.
     fn try_redis_set(
         &self,
         key: &str,
@@ -589,8 +589,13 @@ impl Cache for RedisCache {
         self.try_redis_set(key, bytes, ttl)
     }
 
-    /// As [`Cache::invalidate`], but the final error is returned, not counted.
+    /// As [`Cache::invalidate`], but the final error is returned. It is not
+    /// added to the invalidation failure counter. A reserved key is refused.
+    /// Like `invalidate`, this needs a multi-thread runtime.
     fn try_invalidate(&self, key: &str) -> Result<(), InvalidationError> {
+        if is_reserved_key(key) {
+            return Err(InvalidationError::new(0, "the key is reserved"));
+        }
         block_on(self.delete_key(key))
     }
 

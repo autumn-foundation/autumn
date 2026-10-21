@@ -306,7 +306,8 @@ impl InvalidationError {
 
 /// A backend read or write that did not complete.
 ///
-/// Returned by [`Cache::try_get_value`] and [`Cache::try_insert_raw_bytes`].
+/// Returned by [`Cache::try_get_value`], [`Cache::try_insert_raw_bytes`],
+/// [`try_get_cached`] and [`try_insert_cached`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("cache backend failed: {reason}")]
 pub struct CacheBackendError {
@@ -557,11 +558,15 @@ pub trait Cache: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Remove a key, and report a failure. Blocks like
-    /// [`invalidate`](Cache::invalidate). Prefer
-    /// [`invalidate_async`](Cache::invalidate_async) in async code.
+    /// Remove a key, and report a failure.
     ///
-    /// The default calls `invalidate` and returns `Ok`.
+    /// This method blocks, like [`invalidate`](Cache::invalidate). In async
+    /// code, use [`invalidate_async`](Cache::invalidate_async). The default
+    /// calls `invalidate` and returns `Ok`.
+    ///
+    /// A decorator that wraps another cache must forward `try_get_value`,
+    /// `try_insert_raw_bytes` and `try_invalidate`. If it does not, it uses the
+    /// defaults, and the backend failures are lost.
     ///
     /// # Errors
     ///
@@ -787,7 +792,7 @@ where
 /// [`get_cached`], with a backend failure kept apart from a miss.
 ///
 /// A value that cannot be decoded is a miss, as in [`get_cached`]. A failed
-/// read is recorded as a miss in a failure capsule.
+/// read marks a failure capsule incomplete, so replay does not run it.
 ///
 /// # Errors
 ///
@@ -815,7 +820,7 @@ where
                 .and_then(|raw| serde_json::from_slice::<V>(&raw.0).ok())
         }),
         Err(error) => {
-            record_cache_get::<V>(key, None);
+            mark_failed_cache_op(FAILED_READ_NOTE);
             return Err(error);
         }
     };
@@ -847,8 +852,34 @@ where
     #[cfg(feature = "reporting")]
     let _helper = HelperCall::enter();
     cache.insert_value(key, Arc::new(value));
-    cache.try_insert_raw_bytes(key, bytes, ttl)
+    let stored = cache.try_insert_raw_bytes(key, bytes, ttl);
+    if stored.is_err() {
+        // The write is already recorded, but it did not land.
+        mark_failed_cache_op(FAILED_WRITE_NOTE);
+    }
+    stored
 }
+
+/// Why a capsule with a failed cache read is not replayable.
+const FAILED_READ_NOTE: &str = "a cache read failed; the failure is not recorded, so replay \
+     cannot take the same path";
+
+/// Why a capsule with a failed cache write is not replayable.
+const FAILED_WRITE_NOTE: &str = "a cache write failed; the capsule recorded it as stored, so \
+     replay cannot take the same path";
+
+/// Mark the capture scope incomplete after a failed cache read or write.
+#[cfg(feature = "reporting")]
+fn mark_failed_cache_op(note: &str) {
+    if let Some(scope) = crate::capsule::current_scope() {
+        scope.note(note);
+        scope.mark_truncated();
+    }
+}
+
+/// No capsule support compiled in: nothing records the failure.
+#[cfg(not(feature = "reporting"))]
+const fn mark_failed_cache_op(_note: &str) {}
 
 /// Like [`insert_cached`], but store only if the shared epoch did not change.
 ///
@@ -1390,8 +1421,12 @@ impl Cache for CapsuleSeamCache {
         if replay_blocked() {
             return Ok(());
         }
+        // `unchecked_removal` covers a backend that keeps the default
+        // `try_invalidate` and counts its failure with
+        // `record_invalidation_failure`. A returned error is recorded below.
         let slot = Self::reserve();
-        let result = self.0.try_invalidate(key);
+        let mut result = Ok(());
+        Self::unchecked_removal(|| result = self.0.try_invalidate(key));
         Self::fill(
             slot,
             crate::capsule::CacheEffect::Invalidate {
@@ -2142,7 +2177,7 @@ mod tests {
         );
     }
 
-    /// Fails every acknowledged operation.
+    /// Fails every `try_*` read and write.
     struct DownBackend;
 
     impl Cache for DownBackend {
@@ -2177,17 +2212,54 @@ mod tests {
     #[test]
     fn the_capsule_seam_passes_try_failures_through() {
         let cache = with_capsule_seam(Arc::new(DownBackend));
+        for op in [
+            (|c: &dyn Cache| assert!(try_insert_cached(c, "k", 1_i64, None).is_err()))
+                as fn(&dyn Cache),
+            |c| assert!(try_get_cached::<i64>(c, "k").is_err()),
+        ] {
+            // A failed read or write cannot replay, so it marks the capsule.
+            let scope = capture_scope();
+            block_on(crate::capsule::capture::with_capture_scope(
+                Arc::clone(&scope),
+                async { op(cache.as_ref()) },
+            ));
+            assert!(scope.is_truncated(), "a failed cache op is not replayable");
+        }
+        // A failed removal is recorded with its error, so replay can match it.
         let scope = capture_scope();
         block_on(crate::capsule::capture::with_capture_scope(
             Arc::clone(&scope),
-            async {
-                assert!(try_insert_cached(cache.as_ref(), "k", 1_i64, None).is_err());
-                assert!(try_get_cached::<i64>(cache.as_ref(), "k").is_err());
-                assert!(cache.try_invalidate("k").is_err());
-            },
+            async { assert!(cache.try_invalidate("k").is_err()) },
         ));
         let _ = scope.effects_snapshot();
-        assert!(!scope.is_truncated(), "helper calls are recorded");
+        assert!(!scope.is_truncated(), "a recorded removal error replays");
+
+        // Control: a direct call is not a helper call, so it marks the capsule.
+        let direct = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&direct),
+            async {
+                let _ = cache.try_get_value("k");
+            },
+        ));
+        assert!(direct.is_truncated(), "a direct read is not recorded");
+    }
+
+    /// A value whose `Serialize` always fails.
+    #[derive(Clone)]
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("no"))
+        }
+    }
+
+    #[test]
+    fn try_insert_cached_reports_a_serialization_failure() {
+        let cache = MokaCache::new(8, None);
+        let err = try_insert_cached(&cache, "k", Unserializable, None).expect_err("no bytes");
+        assert!(err.reason().contains("cannot be serialized"));
     }
 
     #[test]

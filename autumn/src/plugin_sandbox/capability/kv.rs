@@ -419,6 +419,8 @@ impl KvStore for MemoryKvStore {
 /// exists: a plugin's KV inherits whatever the operator already chose — Moka in
 /// process, Redis across replicas — and the eviction, TTL and metrics that come
 /// with it, rather than growing a second storage system nobody configured.
+///
+/// A backend failure reaches the guest as an error. It is not a miss.
 #[derive(Clone)]
 pub struct CacheKvStore(pub std::sync::Arc<dyn crate::cache::Cache>);
 
