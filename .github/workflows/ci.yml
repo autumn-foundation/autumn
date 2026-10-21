@@ -2292,6 +2292,12 @@ jobs:
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #2555: the SQLite `TestDb` and the generated UUID key default.
+          # Both are sqlite-only code. Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_test_db
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_uuid_primary_key
           # Issue #3234: the fleet sweeper end to end. Same features, so no
           # rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
@@ -2472,10 +2478,11 @@ jobs:
             tests::fleet_subcommands db::replica:: \
             | tee "$RUNNER_TEMP/cli-fleet-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
-          # Issue #2555: same gap for the SQLite scaffold smoke-test output. Check
-          # the count.
-          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- \
-            generate::scaffold::tests::sqlite_ \
+          # Issue #2555: same gap for the generators. The SQLite uuid key and the
+          # SQLite scaffold smoke test change `generate::model`, `generate::dsl`,
+          # `generate::scaffold` and `generate::admin`, and their unit tests are
+          # instrumented by no other lane. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate:: \
             | tee "$RUNNER_TEMP/cli-scaffold-sqlite-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scaffold-sqlite-cov.log"
           # Issue #2396: same gap for `db::retention::` (the force env and the
