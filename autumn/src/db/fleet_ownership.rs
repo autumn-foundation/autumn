@@ -376,11 +376,13 @@ impl OwnershipTable {
             .iter_mut()
             .find(|row| row.range == range && row.owner == *owner && row.epoch.get() > floor)
         {
-            row.lease_expires_ms = lease_expires_ms;
+            // Never earlier: a call that timed out may land after a newer one.
+            // So a shorter `ttl` takes effect when the old lease ends.
+            row.lease_expires_ms = row.lease_expires_ms.max(lease_expires_ms);
             return Ok(Grant {
                 range,
                 epoch: row.epoch,
-                lease_expires_ms,
+                lease_expires_ms: row.lease_expires_ms,
                 fresh: false,
             });
         }
@@ -424,7 +426,8 @@ impl OwnershipTable {
         let row = self
             .held_mut(range, owner, epoch)
             .ok_or(OwnershipError::Lost { range })?;
-        row.lease_expires_ms = lease_end(now_ms, ttl);
+        // Never earlier: a call that timed out may land after a newer one.
+        row.lease_expires_ms = row.lease_expires_ms.max(lease_end(now_ms, ttl));
         Ok(Grant {
             range,
             epoch,
@@ -722,6 +725,26 @@ struct Held {
     valid_until: tokio::time::Instant,
 }
 
+/// A store call that runs on its own task.
+type PendingCall = tokio::task::JoinHandle<()>;
+
+/// The `failed` text of a call that took longer than one renew interval.
+const TIMED_OUT: &str = "the store call timed out";
+
+/// The `failed` text of a range whose last call still runs.
+const STILL_RUNNING: &str = "the last store call is still running";
+
+/// What one range did in a refresh.
+enum Outcome {
+    Claimed(FencingToken),
+    Renewed,
+    Lost,
+    Waiting,
+    Failed(String),
+    TimedOut,
+    Busy,
+}
+
 /// What one [`FleetOwnership::refresh`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshReport {
@@ -733,7 +756,8 @@ pub struct RefreshReport {
     pub lost: Vec<SlotRange>,
     /// Ranges another host still holds.
     pub waiting: Vec<SlotRange>,
-    /// Ranges whose call failed, with the error.
+    /// Ranges whose call failed, with the error. A call that takes longer
+    /// than one renew interval fails with a time-out.
     pub failed: Vec<(SlotRange, String)>,
 }
 
@@ -750,6 +774,9 @@ pub struct FleetOwnership {
     /// Per range of `ranges`: the newest epoch a replicator saw at the
     /// destination for a slot in it. Claims of the range go above it.
     fence_floors: Vec<std::sync::atomic::AtomicU64>,
+    /// Per range of `ranges`: a store call that outlived its time limit. It
+    /// runs on, so the range makes no new call until it ends.
+    pending: Vec<Mutex<Option<PendingCall>>>,
     /// A store call outlived the shutdown wait. It may still land and
     /// extend a lease, so the ranges lapse instead of being released.
     unsettled: std::sync::atomic::AtomicBool,
@@ -793,6 +820,7 @@ impl FleetOwnership {
         if let Some(pair) = sorted.windows(2).find(|pair| pair[0].overlaps(pair[1])) {
             return Err(OwnershipError::Overlap(pair[0], pair[1]));
         }
+        let pending = ranges.iter().map(|_| Mutex::new(None)).collect();
         let fence_floors = ranges
             .iter()
             .map(|_| std::sync::atomic::AtomicU64::new(0))
@@ -806,6 +834,7 @@ impl FleetOwnership {
             last: Mutex::new(RefreshReport::default()),
             changed: Notify::new(),
             fence_floors,
+            pending,
             unsettled: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -828,7 +857,8 @@ impl FleetOwnership {
         self.ttl
     }
 
-    /// How often to renew: a third of the lease.
+    /// How often to renew: a third of the lease. It is also the time limit
+    /// of one store call.
     #[must_use]
     pub fn renew_interval(&self) -> Duration {
         self.ttl / 3
@@ -836,53 +866,117 @@ impl FleetOwnership {
 
     /// Claim the ranges this host does not hold, renew the others. Run it
     /// before the first open, then every [`renew_interval`](Self::renew_interval).
+    ///
+    /// The ranges run at the same time, and each call has one renew interval.
+    /// A range whose store call is slow fails alone: the other ranges still
+    /// renew. The report keeps the order of the configured ranges. The order
+    /// of the epochs between ranges is not fixed.
     pub async fn refresh(&self) -> RefreshReport {
+        let calls = self
+            .ranges
+            .iter()
+            .zip(&self.fence_floors)
+            .zip(&self.pending)
+            .map(|((&range, floor), pending)| async move {
+                (range, self.refresh_range(range, floor, pending).await)
+            });
         let mut report = RefreshReport::default();
-        for (&range, floor) in self.ranges.iter().zip(&self.fence_floors) {
-            let held = self.held_epoch(range);
-            // Sent before the call: the local lease must not outlive the
-            // store's.
-            let sent = tokio::time::Instant::now();
-            let result = if let Some(epoch) = held {
-                self.store.renew(range, &self.owner, epoch, self.ttl).await
-            } else {
-                let floor = floor.load(std::sync::atomic::Ordering::Acquire);
-                self.store.claim(range, &self.owner, self.ttl, floor).await
-            };
-            match result {
-                // A replicator saw a newer epoch in this range while the
-                // call ran.
-                Ok(grant)
-                    if grant.epoch.get() < floor.load(std::sync::atomic::Ordering::Acquire) =>
-                {
-                    tracing::warn!(range = %range, epoch = %grant.epoch, "fleet slot range fenced while the store call ran");
-                    self.drop_range(range);
-                    report.lost.push(range);
-                }
-                Ok(grant) => {
-                    let valid_for = self.ttl.saturating_sub(self.renew_interval());
-                    self.hold(grant, later(sent, valid_for));
-                    if held.is_some() {
-                        report.renewed.push(range);
-                    } else {
-                        tracing::info!(range = %range, epoch = %grant.epoch, owner = %self.owner, "fleet slot range claimed");
-                        report.claimed.push((range, grant.epoch));
-                    }
-                }
-                Err(OwnershipError::Lost { .. }) => {
-                    tracing::warn!(range = %range, owner = %self.owner, "fleet slot range lost to another host");
-                    self.drop_range(range);
-                    report.lost.push(range);
-                }
-                Err(OwnershipError::Held { .. }) => report.waiting.push(range),
-                Err(error) => {
-                    tracing::warn!(range = %range, %error, "fleet slot ownership call failed");
-                    report.failed.push((range, error.to_string()));
-                }
+        for (range, outcome) in futures::future::join_all(calls).await {
+            match outcome {
+                Outcome::TimedOut => report.failed.push((range, TIMED_OUT.to_owned())),
+                Outcome::Busy => report.failed.push((range, STILL_RUNNING.to_owned())),
+                Outcome::Claimed(epoch) => report.claimed.push((range, epoch)),
+                Outcome::Renewed => report.renewed.push(range),
+                Outcome::Lost => report.lost.push(range),
+                Outcome::Waiting => report.waiting.push(range),
+                Outcome::Failed(error) => report.failed.push((range, error)),
             }
         }
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = report.clone();
         report
+    }
+
+    /// Claim or renew one range, within one renew interval.
+    ///
+    /// The call runs on its own task. A call that is too slow keeps running
+    /// (its transaction and pool connection cannot be cancelled), so the range
+    /// makes no new call until it ends.
+    async fn refresh_range(
+        &self,
+        range: SlotRange,
+        floor: &std::sync::atomic::AtomicU64,
+        pending: &Mutex<Option<PendingCall>>,
+    ) -> Outcome {
+        {
+            let mut slot = pending.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.as_ref().is_some_and(|call| !call.is_finished()) {
+                return Outcome::Busy;
+            }
+            // An ended call is stale: a newer call replaces its answer.
+            *slot = None;
+        }
+        let held = self.held_epoch(range);
+        // Sent before the call: the local lease must not outlive the store's.
+        let sent = tokio::time::Instant::now();
+        let (store, owner, ttl) = (Arc::clone(&self.store), self.owner.clone(), self.ttl);
+        let floor_now = floor.load(std::sync::atomic::Ordering::Acquire);
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let call = tokio::spawn(async move {
+            let result = if let Some(epoch) = held {
+                store.renew(range, &owner, epoch, ttl).await
+            } else {
+                store.claim(range, &owner, ttl, floor_now).await
+            };
+            let _ = answer.send(result);
+        });
+        // Tracked at once: if this refresh is dropped, the call still runs and
+        // `unsettled` must say so.
+        *pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(call);
+        let result = match tokio::time::timeout(self.renew_interval(), answered).await {
+            Ok(Ok(result)) => {
+                // The call ended. Nothing runs for this range now.
+                *pending.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                result
+            }
+            Ok(Err(_closed)) => {
+                *pending.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                return Outcome::Failed("the store call stopped without an answer".to_owned());
+            }
+            Err(_elapsed) => {
+                // The call may still extend the lease at the store. The local
+                // lease does not grow, so serving stays safe.
+                tracing::warn!(range = %range, "fleet slot ownership call timed out");
+                return Outcome::TimedOut;
+            }
+        };
+        match result {
+            // A replicator saw a newer epoch in this range while the call ran.
+            Ok(grant) if grant.epoch.get() < floor.load(std::sync::atomic::Ordering::Acquire) => {
+                tracing::warn!(range = %range, epoch = %grant.epoch, "fleet slot range fenced while the store call ran");
+                self.drop_range(range);
+                Outcome::Lost
+            }
+            Ok(grant) => {
+                let valid_for = self.ttl.saturating_sub(self.renew_interval());
+                self.hold(grant, later(sent, valid_for));
+                if held.is_some() {
+                    Outcome::Renewed
+                } else {
+                    tracing::info!(range = %range, epoch = %grant.epoch, owner = %self.owner, "fleet slot range claimed");
+                    Outcome::Claimed(grant.epoch)
+                }
+            }
+            Err(OwnershipError::Lost { .. }) => {
+                tracing::warn!(range = %range, owner = %self.owner, "fleet slot range lost to another host");
+                self.drop_range(range);
+                Outcome::Lost
+            }
+            Err(OwnershipError::Held { .. }) => Outcome::Waiting,
+            Err(error) => {
+                tracing::warn!(range = %range, %error, "fleet slot ownership call failed");
+                Outcome::Failed(error.to_string())
+            }
+        }
     }
 
     fn held_epoch(&self, range: SlotRange) -> Option<FencingToken> {
@@ -988,7 +1082,15 @@ impl FleetOwnership {
     /// first local lease that runs out before it.
     #[must_use]
     pub fn next_wake(&self) -> tokio::time::Instant {
-        let renew = later(tokio::time::Instant::now(), self.renew_interval());
+        self.next_wake_since(tokio::time::Instant::now())
+    }
+
+    /// As [`next_wake`](Self::next_wake), but the renew interval counts from
+    /// `started`, when the last refresh began. A slow range then does not
+    /// delay the renewal of the others.
+    #[must_use]
+    pub fn next_wake_since(&self, started: tokio::time::Instant) -> tokio::time::Instant {
+        let renew = later(started, self.renew_interval());
         self.next_lapse().map_or(renew, |lapse| lapse.min(renew))
     }
 
@@ -1010,9 +1112,16 @@ impl FleetOwnership {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Whether a store call may still land: no release then.
+    /// Whether a store call may still land: no release then. True while a
+    /// timed-out call runs, and for good after the shutdown wait ran out.
     pub(crate) fn unsettled(&self) -> bool {
         self.unsettled.load(std::sync::atomic::Ordering::Acquire)
+            || self.pending.iter().any(|slot| {
+                slot.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|call| !call.is_finished())
+            })
     }
 
     /// Wakes when a range is lost.
@@ -1032,8 +1141,9 @@ impl FleetOwnership {
         use crate::actuator::HealthCheckOutput;
         let report = self.last_report();
         let now = tokio::time::Instant::now();
-        let held: Vec<serde_json::Value> = self
-            .read_held()
+        let mut ranges: Vec<Held> = self.read_held().clone();
+        ranges.sort_unstable_by_key(|held| held.range);
+        let held: Vec<serde_json::Value> = ranges
             .iter()
             .map(|held| {
                 serde_json::json!({
@@ -1205,6 +1315,30 @@ mod tests {
                 .renew(range(0, 98), &owner("a"), grant.epoch, 40_000, TTL)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_late_renew_does_not_shorten_a_newer_lease() {
+        let mut table = OwnershipTable::new();
+        let grant = table.claim(range(0, 99), &owner("a"), 0, TTL).unwrap();
+        table
+            .renew(range(0, 99), &owner("a"), grant.epoch, 40_000, TTL)
+            .unwrap();
+        // An older call, sent at 10 s, lands after the one sent at 40 s.
+        let late = table
+            .renew(range(0, 99), &owner("a"), grant.epoch, 10_000, TTL)
+            .unwrap();
+        assert_eq!(late.lease_expires_ms, 70_000);
+        assert_eq!(table.rows()[0].lease_expires_ms, 70_000);
+    }
+
+    #[test]
+    fn a_late_reclaim_does_not_shorten_a_newer_lease() {
+        let mut table = OwnershipTable::new();
+        table.claim(range(0, 99), &owner("a"), 40_000, TTL).unwrap();
+        let late = table.claim(range(0, 99), &owner("a"), 10_000, TTL).unwrap();
+        assert_eq!(late.lease_expires_ms, 70_000);
+        assert_eq!(table.rows()[0].lease_expires_ms, 70_000);
     }
 
     #[test]
@@ -1524,6 +1658,249 @@ mod tests {
         fn rows(&self) -> BoxFuture<'_, Result<Vec<OwnershipRow>, OwnershipError>> {
             self.inner.rows()
         }
+    }
+
+    /// A store that never answers for the ranges in `stuck`.
+    struct StuckRanges {
+        inner: SqlSlotOwnership,
+        stuck: Mutex<Vec<SlotRange>>,
+        /// Calls that reached the store.
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StuckRanges {
+        async fn gate(&self, range: SlotRange) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Stuck until the test clears the range.
+            while self.stuck.lock().unwrap().contains(&range) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    impl SlotOwnershipStore for StuckRanges {
+        fn claim<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            ttl: Duration,
+            floor: u64,
+        ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+            Box::pin(async move {
+                self.gate(range).await;
+                self.inner.claim(range, owner, ttl, floor).await
+            })
+        }
+        fn renew<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            epoch: FencingToken,
+            ttl: Duration,
+        ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+            Box::pin(async move {
+                self.gate(range).await;
+                self.inner.renew(range, owner, epoch, ttl).await
+            })
+        }
+        fn release<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            epoch: FencingToken,
+        ) -> BoxFuture<'a, Result<bool, OwnershipError>> {
+            Box::pin(async move {
+                self.gate(range).await;
+                self.inner.release(range, owner, epoch).await
+            })
+        }
+        fn rows(&self) -> BoxFuture<'_, Result<Vec<OwnershipRow>, OwnershipError>> {
+            self.inner.rows()
+        }
+    }
+
+    async fn two_ranges_one_stuck(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<StuckRanges>,
+        Arc<FleetOwnership>,
+        crate::time::TickingClock,
+    ) {
+        let clock = clock_at(1_000_000);
+        let stuck = Arc::new(StuckRanges {
+            inner: store(dir, &clock).await,
+            stuck: Mutex::new(Vec::new()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let a = Arc::new(
+            FleetOwnership::new(
+                stuck.clone(),
+                owner("a"),
+                vec![range(0, 9), range(10, 19)],
+                TTL,
+            )
+            .unwrap(),
+        );
+        (stuck, a, clock)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_renewal_on_one_range_does_not_lapse_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, clock) = two_ranges_one_stuck(dir.path()).await;
+        assert_eq!(a.refresh().await.claimed.len(), 2);
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+
+        // Three cycles: more than one local lease.
+        let step = a.renew_interval();
+        let mut report = RefreshReport::default();
+        for _ in 0..3 {
+            clock.advance(step);
+            tokio::time::advance(step).await;
+            report = a.refresh().await;
+            assert_eq!(report.renewed, vec![range(10, 19)]);
+        }
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, range(0, 9));
+        assert_eq!(a.epoch_for(15), Some(token(2)), "the live range serves");
+        assert_eq!(a.epoch_for(3), None, "the stuck range lapsed");
+        assert!(a.unsettled(), "a timed out call may still land");
+
+        let health = a.indicator().check().await;
+        assert_eq!(health.status, crate::actuator::HealthStatus::Down);
+        let held = health.details["held"].as_array().unwrap();
+        assert_eq!(held.len(), 2, "each range stays listed");
+        assert_eq!(held[0]["serving"], false);
+        assert_eq!(held[1]["serving"], true);
+        assert_eq!(health.details["failed"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_claim_on_one_range_does_not_block_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+        let report = a.refresh().await;
+        assert_eq!(report.claimed.len(), 1);
+        assert_eq!(report.claimed[0].0, range(10, 19));
+        assert_eq!(report.failed[0].0, range(0, 9));
+        assert!(a.epoch_for(15).is_some());
+        assert_eq!(a.epoch_for(3), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_report_keeps_range_order_whatever_the_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        let report = a.refresh().await;
+        let ranges: Vec<_> = report.claimed.iter().map(|(range, _)| *range).collect();
+        assert_eq!(ranges, vec![range(0, 9), range(10, 19)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_calls_run_at_the_same_time_and_a_range_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+        let start = tokio::time::Instant::now();
+        let report = a.refresh().await;
+        assert_eq!(
+            start.elapsed(),
+            a.renew_interval(),
+            "one interval, not one per range"
+        );
+        assert_eq!(
+            report.failed,
+            vec![(range(0, 9), "the store call timed out".to_owned())]
+        );
+        assert!(a.unsettled());
+        let health = a.indicator().check().await;
+        assert_eq!(health.details["failed"][0], "0-9: the store call timed out");
+
+        // The stuck call still runs, so the range makes no new call.
+        let report = a.refresh().await;
+        assert_eq!(
+            report.failed,
+            vec![(
+                range(0, 9),
+                "the last store call is still running".to_owned()
+            )]
+        );
+
+        // The store answers; the next refresh claims the range.
+        stuck.stuck.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!a.unsettled(), "no call runs now");
+        let report = a.refresh().await;
+        assert!(report.failed.is_empty());
+        assert_eq!(report.claimed.len(), 1);
+        assert_eq!(report.renewed, vec![range(10, 19)]);
+        // 0-9 was claimed after 10-19, but the details keep config order.
+        let health = a.indicator().check().await;
+        assert_eq!(health.details["held"][0]["range"], "0-9");
+        assert_eq!(health.details["held"][1]["range"], "10-19");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_still_running_is_not_started_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, clock) = two_ranges_one_stuck(dir.path()).await;
+        a.refresh().await;
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+        let before = stuck.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let step = a.renew_interval();
+        for _ in 0..3 {
+            clock.advance(step);
+            let report = a.refresh().await;
+            assert_eq!(report.failed.len(), 1);
+            assert_eq!(report.renewed, vec![range(10, 19)]);
+        }
+        // One call for the stuck range, three for the live one.
+        let after = stuck.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after - before, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_dropped_in_flight_leaves_its_call_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+        let running = Arc::clone(&a);
+        let refresh = tokio::spawn(async move { running.refresh().await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        refresh.abort();
+        let _ = refresh.await;
+        assert!(a.unsettled(), "the call to the store still runs");
+        stuck.stuck.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!a.unsettled(), "it ended");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_time_out_and_a_lost_range_report_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        a.refresh().await;
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+        assert!(a.lose(15, token(9)));
+        let report = a.refresh().await;
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, range(0, 9));
+        assert_eq!(report.claimed, vec![(range(10, 19), token(10))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_next_wake_counts_from_the_start_of_the_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        a.refresh().await;
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+        let started = tokio::time::Instant::now();
+        a.refresh().await;
+        assert!(
+            a.next_wake_since(started) <= tokio::time::Instant::now(),
+            "a slow range does not delay the next renewal"
+        );
     }
 
     #[test]
