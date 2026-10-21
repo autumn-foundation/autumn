@@ -355,9 +355,10 @@ the [cell router](cell-isolation.md).
 | Step | Rule |
 | --- | --- |
 | Claim | At boot, before the first request. If the range is free, or each lease on it ended, the host gets a new epoch. If the host already has the same range, it keeps its epoch. A live lease on any slot of the range refuses the claim, also a lease of the same owner on a range of another shape. |
-| Renew | Every `lease_secs / 3`. If the row has another owner or epoch, the host loses the range. |
+| Renew | Every `lease_secs / 3`. The host renews all ranges at the same time. Each call has `lease_secs / 3` to answer. A slow range fails alone; the other ranges keep their leases. A slow call keeps running, so the range makes no new call until it ends. If the row has another owner or epoch, the host loses the range. |
 | Serve | `open` checks the slot first. If the host does not own the slot, `open` returns `421 Misdirected Request` and does not touch the disk. So `restore_missing` runs only for an owned key. |
 | Lose | The host closes every open database of the range. The close does not wait for workers, but it waits for connections that are in use. The sweeper and the fan-outs skip the range. |
+| Lease length | A lease never ends earlier than an older call set it. If you make `lease_secs` shorter, the new length applies when the old lease ends. |
 | Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after it sent its last renew. This is before the lease in the table ends. |
 | Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. A replicator reads the epochs at the destination at each new generation and every 60 s. If it finds a newer epoch, it stops, and the host loses the range. |
 | Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped. The next owner can then claim them at once. In all other cases, the leases end on their own. |
