@@ -198,3 +198,125 @@ fn the_manifest_is_committed_not_ignored() {
         "the baseline must be trackable: {gitignore}"
     );
 }
+
+// ---- issue #2557: files the templates no longer name ----------------------
+//
+// A newer template can rename or drop a file. The recomputed plan then names
+// no action for the old path. The same trick as above reproduces it: put a
+// file on disk that the current render never writes, and record it under the
+// model's own invocation, as an older CLI would have.
+
+const ORPHAN: &str = "src/models/post_v1.rs";
+
+/// Write `contents` at [`ORPHAN`] and record it beside [`OWNED`], with the
+/// same invocation and the given `scope` (`None` writes no scope key, as
+/// 0.8.0 did).
+fn plant_orphan(project: &Path, contents: &str, scope: Option<&str>) {
+    fs::write(project.join(ORPHAN), contents).unwrap();
+    let path = project.join(MANIFEST);
+    let mut doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+    let files = doc
+        .get_mut("files")
+        .and_then(toml::Value::as_table_mut)
+        .expect("files table");
+    let mut entry = files[OWNED].as_table().expect("owned entry").clone();
+    entry.insert("digest".to_owned(), toml::Value::String(digest(contents)));
+    match scope {
+        Some(scope) => entry.insert("scope".to_owned(), toml::Value::String(scope.to_owned())),
+        None => entry.remove("scope"),
+    };
+    files.insert(ORPHAN.to_owned(), toml::Value::Table(entry));
+    fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+}
+
+#[test]
+fn generate_records_the_owned_scope() {
+    let (_tmp, project) = project_with_model("prov-scope");
+    let doc: toml::Table = fs::read_to_string(project.join(MANIFEST))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(doc["files"][OWNED]["scope"].as_str(), Some("owned"));
+}
+
+#[test]
+fn destroy_removes_an_untouched_file_the_templates_renamed() {
+    let (_tmp, project) = project_with_model("prov-orphan");
+    plant_orphan(&project, "// an older template's file\n", Some("owned"));
+
+    let output = run_autumn_ok(&project, &["destroy", "model", "Post", "title:String"]);
+
+    assert!(!project.join(ORPHAN).exists(), "the stranded file must go");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(ORPHAN) && stdout.contains("no longer generated"),
+        "{stdout}"
+    );
+    assert!(
+        !fs::read_to_string(project.join(MANIFEST))
+            .unwrap_or_default()
+            .contains(ORPHAN),
+        "its entry must go with it"
+    );
+}
+
+#[test]
+fn destroy_dry_run_lists_the_stranded_file() {
+    let (_tmp, project) = project_with_model("prov-orphan-dry");
+    plant_orphan(&project, "// an older template's file\n", Some("owned"));
+
+    let output = run_autumn_ok(
+        &project,
+        &["destroy", "model", "Post", "title:String", "--dry-run"],
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("Would remove {ORPHAN}")),
+        "{stdout}"
+    );
+    assert!(project.join(ORPHAN).exists());
+}
+
+#[test]
+fn destroy_keeps_an_edited_stranded_file_and_names_it() {
+    let (_tmp, project) = project_with_model("prov-orphan-edited");
+    plant_orphan(&project, "// an older template's file\n", Some("owned"));
+    fs::write(project.join(ORPHAN), "// my own code\n").unwrap();
+
+    let output = run_autumn_ok(&project, &["destroy", "model", "Post", "title:String"]);
+
+    assert!(project.join(ORPHAN).exists(), "an edit is never swept");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(ORPHAN), "{stderr}");
+}
+
+#[test]
+fn destroy_names_a_stranded_file_from_an_older_manifest() {
+    // 0.8.0 wrote no scope, so owned and shared look the same: keep and warn.
+    let (_tmp, project) = project_with_model("prov-orphan-legacy");
+    plant_orphan(&project, "// an older template's file\n", None);
+
+    let output = run_autumn_ok(&project, &["destroy", "model", "Post", "title:String"]);
+
+    assert!(project.join(ORPHAN).exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(ORPHAN), "{stderr}");
+}
+
+#[test]
+fn destroy_never_sweeps_another_resources_files() {
+    let (_tmp, project) = project_with_model("prov-orphan-sibling");
+    run_autumn_ok(&project, &["generate", "model", "Comment", "body:String"]);
+    plant_orphan(&project, "// an older template's file\n", Some("owned"));
+
+    run_autumn_ok(&project, &["destroy", "model", "Post", "title:String"]);
+
+    assert!(!project.join(ORPHAN).exists());
+    assert!(project.join("src/models/comment.rs").exists());
+    assert!(
+        fs::read_to_string(project.join(MANIFEST))
+            .unwrap()
+            .contains("src/models/comment.rs")
+    );
+}

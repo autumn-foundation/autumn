@@ -75,6 +75,32 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// How a recorded file relates to the resource that wrote it (issue #2557).
+///
+/// Only a plan that claims to be the sole resource of its invocation records
+/// a scope (see `Plan::claim_sole_resource`). No scope means an older CLI or
+/// an unclaimed plan wrote the entry. `destroy` never sweeps such an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// A `Create`/`CreateBytes` file. Only this resource uses it.
+    Owned,
+    /// A `CreateIfAbsent` file. Sibling resources can use it too.
+    Shared,
+}
+
+/// One entry, as the orphan sweep reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded<'a> {
+    /// Project-relative, forward-slashed key. Not validated: it is manifest
+    /// data.
+    pub key: &'a str,
+    /// Digest of the file as it was written.
+    pub digest: &'a str,
+    /// See [`Scope`].
+    pub scope: Option<Scope>,
+}
+
 /// One recorded file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {
@@ -297,11 +323,25 @@ impl Provenance {
         key(root, path).is_some_and(|k| self.entries.get(&k).is_some_and(|e| e.digest == digest))
     }
 
+    /// Every entry `invocation` wrote, for the orphan sweep (issue #2557).
+    pub fn recorded_by<'a>(&'a self, invocation: &'a str) -> impl Iterator<Item = Recorded<'a>> {
+        let _ = invocation;
+        std::iter::empty()
+    }
+
     /// Record `digest` as the content `invocation` wrote to `path`.
     ///
     /// A path outside `root` cannot be keyed and is dropped: the manifest
     /// describes one project, and destroy would never look it up.
-    pub fn record(&mut self, root: &Path, path: &Path, digest: String, invocation: &str) {
+    pub fn record(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        digest: String,
+        invocation: &str,
+        scope: Option<Scope>,
+    ) {
+        let _ = scope;
         if let Some(k) = key(root, path) {
             // Keyed by path, so the newest writer replaces the previous one:
             // a file has exactly one owner, and the manifest cannot grow an
@@ -452,7 +492,7 @@ mod tests {
         let dir = tmp();
         let file = dir.path().join("src/models/post.rs");
         let mut p = Provenance::default();
-        p.record(dir.path(), &file, text_digest("// model\n"), OWNER);
+        p.record(dir.path(), &file, text_digest("// model\n"), OWNER, None);
         p.save(dir.path()).unwrap();
 
         let reloaded = Provenance::load(dir.path());
@@ -465,7 +505,7 @@ mod tests {
         let dir = tmp();
         let file = dir.path().join("src/models/post.rs");
         let mut p = Provenance::default();
-        p.record(dir.path(), &file, text_digest("// model\n"), OWNER);
+        p.record(dir.path(), &file, text_digest("// model\n"), OWNER, None);
 
         assert!(!p.is_ours(
             dir.path(),
@@ -533,7 +573,13 @@ mod tests {
     fn a_path_outside_the_project_is_dropped() {
         let dir = tmp();
         let mut p = Provenance::default();
-        p.record(dir.path(), Path::new("/etc/passwd"), text_digest(""), OWNER);
+        p.record(
+            dir.path(),
+            Path::new("/etc/passwd"),
+            text_digest(""),
+            OWNER,
+            None,
+        );
         assert_eq!(p, Provenance::default());
     }
 
@@ -546,6 +592,7 @@ mod tests {
             &dir.path().join("../secret.toml"),
             text_digest(""),
             OWNER,
+            None,
         );
         assert_eq!(p, Provenance::default());
     }
@@ -705,7 +752,7 @@ mod tests {
         let dir = tmp();
         let file = dir.path().join("a.rs");
         let mut p = Provenance::default();
-        p.record(dir.path(), &file, text_digest("x"), OWNER);
+        p.record(dir.path(), &file, text_digest("x"), OWNER, None);
         p.save(dir.path()).unwrap();
         assert!(dir.path().join(MANIFEST_PATH).is_file());
 
@@ -723,17 +770,121 @@ mod tests {
             &dir.path().join("migrations/a/up.sql"),
             "1".to_owned(),
             OWNER,
+            None,
         );
         p.record(
             dir.path(),
             &dir.path().join("migrations/ab/up.sql"),
             "2".to_owned(),
             OWNER,
+            None,
         );
         p.forget_dir(dir.path(), &dir.path().join("migrations/a"));
 
         assert!(!p.contains("migrations/a/up.sql"));
         assert!(p.contains("migrations/ab/up.sql"));
+    }
+
+    #[test]
+    fn a_scope_survives_a_save_and_load() {
+        let dir = tmp();
+        let owned = dir.path().join("src/a.rs");
+        let shared = dir.path().join("templates/_layout.html");
+        let mut p = Provenance::default();
+        p.record(
+            dir.path(),
+            &owned,
+            "1".to_owned(),
+            OWNER,
+            Some(Scope::Owned),
+        );
+        p.record(
+            dir.path(),
+            &shared,
+            "2".to_owned(),
+            OWNER,
+            Some(Scope::Shared),
+        );
+        p.save(dir.path()).unwrap();
+
+        let reloaded = Provenance::load(dir.path());
+        let mut seen: Vec<_> = reloaded.recorded_by(OWNER).collect();
+        seen.sort_by_key(|r| r.key);
+        assert_eq!(
+            seen,
+            vec![
+                Recorded {
+                    key: "src/a.rs",
+                    digest: "1",
+                    scope: Some(Scope::Owned)
+                },
+                Recorded {
+                    key: "templates/_layout.html",
+                    digest: "2",
+                    scope: Some(Scope::Shared)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_scope_writes_no_scope_key() {
+        // A 0.8.0 CLI reads this manifest too. It must see the shape it wrote.
+        let dir = tmp();
+        let mut p = Provenance::default();
+        p.record(
+            dir.path(),
+            &dir.path().join("a.rs"),
+            "1".to_owned(),
+            OWNER,
+            None,
+        );
+        p.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_PATH)).unwrap();
+        assert!(!text.contains("scope"), "{text}");
+    }
+
+    #[test]
+    fn a_legacy_entry_loads_with_no_scope() {
+        let dir = tmp();
+        std::fs::create_dir_all(dir.path().join(".autumn")).unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_PATH),
+            "[files.\"src/a.rs\"]\ndigest = \"1\"\ninvocation = \"x\"\n",
+        )
+        .unwrap();
+        let p = Provenance::load(dir.path());
+        let seen: Vec<_> = p.recorded_by("x").collect();
+        assert_eq!(
+            seen,
+            vec![Recorded {
+                key: "src/a.rs",
+                digest: "1",
+                scope: None
+            }]
+        );
+    }
+
+    #[test]
+    fn recorded_by_lists_only_that_invocation() {
+        let dir = tmp();
+        let mut p = Provenance::default();
+        p.record(
+            dir.path(),
+            &dir.path().join("a.rs"),
+            "1".to_owned(),
+            OWNER,
+            None,
+        );
+        p.record(
+            dir.path(),
+            &dir.path().join("b.rs"),
+            "2".to_owned(),
+            "other",
+            None,
+        );
+        let keys: Vec<_> = p.recorded_by(OWNER).map(|r| r.key).collect();
+        assert_eq!(keys, vec!["a.rs"]);
     }
 
     #[cfg(unix)]
@@ -754,6 +905,7 @@ mod tests {
             &dir.path().join("a.rs"),
             text_digest("x"),
             OWNER,
+            None,
         );
 
         assert!(p.save(dir.path()).is_err());

@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use autumn_web::config::DatabaseBackend;
 
@@ -594,6 +595,9 @@ pub struct Plan {
     /// `autumn-web` features this run no longer needs (issue #2328).
     /// [`Plan::settle_released_features`] resolves this list.
     released_features: Vec<ReleasedFeature>,
+    /// Whether this plan is the sole resource of its invocation (issue
+    /// #2557). Set by [`Plan::claim_sole_resource`].
+    pub(super) sole_resource: bool,
 }
 
 /// An `autumn-web` feature a regenerate run no longer needs.
@@ -618,7 +622,20 @@ impl Plan {
             warnings: Vec::new(),
             reverts: Vec::new(),
             released_features: Vec::new(),
+            sole_resource: false,
         }
+    }
+
+    /// Claim that this plan is the sole resource of its invocation.
+    pub fn claim_sole_resource(&mut self) -> bool {
+        static CLAIMED: AtomicBool = AtomicBool::new(false);
+        self.claim_with(&CLAIMED)
+    }
+
+    /// [`Self::claim_sole_resource`] against `claimed`.
+    fn claim_with(&mut self, claimed: &AtomicBool) -> bool {
+        let _ = claimed;
+        false
     }
 
     /// Record an advisory message, printed by [`Plan::execute`] but never
@@ -892,7 +909,7 @@ impl Plan {
         }
         let mut recorded = provenance::Provenance::load(&self.project_root);
         for (path, digest) in written {
-            recorded.record(&self.project_root, &path, digest, &self.invocation);
+            recorded.record(&self.project_root, &path, digest, &self.invocation, None);
         }
         if let Err(e) = recorded.save(&self.project_root) {
             eprintln!(
@@ -1354,6 +1371,7 @@ impl Plan {
             modifies,
             diverged,
             warnings,
+            swept: Vec::new(),
         }
     }
 }
@@ -1378,6 +1396,9 @@ struct RevertPlan {
     modifies: Vec<(PathBuf, Option<String>)>,
     diverged: Vec<PathBuf>,
     warnings: Vec<String>,
+    /// Files the orphan sweep removes (issue #2557). Also in
+    /// `files_to_remove`.
+    swept: Vec<PathBuf>,
 }
 
 /// Group `reverts` by target path, preserving push order both across groups
@@ -3978,5 +3999,243 @@ mod tests {
         // under-retaining strips a dependency out from under code that still
         // compiles against it. The tie goes to the build.
         assert!(matches("use autumn_admin_plugin_extras::Thing;"));
+    }
+
+    // ---- issue #2557: sweep files the templates no longer name ------------
+    //
+    // A newer template can rename or drop a generated file. The recomputed
+    // plan then names no action for the old path. A claimed plan sweeps it.
+
+    /// A plan claimed as the sole resource of its invocation.
+    fn sole(mut plan: Plan) -> Plan {
+        plan.sole_resource = true;
+        plan
+    }
+
+    /// Generate `old.rs` + `kept.rs` under a claimed plan.
+    fn generated_v1(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let old = tmp.path().join("src/widgets/old.rs");
+        let kept = tmp.path().join("src/kept.rs");
+        let mut v1 = sole(Plan::new(tmp.path()));
+        v1.create(old.clone(), "// v1 old\n");
+        v1.create(kept.clone(), "// kept\n");
+        v1.execute(Flags::default()).unwrap();
+        (old, kept)
+    }
+
+    /// The plan a newer CLI builds: `old.rs` is now `new.rs`.
+    fn renamed_v2(tmp: &tempfile::TempDir) -> Plan {
+        let mut v2 = sole(Plan::new(tmp.path()));
+        v2.create(tmp.path().join("src/widgets/new.rs"), "// v2 new\n");
+        v2.create(tmp.path().join("src/kept.rs"), "// kept\n");
+        v2
+    }
+
+    #[test]
+    fn a_claimed_execute_records_owned_and_shared_scopes() {
+        let (tmp, plan) = fixture();
+        let mut plan = sole(plan);
+        plan.create(tmp.path().join("a.rs"), "a");
+        plan.create_bytes(tmp.path().join("b.png"), vec![1]);
+        plan.create_if_absent(tmp.path().join("c.html"), "c");
+        plan.execute(Flags::default()).unwrap();
+
+        let recorded = provenance::Provenance::load(tmp.path());
+        let mut scopes: Vec<_> = recorded
+            .recorded_by(&plan.invocation)
+            .map(|r| (r.key.to_owned(), r.scope))
+            .collect();
+        scopes.sort();
+        assert_eq!(
+            scopes,
+            vec![
+                ("a.rs".to_owned(), Some(provenance::Scope::Owned)),
+                ("b.png".to_owned(), Some(provenance::Scope::Owned)),
+                ("c.html".to_owned(), Some(provenance::Scope::Shared)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_execute_records_no_scope() {
+        let (tmp, mut plan) = fixture();
+        plan.create(tmp.path().join("a.rs"), "a");
+        plan.execute(Flags::default()).unwrap();
+
+        let recorded = provenance::Provenance::load(tmp.path());
+        let scopes: Vec<_> = recorded
+            .recorded_by(&plan.invocation)
+            .map(|r| r.scope)
+            .collect();
+        assert_eq!(scopes, vec![None]);
+    }
+
+    #[test]
+    fn destroy_removes_a_file_the_templates_have_since_renamed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, kept) = generated_v1(&tmp);
+
+        renamed_v2(&tmp).revert(Flags::default()).unwrap();
+
+        assert!(!old.exists(), "the stranded file must go");
+        assert!(!kept.exists());
+        assert!(
+            !tmp.path().join("src/widgets").exists(),
+            "the emptied directory is pruned"
+        );
+        assert!(
+            !tmp.path().join(provenance::MANIFEST_PATH).exists(),
+            "no entry outlives its file"
+        );
+    }
+
+    #[test]
+    fn destroy_keeps_an_edited_renamed_file_even_with_force() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, _) = generated_v1(&tmp);
+        fs::write(&old, "// mine\n").unwrap();
+
+        renamed_v2(&tmp)
+            .revert(Flags {
+                force: true,
+                dry_run: false,
+            })
+            .unwrap();
+
+        assert!(old.exists(), "an edit is never swept");
+        assert!(provenance::Provenance::load(tmp.path()).contains("src/widgets/old.rs"));
+    }
+
+    #[test]
+    fn a_dry_run_lists_the_sweep_and_touches_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, _) = generated_v1(&tmp);
+        let v2 = renamed_v2(&tmp);
+
+        let plan = v2.compute_revert_plan(false);
+        assert_eq!(plan.swept, vec![old.clone()]);
+
+        v2.revert(Flags {
+            dry_run: true,
+            force: false,
+        })
+        .unwrap();
+        assert!(old.exists());
+        assert!(provenance::Provenance::load(tmp.path()).contains("src/widgets/old.rs"));
+    }
+
+    #[test]
+    fn a_refused_destroy_sweeps_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, kept) = generated_v1(&tmp);
+        fs::write(&kept, "// mine\n").unwrap();
+
+        let err = renamed_v2(&tmp).revert(Flags::default()).unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(old.exists(), "a refused destroy removes nothing");
+    }
+
+    #[test]
+    fn an_unclaimed_destroy_never_sweeps() {
+        // The shape of the nine "destroying one of two resources" tests: two
+        // resources from one process share one argv.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut first = Plan::new(tmp.path());
+        first.create(tmp.path().join("src/jobs/a.rs"), "a");
+        first.execute(Flags::default()).unwrap();
+        let mut second = Plan::new(tmp.path());
+        second.create(tmp.path().join("src/jobs/b.rs"), "b");
+        second.execute(Flags::default()).unwrap();
+
+        second.revert(Flags::default()).unwrap();
+
+        assert!(tmp.path().join("src/jobs/a.rs").exists());
+    }
+
+    #[test]
+    fn a_claimed_destroy_never_sweeps_an_unclaimed_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut first = Plan::new(tmp.path());
+        first.create(tmp.path().join("src/jobs/a.rs"), "a");
+        first.execute(Flags::default()).unwrap();
+        let mut second = sole(Plan::new(tmp.path()));
+        second.create(tmp.path().join("src/jobs/b.rs"), "b");
+
+        second.revert(Flags::default()).unwrap();
+
+        assert!(tmp.path().join("src/jobs/a.rs").exists());
+    }
+
+    #[test]
+    fn a_missing_orphan_loses_its_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, _) = generated_v1(&tmp);
+        fs::remove_file(&old).unwrap();
+
+        renamed_v2(&tmp).revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join(provenance::MANIFEST_PATH).exists());
+    }
+
+    #[test]
+    fn a_stale_entry_alone_is_still_pruned() {
+        // Nothing to remove, but the entry for a missing file must go.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old = tmp.path().join("src/old.rs");
+        let mut v1 = sole(Plan::new(tmp.path()));
+        v1.create(old.clone(), "x");
+        v1.execute(Flags::default()).unwrap();
+        fs::remove_file(&old).unwrap();
+
+        sole(Plan::new(tmp.path()))
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join(provenance::MANIFEST_PATH).exists());
+    }
+
+    #[test]
+    fn a_swept_file_no_longer_keeps_a_dependency_alive() {
+        // `old.rs` used the crate. It goes with this destroy, so it is not
+        // evidence that the crate is still needed.
+        no_db_env(|| {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cargo = tmp.path().join("Cargo.toml");
+            fs::write(
+                &cargo,
+                "[package]\nname = \"app\"\n\n[dependencies]\nfoo-crate = \"1\"\n",
+            )
+            .unwrap();
+            let mut v1 = sole(Plan::new(tmp.path()));
+            v1.create(tmp.path().join("src/old.rs"), "use foo_crate::X;\n");
+            v1.execute(Flags::default()).unwrap();
+
+            let mut v2 = sole(Plan::new(tmp.path()));
+            v2.push_revert(Revert::CargoDeps {
+                path: cargo.clone(),
+                names: vec!["foo-crate".to_owned()],
+                owner_dir: tmp.path().join("src/models"),
+            });
+            v2.revert(Flags::default()).unwrap();
+
+            assert!(!tmp.path().join("src/old.rs").exists());
+            assert!(
+                !fs::read_to_string(&cargo).unwrap().contains("foo-crate"),
+                "the dependency must go with its last user"
+            );
+        });
+    }
+
+    #[test]
+    fn only_the_first_claim_in_a_process_is_sole() {
+        let claimed = AtomicBool::new(false);
+        let (_tmp, mut first) = fixture();
+        let (_tmp2, mut second) = fixture();
+
+        assert!(first.claim_with(&claimed));
+        assert!(first.sole_resource);
+        assert!(!second.claim_with(&claimed), "one plan per process");
+        assert!(!second.sole_resource);
     }
 }
