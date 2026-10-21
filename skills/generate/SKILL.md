@@ -130,9 +130,10 @@ bundled `libsqlite3-sys`, `autumn-web/sqlite`, no `pq-sys`), a generated
 newtypes that are `Copy`, deref to the wrapped type, and are
 `#[serde(transparent)]` (`uuid::Uuid` and `rust_decimal::Decimal` are foreign
 types no crate but their own can convert for SQLite). `--searchable` works via
-FTS5 (#1910); UUID primary keys and `--sharded` remain Postgres-only. A
-scaffolded SQLite app's `tests/<model>.rs` still uses the Postgres-only
-`TestDb`, so `cargo test` on it does not compile yet (#2555).
+FTS5 (#1910); `--id uuid` works too (#2555): the database fills the id with a
+`randomblob` default. `--sharded` remains Postgres-only. A scaffolded SQLite
+app's `tests/<model>.rs` uses the SQLite `TestDb` (a temp-file database), so it
+runs in a plain `cargo test` with no Docker.
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and

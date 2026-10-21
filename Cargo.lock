@@ -855,6 +855,7 @@ dependencies = [
  "autumn-macros",
  "autumn-macros-model",
  "autumn-macros-repository",
+ "autumn-schema-core",
  "axum",
  "base64 0.23.1",
  "bcrypt",

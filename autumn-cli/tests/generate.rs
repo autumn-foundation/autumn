@@ -2065,10 +2065,8 @@ fn generate_model_help_shows_example() {
 ///    `autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}`, and the
 ///    generated `enum` carries `Text`/`Sqlite` (not `Pg`) conversions.
 ///
-/// `cargo check`, not `--all-targets`: the scaffold's `tests/<model>.rs` smoke
-/// test still uses `autumn_web::test::TestDb`, a Postgres-only testcontainer.
-/// Issue #2555 tracks a `SQLite`-native harness. See
-/// `docs/guide/sqlite-in-production.md`.
+/// `cargo check` only. The scaffold's smoke tests have their own run in
+/// [`generated_sqlite_scaffold_smoke_tests_pass`] (issue #2555).
 ///
 /// Ignored by default; run with:
 /// `cargo test -p autumn-cli --test generate generated_sqlite_scaffold_cargo_checks -- --ignored --exact`
@@ -2115,6 +2113,28 @@ fn generated_sqlite_scaffold_cargo_checks() {
         ],
     );
 
+    // A UUID-keyed model (issue #2555) generates and compiles on SQLite too.
+    run_autumn_with_env(
+        &project,
+        &[
+            "generate",
+            "model",
+            "Ticket",
+            "title:String",
+            "--id",
+            "uuid",
+        ],
+        &[
+            ("DATABASE_URL", "sqlite://./app.db"),
+            ("AUTUMN_DATABASE__URL", "sqlite://./app.db"),
+        ],
+    );
+    let ticket = fs::read_to_string(project.join("src/models/ticket.rs")).unwrap();
+    assert!(
+        ticket.contains("pub id: autumn_web::db::sqlite_types::SqliteUuid,"),
+        "uuid key must render the SQLite newtype:\n{ticket}"
+    );
+
     let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
     assert!(
         cargo.contains("libsqlite3-sys"),
@@ -2150,6 +2170,74 @@ fn generated_sqlite_scaffold_cargo_checks() {
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
+}
+
+/// A scaffolded `SQLite` app runs its own smoke tests with a plain `cargo test`
+/// (issue #2555). The tests use the `SQLite` `TestDb` and need no Docker.
+///
+/// The HTML scaffold covers the index, enum, unique-violation and write-path
+/// tests. The `--api` scaffold covers the paginated list seed.
+///
+/// Ignored by default; run with:
+/// `cargo test -p autumn-cli --test generate generated_sqlite_scaffold_smoke_tests_pass -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-tests a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_sqlite_scaffold_smoke_tests_pass() {
+    let (_tmp, project) = fresh_project("sqlite-smoke");
+    patch_generated_cargo_toml(&project);
+    fs::write(
+        project.join("autumn.toml"),
+        "[database]\nprimary_url = \"sqlite://./app.db\"\n",
+    )
+    .unwrap();
+    let envs = [
+        ("DATABASE_URL", "sqlite://./app.db"),
+        ("AUTUMN_DATABASE__URL", "sqlite://./app.db"),
+    ];
+    run_autumn_with_env(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Widget",
+            "name:String:unique",
+            "token:Uuid",
+            "price:decimal{10,2}",
+            "status:enum{draft,published}",
+            "at:DateTime",
+            "payload:json",
+            "ratio:f64",
+            "active:bool",
+        ],
+        &envs,
+    );
+    run_autumn_with_env(
+        &project,
+        &["generate", "scaffold", "Gadget", "label:String", "--api"],
+        &envs,
+    );
+
+    let test = Command::new("cargo")
+        .args(["test", "--tests"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo test");
+    let stdout = String::from_utf8_lossy(&test.stdout);
+    assert!(
+        test.status.success(),
+        "cargo test failed on the generated SQLite scaffold:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&test.stderr),
+    );
+    // Not ignored: the DB-backed tests really ran.
+    assert!(
+        stdout.contains("widgets_index_renders_scaffolded_rows ... ok"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("gadgets_api_list_paginates_against_a_real_database ... ok"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("0 ignored"), "{stdout}");
 }
 
 /// Slow end-to-end check: scaffold a fresh project, run `autumn generate

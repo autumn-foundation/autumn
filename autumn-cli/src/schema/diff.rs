@@ -3791,8 +3791,9 @@ fn pk_kind_for(column: &Column) -> Option<IdKind> {
 }
 
 /// Whether a UUID primary-key column's stored default is *exactly* the Autumn model
-/// convention `gen_random_uuid()` — the value `parse::convention_default` records for
-/// a Postgres UUID `#[id]` and the string introspection preserves verbatim
+/// convention `gen_random_uuid()` (Postgres) or the `SQLite` `randomblob` v4
+/// expression — the value `parse::convention_default` records for
+/// a UUID `#[id]` and the string introspection preserves verbatim
 /// (`normalize_default` keeps it as-is). Only then may the DDL emitter collapse the
 /// column into the `IdKind::Uuid` shape (`UUID PRIMARY KEY DEFAULT
 /// gen_random_uuid()`); a UUID PK with any other default — or none — is rendered as an
@@ -3800,7 +3801,9 @@ fn pk_kind_for(column: &Column) -> Option<IdKind> {
 fn is_convention_uuid_default(column: &Column) -> bool {
     matches!(
         &column.default,
-        Some(ColumnDefault::Sql(sql)) if sql.trim() == "gen_random_uuid()"
+        Some(ColumnDefault::Sql(sql))
+            if sql.trim() == "gen_random_uuid()"
+                || sql.trim() == autumn_schema_core::SQLITE_UUID_V4_SQL
     )
 }
 
@@ -5988,6 +5991,39 @@ mod tests {
             up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
             "uuid PK: {up}"
         );
+    }
+
+    #[test]
+    fn create_table_uuid_pk_renders_the_v4_expression_on_sqlite() {
+        let mut t = Table::new("posts", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Uuid);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql(
+            autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        ));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::CreateTable(t)],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4)))"),
+            "uuid PK: {up}"
+        );
+        // The shape owns the default: it is not appended a second time.
+        assert_eq!(up.matches("randomblob(4)").count(), 1, "{up}");
+    }
+
+    #[test]
+    fn pk_kind_for_uuid_accepts_the_sqlite_convention_default() {
+        let mut conv = col("id", ColumnType::Uuid);
+        conv.primary_key = true;
+        conv.default = Some(ColumnDefault::Sql(
+            autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        ));
+        assert_eq!(pk_kind_for(&conv), Some(IdKind::Uuid));
     }
 
     #[test]

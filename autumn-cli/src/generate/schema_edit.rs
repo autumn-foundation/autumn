@@ -253,6 +253,7 @@ fn existing_schema_columns(schema: &str, table: &str) -> Vec<String> {
 /// honouring the caller-supplied `id_type`.
 /// For `Uuid`, prepends a comment documenting the index-locality trade-off and
 /// the `UUIDv7` upgrade path.
+#[cfg(test)]
 #[must_use]
 pub fn create_table_sql_with_metadata_and_id(
     table: &str,

@@ -228,18 +228,10 @@ fn plan_model_with_options_impl(
     // compile error in a file the author did not write.
     metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
 
-    // A UUID primary key needs app-side id generation on SQLite (no
-    // `gen_random_uuid()`), which the runtime slice deferred to #2555;
-    // reject `--id uuid` on a SQLite app at generate time rather than emit a
-    // `TEXT PRIMARY KEY` column that would accept NULL/omitted ids (AC #4).
-    if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
-        return Err(super::sqlite_uuid_pk_unsupported_error());
-    }
     // `comments:commentable` on a UUID-keyed model would plan every file and
     // then hand back a project that does not compile: the shared table stores
     // `commentable_id BIGINT` and the generated helpers take `parent_id: i64`.
-    // Refused here, before anything is written, exactly as the SQLite/UUID
-    // combination above is.
+    // Refused here, before anything is written.
     if options.id_type == IdType::Uuid && fields.iter().any(|f| f.kind.is_commentable()) {
         return Err(super::uuid_pk_commentable_unsupported_error());
     }
@@ -3019,7 +3011,7 @@ fn render_model_file(
     }
     let _ = writeln!(out, "pub struct {name} {{");
     out.push_str("    #[id]\n");
-    let _ = writeln!(out, "    pub id: {},", id_type.rust_type());
+    let _ = writeln!(out, "    pub id: {},", id_type.rust_type_for(backend));
     for f in fields {
         if metadata.indexes.contains(&f.name) {
             out.push_str("    #[indexed]\n");
@@ -4806,17 +4798,15 @@ mod tests {
         });
     }
 
-    /// `generate model --id uuid` on a `SQLite` app is rejected at generate time
-    /// citing #2555 (issue #1614 AC #4): `SQLite` has no `gen_random_uuid()` and
-    /// the generated `New*` insert type omits `#[id]` fields, so a `TEXT PRIMARY
-    /// KEY` column would accept NULL/omitted ids. App-side UUID generation is
-    /// tracked in #2555 — the runtime slice (#1905) deferred it and has since
-    /// closed, so the message must not send a reader to a closed issue.
+    /// `generate model --id uuid` on a `SQLite` app generates a key the database
+    /// fills in (issue #2555). `SQLite` has no `gen_random_uuid()`, so the column
+    /// default is a `randomblob` expression. `NOT NULL` closes the hole a bare
+    /// `TEXT PRIMARY KEY` leaves: `SQLite` lets such a key be `NULL`.
     #[test]
-    fn sqlite_app_uuid_primary_key_is_rejected_citing_the_tracking_issue() {
+    fn sqlite_app_uuid_primary_key_generates() {
         with_no_db_env(|| {
             let tmp = project_with_db_url("sqlite://app.db");
-            let err = plan_model_with_options(
+            let plan = plan_model_with_options(
                 tmp.path(),
                 "Post",
                 &["title:String".into()],
@@ -4826,22 +4816,34 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap_err();
-            let msg = err.to_string();
+            .expect("--id uuid must generate on SQLite");
+            plan.execute(Flags::default()).unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
             assert!(
-                matches!(err, GenerateError::Config(_)),
-                "expected Config error, got: {err:?}"
+                up.contains("id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4)))"),
+                "up.sql: {up}"
             );
-            assert!(msg.contains("2555"), "must cite issue #2555: {msg}");
+            assert!(!up.contains("gen_random_uuid"), "up.sql: {up}");
+            assert!(!up.contains("UUID PRIMARY KEY"), "up.sql: {up}");
+
+            let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
             assert!(
-                msg.contains("SQLite") && msg.contains("UUID"),
-                "message must be actionable: {msg}"
+                model.contains("pub id: autumn_web::db::sqlite_types::SqliteUuid,"),
+                "model: {model}"
             );
+            assert!(!model.contains("uuid::Uuid"), "model: {model}");
+
+            let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+            assert!(schema.contains("id -> Text,"), "schema: {schema}");
         });
     }
 
-    /// The default INTEGER primary key still works on a `SQLite` app — only the
-    /// uuid key is gated, so `generate model` without `--id` is unaffected.
+    /// The default INTEGER primary key still works on a `SQLite` app.
     #[test]
     fn sqlite_app_integer_primary_key_still_works() {
         with_no_db_env(|| {

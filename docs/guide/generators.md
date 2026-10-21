@@ -1144,10 +1144,11 @@ Everything `model` produces, plus:
   `autumn_web::test::{TestApp, TestClient, TestDb}`: it boots a throwaway
   Postgres database, fires a request at a stand-in for the scaffolded index
   route, and asserts a real response — no running server, no env var, no
-  silent skip. `cargo test` reports it as `ignored` with an explicit reason
-  (Docker isn't assumed to be available); run `cargo test -- --ignored` to
-  execute it for real. `--api` scaffolds get the JSON equivalent, asserting
-  against `GET /api/<plural>`.
+  silent skip. On Postgres, `cargo test` reports it as `ignored` with an
+  explicit reason (Docker isn't assumed to be available); run
+  `cargo test -- --ignored` to execute it for real. On a SQLite app it uses a
+  temp-file database, so a plain `cargo test` runs it. `--api` scaffolds get the
+  JSON equivalent, asserting against `GET /api/<plural>`.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op. By default, the scaffold registers only

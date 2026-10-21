@@ -118,19 +118,6 @@ fn format_collisions(paths: &[PathBuf]) -> String {
     out
 }
 
-/// The generate-time rejection for a UUID primary key (`--id uuid`) on a
-/// `SQLite`-backed app (`SQLite` foundation, issue #1614 AC #4).
-///
-/// Postgres emits `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, so ids are
-/// server-generated. `SQLite` has no `uuid` type nor a `gen_random_uuid()`
-/// default, and the `#[model]` macro's generated `New*` insert type omits
-/// `#[id]` fields — so on `SQLite` an inserted row would get a NULL/omitted id
-/// (a non-integer `PRIMARY KEY` is not implicitly `NOT NULL` in `SQLite`).
-/// Making it work needs app-side UUID generation in the repository insert
-/// codegen, which the `SQLite` runtime slice deferred and #2555 now carries.
-/// Rather than emit a `TEXT PRIMARY KEY` column
-/// that silently accepts NULL ids, generation fails here with an actionable
-/// message (AC #4).
 #[must_use]
 /// `--id uuid` cannot be combined with `comments:commentable`.
 ///
@@ -145,19 +132,6 @@ pub fn uuid_pk_commentable_unsupported_error() -> GenerateError {
  )
 }
 
-pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
-    GenerateError::Config(
-        "UUID primary keys (--id uuid) are not yet supported on SQLite apps; Postgres uses \
-         `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, but SQLite has no uuid type nor a \
-         gen_random_uuid() default, and the generated `New*` insert type omits `#[id]` \
-         fields — so inserted rows would get NULL/omitted ids. App-side UUID generation is \
-         tracked in \
-         https://github.com/autumn-foundation/autumn/issues/2555 — re-run without `--id uuid` to use \
-         the default INTEGER PRIMARY KEY AUTOINCREMENT, or target a Postgres database."
-            .to_owned(),
-    )
-}
-
 /// The generate-time rejection for a sharded model (`--sharded`) on a
 /// `SQLite`-backed app (`SQLite` foundation, issue #1614 AC #4).
 ///
@@ -166,8 +140,8 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
 /// `[[database.shards]]` topology. But `DatabaseConfig::validate_backend_consistency`
 /// rejects *any* `database.shards` against a `SQLite` primary, so no valid
 /// `SQLite` config can ever use a generated sharded resource. Unlike UUID ids
-/// (#2555) — and unlike FTS, now supported on `SQLite` via FTS5 (#1910), and
-/// every field kind, now converted (#1924) — this is **not** a deferred slice:
+/// (#2555), FTS (#1910) and every field kind (#1924), which now generate on
+/// `SQLite`, this is **not** a deferred slice:
 /// `SQLite` is single-host / single-writer, so
 /// horizontal sharding is Postgres-only and permanently out of scope for
 /// `SQLite` (see `docs/guide/sqlite-in-production.md`). Rather than emit a
