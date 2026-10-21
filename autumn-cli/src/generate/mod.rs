@@ -1123,4 +1123,33 @@ mod tests {
             DatabaseBackend::Postgres
         );
     }
+
+    /// Drift guard for the Echo linked-copies record on `tauri`'s and
+    /// `tauri_mobile`'s placeholder icon assets (below Echo's rule of three
+    /// at 2 instances, see issue #2509): both generators hand-copied the same
+    /// PNG/ICO/ICNS bytes and the same placeholder SVG. If either generator's
+    /// copy changes without the other, this fails — change both or neither.
+    #[test]
+    fn placeholder_icon_assets_match_between_desktop_and_mobile_tauri_generators() {
+        assert_eq!(
+            tauri::PLACEHOLDER_PNG,
+            tauri_mobile::PLACEHOLDER_PNG,
+            "tauri's and tauri_mobile's placeholder PNG bytes have drifted"
+        );
+        assert_eq!(
+            tauri::PLACEHOLDER_ICO,
+            tauri_mobile::PLACEHOLDER_ICO,
+            "tauri's and tauri_mobile's placeholder ICO bytes have drifted"
+        );
+        assert_eq!(
+            tauri::PLACEHOLDER_ICNS,
+            tauri_mobile::PLACEHOLDER_ICNS,
+            "tauri's and tauri_mobile's placeholder ICNS bytes have drifted"
+        );
+        assert_eq!(
+            tauri::render_placeholder_icon_svg(),
+            tauri_mobile::render_placeholder_icon_svg(),
+            "tauri's and tauri_mobile's placeholder SVG have drifted"
+        );
+    }
 }
