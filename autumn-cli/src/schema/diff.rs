@@ -3686,6 +3686,14 @@ fn default_sql(default: &ColumnDefault, backend: Backend) -> String {
             Backend::Postgres => "NOW()".to_owned(),
             Backend::Sqlite => "CURRENT_TIMESTAMP".to_owned(),
         },
+        // `SQLite` takes an expression default only inside parentheses, and its
+        // catalog returns this one without them.
+        ColumnDefault::Sql(sql)
+            if backend == Backend::Sqlite
+                && sql.trim() == autumn_schema_core::SQLITE_UUID_V4_SQL =>
+        {
+            format!("({})", sql.trim())
+        }
         ColumnDefault::Sql(sql) => sql.clone(),
     }
 }
@@ -3786,6 +3794,9 @@ fn pk_kind_for(column: &Column) -> Option<IdKind> {
         ColumnType::Int64 if column.default.is_none() => Some(IdKind::BigSerial),
         ColumnType::Int32 if is_nextval_default(column) => Some(IdKind::Serial),
         ColumnType::Uuid if is_convention_uuid_default(column) => Some(IdKind::Uuid),
+        // `SQLite` introspection reads the generated UUID key as `TEXT`. Its
+        // default is the one marker that tells it from a plain text key.
+        ColumnType::Text if is_sqlite_uuid_default(column) => Some(IdKind::Uuid),
         _ => None,
     }
 }
@@ -3804,6 +3815,15 @@ fn is_convention_uuid_default(column: &Column) -> bool {
         Some(ColumnDefault::Sql(sql))
             if sql.trim() == "gen_random_uuid()"
                 || sql.trim() == autumn_schema_core::SQLITE_UUID_V4_SQL
+    )
+}
+
+/// Whether a column's default is exactly the `SQLite` `randomblob` v4 UUID
+/// expression (issue #2555).
+fn is_sqlite_uuid_default(column: &Column) -> bool {
+    matches!(
+        &column.default,
+        Some(ColumnDefault::Sql(sql)) if sql.trim() == autumn_schema_core::SQLITE_UUID_V4_SQL
     )
 }
 
@@ -6014,6 +6034,34 @@ mod tests {
         );
         // The shape owns the default: it is not appended a second time.
         assert_eq!(up.matches("randomblob(4)").count(), 1, "{up}");
+    }
+
+    /// `SQLite` introspection reads the generated UUID key as `TEXT`, not `Uuid`.
+    /// A table rebuild from that shape must still write the key as the shape does,
+    /// with the default in parentheses. A bare function call is a syntax error.
+    #[test]
+    fn rebuild_from_an_introspected_sqlite_uuid_key_keeps_the_parenthesized_default() {
+        let mut t = Table::new("posts", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Text);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql(
+            autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        ));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        assert_eq!(single_pk_column(&t).map(|(_, k)| k), Some(IdKind::Uuid));
+        let body = render_create_table_body("posts", &t, Backend::Sqlite);
+        assert!(
+            body.contains("id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4)))"),
+            "{body}"
+        );
+        // A non-key column with the same default is parenthesized too.
+        let mut other = col("ref", ColumnType::Text);
+        other.default = Some(ColumnDefault::Sql(
+            autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        ));
+        let def = render_column_def(&other, Backend::Sqlite, false);
+        assert!(def.contains("DEFAULT (lower(hex(randomblob(4)))"), "{def}");
     }
 
     #[test]
