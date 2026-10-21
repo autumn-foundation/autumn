@@ -1102,6 +1102,18 @@ impl Plan {
         touched_dirs: &mut Vec<PathBuf>,
         removed: &mut Removed,
     ) -> Result<(), GenerateError> {
+        // The reverts below were computed with every swept file gone (the
+        // dependency scans skip them). If one changed since the plan was
+        // made, those reverts are wrong for it, so change nothing at all.
+        let changed: Vec<PathBuf> = plan
+            .swept
+            .iter()
+            .filter(|(path, digest)| !sweep::still_sweepable(&self.project_root, path, digest))
+            .map(|(path, _)| path.clone())
+            .collect();
+        if !changed.is_empty() {
+            return Err(GenerateError::Diverged(changed));
+        }
         for path in &plan.files_to_remove {
             let expected = plan.swept.get(path);
             let swept = expected.is_some();
@@ -4211,6 +4223,24 @@ mod tests {
         .unwrap();
         assert!(old.exists());
         assert!(provenance::Provenance::load(tmp.path()).contains("src/widgets/old.rs"));
+    }
+
+    #[test]
+    fn a_swept_file_edited_after_planning_refuses_the_whole_destroy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, kept) = generated_v1(&tmp);
+        let v2 = renamed_v2(&tmp);
+        let plan = v2.compute_revert_plan(false);
+        fs::write(&old, "// saved late\n").unwrap();
+
+        let mut touched = Vec::new();
+        let mut removed = Removed::default();
+        let err = v2
+            .apply_revert(&plan, &mut touched, &mut removed)
+            .unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(ref paths) if paths == &vec![old.clone()]));
+        assert!(old.exists() && kept.exists(), "nothing is changed");
     }
 
     #[test]

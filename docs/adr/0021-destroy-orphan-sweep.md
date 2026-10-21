@@ -82,8 +82,9 @@ Six hats:
    - `owned`: delete when the digest matches, the plan creates a file in the
      same directory, and no `mod` line declares it. Otherwise warn and keep.
 4. When `destroy` refuses (diverged files, no `--force`), the sweep removes
-   nothing. `--dry-run` lists the sweep. Each delete checks the path again
-   first.
+   nothing. `--dry-run` lists the sweep. Before it changes anything,
+   `destroy` checks each swept file again. If one changed, it refuses, because
+   the dependency reverts assumed that file was gone.
 
 ## Consequences
 

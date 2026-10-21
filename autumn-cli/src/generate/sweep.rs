@@ -111,16 +111,25 @@ impl Planned {
     /// Whether the plan handles the file at `key`.
     ///
     /// An exact match does. A match that differs only in ASCII case does when
-    /// both paths reach one file, as on a case-insensitive file system. On a
-    /// case-sensitive one they are two files, and the old one is an orphan.
+    /// both spellings reach one directory entry, as on a case-insensitive
+    /// file system. Two entries are two names to remove, even when they are
+    /// hard links to one file, so the old one is then an orphan.
     fn names(&self, key: &str, path: &Path) -> bool {
         if self.keys.contains(key) {
             return true;
         }
         let lower = key.to_ascii_lowercase();
-        self.folded
-            .iter()
-            .any(|(k, planned)| *k == lower && same_file(path, planned))
+        self.folded.iter().any(|(k, planned)| {
+            *k == lower && same_file(path, planned) && !(listed(path) && listed(planned))
+        })
+    }
+}
+
+/// Whether the directory of `path` lists an entry with exactly its name.
+fn listed(path: &Path) -> bool {
+    match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) => has_exact_entry(dir, name),
+        _ => false,
     }
 }
 
@@ -638,9 +647,10 @@ mod tests {
     }
 
     #[test]
-    fn a_case_only_match_that_is_one_file_is_left_to_the_plan() {
-        // On a case-insensitive file system both spellings reach one file.
-        // A hard link gives the same shape on any host.
+    fn a_case_only_match_is_one_file_only_when_it_is_one_entry() {
+        // A case-insensitive file system lists one entry for both spellings:
+        // the plan removes it. A case-sensitive one can hold two hard-linked
+        // entries: removing `post.rs` leaves `Post.rs`, so it is an orphan.
         let dir = tmp();
         let root = dir.path();
         let mut p = Provenance::default();
@@ -653,13 +663,18 @@ mod tests {
             Some(Scope::Owned),
         );
         let new = root.join("src/models/post.rs");
-        if !new.exists() && fs::hard_link(&old, &new).is_err() {
+        let one_entry = new.exists();
+        if !one_entry && fs::hard_link(&old, &new).is_err() {
             return; // no hard links on this file system; nothing to test.
         }
 
         let sweep = plan_sweep(root, &p, ME, &[create(root, "src/models/post.rs")], &[]);
 
-        assert_eq!(sweep, Sweep::default());
+        if one_entry {
+            assert_eq!(sweep, Sweep::default());
+        } else {
+            assert_eq!(sweep.remove, vec![old]);
+        }
     }
 
     #[test]
