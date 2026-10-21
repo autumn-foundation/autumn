@@ -5083,6 +5083,27 @@ pub async fn drain_ready_repository_commit_hooks(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    fn plain_identifiers_are_accepted() {
+        super::assert_plain_identifier("posts");
+        super::assert_plain_identifier("Post_2");
+    }
+
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    #[should_panic(expected = "plain identifier")]
+    fn an_empty_identifier_is_rejected() {
+        super::assert_plain_identifier("");
+    }
+
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    #[should_panic(expected = "plain identifier")]
+    fn sql_in_an_identifier_is_rejected() {
+        super::assert_plain_identifier("t; DROP TABLE x");
+    }
+
     use super::*;
 
     fn cleanup_probe_job(

@@ -523,6 +523,7 @@ mod tenant_cell_unit;
 mod tenant_db_bulkhead;
 mod test_app_integration;
 mod test_db_integration;
+mod test_db_reset_table;
 mod throttle_route;
 mod time_zone_integration;
 #[cfg(feature = "tls")]
