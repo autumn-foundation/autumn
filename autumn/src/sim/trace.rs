@@ -256,6 +256,15 @@ pub(crate) fn alias(kind: &str, token: &str) {
 struct Router;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Router {
+    // The answer of `enabled` depends on the live captures, so it must run for
+    // each event and not once for each callsite.
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
         target_capture().is_some_and(|capture| capture.wants(metadata.target()))
     }
@@ -399,6 +408,22 @@ mod tests {
         }
         let ((), trace) = capture(Noisy(Box::pin(async {}))).await;
         assert_eq!(trace.len(), 1, "{trace:?}");
+    }
+
+    /// One callsite that a capture rejects first is still recorded by a later
+    /// capture that wants it.
+    #[tokio::test(start_paused = true)]
+    async fn sim_trace_capture_filters_each_event_not_each_callsite() {
+        fn emit() {
+            tracing::info!(target: "autumn_web::x", "from one callsite");
+        }
+        let ((), outer) = capture_targets(&["other"], async {
+            emit();
+            let ((), inner) = capture(async { emit() }).await;
+            assert_eq!(inner.len(), 1, "{inner:?}");
+        })
+        .await;
+        assert!(outer.is_empty(), "{outer:?}");
     }
 
     /// Tasks the captured future spawns are recorded too.
