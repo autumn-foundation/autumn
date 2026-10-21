@@ -1108,13 +1108,23 @@ impl CustomDomainTask {
             }),
             now_unix,
         );
+        // Copy orders the ledger lacks, such as those from before an upgrade.
+        // Do it before a domain can be offboarded and take its record away.
+        let recent = self
+            .registry
+            .list()
+            .into_iter()
+            .flat_map(|d| d.issuance_attempts_unix)
+            .collect();
+        if let Err(e) = self.registry.merge_global_attempts(recent, now_unix).await {
+            tracing::warn!(error = %e, "cannot copy orders into the custom-domain attempt ledger");
+        }
         // The ledger also holds orders for offboarded domains.
         match self.registry.load_global_attempts().await {
             Ok(ledger) => self.limiter.hydrate_global(ledger, now_unix),
             Err(e) => tracing::warn!(
                 error = %e,
-                "could not read the custom-domain attempt ledger; orders for offboarded domains \
-                 do not count against the budget"
+                "cannot read the custom-domain attempt ledger; offboarded orders do not count"
             ),
         }
     }
@@ -1162,8 +1172,8 @@ impl CustomDomainTask {
             tracing::warn!(
                 hostname,
                 error = %e,
-                "could not persist the global attempt ledger; the order will not count after an \
-                 offboarding and a restart"
+                "cannot persist the attempt ledger; this order is lost if the domain goes and the \
+                 process restarts"
             );
         }
         if let Err(e) = self
@@ -1501,6 +1511,19 @@ mod tests {
         }
         fn delete<'a>(&'a self, hostname: &'a str) -> StoreFuture<'a, std::io::Result<()>> {
             self.inner.delete(hostname)
+        }
+        fn load_attempts(&self) -> StoreFuture<'_, std::io::Result<Vec<i64>>> {
+            self.inner.load_attempts()
+        }
+        fn append_attempt(&self, at_unix: i64) -> StoreFuture<'_, std::io::Result<()>> {
+            self.inner.append_attempt(at_unix)
+        }
+        fn merge_attempts(
+            &self,
+            attempts: Vec<i64>,
+            now_unix: i64,
+        ) -> StoreFuture<'_, std::io::Result<()>> {
+            self.inner.merge_attempts(attempts, now_unix)
         }
     }
 

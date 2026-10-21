@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use autumn_web::acme::store::{AcmeStore as _, CertId, FsAcmeStore};
 
 use autumn_web::acme::tenant_domains::CustomDomainTask;
+use autumn_web::custom_domain::CustomDomainStore as _;
 use autumn_web::custom_domain::{
     CustomDomainCertCache, CustomDomainRegistry, DomainIssuer, DomainStatus, DomainVerifier,
     ExpectedIngress, IssuanceLimiter, IssuedCertificate, MemoryCustomDomainStore, ObservedTarget,
@@ -699,6 +700,71 @@ async fn an_offboarded_domains_order_still_counts_after_a_restart() {
         issuer.count(),
         1,
         "an offboarded domain's order must still count after a restart"
+    );
+}
+
+#[tokio::test]
+async fn an_order_from_before_the_ledger_survives_offboarding_and_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let backing = Arc::new(MemoryCustomDomainStore::new());
+    let store = || Arc::clone(&backing) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>;
+    let registry = Arc::new(CustomDomainRegistry::new(store(), 100));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(8));
+    let issuer = ScriptedIssuer::new(&[]);
+    let verifier = TableVerifier::new(&[("second.clientco.com", points_here())]);
+
+    // An old version left an order on the record and no ledger.
+    let record = registry
+        .register("first.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry
+        .record_attempt_for_registration(
+            "first.clientco.com",
+            "tenant-a",
+            record.verification_token.as_deref(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert!(backing.load_attempts().await.unwrap().is_empty());
+
+    // First boot after the upgrade, then the domain goes.
+    let first = task_over(
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+        Arc::clone(&certs),
+        Arc::clone(&verifier) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    first.hydrate_limiter(NOW + 5).await;
+    first.offboard("first.clientco.com").await.unwrap();
+
+    // Second restart: no record names the order.
+    let restarted = Arc::new(CustomDomainRegistry::new(store(), 100));
+    restarted.load().await.unwrap();
+    let mut after = task_over(
+        Arc::clone(&restarted),
+        cache,
+        certs,
+        verifier as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    after.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
+    after.hydrate_limiter(NOW + 10).await;
+    restarted
+        .register("second.clientco.com", "tenant-b", NOW + 10)
+        .await
+        .unwrap();
+    after.tick(NOW + 10).await;
+
+    assert_eq!(issuer.count(), 0, "the old order must still count");
+    let second = restarted.get("second.clientco.com").unwrap();
+    assert!(
+        second.failure_reason.as_deref().unwrap().contains("budget"),
+        "{second:?}"
     );
 }
 
