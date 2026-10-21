@@ -835,6 +835,43 @@ mod tests {
     }
 
     #[test]
+    fn the_helper_on_a_union_field_is_refused() {
+        let out = err_of(quote! {
+            union U { #[openapi_schema(crate = "web_new")] a: u32, b: f32 }
+        });
+        assert!(out.contains("struct or enum only"), "{out}");
+    }
+
+    #[test]
+    fn a_union_is_refused_for_its_shape() {
+        let out = err_of(quote! { union U { a: u32, b: f32 } });
+        assert!(out.contains("structs and enums"), "{out}");
+    }
+
+    #[test]
+    fn a_generic_type_is_refused_with_an_override() {
+        let out = err_of(quote! {
+            #[openapi_schema(crate = "web_new")]
+            struct G<T> { q: T }
+        });
+        assert!(out.contains("generic"), "{out}");
+    }
+
+    #[test]
+    fn input_that_is_not_an_item_is_refused() {
+        let out = derive_str(quote! { not an item });
+        assert!(out.contains("compile_error"), "{out}");
+    }
+
+    #[test]
+    fn the_helper_on_a_tuple_field_is_refused() {
+        let out = err_of(quote! {
+            struct T(#[openapi_schema(crate = "web_new")] String);
+        });
+        assert!(out.contains("struct or enum only"), "{out}");
+    }
+
+    #[test]
     fn a_bare_helper_attribute_is_refused() {
         helper_err_of(quote! {
             #[openapi_schema]
