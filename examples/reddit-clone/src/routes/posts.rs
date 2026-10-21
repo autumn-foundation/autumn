@@ -1730,6 +1730,8 @@ fn is_post_slug_conflict(err: &AutumnError) -> bool {
 /// obvious slug in one query, not to enforce uniqueness by itself — that is
 /// [`POSTS_SLUG_UNIQUE_CONSTRAINT`]'s job, with the caller retrying this
 /// function (via [`is_post_slug_conflict`]) when the database disagrees.
+/// The `posts_resolve_slug` trigger (#2573) now also suffixes a taken slug, so
+/// the retry is a second guard.
 async fn unique_slug(
     base: &str,
     subreddit_id: i64,
