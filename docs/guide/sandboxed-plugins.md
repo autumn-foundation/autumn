@@ -339,6 +339,7 @@ would the GET and the host discards the body for you.
 | `memory_bytes` | one instance's linear memory | the guest's `memory.grow` fails; usually a trap, then 502 |
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
 | `max_response_bytes` | the frame accepted back. It also limits each frame the guest writes. The host refuses at load a manifest when a call frame is larger than `2 × max_response_bytes + 4096`. The frame is `outbound_request_bytes` × 6, `kv_value_bytes`, or a full row (`db`, `jobs`), plus 4096 | 502 for an oversized frame; 504 for one that never ends |
+| frame shape | the host counts the containers and commas of each guest frame before it parses the frame. It refuses a frame with more than 65,536, or nesting deeper than 32 levels. No legal frame comes near either | 502 |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
 | shared guest pool | guests that run at once in the whole process, all plugins together. Default 128. Set it with `plugin_sandbox::set_guest_slots` before you build any plugin, to at most a quarter of `max_blocking_threads` | 503 with `Retry-After`. It can refuse a request that `max_concurrency` allows. The first request to arrive gets the slot, so keep each `max_concurrency` well under the limit |
 | `request_body_timeout_ms` | how long a request may take to send its body | 408, and the permit goes back |
