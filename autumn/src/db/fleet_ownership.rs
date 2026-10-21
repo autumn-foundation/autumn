@@ -377,6 +377,7 @@ impl OwnershipTable {
             .find(|row| row.range == range && row.owner == *owner && row.epoch.get() > floor)
         {
             // Never earlier: a call that timed out may land after a newer one.
+            // So a shorter `ttl` takes effect when the old lease ends.
             row.lease_expires_ms = row.lease_expires_ms.max(lease_expires_ms);
             return Ok(Grant {
                 range,
