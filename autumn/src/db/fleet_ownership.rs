@@ -726,7 +726,7 @@ struct Held {
 }
 
 /// A store call that runs on its own task.
-type PendingCall = tokio::task::JoinHandle<Result<Grant, OwnershipError>>;
+type PendingCall = tokio::task::JoinHandle<()>;
 
 /// The `failed` text of a call that took longer than one renew interval.
 const TIMED_OUT: &str = "the store call timed out";
@@ -920,19 +920,31 @@ impl FleetOwnership {
         let sent = tokio::time::Instant::now();
         let (store, owner, ttl) = (Arc::clone(&self.store), self.owner.clone(), self.ttl);
         let floor_now = floor.load(std::sync::atomic::Ordering::Acquire);
-        let mut call: PendingCall = tokio::spawn(async move {
-            if let Some(epoch) = held {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let call = tokio::spawn(async move {
+            let result = if let Some(epoch) = held {
                 store.renew(range, &owner, epoch, ttl).await
             } else {
                 store.claim(range, &owner, ttl, floor_now).await
-            }
+            };
+            let _ = answer.send(result);
         });
-        let result = match tokio::time::timeout(self.renew_interval(), &mut call).await {
-            Ok(joined) => joined.unwrap_or_else(|error| Err(store_error(error))),
+        // Tracked at once: if this refresh is dropped, the call still runs and
+        // `unsettled` must say so.
+        *pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(call);
+        let result = match tokio::time::timeout(self.renew_interval(), answered).await {
+            Ok(Ok(result)) => {
+                // The call ended. Nothing runs for this range now.
+                *pending.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                result
+            }
+            Ok(Err(_closed)) => {
+                *pending.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                return Outcome::Failed("the store call stopped without an answer".to_owned());
+            }
             Err(_elapsed) => {
                 // The call may still extend the lease at the store. The local
                 // lease does not grow, so serving stays safe.
-                *pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(call);
                 tracing::warn!(range = %range, "fleet slot ownership call timed out");
                 return Outcome::TimedOut;
             }
@@ -1846,6 +1858,22 @@ mod tests {
         // One call for the stuck range, three for the live one.
         let after = stuck.calls.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after - before, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_dropped_in_flight_leaves_its_call_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+        let running = Arc::clone(&a);
+        let refresh = tokio::spawn(async move { running.refresh().await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        refresh.abort();
+        let _ = refresh.await;
+        assert!(a.unsettled(), "the call to the store still runs");
+        stuck.stuck.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!a.unsettled(), "it ended");
     }
 
     #[tokio::test(start_paused = true)]
