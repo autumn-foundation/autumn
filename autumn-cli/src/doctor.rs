@@ -9481,6 +9481,13 @@ pub fn run(opts: DoctorOptions) {
 
     let cli_version = env!("CARGO_PKG_VERSION");
 
+    // The dependency audit runs in its own process group, so Ctrl+C does not
+    // reach it. Stop it here, or it keeps Cargo's package-cache lock.
+    let _ = ctrlc::set_handler(|| {
+        crate::deps::stop_all();
+        std::process::exit(130);
+    });
+
     if !opts.json {
         println!("\u{1F342} autumn doctor\n");
     }

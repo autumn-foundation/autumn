@@ -793,6 +793,7 @@ pub fn spawn_evaluation(root: &Path) -> Running {
     let (sender, receiver) = mpsc::channel();
     let root = root.to_path_buf();
     let stop = StopHandle::default();
+    ACTIVE.register(&stop);
     let worker_stop = stop.clone();
     std::thread::spawn(move || {
         // A closed receiver means the caller moved on. Nothing to report.
@@ -827,6 +828,41 @@ fn await_or_stop(running: &Running, budget: Duration) -> Evaluation {
             checks: Vec::new(),
         }
     })
+}
+
+/// The audits that may still be running.
+static ACTIVE: Registry = Registry(std::sync::Mutex::new(Vec::new()));
+
+/// Stop every audit this process started.
+///
+/// A process that dies on Ctrl+C runs no destructors, and each auditor leads
+/// its own process group, so the terminal does not reach it. The interrupt
+/// handler calls this first.
+pub fn stop_all() {
+    ACTIVE.stop_all();
+}
+
+/// A list of audits to stop together.
+struct Registry(std::sync::Mutex<Vec<StopHandle>>);
+
+impl Registry {
+    fn register(&self, stop: &StopHandle) {
+        let mut handles = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.push(stop.clone());
+    }
+
+    fn stop_all(&self) {
+        let handles = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stop in handles.iter() {
+            stop.stop();
+        }
+    }
 }
 
 /// State shared by an audit thread and the caller that may stop it.
@@ -1652,6 +1688,16 @@ mod tests {
                     nix::sys::signal::Signal::SIGKILL,
                 );
             }
+        }
+
+        #[test]
+        fn stop_all_stops_every_registered_audit() {
+            let registry = Registry(std::sync::Mutex::new(Vec::new()));
+            let (first, second) = (StopHandle::default(), StopHandle::default());
+            registry.register(&first);
+            registry.register(&second);
+            registry.stop_all();
+            assert!(first.is_stopped() && second.is_stopped());
         }
 
         #[test]
