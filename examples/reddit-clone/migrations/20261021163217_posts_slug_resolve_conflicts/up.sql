@@ -2,19 +2,21 @@
 --
 -- `posts_subreddit_id_slug_key` (#2544) rejects a duplicate slug. The HTML
 -- routes retry with a new suffix. The generated repository `save` and
--- `update_by_id` cannot: their hook has no connection. A race there ended in
--- an unhandled unique violation.
+-- `update_by_id` cannot retry: their hook has no connection. A race there
+-- ended in a unique violation.
 --
 -- This trigger gives every write path the same rule. A taken slug gets the
 -- next free `-2`, `-3`, ... suffix. The unique constraint stays as the last
 -- guard.
 --
--- The advisory lock serializes writers per subreddit until commit. A later
--- writer then sees the committed row and picks the next free suffix. The lock
--- is per subreddit, not per slug, so `foo-2` cannot race with a title `foo`.
+-- The advisory lock makes writers of one subreddit wait for each other until
+-- commit. A later writer then sees the committed row and picks the next free
+-- suffix. The lock covers the whole subreddit, not one slug. So `foo-2` and a
+-- title `foo` cannot race.
 --
--- Limit: one UPDATE that sets the same slug on many rows still fails. A row
--- trigger cannot see rows that the same statement changed.
+-- The lock lasts until commit. A transaction that writes posts in two
+-- subreddits must write them in the same order every time. Else two such
+-- transactions can deadlock.
 CREATE FUNCTION posts_resolve_slug() RETURNS trigger AS $$
 DECLARE
     base   TEXT := NEW.slug;

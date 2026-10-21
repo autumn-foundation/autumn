@@ -114,7 +114,7 @@ async fn assert_no_duplicate_slugs(conn: &mut AsyncPgConnection, context: &str) 
 fn pg_pool(url: &str) -> Pool<AsyncPgConnection> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_string());
     Pool::builder(manager)
-        .max_size(4)
+        .max_size(16)
         .build()
         .expect("build pool")
 }
@@ -405,6 +405,7 @@ async fn slow_tx<T>(
 /// Insert one post inside [`slow_tx`]. Returns the stored slug.
 async fn insert_post_slow(
     pool: &Pool<AsyncPgConnection>,
+    author_id: i64,
     subreddit_id: i64,
     title: &str,
     slug: &str,
@@ -413,16 +414,31 @@ async fn insert_post_slow(
     slow_tx(&mut conn, async |conn| {
         let row: Slug = diesel::sql_query(
             "INSERT INTO posts (title, slug, body, author_id, subreddit_id) \
-             VALUES ($1, $2, 'x', 1, $3) RETURNING slug",
+             VALUES ($1, $2, 'x', $3, $4) RETURNING slug",
         )
         .bind::<Text, _>(title)
         .bind::<Text, _>(slug)
+        .bind::<BigInt, _>(author_id)
         .bind::<BigInt, _>(subreddit_id)
         .get_result(conn)
         .await?;
         Ok(row.slug)
     })
     .await
+}
+
+async fn user_id_of(conn: &mut AsyncPgConnection, username: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+    }
+    diesel::sql_query("SELECT id FROM users WHERE username = $1")
+        .bind::<Text, _>(username)
+        .get_result::<Id>(conn)
+        .await
+        .expect("user id")
+        .id
 }
 
 async fn subreddit_id_of(conn: &mut AsyncPgConnection, slug: &str) -> i64 {
@@ -446,13 +462,14 @@ async fn concurrent_identical_inserts_get_distinct_slugs() {
     let pool = pg_pool(&db.urls()[0]);
     let mut conn = pool.get().await.expect("connection");
     let sub_id = subreddit_id_of(&mut conn, "dbrace").await;
+    let author = user_id_of(&mut conn, "racer1").await;
     drop(conn);
 
     let inserts = (0..CONCURRENT_SUBMITS).map(|_| {
         let pool = pool.clone();
-        tokio::spawn(
-            async move { insert_post_slow(&pool, sub_id, "Same title", "same-title").await },
-        )
+        tokio::spawn(async move {
+            insert_post_slow(&pool, author, sub_id, "Same title", "same-title").await
+        })
     });
     let mut slugs = Vec::new();
     for result in futures::future::join_all(inserts).await {
@@ -485,8 +502,9 @@ async fn concurrent_slug_updates_get_distinct_slugs() {
     let pool = pg_pool(&db.urls()[0]);
     let mut conn = pool.get().await.expect("connection");
     let sub_id = subreddit_id_of(&mut conn, "dbupdate").await;
+    let author = user_id_of(&mut conn, "racer1").await;
     for n in 0..4 {
-        insert_post_slow(&pool, sub_id, "Seed", &format!("seed-{n}"))
+        insert_post_slow(&pool, author, sub_id, "Seed", &format!("seed-{n}"))
             .await
             .expect("seed insert");
     }
@@ -524,7 +542,7 @@ async fn slugs_are_left_alone_when_nothing_clashes() {
     let (db, _app, client, base_url) = boot_with_one_subreddit("dbquiet").await;
     // A second community: the same slug there is not a clash.
     let csrf = hidden_value_from(&client, &format!("{base_url}/r/create"), "_csrf").await;
-    client
+    let created = client
         .post(format!("{base_url}/r/create"))
         .form(&[
             ("_csrf", csrf.as_str()),
@@ -534,21 +552,29 @@ async fn slugs_are_left_alone_when_nothing_clashes() {
         .send()
         .await
         .expect("POST /r/create");
+    assert!(
+        created.status().is_redirection(),
+        "create subreddit should redirect; got {}",
+        created.status()
+    );
     let pool = pg_pool(&db.urls()[0]);
     let mut conn = pool.get().await.expect("connection");
     let quiet = subreddit_id_of(&mut conn, "dbquiet").await;
     let other = subreddit_id_of(&mut conn, "dbother").await;
+    let author = user_id_of(&mut conn, "racer1").await;
 
-    let first = insert_post_slow(&pool, quiet, "T", "same")
+    let first = insert_post_slow(&pool, author, quiet, "T", "same")
         .await
         .expect("insert");
-    let elsewhere = insert_post_slow(&pool, other, "T", "same")
+    let elsewhere = insert_post_slow(&pool, author, other, "T", "same")
         .await
         .expect("insert");
     assert_eq!((first.as_str(), elsewhere.as_str()), ("same", "same"));
 
-    // An update that keeps the slug must not rename the post to `same-2`.
-    diesel::sql_query("UPDATE posts SET title = 'New title' WHERE subreddit_id = $1")
+    // A write that keeps the slug must not rename the post to `same-2`.
+    // `SET slug = slug` fires the trigger, so the `WHEN` clause is what
+    // spares the post.
+    diesel::sql_query("UPDATE posts SET slug = slug, title = 'New title' WHERE subreddit_id = $1")
         .bind::<BigInt, _>(quiet)
         .execute(&mut conn)
         .await
@@ -567,5 +593,10 @@ async fn slugs_are_left_alone_when_nothing_clashes() {
         .execute(&mut conn)
         .await
         .expect("move");
+    let moved: Slug = diesel::sql_query("SELECT slug FROM posts WHERE title = 'New title'")
+        .get_result(&mut conn)
+        .await
+        .expect("moved slug");
+    assert_eq!(moved.slug, "same-2");
     assert_no_duplicate_slugs(&mut conn, "moving a post").await;
 }
