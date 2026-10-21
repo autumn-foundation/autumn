@@ -1103,10 +1103,14 @@ impl Plan {
         removed: &mut Removed,
     ) -> Result<(), GenerateError> {
         for path in &plan.files_to_remove {
-            let swept = plan.swept.contains(path);
+            let expected = plan.swept.get(path);
+            let swept = expected.is_some();
             // A swept path comes from the manifest. Check it again just
-            // before the delete, in case a directory became a symlink.
-            if swept && !sweep::still_sweepable(&self.project_root, path) {
+            // before the delete: a directory can have become a symlink, or
+            // an edit can have been saved since the plan was made.
+            if expected
+                .is_some_and(|digest| !sweep::still_sweepable(&self.project_root, path, digest))
+            {
                 eprintln!(
                     "Warning: {} changed during destroy; leaving it in place.",
                     relative_display(path, &self.project_root)
@@ -1436,7 +1440,7 @@ impl Plan {
             modifies,
             diverged,
             warnings,
-            swept: sweep.remove,
+            swept: sweep.digests,
             stale: sweep.forget,
         }
     }
@@ -1468,9 +1472,9 @@ struct RevertPlan {
     modifies: Vec<(PathBuf, Option<String>)>,
     diverged: Vec<PathBuf>,
     warnings: Vec<String>,
-    /// Files the orphan sweep removes (issue #2557). Also in
-    /// `files_to_remove`.
-    swept: Vec<PathBuf>,
+    /// Files the orphan sweep removes, with their recorded digests (issue
+    /// #2557). Also in `files_to_remove`.
+    swept: HashMap<PathBuf, String>,
     /// Entries whose file is already gone. Dropped from the manifest.
     stale: Vec<PathBuf>,
 }
@@ -1478,7 +1482,7 @@ struct RevertPlan {
 impl RevertPlan {
     /// The note printed after a swept path.
     fn sweep_note(&self, path: &Path) -> &'static str {
-        if self.swept.iter().any(|p| p == path) {
+        if self.swept.contains_key(path) {
             " (no longer generated)"
         } else {
             ""
@@ -4198,7 +4202,7 @@ mod tests {
         let v2 = renamed_v2(&tmp);
 
         let plan = v2.compute_revert_plan(false);
-        assert_eq!(plan.swept, vec![old.clone()]);
+        assert_eq!(plan.swept.keys().collect::<Vec<_>>(), vec![&old]);
 
         v2.revert(Flags {
             dry_run: true,

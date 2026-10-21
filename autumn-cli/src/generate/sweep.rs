@@ -9,7 +9,7 @@
 //! The paths come from the manifest, which is project content. Every check
 //! here treats them as untrusted. See `docs/adr/0021-destroy-orphan-sweep.md`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +32,9 @@ const PROTECTED_FILES: &[&str] = &[
 pub(super) struct Sweep {
     /// Untouched owned files to delete.
     pub remove: Vec<PathBuf>,
+    /// The recorded digest of each file in `remove`. `revert` checks it again
+    /// just before the delete.
+    pub digests: HashMap<PathBuf, String>,
     /// Entries whose file is gone. Drop them from the manifest.
     pub forget: Vec<PathBuf>,
     /// Files kept, and why.
@@ -241,15 +244,20 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
              it. autumn destroy keeps it. Remove the `mod` line and the file by hand if you \
              do not need them.",
         ),
-        Some(Scope::Owned) => sweep.remove.push(path),
+        Some(Scope::Owned) => {
+            sweep.digests.insert(path.clone(), entry.digest.to_owned());
+            sweep.remove.push(path);
+        }
     }
 }
 
-/// Whether a `mod <stem>;` line declares the Rust file at `parts`.
+/// Whether a `mod` item can still load the Rust file at `parts`.
 ///
-/// Reads the files that can declare it: `<dir>/mod.rs` and `<dir>.rs`, and
-/// `src/main.rs` and `src/lib.rs` for a file directly in `src/`. Errs on the
-/// side of "declared": any `mod <stem>` followed by `;` or `{` counts.
+/// Reads the files that can declare it by name: `<dir>/mod.rs` and
+/// `<dir>.rs`, and `src/main.rs` and `src/lib.rs` for a file directly in
+/// `src/`. Also reads every Rust file in the project for a `#[path]` that
+/// names the file. Errs on the side of "declared": a comment that looks like
+/// a declaration counts too.
 fn declared_module(project_root: &Path, parts: &[&str]) -> bool {
     let Some((file, dirs)) = parts.split_last() else {
         return false;
@@ -273,20 +281,72 @@ fn declared_module(project_root: &Path, parts: &[&str]) -> bool {
     declarers
         .iter()
         .any(|declarer| fs::read_to_string(declarer).is_ok_and(|text| declares(&text, stem)))
+        || path_attribute_names(project_root, file)
 }
 
-/// Whether `text` holds `mod <stem>` followed by `;` or `{`.
+/// Whether `text` holds `mod`, whitespace, `<stem>` (or `r#<stem>`), then
+/// `;` or `{`. Any Rust whitespace counts, newlines too.
 fn declares(text: &str, stem: &str) -> bool {
-    text.match_indices("mod ").any(|(at, _)| {
-        let before_ok = text[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-        let rest = text[at + 4..].trim_start();
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices("mod").any(|(at, _)| {
+        let before_ok = text[..at].chars().next_back().is_none_or(|c| !ident(c));
+        let rest = &text[at + 3..];
+        let name = rest.trim_start();
+        let spaced = name.len() < rest.len();
+        let name = name.strip_prefix("r#").unwrap_or(name);
         before_ok
-            && rest
+            && spaced
+            && name
                 .strip_prefix(stem)
                 .is_some_and(|tail| tail.trim_start().starts_with([';', '{']))
+    })
+}
+
+/// Whether any Rust file in the project has a `path = "…"` whose last
+/// segment is `file` — the form of a `#[path]` attribute on a `mod` item.
+fn path_attribute_names(project_root: &Path, file: &str) -> bool {
+    let mut pending = vec![project_root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                // Build output and hidden directories hold no project source.
+                if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                    pending.push(entry.path());
+                }
+            } else if kind.is_file()
+                && name.ends_with(".rs")
+                && fs::read_to_string(entry.path()).is_ok_and(|text| names_path(&text, file))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `text` holds `path`, `=`, and a string literal that ends in `file`.
+fn names_path(text: &str, file: &str) -> bool {
+    text.match_indices("path").any(|(at, _)| {
+        let Some(rest) = text[at + 4..].trim_start().strip_prefix('=') else {
+            return false;
+        };
+        let Some(literal) = rest.trim_start().strip_prefix('"') else {
+            return false;
+        };
+        literal.split('"').next().is_some_and(|value| {
+            value
+                .rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|last| last == file)
+        })
     })
 }
 
@@ -366,15 +426,17 @@ fn has_exact_entry(dir: &Path, name: &str) -> bool {
     })
 }
 
-/// Whether `path` is still a regular file reached through no symlink.
+/// Whether `path` is still a regular file, reached through no symlink, that
+/// holds `digest`.
 ///
-/// `revert` calls this again just before it deletes a swept file, so a
-/// directory swapped for a symlink after the plan was made is not followed.
-pub(super) fn still_sweepable(project_root: &Path, path: &Path) -> bool {
+/// `revert` calls this again just before it deletes a swept file. So a
+/// directory swapped for a symlink, or an edit saved after the plan was made,
+/// keeps the file.
+pub(super) fn still_sweepable(project_root: &Path, path: &Path, digest: &str) -> bool {
     provenance::key(project_root, path).is_some_and(|key| {
         plain_parts(&key)
             .is_some_and(|parts| matches!(inspect(project_root, &parts), Inspect::File))
-    })
+    }) && untouched(path, digest)
 }
 
 /// Whether the file still holds what `generate` wrote.
@@ -954,6 +1016,38 @@ mod tests {
         assert!(!declares("pub mod barfoo;", "foo"));
         assert!(!declares("pub mod bar;", "foo"));
         assert!(!declares("// a mod for foo\n", "foo"));
+        assert!(declares("mod\tfoo;", "foo"));
+        assert!(declares("pub mod\nfoo\n;", "foo"));
+        assert!(declares("mod r#foo;", "foo"));
+        assert!(!declares("modfoo;", "foo"));
+    }
+
+    #[test]
+    fn an_orphan_a_path_attribute_loads_is_kept() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = generated(root, &mut p, "src/jobs/foo.rs", "x", ME, Some(Scope::Owned));
+        fs::write(
+            root.join("src/main.rs"),
+            "#[path = \"jobs/foo.rs\"]\nmod bar;\nfn main() {}\n",
+        )
+        .unwrap();
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/jobs/new.rs")], &[]);
+
+        assert!(sweep.remove.is_empty(), "{:?}", sweep.remove);
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn names_path_matches_only_the_file_name() {
+        assert!(names_path("#[path = \"jobs/foo.rs\"]", "foo.rs"));
+        assert!(names_path("#[path=\"foo.rs\"]", "foo.rs"));
+        assert!(names_path("#[path = \"a\\\\foo.rs\"]", "foo.rs"));
+        assert!(!names_path("#[path = \"jobs/foo.rs.bak\"]", "foo.rs"));
+        assert!(!names_path("#[path = \"jobs/barfoo.rs\"]", "foo.rs"));
+        assert!(!names_path("let path = 3;", "foo.rs"));
     }
 
     #[test]
@@ -1039,9 +1133,12 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         let file = root.join("src/old.rs");
         fs::write(&file, "x").unwrap();
-        assert!(still_sweepable(root, &file));
+        let digest = text_digest("x");
+        assert!(still_sweepable(root, &file, &digest));
+        fs::write(&file, "edited").unwrap();
+        assert!(!still_sweepable(root, &file, &digest), "an edit saved late");
         fs::remove_file(&file).unwrap();
-        assert!(!still_sweepable(root, &file));
-        assert!(!still_sweepable(root, &root.join("../x.rs")));
+        assert!(!still_sweepable(root, &file, &digest));
+        assert!(!still_sweepable(root, &root.join("../x.rs"), &digest));
     }
 }
