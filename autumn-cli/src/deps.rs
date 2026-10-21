@@ -809,20 +809,22 @@ pub fn evaluate_within(root: &Path, budget: Duration) -> Evaluation {
 
 /// The directory holding the app's policy file, searching upward from `start`.
 ///
-/// The CI gate runs at the repository root. A developer inside a workspace
-/// member must get that same graph, not "no policy".
+/// The CI gate runs at the repository root, so the outermost policy up to the
+/// `.git` boundary wins over a workspace member's own. A developer inside a
+/// member gets the same graph and rules as CI.
 pub fn find_policy_root(start: &Path) -> Option<PathBuf> {
     let start = start.canonicalize().ok()?;
+    let mut found = None;
     for dir in start.ancestors() {
         if dir.join(POLICY_FILE).is_file() {
-            return Some(dir.to_path_buf());
+            found = Some(dir.to_path_buf());
         }
         // The repository root bounds the search.
         if dir.join(".git").exists() {
             break;
         }
     }
-    None
+    found
 }
 
 /// Evaluate the dependency policy for the app rooted at `root`.
@@ -1678,6 +1680,35 @@ mod tests {
         assert_eq!(
             find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
             Some(root.path().canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn the_outermost_policy_wins_over_a_workspace_members() {
+        // CI reads the root policy. A member policy must not replace it.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git");
+        std::fs::write(root.path().join(POLICY_FILE), "[advisories]\n").expect("policy");
+        let member = root.path().join("crates").join("app");
+        std::fs::create_dir_all(&member).expect("member");
+        std::fs::write(member.join(POLICY_FILE), "[bans]\n").expect("member policy");
+        assert_eq!(
+            find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
+            Some(root.path().canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn the_outermost_policy_search_still_stops_at_the_repository_root() {
+        // A policy above the `.git` boundary is not part of this repository.
+        let outer = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outer.path().join(POLICY_FILE), "[bans]\n").expect("outer policy");
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git");
+        std::fs::write(repo.join(POLICY_FILE), "[advisories]\n").expect("policy");
+        assert_eq!(
+            find_policy_root(&repo).map(|found| found.canonicalize().expect("canonical")),
+            Some(repo.canonicalize().expect("canonical"))
         );
     }
 
