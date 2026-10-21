@@ -12698,6 +12698,32 @@ struct PgPayloadRow {
 }
 
 #[cfg(feature = "db")]
+/// Operator retry of a failed row.
+///
+/// A claim moved a `pending`-window key to `pending_unique_key`. This UPDATE
+/// moves it back, unless a live duplicate holds the key. Thus, an equal enqueue
+/// stays deduplicated while the retry waits. Same rule as `pg_nack_failure`.
+const PG_RETRY_FAILED_SQL: &str = "UPDATE autumn_jobs \
+     SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
+         started_at = NULL, finished_at = NULL, \
+         claimed_by = NULL, claimed_at = NULL, last_error = NULL, \
+         unique_key = CASE \
+           WHEN pending_unique_key IS NOT NULL \
+                AND NOT EXISTS ( \
+                  SELECT 1 FROM autumn_jobs dup \
+                  WHERE dup.name = autumn_jobs.name \
+                    AND dup.unique_key = autumn_jobs.pending_unique_key \
+                    AND dup.id != autumn_jobs.id \
+                    AND dup.status IN ('enqueued', 'running') \
+                ) \
+           THEN pending_unique_key \
+           ELSE unique_key \
+         END, \
+         pending_unique_key = NULL \
+     WHERE id = $1 AND status = 'failed' \
+     RETURNING payload::TEXT AS payload";
+
+#[cfg(feature = "db")]
 impl PgJobAdminBackend {
     async fn pg_snapshot(&self, query: &JobAdminQuery) -> AutumnResult<JobAdminSnapshot> {
         let mut conn = self.pool.get().await.map_err(|e| {
@@ -12786,32 +12812,25 @@ impl PgJobAdminBackend {
             }
             None => None,
         };
-        let updated = diesel::sql_query(
-            "UPDATE autumn_jobs \
-             SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
-                 started_at = NULL, finished_at = NULL, \
-                 claimed_by = NULL, claimed_at = NULL, last_error = NULL \
-             WHERE id = $1 AND status = 'failed' \
-             RETURNING payload::TEXT AS payload",
-        )
-        .bind::<diesel::sql_types::Text, _>(id)
-        .get_result::<PgPayloadRow>(&mut *conn)
-        .await
-        .optional()
-        .map_err(|e| {
-            // The retried row keeps its unique_key, so re-enqueueing while an
-            // equivalent job is already in flight trips the partial unique
-            // index — surface that as an operator-actionable conflict rather
-            // than silently dropping uniqueness for the retried job.
-            if e.to_string().contains("idx_autumn_jobs_unique_inflight") {
-                AutumnError::bad_request_msg(
-                    "an equivalent unique job is already pending or running; \
+        let updated = diesel::sql_query(PG_RETRY_FAILED_SQL)
+            .bind::<diesel::sql_types::Text, _>(id)
+            .get_result::<PgPayloadRow>(&mut *conn)
+            .await
+            .optional()
+            .map_err(|e| {
+                // The retried row keeps its unique_key, so re-enqueueing while an
+                // equivalent job is already in flight trips the partial unique
+                // index — surface that as an operator-actionable conflict rather
+                // than silently dropping uniqueness for the retried job.
+                if e.to_string().contains("idx_autumn_jobs_unique_inflight") {
+                    AutumnError::bad_request_msg(
+                        "an equivalent unique job is already pending or running; \
                      retry after it settles",
-                )
-            } else {
-                AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
-            }
-        })?;
+                    )
+                } else {
+                    AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
+                }
+            })?;
         let Some(row) = updated else {
             return Err(AutumnError::not_found_msg(format!(
                 "job '{id}' not found or not in failed state"
@@ -22581,6 +22600,76 @@ mod tests {
                 .unwrap(),
                 EnqueueOutcome::Deduplicated
             );
+        }
+
+        #[test]
+        fn pg_admin_retry_sql_restores_pending_window_unique_key() {
+            let sql = PG_RETRY_FAILED_SQL;
+            assert!(sql.contains("unique_key = CASE"), "{sql}");
+            assert!(sql.contains("pending_unique_key = NULL"), "{sql}");
+            assert!(
+                sql.contains("NOT EXISTS"),
+                "a live duplicate must keep the key: {sql}"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_restores_pending_window_unique_key() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
+            };
+
+            let constraints = unique_constraints("acct-9", JobUniquenessWindow::Pending);
+            let enqueue = |id: &'static str| {
+                let pool = pool.clone();
+                let constraints = constraints.clone();
+                async move {
+                    pg_enqueue_job(
+                        &pool,
+                        id.to_string(),
+                        "sync_account",
+                        "default",
+                        serde_json::json!({}),
+                        1,
+                        10,
+                        &constraints,
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(enqueue("pend-fail").await, EnqueueOutcome::Queued);
+            // Claim moves the key to `pending_unique_key`; a final nack fails the row.
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
+            assert!(
+                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, Some("acct-9"), 0)
+                    .await
+                    .unwrap()
+            );
+
+            backend.pg_retry_failed("pend-fail").await.unwrap();
+
+            // The retried row holds its key again, so a twin is deduplicated.
+            assert_eq!(enqueue("pend-twin").await, EnqueueOutcome::Deduplicated);
+            // The claim moves the key back, so the key is not lost.
+            let claimed = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim retried");
+            assert_eq!(claimed.id, "pend-fail");
+            assert_eq!(enqueue("pend-after-claim").await, EnqueueOutcome::Queued);
         }
 
         async fn pg_fetch_by_id(pool: &PgPool, id: &str) -> Option<PgJobRow> {
