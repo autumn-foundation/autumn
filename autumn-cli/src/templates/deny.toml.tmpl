@@ -114,6 +114,14 @@ ignore = [
     # exploit here, and no safe upgrade (the author recommends `web-time`).
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — `webpki-roots` 0.26.11 lists a distrusted root.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0381
+    #
+    # Present for the same embedded-Postgres stack: sqlx-core 0.8 pins
+    # webpki-roots 0.26. That release holds no root list. It re-exports
+    # webpki-roots 1.0.10, which has the fix, and no patched 0.26.x exists.
+    # Review-by: 2026-11-03.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core in the managed-pg-bundled stack; it re-exports the fixed webpki-roots 1.0.10; no patched 0.26.x exists; review-by 2026-11-03" },
     # <<< autumn:bundled-pg-waiver
 ]
 
