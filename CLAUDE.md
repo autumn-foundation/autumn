@@ -10,6 +10,14 @@ version, folding the changelog fragments in, dating the changelog section,
 updating install instructions) is a separate, deliberate step the user asks for
 by name.
 
+## Performance agents (Bolt)
+
+**Do not profile or optimize the `request_pipeline` workload**
+(`autumn/benches/request_pipeline.rs`). It is exhausted: repeated callgrind +
+dhat passes have taken it to the floor, and the remainder is allocator cost
+driven by the tower layer-clone cascade (tracked in #2830). Pick another
+`autumn/benches/*` target instead, and skip building that bench.
+
 ## Changelog
 
 **Never edit `CHANGELOG.md` in a feature PR**, and never create a new

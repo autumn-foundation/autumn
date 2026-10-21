@@ -2276,12 +2276,12 @@ fn plan_scaffold_with_options_impl(
         // Say so at generate time rather than let `cargo test` be the messenger.
         if !for_revert {
             plan.warn(format!(
-                "tests/{snake_name}.rs uses `autumn_web::test::TestDb`, a Postgres-only \
-                 testcontainer, so `cargo test` will not compile on this SQLite app. The app \
-                 itself is unaffected — `cargo run`, `cargo build` and `autumn migrate` all \
-                 work. A SQLite `TestDb` lands with the runtime slice, \
-                 https://github.com/autumn-foundation/autumn/issues/1905 — until then, delete \
-                 that file or gate it behind a Postgres-only cargo feature."
+                "tests/{snake_name}.rs uses `autumn_web::test::TestDb`. `TestDb` works only \
+                 with Postgres, so `cargo test` does not compile on this SQLite app. The app \
+                 is not affected: `cargo run`, `cargo build` and `autumn migrate` work. The \
+                 issue for a SQLite smoke harness is \
+                 https://github.com/autumn-foundation/autumn/issues/2555. Until it is done, \
+                 delete that file or put it behind a Postgres-only cargo feature."
             ));
         }
     }
@@ -18946,6 +18946,40 @@ async fn main() {
                     msg.contains("Postgres") && msg.contains("--sharded"),
                     "scaffold --sharded on SQLite must be rejected as Postgres-only: {msg}"
                 );
+            },
+        );
+    }
+
+    /// The `SQLite` smoke-test warning cites open issue #2555, not closed #1905.
+    #[test]
+    fn scaffold_on_sqlite_app_warning_cites_open_tracker() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_main(default_main());
+                fs::write(
+                    tmp.path().join("autumn.toml"),
+                    "[database]\nprimary_url = \"sqlite://app.db\"\n",
+                )
+                .unwrap();
+                let plan = plan_scaffold(
+                    tmp.path(),
+                    "Post",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                let warning = plan
+                    .warnings
+                    .iter()
+                    .find(|w| w.contains("TestDb"))
+                    .unwrap_or_else(|| panic!("no TestDb warning: {:?}", plan.warnings));
+                assert!(warning.contains("issues/2555"), "{warning}");
+                assert!(!warning.contains("1905"), "{warning}");
             },
         );
     }

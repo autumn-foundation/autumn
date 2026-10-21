@@ -570,6 +570,7 @@ mod tests {
         module_path: "app::models",
         file: "src/models.rs",
         line: 1,
+        crate_version: "0.1.0",
     }];
 
     const REPOSITORIES: &[RepositoryGraphDescriptor] = &[RepositoryGraphDescriptor {
@@ -581,6 +582,7 @@ mod tests {
         module_path: "app::repositories",
         file: "src/repositories.rs",
         line: 1,
+        crate_version: "0.1.0",
     }];
 
     const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
@@ -591,6 +593,7 @@ mod tests {
         static_route: false,
         file: "src/routes/posts.rs",
         line: 1,
+        crate_version: "0.1.0",
         signature_symbols: &["PgPostRepository"],
         body_symbols: &[],
         sql_symbols: &[],
@@ -606,6 +609,7 @@ mod tests {
         mutating_symbols: &[],
         file: "src/jobs.rs",
         line: 1,
+        crate_version: "0.1.0",
         signature_symbols: &[],
         signature_bindings: &[],
         dot_mutation_receivers: &[],

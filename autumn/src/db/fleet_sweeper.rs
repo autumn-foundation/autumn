@@ -101,6 +101,9 @@ const MARK_CHUNK: usize = 100;
 /// rounds, so a request never waits long for it.
 const BACKFILL_BATCHES_PER_ROUND: usize = 8;
 
+/// Rows of the index read per pass, per database the pass may visit.
+const DUE_WINDOW: usize = 4;
+
 /// The longest wait before a database that still has work is visited again.
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
@@ -175,6 +178,24 @@ struct EntryRow {
     kind: String,
     #[diesel(sql_type = BigInt)]
     since: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct DueRow {
+    #[diesel(sql_type = Text)]
+    key: String,
+    #[diesel(sql_type = Text)]
+    kind: String,
+    #[diesel(sql_type = BigInt)]
+    since: i64,
+    #[diesel(sql_type = BigInt)]
+    visit_after: i64,
+}
+
+/// A row a visit may take now, and the time it became due.
+struct Due {
+    entry: PendingEntry,
+    visit_after: i64,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -273,9 +294,10 @@ impl FleetPendingIndex {
             None => self.insert(&mut conn, key, kind).await,
             // New work ends the backoff of older work of the same kind.
             Some(row) if row.n > 0 => diesel::sql_query(format!(
-                "UPDATE {PENDING_TABLE} SET visit_after = 0, attempts = 0 \
+                "UPDATE {PENDING_TABLE} SET visit_after = MIN(visit_after, ?), attempts = 0 \
                  WHERE key = ? AND kind = ?"
             ))
+            .bind::<BigInt, _>(self.clock.now().timestamp_millis())
             .bind::<Text, _>(key)
             .bind::<Text, _>(kind.as_str())
             .execute(&mut *conn)
@@ -286,21 +308,25 @@ impl FleetPendingIndex {
         }
     }
 
-    /// Insert a row, or end the backoff of the row that exists: new work is
-    /// due at once. Keeps the time of an existing row.
+    /// Insert a row that is due now, behind the rows that are due already. For
+    /// a row that exists, end its backoff: keep its `since` and an earlier due
+    /// time.
     async fn insert(
         &self,
         conn: &mut RuntimeConnection,
         key: &str,
         kind: PendingKind,
     ) -> AutumnResult<()> {
+        let now = self.clock.now().timestamp_millis();
         diesel::sql_query(format!(
-            "INSERT INTO {PENDING_TABLE} (key, kind, since) VALUES (?, ?, ?) \
-             ON CONFLICT (key, kind) DO UPDATE SET visit_after = 0, attempts = 0"
+            "INSERT INTO {PENDING_TABLE} (key, kind, since, visit_after) VALUES (?, ?, ?, ?) \
+             ON CONFLICT (key, kind) DO UPDATE \
+             SET visit_after = MIN(visit_after, excluded.visit_after), attempts = 0"
         ))
         .bind::<Text, _>(key)
         .bind::<Text, _>(kind.as_str())
-        .bind::<BigInt, _>(self.clock.now().timestamp_millis())
+        .bind::<BigInt, _>(now)
+        .bind::<BigInt, _>(now)
         .execute(conn)
         .await
         .map(drop)
@@ -327,14 +353,17 @@ impl FleetPendingIndex {
         Ok(())
     }
 
-    /// Rows a visit may take now (no backoff in force), oldest first: of the
-    /// databases in `keys`, or else the oldest `limit`.
-    async fn due(&self, keys: Option<&[String]>, limit: usize) -> AutumnResult<Vec<PendingEntry>> {
+    /// Rows a visit may take now: rows with no backoff, and rows whose backoff
+    /// has ended. Of the databases in `keys`, or else the first `limit` in the
+    /// order they became due. A row with no backoff is due on any clock, so
+    /// the clock of the process that wrote it changes only its place.
+    async fn due(&self, keys: Option<&[String]>, limit: usize) -> AutumnResult<Vec<Due>> {
         let now = self.clock.now().timestamp_millis();
         let mut conn = self.conn().await?;
         let Some(keys) = keys else {
-            let rows: Vec<EntryRow> = diesel::sql_query(format!(
-                "SELECT key, kind, since FROM {PENDING_TABLE} WHERE visit_after <= ? \
+            let rows: Vec<DueRow> = diesel::sql_query(format!(
+                "SELECT key, kind, since, visit_after FROM {PENDING_TABLE} \
+                 WHERE attempts = 0 OR visit_after <= ? \
                  ORDER BY visit_after, since, key, kind LIMIT ?"
             ))
             .bind::<BigInt, _>(now)
@@ -342,26 +371,25 @@ impl FleetPendingIndex {
             .load(&mut *conn)
             .await
             .map_err(|error| index_error("read", error))?;
-            return Ok(entries(rows));
+            return Ok(due_entries(rows));
         };
         let mut found = Vec::new();
         for chunk in keys.chunks(MARK_CHUNK) {
             let marks = vec!["?"; chunk.len()].join(", ");
             let mut query = diesel::sql_query(format!(
-                "SELECT key, kind, since FROM {PENDING_TABLE} \
-                 WHERE visit_after <= ? AND key IN ({marks}) \
-                 ORDER BY visit_after, since, key, kind"
+                "SELECT key, kind, since, visit_after FROM {PENDING_TABLE} \
+                 WHERE (attempts = 0 OR visit_after <= ?) AND key IN ({marks})"
             ))
             .into_boxed::<diesel::sqlite::Sqlite>()
             .bind::<BigInt, _>(now);
             for key in chunk {
                 query = query.bind::<Text, _>(key.clone());
             }
-            let rows: Vec<EntryRow> = query
+            let rows: Vec<DueRow> = query
                 .load(&mut *conn)
                 .await
                 .map_err(|error| index_error("read", error))?;
-            found.extend(entries(rows));
+            found.extend(due_entries(rows));
         }
         Ok(found)
     }
@@ -591,6 +619,21 @@ fn entries(rows: Vec<EntryRow>) -> Vec<PendingEntry> {
                 kind: PendingKind::parse(&row.kind)?,
                 key: row.key,
                 since: from_millis(row.since),
+            })
+        })
+        .collect()
+}
+
+fn due_entries(rows: Vec<DueRow>) -> Vec<Due> {
+    rows.into_iter()
+        .filter_map(|row| {
+            Some(Due {
+                entry: PendingEntry {
+                    kind: PendingKind::parse(&row.kind)?,
+                    key: row.key,
+                    since: from_millis(row.since),
+                },
+                visit_after: row.visit_after,
             })
         })
         .collect()
@@ -1033,9 +1076,11 @@ impl FleetSweeper {
         }
         let mut report = SweepReport::default();
         match self.candidates().await {
-            Ok(candidates) => {
+            Ok(Picked { visit, waiting }) => {
+                // They are not opened: the fleet has no room.
+                report.deferred = waiting;
                 let concurrency = inner.options.concurrency.max(1);
-                let visits: Vec<Visit> = futures::stream::iter(candidates)
+                let visits: Vec<Visit> = futures::stream::iter(visit)
                     .map(|key| self.visit(key))
                     .buffer_unordered(concurrency)
                     .collect()
@@ -1104,14 +1149,16 @@ impl FleetSweeper {
         Ok(())
     }
 
-    /// The databases to visit this pass: the ones open here first, then (in
-    /// a worker) those of the oldest rows. Rows in backoff are not read. A
-    /// worker leaves young hook rows of a closed database alone; a web process
-    /// takes only hook rows, as it relays nothing.
-    async fn candidates(&self) -> AutumnResult<Vec<String>> {
+    /// The databases to visit this pass. It reads the due rows of the
+    /// databases open here and (in a worker) the rows due first in the index.
+    /// [`PassPlan::pick`] chooses from them.
+    async fn candidates(&self) -> AutumnResult<Picked> {
         let inner = &self.inner;
         if inner.stop.is_cancelled() {
-            return Ok(Vec::new());
+            return Ok(Picked {
+                visit: Vec::new(),
+                waiting: 0,
+            });
         }
         let open: BTreeSet<String> = inner
             .fleet
@@ -1126,28 +1173,25 @@ impl FleetSweeper {
             let limit = inner
                 .options
                 .max_databases_per_pass
-                .saturating_mul(4)
+                .saturating_mul(DUE_WINDOW)
                 .max(1);
             rows.extend(inner.index.due(None, limit).await?);
         }
-        let now = inner.state.clock().now();
-        let grace = chrono::Duration::from_std(inner.options.hook_grace)
-            .unwrap_or_else(|_| chrono::Duration::zero());
-        let mut chosen: Vec<String> = Vec::new();
-        for entry in rows {
-            let hooks = entry.kind == PendingKind::Hooks;
-            let young_hooks = hooks && now - entry.since < grace;
-            let wanted = if relay {
-                !young_hooks || open.contains(&entry.key)
-            } else {
-                hooks
-            };
-            if wanted && !chosen.contains(&entry.key) {
-                chosen.push(entry.key);
-            }
-        }
-        chosen.truncate(inner.options.max_databases_per_pass.max(1));
-        Ok(chosen)
+        let owned = |name: &str| {
+            inner
+                .fleet
+                .key_for_name(name)
+                .map_or(true, |key| inner.fleet.owns(&key))
+        };
+        let plan = PassPlan {
+            open: &open,
+            relay,
+            hooks_before: hooks_cutoff(inner.state.clock().now(), inner.options.hook_grace),
+            budget: inner.options.max_databases_per_pass,
+            room: inner.fleet.max_open().saturating_sub(open.len()),
+            owned: &owned,
+        };
+        Ok(plan.pick(rows))
     }
 
     async fn visit(&self, name: String) -> Visit {
@@ -1346,6 +1390,108 @@ impl FleetSweeper {
     }
 }
 
+/// The databases one pass visits, and how many closed ones wait for room.
+struct Picked {
+    visit: Vec<String>,
+    waiting: usize,
+}
+
+/// What one pass may take.
+struct PassPlan<'a> {
+    /// The databases open in this process.
+    open: &'a BTreeSet<String>,
+    /// A worker: it opens closed databases.
+    relay: bool,
+    /// In a closed database, a worker does not take a hook row written after
+    /// this time: the process that has it open drains it.
+    hooks_before: DateTime<Utc>,
+    /// Databases per pass, at most.
+    budget: usize,
+    /// Closed databases the fleet can open now.
+    room: usize,
+    /// Whether this host owns a database (issue 3233).
+    owned: &'a dyn Fn(&str) -> bool,
+}
+
+impl PassPlan<'_> {
+    /// The databases one pass visits (issue 3350). Rows go in the order they
+    /// became due. When two rows became due at the same time, the older row
+    /// goes first. When both times are the same, an open database goes first,
+    /// because its visit opens no file.
+    ///
+    /// Half of the budget goes first to the open databases, in that order, so
+    /// a flood of closed rows (a backfill, a full fleet) never stops their
+    /// work. The rest goes in that order to all databases. A pass takes no
+    /// more closed databases than the fleet has room for, and no database of
+    /// another host: their visits do nothing.
+    fn pick(&self, mut rows: Vec<Due>) -> Picked {
+        let open = |row: &Due| self.open.contains(&row.entry.key);
+        rows.retain(|row| self.wanted(row, open(row)));
+        // Rows that compare equal are of one database: the order is total
+        // for the databases.
+        rows.sort_unstable_by(|a, b| {
+            a.visit_after
+                .cmp(&b.visit_after)
+                .then_with(|| a.entry.since.cmp(&b.entry.since))
+                .then_with(|| open(b).cmp(&open(a)))
+                .then_with(|| a.entry.key.cmp(&b.entry.key))
+        });
+        let budget = self.budget.max(1);
+        let mut chosen: Vec<&str> = Vec::with_capacity(budget);
+        for row in rows.iter().filter(|row| open(row)) {
+            if chosen.len() >= budget / 2 {
+                break;
+            }
+            if !chosen.contains(&row.entry.key.as_str()) {
+                chosen.push(&row.entry.key);
+            }
+        }
+        let (mut closed, mut waiting) = (0, Vec::new());
+        for row in &rows {
+            if chosen.len() >= budget {
+                break;
+            }
+            let key = row.entry.key.as_str();
+            if chosen.contains(&key) {
+                continue;
+            }
+            if !open(row) {
+                if closed >= self.room {
+                    if waiting.len() < budget && !waiting.contains(&key) {
+                        waiting.push(key);
+                    }
+                    continue;
+                }
+                closed += 1;
+            }
+            chosen.push(key);
+        }
+        Picked {
+            visit: chosen.into_iter().map(str::to_owned).collect(),
+            waiting: waiting.len(),
+        }
+    }
+
+    /// Whether a visit can do the work of `row`. A web process takes only
+    /// hook rows, because it relays nothing.
+    fn wanted(&self, row: &Due, open: bool) -> bool {
+        let hooks = row.entry.kind == PendingKind::Hooks;
+        if !self.relay {
+            return hooks;
+        }
+        let young_hooks = hooks && row.entry.since > self.hooks_before;
+        (open || !young_hooks) && (self.owned)(&row.entry.key)
+    }
+}
+
+/// The time before which a hook row is old enough for a worker to take it.
+fn hooks_cutoff(now: DateTime<Utc>, grace: Duration) -> DateTime<Utc> {
+    chrono::Duration::from_std(grace)
+        .ok()
+        .and_then(|grace| now.checked_sub_signed(grace))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
 // ── Health ──────────────────────────────────────────────────────────────────
 
 /// `fleet:sweeper`: the backlog and the oldest pending age, read live, and
@@ -1437,6 +1583,48 @@ mod tests {
         .framework_migrations()
         .build()
         .unwrap()
+    }
+
+    async fn ticking_index(dir: &Path, at: i64) -> (FleetPendingIndex, crate::time::TickingClock) {
+        let clock = crate::time::TickingClock::starting_at(from_millis(at));
+        let index = FleetPendingIndex::new(control(dir), Arc::new(clock.clone()));
+        index.ensure_schema().await.unwrap();
+        (index, clock)
+    }
+
+    fn plan(open: &BTreeSet<String>, budget: usize, room: usize) -> PassPlan<'_> {
+        PassPlan {
+            open,
+            relay: true,
+            hooks_before: DateTime::<Utc>::MAX_UTC,
+            budget,
+            room,
+            owned: &|_| true,
+        }
+    }
+
+    fn due_row(key: &str, since: i64, visit_after: i64) -> Due {
+        Due {
+            entry: PendingEntry {
+                key: key.to_owned(),
+                kind: PendingKind::Outbox,
+                since: from_millis(since),
+            },
+            visit_after,
+        }
+    }
+
+    /// The rows one pass reads, as `candidates` reads them: the due rows of
+    /// the open databases, then the rows due first.
+    async fn pass_rows(
+        index: &FleetPendingIndex,
+        open: &BTreeSet<String>,
+        budget: usize,
+    ) -> Vec<Due> {
+        let open: Vec<String> = open.iter().cloned().collect();
+        let mut rows = index.due(Some(&open), 0).await.unwrap();
+        rows.extend(index.due(None, budget * DUE_WINDOW).await.unwrap());
+        rows
     }
 
     #[test]
@@ -1601,7 +1789,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|e| e.key)
+            .map(|e| e.entry.key)
             .collect();
         assert_eq!(due, vec!["slot:00002"], "a stuck database hides no other");
         // New work of the same kind ends the backoff.
@@ -1645,7 +1833,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|e| e.key)
+            .map(|e| e.entry.key)
             .collect();
         assert_eq!(order, vec!["slot:00002", "slot:00001"]);
         assert_eq!(
@@ -1656,5 +1844,158 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // Issue 3350: when open databases went first, busy open databases took
+    // every pass.
+    #[tokio::test]
+    async fn a_closed_database_is_visited_when_more_busy_databases_are_open_than_a_pass_visits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (index, clock) = ticking_index(tmp.path(), 1_000_000).await;
+        let budget = 2;
+        let open: BTreeSet<String> = (1..=5).map(|n| format!("slot:{n:05}")).collect();
+        for key in &open {
+            index.mark(key, PendingKind::Outbox).await.unwrap();
+            clock.advance(Duration::from_millis(1));
+        }
+        // The closed database has the newest work.
+        index.mark("slot:00009", PendingKind::Outbox).await.unwrap();
+        // Each busy database makes progress and keeps work, so the test
+        // requeues it, as a visit does. Half of each pass goes to the open
+        // databases; the rest goes in turn to all.
+        let bound = open.len().div_ceil(budget - budget / 2) + 1;
+        let mut visited_on = None;
+        for pass in 1..=bound {
+            clock.advance(Duration::from_millis(10));
+            let rows = pass_rows(&index, &open, budget).await;
+            let chosen = plan(&open, budget, budget).pick(rows).visit;
+            assert_eq!(chosen.len(), budget, "pass {pass} uses its budget");
+            if chosen.iter().any(|key| key == "slot:00009") {
+                visited_on = Some(pass);
+                break;
+            }
+            for key in &chosen {
+                index.requeue(key).await.unwrap();
+            }
+        }
+        assert!(
+            visited_on.is_some(),
+            "the closed database waited more than {bound} passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_mark_queues_behind_a_database_requeued_before_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (index, clock) = ticking_index(tmp.path(), 1_000_000).await;
+        index.mark("slot:00001", PendingKind::Outbox).await.unwrap();
+        clock.advance(Duration::from_millis(5));
+        index.requeue("slot:00001").await.unwrap();
+        // Slot 2 gets new work after slot 1 is requeued.
+        clock.advance(Duration::from_millis(5));
+        index.mark("slot:00002", PendingKind::Outbox).await.unwrap();
+        let order: Vec<String> = index
+            .due(None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.entry.key)
+            .collect();
+        assert_eq!(
+            order,
+            vec!["slot:00001", "slot:00002"],
+            "the row due first comes first"
+        );
+    }
+
+    #[test]
+    fn an_open_database_goes_first_only_on_a_tie() {
+        let open = BTreeSet::from(["slot:00002".to_owned()]);
+        let one = plan(&open, 1, 1);
+        // In the first two cases the open row comes first, because
+        // `candidates` reads open rows first.
+        let earlier_closed = vec![due_row("slot:00002", 10, 50), due_row("slot:00009", 10, 40)];
+        assert_eq!(one.pick(earlier_closed).visit, vec!["slot:00009"]);
+        let older_closed = vec![due_row("slot:00002", 20, 40), due_row("slot:00009", 10, 40)];
+        assert_eq!(one.pick(older_closed).visit, vec!["slot:00009"]);
+        // The tie puts the open row last, so only the tie rule moves it up.
+        let tie = vec![due_row("slot:00009", 10, 40), due_row("slot:00002", 10, 40)];
+        assert_eq!(one.pick(tie).visit, vec!["slot:00002"]);
+    }
+
+    #[test]
+    fn a_full_fleet_gives_the_pass_to_the_open_databases() {
+        let open = BTreeSet::from(["slot:00005".to_owned()]);
+        let rows = || {
+            vec![
+                due_row("slot:00001", 1, 1),
+                due_row("slot:00002", 2, 2),
+                due_row("slot:00003", 3, 3),
+                due_row("slot:00005", 5, 5),
+            ]
+        };
+        // A closed database waits when the fleet has no room for it.
+        let full = plan(&open, 2, 0).pick(rows());
+        assert_eq!(full.visit, vec!["slot:00005"]);
+        assert_eq!(full.waiting, 2, "counted up to the budget");
+        let one_free = plan(&open, 3, 1).pick(rows());
+        assert_eq!(one_free.visit, vec!["slot:00005", "slot:00001"]);
+        assert_eq!(one_free.waiting, 2);
+    }
+
+    #[test]
+    fn half_of_each_pass_goes_to_the_open_databases() {
+        // A deploy marks many closed databases for a backfill, before the
+        // new work of an open one.
+        let open = BTreeSet::from(["slot:00099".to_owned()]);
+        let mut rows: Vec<Due> = (1..=20)
+            .map(|n| due_row(&format!("slot:{n:05}"), n, n))
+            .collect();
+        rows.push(due_row("slot:00099", 50, 50));
+        assert_eq!(
+            plan(&open, 4, 100).pick(rows).visit,
+            vec!["slot:00099", "slot:00001", "slot:00002", "slot:00003"]
+        );
+    }
+
+    #[test]
+    fn a_row_of_a_database_another_host_owns_takes_no_place() {
+        let open = BTreeSet::new();
+        let rows = vec![due_row("slot:00001", 1, 1), due_row("slot:00002", 2, 2)];
+        let not_one = |name: &str| name != "slot:00001";
+        let plan = PassPlan {
+            owned: &not_one,
+            ..plan(&open, 1, 1)
+        };
+        assert_eq!(plan.pick(rows).visit, vec!["slot:00002"]);
+    }
+
+    #[tokio::test]
+    async fn a_mark_from_a_clock_that_is_ahead_is_due_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worker = index(tmp.path(), 10_000).await;
+        let web = FleetPendingIndex::new(
+            worker.control.clone(),
+            Arc::new(crate::time::FixedClock::at(from_millis(70_000))),
+        );
+        web.mark("slot:00001", PendingKind::Outbox).await.unwrap();
+        assert_eq!(worker.due(None, 10).await.unwrap().len(), 1);
+        let keys = ["slot:00001".to_owned()];
+        assert_eq!(worker.due(Some(&keys), 0).await.unwrap().len(), 1);
+        // A backoff still hides the row.
+        web.defer("slot:00001").await.unwrap();
+        assert!(worker.due(None, 10).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_very_long_hook_grace_does_not_panic() {
+        let now = from_millis(10_000);
+        assert_eq!(
+            hooks_cutoff(now, Duration::from_secs(5)),
+            from_millis(5_000)
+        );
+        let huge = Duration::from_secs(u64::from(u32::MAX) * 3_600);
+        assert_eq!(hooks_cutoff(now, huge), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(hooks_cutoff(now, Duration::MAX), DateTime::<Utc>::MIN_UTC);
     }
 }

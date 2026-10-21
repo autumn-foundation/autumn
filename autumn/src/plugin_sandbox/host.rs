@@ -423,6 +423,15 @@ const CAPABILITY_EVENT_BYTES: usize =
 /// the cost of writing a few hundred bytes to stdout.
 const CAPABILITY_CALL_FUEL: u64 = 2_000;
 
+/// Fuel a guest keeps after a call's reply is priced, so it can read the reply
+/// and write its answer.
+///
+/// The host reserves it before dispatching: a call whose reply the budget could
+/// pay for but whose guest could not then finish would commit and then end the
+/// request as `FuelExhausted`. It covers the host's side of that promise. The
+/// guest's own parsing of a large reply is the guest's to budget.
+const FINISH_ALLOWANCE_FUEL: u64 = 100_000;
+
 /// Refuse a request whose body is over the manifest's declared ceiling.
 ///
 /// The ceiling is enforced here, not only in the Axum adapter. The adapter
@@ -1173,6 +1182,9 @@ pub struct SandboxHost {
     /// is only ever the binding constraint on a direct caller, which is the
     /// one it exists for.
     permits: Semaphore,
+    /// The sealed digest of the whole artifact, when this host came from one.
+    /// Stamped on every job the plugin enqueues.
+    artifact_sha256: Option<String>,
     /// The paths this plugin declared, as the router matches them.
     ///
     /// Built once here because a redirect may only name a route the plugin
@@ -1250,7 +1262,15 @@ impl SandboxHost {
     /// Returns [`SandboxLoadError`] if the module does not compile, imports
     /// something the sandbox does not provide, or exports no `_start`.
     pub fn load(artifact: &SandboxArtifact) -> Result<Self, SandboxLoadError> {
-        Self::from_module(artifact.manifest().clone(), artifact.module())
+        // The whole container's digest, kept here so a direct `run` stamps jobs
+        // with it too, not only a host built through `SandboxedPlugin`.
+        let digest = artifact
+            .artifact_digest()
+            .map_err(|err| SandboxLoadError::InvalidManifest(err.to_string()))?;
+        Ok(
+            Self::from_module(artifact.manifest().clone(), artifact.module())?
+                .with_artifact_sha256(digest),
+        )
     }
 
     /// Compile a module against a manifest.
@@ -1375,6 +1395,7 @@ impl SandboxHost {
             engine,
             module,
             permits: Semaphore::new(manifest.limits.max_concurrency),
+            artifact_sha256: None,
             instantiation_fuel: instantiation,
             owned_routes: super::wire::OwnedRoutes::from_routes(
                 manifest
@@ -1384,6 +1405,13 @@ impl SandboxHost {
             ),
             manifest,
         })
+    }
+
+    /// Record the sealed digest of the artifact this host came from.
+    #[must_use]
+    pub(super) fn with_artifact_sha256(mut self, digest: String) -> Self {
+        self.artifact_sha256 = Some(digest);
+        self
     }
 
     /// The manifest this host enforces.
@@ -1708,7 +1736,12 @@ impl SandboxHost {
             limits,
             line.as_bytes(),
             exchange,
-            crate::plugin_sandbox::capability::CapabilityRuntime::new(&self.manifest, services),
+            crate::plugin_sandbox::capability::CapabilityRuntime::new(&self.manifest, services)
+                .with_artifact_sha256(
+                    self.artifact_sha256
+                        .clone()
+                        .unwrap_or_else(|| self.manifest.sha256.clone()),
+                ),
         );
         state.stdin = VecDeque::from(line.into_bytes());
 
@@ -3203,8 +3236,26 @@ impl HostState {
     /// can get wrong comes back as a denial it can read. The two exits that do
     /// end the request are the host's own encoder failing, and a guest that has
     /// stopped reading its replies — see [`MAX_QUEUED_REPLY_BYTES`].
-    fn service(&mut self, call: &super::capability::CapabilityCall) {
-        let result = self.runtime.dispatch(call);
+    fn service(&mut self, call: &super::capability::CapabilityCall, fuel_left: u64) {
+        // The room the reply must fit, decided *before* the call runs. A reply
+        // cannot be measured until its call has committed, and a request that
+        // fails over a committed write is retried by the caller. So a call is
+        // dispatched only when the worst-case reply fits the unread-reply queue
+        // and the fuel left covers pricing it plus a fixed finishing allowance
+        // for the guest. A call that does not fit is answered with a denial the
+        // guest can read, and nothing runs.
+        let queue_room = MAX_QUEUED_REPLY_BYTES.saturating_sub(self.queued_replies);
+        // A quarter of the budget at most, so a small budget still serves calls.
+        let allowance = FINISH_ALLOWANCE_FUEL.min(self.limits.fuel / 4);
+        let fuel_room = usize::try_from(
+            fuel_left
+                .saturating_sub(allowance)
+                .saturating_mul(BYTES_PER_FUEL),
+        )
+        .unwrap_or(usize::MAX);
+        let result = self
+            .runtime
+            .dispatch_within(call, queue_room.min(fuel_room));
         let line = match to_line(&HostFrame::CallResult(result)) {
             Ok(line) => line,
             Err(err) => {
@@ -3242,11 +3293,11 @@ impl HostState {
     /// Returns `false` when the queue is empty. The caller charges
     /// [`CAPABILITY_CALL_FUEL`] before each `true` step, which is the whole
     /// point of the queue: see [`pending_calls`](Self::pending_calls).
-    fn service_next(&mut self) -> bool {
+    fn service_next(&mut self, fuel_left: u64) -> bool {
         let Some(call) = self.pending_calls.pop_front() else {
             return false;
         };
-        self.service(&call);
+        self.service(&call, fuel_left);
         true
     }
 
@@ -4019,7 +4070,8 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                                     && caller.data().answer.is_none()
                                 {
                                     charge_units(&mut caller, CAPABILITY_CALL_FUEL)?;
-                                    let _ = caller.data_mut().service_next();
+                                    let fuel_left = caller.get_fuel()?;
+                                    let _ = caller.data_mut().service_next(fuel_left);
                                     // Saturating, because this charge follows a
                                     // call that has already run: see
                                     // `charge_units_saturating`. The pre-charge
@@ -7966,6 +8018,130 @@ path = "/hello/greet"
         assert!(
             imports.contains(&"wasi_snapshot_preview1::fd_read".to_owned()),
             "{imports:?}"
+        );
+    }
+
+    // ── Reply room is reserved before a call commits (issue #2523) ───
+
+    fn outbound_state(
+        queued: usize,
+    ) -> (
+        HostState,
+        std::sync::Arc<crate::plugin_sandbox::RecordingHttp>,
+    ) {
+        let limits = ResourceLimits::default();
+        let manifest = crate::plugin_sandbox::manifest::SandboxManifest::parse(&format!(
+            r#"
+name = "hello"
+version = "0.1.0"
+wire_version = 1
+prefix = "/hello"
+capabilities = ["http-request", "http-outbound"]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "/hello/greet"
+
+[grants]
+hosts = ["api.example.com"]
+"#,
+            digest = "a".repeat(64)
+        ))
+        .expect("valid manifest");
+        let http = crate::plugin_sandbox::RecordingHttp::new();
+        let services = crate::plugin_sandbox::CapabilityServices {
+            http: Some(std::sync::Arc::clone(&http)
+                as std::sync::Arc<dyn crate::plugin_sandbox::OutboundHttp>),
+            ..crate::plugin_sandbox::CapabilityServices::none()
+        };
+        let mut state = HostState::new(
+            "hello".to_owned(),
+            limits,
+            b"",
+            Exchange::Request,
+            crate::plugin_sandbox::capability::CapabilityRuntime::new(&manifest, services),
+        );
+        state.queued_replies = queued;
+        (state, http)
+    }
+
+    fn post() -> crate::plugin_sandbox::CapabilityCall {
+        crate::plugin_sandbox::CapabilityCall::HttpFetch {
+            id: 1,
+            method: "POST".to_owned(),
+            url: "https://api.example.com/orders".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_call_is_not_committed_when_its_reply_could_not_be_queued() {
+        // One MiB queue, nearly full of unread replies: a POST could commit and
+        // then fail the request on its own reply.
+        let (mut state, http) = outbound_state(MAX_QUEUED_REPLY_BYTES - 1024);
+        state.service(&post(), u64::MAX);
+        assert!(http.seen().is_empty(), "the POST left the host");
+        assert!(state.answer.is_none(), "the request must go on");
+        let queued =
+            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned();
+        assert!(queued.contains("quota-exceeded"), "{queued}");
+    }
+
+    #[test]
+    fn a_call_is_not_committed_when_the_fuel_could_not_pay_for_its_reply() {
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), 1_000);
+        assert!(http.seen().is_empty(), "the POST left the host");
+        assert!(state.answer.is_none(), "the request must go on");
+    }
+
+    #[test]
+    fn a_call_with_room_and_fuel_is_dispatched() {
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), u64::MAX);
+        assert_eq!(http.seen().len(), 1);
+    }
+    #[test]
+    fn the_fuel_edge_for_a_reply_is_exact() {
+        let reserve = post().reply_reserve();
+        let allowance = FINISH_ALLOWANCE_FUEL.min(ResourceLimits::default().fuel / 4);
+        let need = allowance + (reserve as u64).div_ceil(BYTES_PER_FUEL);
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), need - 1);
+        assert!(http.seen().is_empty(), "one unit short must not dispatch");
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), need);
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn a_get_is_denied_not_failed_when_the_fuel_cannot_price_its_reply() {
+        let read = || crate::plugin_sandbox::CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let queued = |state: &HostState| {
+            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned()
+        };
+        let (mut state, _) = outbound_state(0);
+        state.service(&read(), 10);
+        assert!(state.answer.is_none(), "the request must go on");
+        assert!(
+            queued(&state).contains("quota-exceeded"),
+            "{}",
+            queued(&state)
+        );
+        let (mut state, _) = outbound_state(0);
+        state.service(&read(), 1_000_000);
+        assert!(
+            !queued(&state).contains("quota-exceeded"),
+            "{}",
+            queued(&state)
         );
     }
 }

@@ -331,6 +331,71 @@ pub trait PluginStore: Send + Sync + 'static {
     fn delete(&self, scope: &Scope, row_id: &str) -> Result<(), StoreError>;
 }
 
+/// Check a `db-*` call's shape, without copying any of it.
+///
+/// Run by `CapabilityRuntime::dispatch` *before* the per-capability quota is
+/// charged, so a call refused here spends no backend budget.
+///
+/// # Errors
+///
+/// The denial to answer with.
+pub(super) fn validate(call: &CapabilityCall) -> Result<(), CallResult> {
+    let id = call.id();
+    let checked = match call {
+        CapabilityCall::DbInsert { row, .. } => check_write_row(row),
+        CapabilityCall::DbGet { row_id, .. } | CapabilityCall::DbDelete { row_id, .. } => {
+            check_row_id(row_id)
+        }
+        CapabilityCall::DbQuery { filter, after, .. } => {
+            check_filter(filter).and_then(|()| after.as_deref().map_or(Ok(()), check_row_id))
+        }
+        CapabilityCall::DbUpdate { row_id, row, .. } => {
+            check_row_id(row_id).and_then(|()| check_write_row(row))
+        }
+        _ => Ok(()),
+    };
+    checked.map_err(|denial| denial(id))
+}
+
+/// Refuse rows a store hands back that the host would not have stored.
+///
+/// The limits match the write side, and every row must carry a usable
+/// [`ID_COLUMN`]. The host refuses the whole page: a shortened page would look
+/// like the end of the table. The detail names the row, so the guest can
+/// `db-delete` it, and the log names it for the operator.
+fn check_stored_rows<'a>(rows: impl IntoIterator<Item = &'a PluginRow>) -> Result<(), String> {
+    for row in rows {
+        if let Some(column) = row
+            .keys()
+            .find(|column| RESERVED_COLUMNS.contains(&column.as_str()))
+        {
+            return Err(format!(
+                "the store returned the host's column {column:?}, which a plugin may not write"
+            ));
+        }
+        let id = match row.get(ID_COLUMN) {
+            Some(super::PluginValue::Text(id)) if check_row_id(id).is_ok() => Some(id.as_str()),
+            _ => None,
+        };
+        let fault = match (id, super::check_row_without(row, Some(ID_COLUMN))) {
+            (None, _) => Some("it carries no usable row id".to_owned()),
+            (Some(_), Err(detail)) => Some(detail),
+            (Some(_), Ok(())) => None,
+        };
+        if let Some(fault) = fault {
+            let named = id.unwrap_or("?");
+            tracing::warn!(
+                row_id = named,
+                "a plugin store returned a row the host would not store"
+            );
+            return Err(format!(
+                "the store returned row {named:?}, which the host would not store: {fault}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Answer one `db-*` call. Capability, scope and quota are already checked.
 #[allow(
     clippy::too_many_lines,
@@ -366,6 +431,18 @@ pub(super) fn perform(
         CapabilityCall::DbInsert { row, .. } => match validated_row(row) {
             Err(result) => result(id),
             Ok(row) => match store.insert(&scope, row) {
+                // The write has happened; an id the guest could never use to
+                // address the row is the store's fault, and is reported at the
+                // operation that caused it.
+                Ok(row_id) if check_row_id(&row_id).is_err() => CallResult::denied(
+                    id,
+                    DenialReason::ResultRejected,
+                    format!(
+                        "the row was inserted, but the store assigned an id outside 1..={} \
+                         bytes; do not retry",
+                        super::MAX_ROW_ID_BYTES
+                    ),
+                ),
                 Ok(row_id) => CallResult::Ok {
                     id,
                     value: CallValue::RowId { row_id },
@@ -379,6 +456,9 @@ pub(super) fn perform(
             }
             match store.get(&scope, row_id) {
                 Ok(found) => {
+                    if let Err(detail) = check_stored_rows(found.iter()) {
+                        return CallResult::denied(id, DenialReason::ResultRejected, detail);
+                    }
                     // Through the same bound as a query, though a single row is
                     // under `MAX_ROW_BYTES` and therefore always survives it: a
                     // store is an embedder's implementation, and a row it
@@ -423,6 +503,9 @@ pub(super) fn perform(
                     after.as_deref(),
                 ) {
                     Ok(page) => {
+                        if let Err(detail) = check_stored_rows(page.rows.iter()) {
+                            return CallResult::denied(id, DenialReason::ResultRejected, detail);
+                        }
                         let mut rows = page.rows;
                         // Recorded before the cut, not inferred after it. A
                         // store that returned more than `want` and called the
@@ -487,7 +570,8 @@ pub(super) fn perform(
 /// expression rather than repeating the id into six error constructions.
 type Denial = Box<dyn FnOnce(u64) -> CallResult>;
 
-fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
+/// The checks of [`validated_row`], without building the copy.
+fn check_write_row(row: &PluginRow) -> Result<(), Denial> {
     // The host's own column comes off *before* the guest's ceilings are applied
     // to what is left. `db-get` hands back the row plus its `row_id`, and the
     // documented read-modify-write is to change a field and send that map to
@@ -522,6 +606,11 @@ fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
             }));
         }
     }
+    Ok(())
+}
+
+fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
+    check_write_row(row)?;
     // The one copy, built now that the row is known to be legal. `ID_COLUMN` is
     // dropped rather than refused; see `RESERVED_COLUMNS` for why.
     Ok(row
@@ -539,7 +628,7 @@ fn validated_row(row: &PluginRow) -> Result<PluginRow, Denial> {
 /// this tenant has", so a guest narrowing a query would silently widen it — the
 /// one direction a containment bug can go and still look like it worked.
 /// Refused instead, naming the call that does take an id.
-fn validated_filter(row: &PluginRow) -> Result<PluginRow, Denial> {
+fn check_filter(row: &PluginRow) -> Result<(), Denial> {
     if row.contains_key(ID_COLUMN) {
         return Err(Box::new(move |id| {
             CallResult::denied(
@@ -551,6 +640,11 @@ fn validated_filter(row: &PluginRow) -> Result<PluginRow, Denial> {
             )
         }));
     }
+    check_write_row(row)
+}
+
+fn validated_filter(row: &PluginRow) -> Result<PluginRow, Denial> {
+    check_filter(row)?;
     validated_row(row)
 }
 
