@@ -790,16 +790,42 @@ pub struct Running {
 /// The caller decides how long to wait. A caller that gives up must call
 /// [`StopHandle::stop`], or the auditor keeps running.
 pub fn spawn_evaluation(root: &Path) -> Running {
+    spawn(root, None)
+}
+
+/// Run the evaluation on its own thread, and stop it after `deadline`.
+///
+/// A watchdog thread enforces the deadline. It does not depend on the caller
+/// polling, so it holds while the caller is busy (for example in a rebuild).
+pub fn spawn_evaluation_with_deadline(root: &Path, deadline: Duration) -> Running {
+    spawn(root, Some(deadline))
+}
+
+fn spawn(root: &Path, deadline: Option<Duration>) -> Running {
     let (sender, receiver) = mpsc::channel();
     let root = root.to_path_buf();
     let stop = StopHandle::default();
     ACTIVE.register(&stop);
+    let finished = deadline.map(|deadline| watchdog(stop.clone(), deadline));
     let worker_stop = stop.clone();
     std::thread::spawn(move || {
         // A closed receiver means the caller moved on. Nothing to report.
         let _ = sender.send(evaluate_with(&root, &worker_stop));
+        // Dropping this ends the watchdog without a stop.
+        drop(finished);
     });
     Running { receiver, stop }
+}
+
+/// Stop `stop` after `deadline`, unless the returned sender is dropped first.
+fn watchdog(stop: StopHandle, deadline: Duration) -> mpsc::Sender<()> {
+    let (finished, wait) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if wait.recv_timeout(deadline) == Err(mpsc::RecvTimeoutError::Timeout) {
+            stop.stop();
+        }
+    });
+    finished
 }
 
 /// Wait up to `budget` for a spawned evaluation. `None` means it did not
@@ -1698,6 +1724,27 @@ mod tests {
             registry.register(&second);
             registry.stop_all();
             assert!(first.is_stopped() && second.is_stopped());
+        }
+
+        #[test]
+        fn the_watchdog_stops_an_audit_that_outlives_its_deadline() {
+            let stop = StopHandle::default();
+            let _finished = watchdog(stop.clone(), Duration::from_millis(20));
+            for _ in 0..500 {
+                if stop.is_stopped() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the deadline did not stop the audit");
+        }
+
+        #[test]
+        fn the_watchdog_leaves_a_finished_audit_alone() {
+            let stop = StopHandle::default();
+            drop(watchdog(stop.clone(), Duration::from_millis(50)));
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!stop.is_stopped());
         }
 
         #[test]

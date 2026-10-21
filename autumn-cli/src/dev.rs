@@ -707,8 +707,9 @@ impl DevReloadState {
 /// package-cache lock and slow the build itself — and the watch loop then polls
 /// for the result without blocking. A verdict that has not arrived by this
 /// deadline is dropped, its auditor process is killed, and the dev loop says
-/// nothing. The process is not killed before the deadline, except when the
-/// dev session ends.
+/// nothing. A watchdog thread enforces the deadline, so it holds while the
+/// loop is busy in a rebuild. The process is not killed before the deadline,
+/// except when the dev session ends.
 const DEPENDENCY_AUDIT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Startup lines for an evaluation that may not have finished in time.
@@ -729,7 +730,7 @@ struct DependencyAudit {
 
 impl DependencyAudit {
     fn start(root: &Path) -> Self {
-        let running = crate::deps::spawn_evaluation(root);
+        let running = crate::deps::spawn_evaluation_with_deadline(root, DEPENDENCY_AUDIT_DEADLINE);
         Self {
             receiver: running.receiver,
             stop: running.stop,
