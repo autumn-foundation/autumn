@@ -570,6 +570,12 @@ the same table. The two are held together by a test —
 so a rule that drifts fails the build rather than silently un-enforcing your
 policy.
 
+The two agree on every hand-written policy. They can split in two cases: an
+escaped key, which only doctor sees, and header-like text inside a string, which
+only the grep sees. Then doctor reports no verdict and names the sections. Write
+each section as a plain `[bans]` header, and keep header-like text out of
+strings.
+
 ### `autumn doctor` — the dependency check
 
 One check, `dependencies`, reporting each finding with its advisory or
@@ -696,7 +702,8 @@ On an air-gapped machine, set `[advisories] db-path` in `deny.toml` to a
 directory *holding* database checkouts — the same shape as
 `~/.cargo/advisory-dbs`, not a checkout itself — and mirror the RustSec
 repository into it. `~` and `$CARGO_HOME` are expanded, as cargo-deny expands
-them. Doctor reads that path and ages it the same way.
+them. A relative path is relative to the directory that holds `deny.toml`.
+Doctor reads that path and ages it the same way.
 
 ---
 

@@ -138,15 +138,13 @@ pub fn policy_checks(policy: &str) -> Vec<String> {
     checks
 }
 
-/// Optional checks on which doctor and the scaffolded workflow disagree.
+/// Optional checks that doctor and the scaffolded workflow list differently.
 ///
-/// Doctor parses TOML; the workflow greps, because a shell cannot parse TOML.
-/// They agree on every hand-written policy. They split in two ways:
+/// Doctor parses TOML. The workflow greps, because a shell cannot parse TOML.
+/// They agree on every hand-written policy. They differ in two cases:
 ///
 /// - Only TOML sees the check: an escaped key (`["ban\u0073"]`).
 /// - Only the grep sees the check: header-like text inside a string.
-///
-/// Either way the two check lists differ, so the split is reported.
 pub fn derivations_disagree(policy: &str) -> Vec<String> {
     let parsed = declared_sections(policy);
     OPTIONAL_CHECKS
@@ -195,21 +193,12 @@ fn line_declares(code: &str, section: &str) -> bool {
         .strip_prefix("[[")
         .or_else(|| code.strip_prefix('['))
         .map_or(code, ascii_trim_start);
-    // Quoted keys: ["bans"] and ['bans'].
-    let (body, quote) = match body.chars().next() {
-        Some(q @ ('"' | '\'')) => (&body[q.len_utf8()..], Some(q)),
-        _ => (body, None),
-    };
+    // Each quote is optional on its own, as in the workflow's grep.
+    let body = body.strip_prefix(['"', '\'']).unwrap_or(body);
     let Some(rest) = body.strip_prefix(section) else {
         return false;
     };
-    let rest = match quote {
-        Some(quote) => match rest.strip_prefix(quote) {
-            Some(rest) => rest,
-            None => return false,
-        },
-        None => rest,
-    };
+    let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
     matches!(ascii_trim_start(rest).chars().next(), Some(']' | '.' | '='))
 }
 
@@ -853,13 +842,13 @@ pub fn evaluate(root: &Path) -> Evaluation {
             checks,
         };
     }
-    // A section only one of the two derivations can see means the local check
-    // list and the CI check list differ, so no verdict here predicts that gate.
+    // One derivation sees a section that the other does not. The local and CI
+    // check lists differ, so doctor gives no verdict.
     let split = derivations_disagree(&policy);
     if !split.is_empty() {
         return Evaluation::Unavailable {
             reason: format!(
-                "{POLICY_FILE} reads differently to doctor and to the CI workflow for {}; write each as a plain [{}] header, and keep header-like text out of strings",
+                "{POLICY_FILE} gives doctor and the CI workflow different check lists for {}. Write each as a plain [{}] header. Do not put header-like text in strings.",
                 split.join(", "),
                 split.join("], [")
             ),
@@ -937,8 +926,8 @@ pub fn evaluate(root: &Path) -> Evaluation {
 
 /// The advisory database directory to age.
 ///
-/// cargo-deny runs in the policy root, so a relative `db-path` is relative to
-/// that root, not to the process directory.
+/// cargo-deny runs in the policy root. A relative `db-path` is therefore
+/// relative to that root, not to the process directory.
 fn resolve_db_dir(custom: Option<String>, root: &Path) -> PathBuf {
     custom.map_or_else(default_db_dir, |path| root.join(path))
 }
@@ -1439,25 +1428,49 @@ mod tests {
     }
 
     #[test]
-    fn agreeing_derivations_report_nothing() {
-        for policy in ["[advisories]\n", "[bans]\n[sources]\n", "# [bans]\n"] {
-            assert!(derivations_disagree(policy).is_empty(), "{policy:?}");
+    fn a_header_quoted_in_any_string_is_a_phantom_for_every_optional_check() {
+        for section in OPTIONAL_CHECKS {
+            for quote in ["\"\"\"", "'''"] {
+                let policy = format!(
+                    "[advisories]\nignore = [{{ id = \"X\", reason = {quote}\n[{section}]\n{quote} }}]\n"
+                );
+                assert_eq!(derivations_disagree(&policy), vec![(*section).to_owned()]);
+            }
         }
     }
 
     #[test]
+    fn a_real_header_plus_quoted_text_is_not_a_split() {
+        let policy =
+            "[bans]\n[advisories]\nignore = [{ id = \"X\", reason = \"\"\"\n[bans]\n\"\"\" }]\n";
+        assert!(derivations_disagree(policy).is_empty());
+        assert!(derivations_disagree("[advisories]\n# [bans]\n").is_empty());
+    }
+
+    #[test]
+    fn unpaired_quotes_in_a_string_match_the_grep() {
+        // The grep makes each quote optional, so `["bans']` matches it.
+        let policy = "[advisories]\nnote = \"\"\"\n[\"bans']\n\"\"\"\n";
+        assert_eq!(derivations_disagree(policy), vec!["bans".to_owned()]);
+    }
+
+    #[test]
+    fn invalid_toml_falls_back_to_the_scan_and_agrees() {
+        assert!(derivations_disagree("[bans\n[sources]\n").is_empty());
+    }
+
+    #[test]
     fn a_relative_db_path_is_resolved_against_the_policy_root() {
-        let root = Path::new("/repo");
+        let root = tempfile::tempdir().expect("tempdir");
+        let abs = tempfile::tempdir().expect("tempdir");
         assert_eq!(
-            resolve_db_dir(Some("advisory-dbs".to_owned()), root),
-            PathBuf::from("/repo/advisory-dbs")
+            resolve_db_dir(Some("advisory-dbs".to_owned()), root.path()),
+            root.path().join("advisory-dbs")
         );
         // An absolute path stays as written.
-        assert_eq!(
-            resolve_db_dir(Some("/srv/db".to_owned()), root),
-            PathBuf::from("/srv/db")
-        );
-        assert_eq!(resolve_db_dir(None, root), default_db_dir());
+        let abs_path = abs.path().to_string_lossy().into_owned();
+        assert_eq!(resolve_db_dir(Some(abs_path), root.path()), abs.path());
+        assert_eq!(resolve_db_dir(None, root.path()), default_db_dir());
     }
 
     #[test]
@@ -1474,7 +1487,7 @@ mod tests {
         ] {
             assert!(
                 derivations_disagree(policy).is_empty(),
-                "wrongly reported as invisible: {policy:?}"
+                "wrongly reported as a disagreement: {policy:?}"
             );
         }
     }
