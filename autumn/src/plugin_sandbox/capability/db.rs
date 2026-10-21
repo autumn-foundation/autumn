@@ -934,7 +934,7 @@ impl PluginStore for MemoryPluginStore {
             let Some(row) = rows.map.get(key) else {
                 continue;
             };
-            let weight = super::row_weight(row);
+            let weight = super::row_weight(row).saturating_add(super::row_framing(row));
             // No "but keep the first one" exemption, the same as
             // `bounded_rows` one layer up — and this is the sibling that pass
             // missed. `seed` can place a row the plugin path would have

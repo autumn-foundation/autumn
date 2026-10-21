@@ -528,10 +528,9 @@ pub(crate) fn from_line<T: serde::de::DeserializeOwned>(line: &str) -> Result<T,
     Ok(serde_json::from_str(line)?)
 }
 
-/// The most JSON values a legal guest frame holds.
+/// The most values and containers a legal guest frame holds.
 ///
-/// A fragment of [`MAX_NODES`](super::capability::render::MAX_NODES) nodes with
-/// the most attributes holds about 55,000. A larger count cannot be legal.
+/// A fragment of 512 nodes with 32 attributes each holds about 51,000.
 pub(crate) const MAX_FRAME_VALUES: usize = 65_536;
 
 /// The deepest JSON nesting a legal guest frame has.
@@ -539,11 +538,11 @@ pub(crate) const MAX_FRAME_VALUES: usize = 65_536;
 /// A fragment at its depth limit nests about 21 levels.
 pub(crate) const MAX_FRAME_DEPTH: usize = 32;
 
-/// Count a line's values and nesting without allocating.
+/// Count a line's containers, separators and nesting without allocating.
 ///
-/// A serde derive on an internally tagged enum copies the whole frame into a
-/// buffer before any `deserialize_with` limit runs. This scan refuses a frame
-/// that no legal guest sends, before that copy exists.
+/// A serde derive on a tagged enum copies the whole frame before any
+/// `deserialize_with` limit runs. This scan refuses a frame that no legal
+/// guest sends, before that copy exists.
 fn check_frame_shape(line: &str) -> Result<(), WireError> {
     let (mut depth, mut values) = (0_usize, 0_usize);
     let (mut in_string, mut escaped) = (false, false);
@@ -561,16 +560,20 @@ fn check_frame_shape(line: &str) -> Result<(), WireError> {
             b'"' => in_string = true,
             b'{' | b'[' => {
                 depth = depth.saturating_add(1);
-                values = values.saturating_add(1);
                 if depth > MAX_FRAME_DEPTH {
                     return Err(shape_error(format!(
                         "a frame nests deeper than {MAX_FRAME_DEPTH} levels"
                     )));
                 }
+                values = values.saturating_add(1);
             }
-            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'}' | b']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| shape_error("a frame closes more than it opens".to_owned()))?;
+            }
             b',' => values = values.saturating_add(1),
-            _ => {}
+            _ => continue,
         }
         if values > MAX_FRAME_VALUES {
             return Err(shape_error(format!(
@@ -1665,6 +1668,46 @@ mod tests {
         let nodes = vec![node; 512].join(",");
         let line = format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#);
         assert!(from_guest_line(&line).is_ok());
+    }
+
+    #[test]
+    fn the_value_ceiling_is_exact() {
+        // `[` counts one and each `,` counts one: n items hold n values.
+        let frame = |items: usize| {
+            let nodes = vec!["0"; items].join(",");
+            format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#)
+        };
+        // The frame, the array and the comma after `"op"` hold three.
+        let at_limit = MAX_FRAME_VALUES - 2;
+        assert!(check_frame_shape(&frame(at_limit)).is_ok());
+        let message = guest_err(&frame(at_limit + 1));
+        assert!(message.contains("values"), "{message}");
+    }
+
+    #[test]
+    fn the_depth_ceiling_is_exact() {
+        let nest = |levels: usize| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+        assert!(check_frame_shape(&nest(MAX_FRAME_DEPTH)).is_ok());
+        let message = guest_err(&nest(MAX_FRAME_DEPTH + 1));
+        assert!(message.contains("deep"), "{message}");
+    }
+
+    #[test]
+    fn a_frame_that_closes_more_than_it_opens_is_refused() {
+        let message = guest_err("]]]]");
+        assert!(message.contains("closes"), "{message}");
+    }
+
+    #[test]
+    fn a_backslash_before_the_closing_quote_ends_the_string() {
+        // `"a\\"` is a string holding one backslash. The scan must leave the
+        // string there, or it skips the `[` that follows.
+        let deep = "[".repeat(MAX_FRAME_DEPTH + 1);
+        let line = format!(r#"{{"a":"x\\","b":{deep}}}"#);
+        assert!(guest_err(&line).contains("deep"));
+        // An escaped quote does not end the string.
+        let line = r#"{"a":"x\"[[[[","b":0}"#;
+        assert!(check_frame_shape(line).is_ok());
     }
 
     #[test]

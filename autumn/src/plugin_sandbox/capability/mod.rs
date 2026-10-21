@@ -579,7 +579,7 @@ pub fn row_weight(row: &PluginRow) -> usize {
 
 /// Bytes of JSON syntax around a row: quotes, colons and commas per column,
 /// and the braces and `row_id` key.
-fn row_framing(row: &PluginRow) -> usize {
+pub(super) fn row_framing(row: &PluginRow) -> usize {
     row.len().saturating_mul(8).saturating_add(16)
 }
 
@@ -606,8 +606,7 @@ pub fn bounded_rows(rows: Vec<PluginRow>) -> (Vec<PluginRow>, bool) {
     let mut total = 0_usize;
     let mut truncated = false;
     for row in rows {
-        // The JSON around each column counts too, or many narrow rows encode
-        // past the ceiling `reply_reserve` promised the reply fits in.
+        // JSON syntax counts too. Else many narrow rows exceed the reply room.
         let weight = row_weight(&row).saturating_add(row_framing(&row));
         // No "but keep the first one" exemption. Letting an empty `kept` skip
         // the ceiling meant one corrupt or oversized row from an embedder's
@@ -3483,6 +3482,17 @@ path = "/shop/panel"
             encoded <= MAX_RESULT_BYTES,
             "{} rows encode to {encoded} bytes",
             kept.len()
+        );
+
+        // Text that grows when escaped: a control character takes six bytes.
+        let row: PluginRow = (0..MAX_ROW_COLUMNS)
+            .map(|i| (format!("c{i:02}"), PluginValue::Text("\u{1}\"".to_owned())))
+            .collect();
+        let (kept, _) = bounded_rows(vec![row; 20_000]);
+        let encoded = serde_json::to_vec(&kept).expect("encodes").len();
+        assert!(
+            encoded <= MAX_RESULT_BYTES,
+            "escaped rows encode to {encoded}"
         );
     }
 
