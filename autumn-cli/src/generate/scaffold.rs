@@ -12771,7 +12771,7 @@ fn render_reference_stub_tables_sql(
 /// Delegates to [`render_index_smoke_test`] or [`render_api_smoke_test`]
 /// depending on `api`, after computing the exact `CREATE TABLE`/`CREATE
 /// INDEX` SQL the generated migration also emits (see
-/// [`create_table_sql_with_metadata_and_id`]), so the throwaway table the
+/// [`create_table_sql_with_metadata_and_id_for`]), so the throwaway table the
 /// test creates in `TestDb` matches the real schema. Any `references` field
 /// also gets a stub target table created first — see
 /// [`render_reference_stub_tables_sql`].
