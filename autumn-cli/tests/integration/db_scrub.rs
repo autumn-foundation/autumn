@@ -216,7 +216,7 @@ pub fn gdpr_registry() -> GdprRegistry {
 ///
 /// Every profile the tests drive gets a key, so a test that exercises the
 /// production-profile refusal fails on THAT guard rather than on a missing key.
-fn write_encryption_credentials(dir: &Path) {
+pub(super) fn write_encryption_credentials(dir: &Path) {
     let editor = dir.join("fixture-editor.sh");
     std::fs::write(
         &editor,

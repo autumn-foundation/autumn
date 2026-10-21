@@ -60,13 +60,13 @@ pub const RETENTION_AUDIT_ACTOR: &str = "autumn:retention";
 /// How many rows one `DELETE` removes. A sweep never issues one unbounded
 /// delete: it walks the stale rows in batches so a single run cannot hold a
 /// long lock or spike replication lag on a hot table.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 const SWEEP_BATCH_ROWS: i64 = 500;
 
 /// Upper bound on batches per dataset per run. A run that hits this stops and
 /// resumes on the next tick, so a first sweep of a years-old table is spread
 /// over several ticks instead of one very long transaction storm.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 const SWEEP_MAX_BATCHES: usize = 1_000;
 
 // ── Dataset registry ─────────────────────────────────────────────────────
@@ -954,7 +954,7 @@ const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str,
 }
 
 /// The primary-key column each sweepable table batches by.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 const fn sweep_key_column(dataset: RetentionDataset) -> &'static str {
     match dataset {
         RetentionDataset::JobTracking => "key",
@@ -962,7 +962,7 @@ const fn sweep_key_column(dataset: RetentionDataset) -> &'static str {
     }
 }
 
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 async fn apply_sweep(
     state: &AppState,
     dataset: RetentionDataset,
@@ -975,7 +975,24 @@ async fn apply_sweep(
             Some("no database is configured, so this dataset has no rows here".to_owned());
         return;
     };
-    match sweep_postgres(&pool, dataset, window, dry_run).await {
+    #[cfg(not(feature = "sqlite"))]
+    let outcome = sweep_postgres(&pool, dataset, window, dry_run).await;
+    #[cfg(feature = "sqlite")]
+    let outcome = match sweep_sqlite(&pool, dataset, window, dry_run).await {
+        Ok(SqliteSweep::Swept(swept)) => Ok(swept),
+        Ok(SqliteSweep::MissingTable(table)) => {
+            report.skipped = Some(format!(
+                "{table} does not exist in this database, so this dataset has no rows here"
+            ));
+            return;
+        }
+        Ok(SqliteSweep::Skipped(reason)) => {
+            report.skipped = Some(reason);
+            return;
+        }
+        Err(failure) => Err(failure),
+    };
+    match outcome {
         Ok(swept) => {
             // Overwrite the provisional app-clock cutoff with the instant the
             // database actually applied, so the report and the audit record
@@ -1006,17 +1023,9 @@ async fn apply_sweep(
     }
 }
 
-/// The sweep itself is Postgres-only. Its predicates and batching are written
-/// against Postgres types and `NOW()`, and `autumn_experiment_assignments` is
-/// created by a Postgres-specific migration, so there is nothing here to run on
-/// `SQLite`. Report that rather than pretending a sweep ran.
-///
-/// The durable `SQLite` job backend (issue #1907) does create `autumn_jobs` and
-/// `autumn_job_tracking` in the app's own file, and prunes them itself from its
-/// maintenance loop — expired tracking records always, and terminal job rows
-/// when `retention.job_history` is set. A `SQLite` sweep driven from
-/// `autumn db retention` is tracked under #1909.
-#[cfg(any(not(feature = "db"), feature = "sqlite"))]
+/// A build without the `db` feature has no database to sweep. Report that
+/// rather than pretending a sweep ran.
+#[cfg(not(feature = "db"))]
 #[allow(clippy::unused_async)]
 async fn apply_sweep(
     _state: &AppState,
@@ -1025,15 +1034,7 @@ async fn apply_sweep(
     _dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
-    report.skipped = Some(
-        if cfg!(feature = "sqlite") {
-            "the retention sweep is Postgres-only; on SQLite the durable job runtime prunes \
-             its own tables (see retention.job_history) and a sweep for the rest is planned"
-        } else {
-            "this build has no database support (`db` feature off)"
-        }
-        .to_owned(),
-    );
+    report.skipped = Some("this build has no database support (`db` feature off)".to_owned());
 }
 
 /// Resolve the sweep cutoff **on the database server** and count/delete
@@ -1156,7 +1157,7 @@ async fn sweep_postgres(
 
 /// Pair an error with the rows the pass had already deleted when it hit that
 /// error, so no failure path can silently drop the count.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 fn sweep_failed(removed: u64, message: String) -> SweepFailure {
     SweepFailure {
         cutoff: None,
@@ -1173,7 +1174,7 @@ fn sweep_failed(removed: u64, message: String) -> SweepFailure {
 /// must state it — not the provisional app-clock value `run_one_dataset`
 /// seeded, which under clock skew names a different deletion boundary from
 /// the one actually applied.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 fn sweep_failed_at(
     cutoff: DateTime<Utc>,
     removed: u64,
@@ -1191,7 +1192,7 @@ fn sweep_failed_at(
 /// A sweep pass that failed, carrying everything the pass still has to
 /// report: the cutoff the database applied (once known), the rows earlier
 /// autocommit batches already deleted, and the error itself.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 struct SweepFailure {
     cutoff: Option<DateTime<Utc>>,
     removed: u64,
@@ -1288,8 +1289,8 @@ async fn count_stale(
     })
 }
 
-/// What one Postgres sweep pass achieved.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+/// What one sweep pass achieved.
+#[cfg(feature = "db")]
 struct SweptDataset {
     /// The instant the database itself resolved for the window.
     cutoff: DateTime<Utc>,
@@ -1299,6 +1300,378 @@ struct SweptDataset {
     removed: u64,
     /// `true` when stale rows are still present after the pass.
     truncated: bool,
+}
+
+// ── SQLite sweep (issue #2553) ───────────────────────────────────────────
+
+/// The database clock in epoch milliseconds. Like the Postgres sweep, the
+/// cutoff is read on the database side. The job runtime's own prune uses the
+/// app clock, so the two differ only under a simulated clock.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+const SQLITE_NOW_MS: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+
+/// How a `SQLite` dataset stores the time its predicate compares.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteClock {
+    /// `BIGINT` epoch milliseconds (`autumn_jobs`).
+    Millis,
+    /// `TEXT` as `YYYY-MM-DD HH:MM:SS`, UTC (`CURRENT_TIMESTAMP`).
+    Text,
+}
+
+/// The `SQLite` counterpart of [`stale_row_predicate`]: table, predicate and
+/// clock. `?1` is the cutoff. The rules match the Postgres predicates and the
+/// job runtime's own history prune.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+#[must_use]
+fn stale_row_predicate_sqlite(
+    dataset: RetentionDataset,
+) -> Option<(&'static str, String, SqliteClock)> {
+    match dataset {
+        RetentionDataset::JobHistory => Some((
+            "autumn_jobs",
+            format!(
+                "status IN ('completed', 'failed', 'discarded') \
+                 AND finished_at IS NOT NULL AND finished_at < ?1 \
+                 AND NOT (unique_key IS NOT NULL AND unique_window = 'ttl' \
+                          AND enqueued_at > ({SQLITE_NOW_MS}) - COALESCE(unique_ttl_ms, 0))"
+            ),
+            SqliteClock::Millis,
+        )),
+        RetentionDataset::CommitHooks => Some((
+            "autumn_repository_commit_hooks",
+            "status IN ('completed', 'failed', 'after_hook_failed') \
+             AND finished_at IS NOT NULL AND finished_at < ?1"
+                .to_owned(),
+            SqliteClock::Text,
+        )),
+        RetentionDataset::ExperimentAssignments => Some((
+            "autumn_experiment_assignments",
+            "assigned_at < ?1 AND NOT EXISTS ( \
+                 SELECT 1 FROM autumn_experiments e \
+                 WHERE e.name = autumn_experiment_assignments.experiment \
+                   AND e.state IN ('draft', 'running', 'concluded'))"
+                .to_owned(),
+            SqliteClock::Text,
+        )),
+        // `job_tracking` is a backend-TTL dataset on `SQLite`: the job runtime
+        // deletes expired rows itself.
+        RetentionDataset::JobTracking
+        | RetentionDataset::Idempotency
+        | RetentionDataset::WebhookReplay
+        | RetentionDataset::Sessions
+        | RetentionDataset::AuditArchives
+        | RetentionDataset::CustomDomains => None,
+    }
+}
+
+/// The index that serves a dataset's cutoff scan, created if it is missing.
+/// `autumn_jobs` already has `idx_autumn_jobs_status_finished`.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+const fn sqlite_sweep_index(dataset: RetentionDataset) -> Option<&'static str> {
+    match dataset {
+        RetentionDataset::CommitHooks => Some(
+            "CREATE INDEX IF NOT EXISTS idx_autumn_commit_hooks_finished \
+             ON autumn_repository_commit_hooks (finished_at) \
+             WHERE status IN ('completed', 'failed', 'after_hook_failed')",
+        ),
+        RetentionDataset::ExperimentAssignments => Some(
+            "CREATE INDEX IF NOT EXISTS idx_autumn_exp_assignments_assigned_at \
+             ON autumn_experiment_assignments (assigned_at)",
+        ),
+        _ => None,
+    }
+}
+
+/// The resolved cutoff, in the form the dataset's column stores.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+enum SqliteCutoff {
+    Millis(i64),
+    Text(String),
+}
+
+/// What a `SQLite` sweep did, or why it had nothing to do.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+enum SqliteSweep {
+    Swept(SweptDataset),
+    /// A dataset table this database does not have.
+    MissingTable(&'static str),
+    /// The table exists but its schema is too old to sweep safely.
+    Skipped(String),
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[derive(diesel::QueryableByName)]
+struct SqliteCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+/// Run (or dry-run) one dataset's sweep against the app's `SQLite` file.
+///
+/// Same contract as the Postgres sweep: the cutoff is resolved on the
+/// database, deletes run in bounded batches as separate statements, the outer
+/// `DELETE` repeats the predicate so a row revived mid-sweep survives, and a
+/// failure reports what earlier batches already removed.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+// One pass: look, resolve, count, index, delete in batches, recount.
+#[allow(clippy::too_many_lines)]
+async fn sweep_sqlite(
+    pool: &diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+    dataset: RetentionDataset,
+    window: Duration,
+    dry_run: bool,
+) -> Result<SqliteSweep, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    let Some((table, predicate, clock)) = stale_row_predicate_sqlite(dataset) else {
+        return Err(sweep_failed(
+            0,
+            format!("{dataset} is not a sweep-enforced dataset"),
+        ));
+    };
+    let key = sweep_key_column(dataset);
+    let mut conn = pool.get().await.map_err(|e| {
+        sweep_failed(
+            0,
+            format!("retention sweep could not acquire a connection: {e}"),
+        )
+    })?;
+
+    for needed in std::iter::once(table)
+        .chain((dataset == RetentionDataset::ExperimentAssignments).then_some("autumn_experiments"))
+    {
+        if !sqlite_table_exists(&mut conn, needed).await? {
+            return Ok(SqliteSweep::MissingTable(needed));
+        }
+    }
+
+    // The job runtime adds `unique_ttl_ms` when it starts. A sweep that runs
+    // first on an older file must not guess: skip it and delete nothing.
+    if dataset == RetentionDataset::JobHistory
+        && !sqlite_column_exists(&mut conn, table, "unique_ttl_ms").await?
+    {
+        return Ok(SqliteSweep::Skipped(format!(
+            "{table} predates the unique_ttl_ms column, so the sweep cannot check TTL holds. \
+             Start the app once so the job runtime upgrades the table, then run this again"
+        )));
+    }
+
+    let (cutoff_at, cutoff) = resolve_sqlite_cutoff(&mut conn, table, window, clock).await?;
+    let eligible =
+        count_stale_sqlite(&mut conn, table, &predicate, &cutoff, 0, None, cutoff_at).await?;
+    if dry_run || eligible == 0 {
+        return Ok(SqliteSweep::Swept(SweptDataset {
+            cutoff: cutoff_at,
+            eligible,
+            removed: 0,
+            truncated: false,
+        }));
+    }
+
+    // The same indexes the Postgres migration adds. The SQLite migration for
+    // them is a no-op shim that existing files have already applied, so the
+    // sweep creates them. Without one, every batch rescans the table.
+    if let Some(index) = sqlite_sweep_index(dataset) {
+        diesel::sql_query(index)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                sweep_failed_at(
+                    cutoff_at,
+                    0,
+                    Some(eligible),
+                    format!("retention could not create the sweep index on {table}: {e}"),
+                )
+            })?;
+    }
+
+    let mut removed: u64 = 0;
+    for _ in 0..SWEEP_MAX_BATCHES {
+        let sql = format!(
+            "DELETE FROM {table} WHERE {predicate} AND {key} IN \
+             (SELECT {key} FROM {table} WHERE {predicate} LIMIT ?2)"
+        );
+        let query = diesel::sql_query(sql);
+        let affected = match &cutoff {
+            SqliteCutoff::Millis(ms) => {
+                query
+                    .bind::<diesel::sql_types::BigInt, _>(*ms)
+                    .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
+                    .execute(&mut *conn)
+                    .await
+            }
+            SqliteCutoff::Text(text) => {
+                query
+                    .bind::<diesel::sql_types::Text, _>(text.clone())
+                    .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
+                    .execute(&mut *conn)
+                    .await
+            }
+        }
+        .map_err(|e| {
+            sweep_failed_at(
+                cutoff_at,
+                removed,
+                Some(eligible),
+                format!("retention sweep of {table} failed: {e}"),
+            )
+        })?;
+        removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
+        // Stop on a batch that deleted nothing, not a short one: the outer
+        // predicate is re-checked at delete time, so a short batch does not
+        // mean the table is drained.
+        if affected == 0 {
+            break;
+        }
+    }
+
+    let remaining = count_stale_sqlite(
+        &mut conn,
+        table,
+        &predicate,
+        &cutoff,
+        removed,
+        Some(eligible),
+        cutoff_at,
+    )
+    .await?;
+    Ok(SqliteSweep::Swept(SweptDataset {
+        cutoff: cutoff_at,
+        eligible,
+        removed,
+        truncated: remaining > 0,
+    }))
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn sqlite_table_exists(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+) -> Result<bool, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?1",
+    )
+    .bind::<diesel::sql_types::Text, _>(table)
+    .get_result::<SqliteCount>(&mut **conn)
+    .await
+    .map(|row| row.count > 0)
+    .map_err(|e| sweep_failed(0, format!("retention could not look for {table}: {e}")))
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn sqlite_column_exists(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    diesel::sql_query("SELECT COUNT(*) AS count FROM pragma_table_info(?1) WHERE name = ?2")
+        .bind::<diesel::sql_types::Text, _>(table)
+        .bind::<diesel::sql_types::Text, _>(column)
+        .get_result::<SqliteCount>(&mut **conn)
+        .await
+        .map(|row| row.count > 0)
+        .map_err(|e| sweep_failed(0, format!("retention could not inspect {table}: {e}")))
+}
+
+/// Resolve `now - window` **on the database**, as an instant and in the form
+/// the dataset's column stores.
+///
+/// An out-of-range window is an error, never a clamp: clamping would delete
+/// rows the report claims are inside the policy.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn resolve_sqlite_cutoff(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+    window: Duration,
+    clock: SqliteClock,
+) -> Result<(DateTime<Utc>, SqliteCutoff), SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct CutoffRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        cutoff_ms: Option<i64>,
+    }
+
+    let too_wide = || {
+        sweep_failed(
+            0,
+            format!(
+                "retention window for {table} ({}s) exceeds the maximum the sweep can \
+                 apply; refusing rather than silently sweeping a shorter window",
+                window.as_secs()
+            ),
+        )
+    };
+    let window_ms = i64::try_from(window.as_millis()).map_err(|_| too_wide())?;
+    let row = diesel::sql_query(format!("SELECT {SQLITE_NOW_MS} - ?1 AS cutoff_ms"))
+        .bind::<diesel::sql_types::BigInt, _>(window_ms)
+        .get_result::<CutoffRow>(&mut **conn)
+        .await
+        .map_err(|e| {
+            sweep_failed(
+                0,
+                format!("retention could not resolve the cutoff for {table}: {e}"),
+            )
+        })?;
+    let ms = row.cutoff_ms.ok_or_else(too_wide)?;
+    // A text column holds whole seconds. Report the instant that is applied.
+    let at = match clock {
+        SqliteClock::Millis => DateTime::<Utc>::from_timestamp_millis(ms),
+        SqliteClock::Text => DateTime::<Utc>::from_timestamp(ms.div_euclid(1000), 0),
+    }
+    .ok_or_else(too_wide)?;
+    let cutoff = match clock {
+        SqliteClock::Millis => SqliteCutoff::Millis(ms),
+        SqliteClock::Text => SqliteCutoff::Text(at.format("%Y-%m-%d %H:%M:%S").to_string()),
+    };
+    Ok((at, cutoff))
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn count_stale_sqlite(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+    predicate: &str,
+    cutoff: &SqliteCutoff,
+    removed_so_far: u64,
+    eligible: Option<u64>,
+    cutoff_at: DateTime<Utc>,
+) -> Result<u64, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    let query = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
+    ));
+    match cutoff {
+        SqliteCutoff::Millis(ms) => {
+            query
+                .bind::<diesel::sql_types::BigInt, _>(*ms)
+                .get_result::<SqliteCount>(&mut **conn)
+                .await
+        }
+        SqliteCutoff::Text(text) => {
+            query
+                .bind::<diesel::sql_types::Text, _>(text.clone())
+                .get_result::<SqliteCount>(&mut **conn)
+                .await
+        }
+    }
+    .map(|row| u64::try_from(row.count).unwrap_or(0))
+    .map_err(|e| {
+        sweep_failed_at(
+            cutoff_at,
+            removed_so_far,
+            eligible,
+            format!("retention count for {table} failed: {e}"),
+        )
+    })
 }
 
 // ── Audit record (AC #6) ─────────────────────────────────────────────────
@@ -1896,13 +2269,69 @@ mod tests {
         assert!(!note.contains("quiet process"), "{note}");
     }
 
-    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[cfg(feature = "db")]
     #[test]
     fn a_failure_after_the_count_keeps_the_eligible_count() {
         let failure = sweep_failed_at(Utc::now(), 500, Some(5_000_000), "timeout".to_owned());
         assert_eq!(failure.eligible, Some(5_000_000));
         assert_eq!(failure.removed, 500);
         assert_eq!(sweep_failed(0, "no pool".to_owned()).eligible, None);
+    }
+
+    #[test]
+    fn sqlite_predicates_use_one_cutoff_and_the_same_statuses_as_postgres() {
+        for dataset in RETENTION_DATASETS {
+            let sqlite = stale_row_predicate_sqlite(dataset);
+            let pg = stale_row_predicate(dataset);
+            assert_eq!(
+                sqlite.as_ref().map(|(table, ..)| *table),
+                pg.map(|(table, _)| table)
+                    .filter(|_| dataset != RetentionDataset::JobTracking),
+                "{dataset}: same table set, job_tracking is TTL-only on SQLite"
+            );
+            if let Some((_, predicate, _)) = sqlite {
+                assert!(predicate.contains("?1"), "{dataset}: {predicate}");
+                assert!(
+                    !predicate.contains("$1") && !predicate.contains("?2"),
+                    "{predicate}"
+                );
+                if let Some((_, pg_predicate)) = pg {
+                    if pg_predicate.contains("status IN (") {
+                        assert_eq!(
+                            statuses_in(&predicate),
+                            statuses_in(pg_predicate),
+                            "{dataset}"
+                        );
+                    }
+                    if pg_predicate.contains("state IN (") {
+                        assert_eq!(states_in(&predicate), states_in(pg_predicate), "{dataset}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_sqlite_sweep_has_an_index_or_one_already_exists() {
+        for dataset in RETENTION_DATASETS {
+            let Some(index) = sqlite_sweep_index(dataset) else {
+                continue;
+            };
+            let (table, ..) = stale_row_predicate_sqlite(dataset).expect("a sweep");
+            assert!(index.contains(table), "{dataset}: {index}");
+            assert!(index.contains("IF NOT EXISTS"), "{index}");
+        }
+        assert!(sqlite_sweep_index(RetentionDataset::CommitHooks).is_some());
+        assert!(sqlite_sweep_index(RetentionDataset::ExperimentAssignments).is_some());
+    }
+
+    #[test]
+    fn sqlite_job_history_keeps_a_live_ttl_dedup_hold() {
+        let (_, predicate, clock) =
+            stale_row_predicate_sqlite(RetentionDataset::JobHistory).expect("sweepable");
+        assert_eq!(clock, SqliteClock::Millis);
+        assert!(predicate.contains("unique_ttl_ms"), "{predicate}");
+        assert!(predicate.contains("finished_at IS NOT NULL"), "{predicate}");
     }
 
     #[test]

@@ -160,6 +160,11 @@ impl FakeProvider {
         *self.live_subscription.lock().unwrap() = Some(snapshot);
     }
 
+    /// Back to "cannot look subscriptions up".
+    pub fn clear_live_subscription(&self) {
+        *self.live_subscription.lock().unwrap() = None;
+    }
+
     /// Number of `fetch_subscription` calls.
     pub fn fetch_calls(&self) -> usize {
         self.calls()
@@ -821,6 +826,30 @@ pub fn harness_dyn(
             .plans(&catalog())
             .provider(provider.clone())
             .store(store.clone()),
+    );
+    let client = customize(app).build();
+    DynHarness {
+        client,
+        store,
+        provider,
+    }
+}
+
+/// Like [`harness_dyn`] with recording `hooks`.
+pub fn harness_dyn_hooks(
+    billing: BillingConfig,
+    hooks: Arc<dyn BillingHooks>,
+    store: Arc<dyn BillingStore>,
+    provider: Arc<FakeProvider>,
+    customize: impl FnOnce(TestApp) -> TestApp,
+) -> DynHarness {
+    let app = TestApp::new().config(autumn_config(&billing)).plugin(
+        BillingPlugin::new()
+            .config(billing)
+            .plans(&catalog())
+            .provider(provider.clone())
+            .store(store.clone())
+            .hooks(hooks),
     );
     let client = customize(app).build();
     DynHarness {
