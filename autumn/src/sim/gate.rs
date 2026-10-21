@@ -570,6 +570,18 @@ mod tests {
         assert_eq!(order, ["local", "local", "local", "blocking"]);
     }
 
+    /// `SimRuntime` still gives the `Runtime` methods, and it shuts down.
+    #[test]
+    fn sim_gate_runtime_derefs_and_shuts_down() {
+        let rt = runtime().unwrap();
+        let out = rt.handle().block_on(async { 7 });
+        assert_eq!(out, 7);
+        let task = rt.spawn(async { 1 });
+        assert_eq!(rt.block_on(task).unwrap(), 1);
+        rt.shutdown_timeout(std::time::Duration::from_millis(10));
+        runtime().unwrap().shutdown_background();
+    }
+
     #[test]
     fn sim_gate_off_a_sim_runtime_does_nothing() {
         let _scope = Scope::enter();
