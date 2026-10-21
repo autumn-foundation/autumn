@@ -1107,6 +1107,18 @@ path = "tests/sqlite_ledger_out_of_band.rs"
 name = "sqlite_commit_hook_worker"
 path = "tests/sqlite_commit_hook_worker.rs"
 
+# The unified retention sweeps against a SQLite-backed app (issue #2553). Runs the
+# real `run_retention` engine over a file database built by the real framework
+# migrations: aged rows go, newer and live rows stay, a dry run only counts, the
+# cutoff comes from the database clock, a legal hold vetoes a dataset, and a
+# 1200-row backlog drains in batches. No Docker. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_framework_retention`.
+[[test]]
+name = "sqlite_framework_retention"
+path = "tests/sqlite_framework_retention.rs"
+
 # SQLite durable-jobs + single-host scheduler e2e proof (issue #1907). On a real
 # SQLite pool/app it (1) starts the default in-process `local` job runtime and
 # drives an enqueued job to completion, (2) builds the default `in_process`
