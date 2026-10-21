@@ -326,13 +326,19 @@ fn any_rust_file(project_root: &Path, test: impl Fn(&str) -> bool) -> bool {
     false
 }
 
-/// Whether `text` holds `path`, `=`, and a string literal that ends in `file`.
+/// Whether `text` holds `path`, `=`, and a string literal (plain or raw) that
+/// ends in `file`.
 fn names_path(text: &str, file: &str) -> bool {
     text.match_indices("path").any(|(at, _)| {
         let Some(rest) = text[at + 4..].trim_start().strip_prefix('=') else {
             return false;
         };
-        let Some(literal) = rest.trim_start().strip_prefix('"') else {
+        // A plain `"…"` or a raw `r"…"` / `r#"…"#` literal.
+        let rest = rest.trim_start();
+        let rest = rest
+            .strip_prefix('r')
+            .map_or(rest, |raw| raw.trim_start_matches('#'));
+        let Some(literal) = rest.strip_prefix('"') else {
             return false;
         };
         literal.split('"').next().is_some_and(|value| {
@@ -1066,6 +1072,8 @@ mod tests {
         assert!(!names_path("#[path = \"jobs/foo.rs.bak\"]", "foo.rs"));
         assert!(!names_path("#[path = \"jobs/barfoo.rs\"]", "foo.rs"));
         assert!(!names_path("let path = 3;", "foo.rs"));
+        assert!(names_path("#[path = r\"jobs/foo.rs\"]", "foo.rs"));
+        assert!(names_path("#[path = r#\"foo.rs\"#]", "foo.rs"));
     }
 
     #[test]
