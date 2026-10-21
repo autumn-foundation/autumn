@@ -555,9 +555,8 @@ cargo-deny is not installed, doctor does not check the schema: `yanked =
 the doctor line says `not evaluated` and that doctor cannot check `deny.toml`. Install cargo-deny to close the gap.
 
 When a doctor or dev audit reaches its deadline (30 seconds), Autumn kills the
-`cargo-deny` process. On Unix, it also kills the processes that `cargo-deny`
-started, so they cannot hold Cargo's package-cache lock. On Windows, only
-`cargo-deny` itself is killed. A finished audit is never killed.
+`cargo-deny` process and the processes it started, so they cannot hold Cargo's
+package-cache lock. A finished audit is never killed.
 
 Uncommenting a section widens both sides at once. The generated workflow
 derives its check list from the file:

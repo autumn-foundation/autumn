@@ -868,19 +868,14 @@ impl StopHandle {
     }
 }
 
-/// Kill a child and, on Unix, every process it started.
+/// Kill a child and every process it started.
 ///
-/// On Windows only the child dies. The auditor runs `cargo metadata` as its own child. Killing only the
-/// auditor leaves that process holding the package-cache lock.
+/// The auditor runs `cargo metadata` as its own child. Killing only the
+/// auditor leaves that process holding the package-cache lock. On Unix the
+/// child leads its own process group (see `run_stoppable`). On Windows the
+/// sweep walks the process tree.
 fn kill_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // The child leads its own process group (see `run_stoppable`).
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
+    crate::process::force_kill_group(child.id());
     let _ = child.kill();
 }
 
