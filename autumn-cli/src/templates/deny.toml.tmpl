@@ -114,6 +114,15 @@ ignore = [
     # exploit here, and no safe upgrade (the author recommends `web-time`).
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — `webpki-roots` 0.26 bundles a root that allows paths
+    # through distrusted emSign intermediates.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0381
+    #
+    # Present for the same reason: the 0.26.11 copy arrives through
+    # sqlx-core 0.8.6, under the embedded-Postgres stack. No patched 0.26.x
+    # exists. Version 1.0.10 has the fix, and the rest of the tree uses it.
+    # Review-by: 2026-11-03.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 under the managed-pg-bundled embedded-Postgres stack (no patched 0.26.x exists); added 2026-10-20; review-by 2026-11-03" },
     # <<< autumn:bundled-pg-waiver
 ]
 
