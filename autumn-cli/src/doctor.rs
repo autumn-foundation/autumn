@@ -266,7 +266,7 @@ pub fn check_dependencies_impl(eval: &crate::deps::Evaluation) -> CheckResult {
         Evaluation::AuditorMissing { checks } => (
             CheckStatus::Pass,
             format!(
-                "not evaluated — cargo-deny is not installed (`cargo install --locked cargo-deny`); {}",
+                "not evaluated or validated — cargo-deny is not installed (`cargo install --locked cargo-deny`); only cargo-deny can check that deny.toml is valid, so CI can still reject it; {}",
                 dependency_checks_phrase(checks)
             ),
             None,
@@ -22839,6 +22839,19 @@ redirect_uri = "http://localhost/callback"
                 detail.contains("cargo install"),
                 "the detail must say how to enable it: {detail}"
             );
+        }
+
+        #[test]
+        fn a_missing_auditor_says_the_policy_is_not_validated_either() {
+            // Only cargo-deny knows its config schema. `yanked = "bogus"` is
+            // valid TOML, so doctor passes it, and CI rejects it (issue #2575).
+            let result = check_dependencies_impl(&Evaluation::AuditorMissing {
+                checks: vec!["advisories".to_owned()],
+            });
+            assert_eq!(result.status, CheckStatus::Pass);
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("validated"), "{detail}");
+            assert!(detail.contains("CI can still reject"), "{detail}");
         }
 
         #[test]
