@@ -1711,6 +1711,19 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
             || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
+          # Issue #2576: the Postgres admin-retry unique-key tests are `--lib`
+          # (they drive the crate-private `PgJobAdminBackend`). Named by full
+          # path, with a pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::pg::pg_admin_retry_restores_pending_window_unique_key \
+              job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
+              | tee "${RUNNER_TEMP}/pg-admin-retry-key.log"
+          )
+          grep -qE 'test result: ok\. 2 passed' "${RUNNER_TEMP}/pg-admin-retry-key.log" \
+            || { echo "::error::the pg admin-retry key tests did not all run — the ci.yml filters no longer match"; exit 1; }
           # The migration lock_timeout + retry suite (#3057) is `--lib`: it
           # drives the migrator's private retry policy. Named by full path,
           # with a pass count, for the same reason as the suites above.

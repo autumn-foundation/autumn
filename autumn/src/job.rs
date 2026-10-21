@@ -20814,6 +20814,10 @@ mod tests {
                 include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
             conn.batch_execute(sql2).await.unwrap();
 
+            let sql_pending =
+                include_str!("../migrations/20260611000000_add_pending_unique_key_to_jobs/up.sql");
+            conn.batch_execute(sql_pending).await.unwrap();
+
             let sql3 = include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql");
             conn.batch_execute(sql3).await.unwrap();
         }
@@ -22602,11 +22606,18 @@ mod tests {
 
         #[test]
         fn pg_admin_retry_sql_restores_pending_window_unique_key() {
-            let sql = PG_RETRY_FAILED_SQL;
-            assert!(sql.contains("unique_key = CASE"), "{sql}");
-            assert!(sql.contains("pending_unique_key = NULL"), "{sql}");
+            let sql = PG_RETRY_FAILED_SQL
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             assert!(
-                sql.contains("NOT EXISTS"),
+                sql.contains(
+                    "unique_key = CASE WHEN pending_unique_key IS NOT NULL AND NOT EXISTS"
+                ),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("dup.status IN ('enqueued', 'running') ) THEN pending_unique_key ELSE unique_key END, pending_unique_key = NULL"),
                 "a live duplicate must keep the key: {sql}"
             );
         }
@@ -22668,6 +22679,83 @@ mod tests {
                 .expect("claim retried");
             assert_eq!(claimed.id, "pend-fail");
             assert_eq!(enqueue("pend-after-claim").await, EnqueueOutcome::Queued);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
+            };
+
+            let constraints = unique_constraints("acct-10", JobUniquenessWindow::Pending);
+            let enqueue = |id: &'static str| {
+                let pool = pool.clone();
+                let constraints = constraints.clone();
+                async move {
+                    pg_enqueue_job(
+                        &pool,
+                        id.to_string(),
+                        "sync_account",
+                        "default",
+                        serde_json::json!({}),
+                        1,
+                        10,
+                        &constraints,
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(enqueue("held-fail").await, EnqueueOutcome::Queued);
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
+            assert!(
+                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, Some("acct-10"), 0)
+                    .await
+                    .unwrap()
+            );
+            // The claim freed the key, so a twin takes it while the row is failed.
+            assert_eq!(enqueue("held-twin").await, EnqueueOutcome::Queued);
+
+            // The retry succeeds. The twin keeps the key; the retried row has none.
+            backend.pg_retry_failed("held-fail").await.unwrap();
+            let retried = pg_fetch_by_id(&pool, "held-fail").await.unwrap();
+            assert_eq!(retried.status, "enqueued");
+            assert!(pg_unique_keys(&pool, "held-fail").await.0.is_none());
+            assert!(pg_unique_keys(&pool, "held-fail").await.1.is_none());
+        }
+
+        async fn pg_unique_keys(pool: &PgPool, id: &str) -> (Option<String>, Option<String>) {
+            use diesel_async::RunQueryDsl as _;
+
+            #[derive(diesel::QueryableByName)]
+            struct Keys {
+                #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+                unique_key: Option<String>,
+                #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+                pending_unique_key: Option<String>,
+            }
+            let mut conn = pool.get().await.unwrap();
+            let keys = diesel::sql_query(
+                "SELECT unique_key, pending_unique_key FROM autumn_jobs WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(id)
+            .get_result::<Keys>(&mut *conn)
+            .await
+            .unwrap();
+            (keys.unique_key, keys.pending_unique_key)
         }
 
         async fn pg_fetch_by_id(pool: &PgPool, id: &str) -> Option<PgJobRow> {
