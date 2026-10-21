@@ -114,6 +114,15 @@ ignore = [
     # exploit here, and no safe upgrade (the author recommends `web-time`).
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — `webpki-roots` 0.26.x bundles a distrusted root.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0381
+    #
+    # Present for the same apps: `webpki-roots` 0.26.11 arrives through
+    # sqlx-core -> postgresql_embedded. The advisory is fixed only in 1.0.10 and
+    # later, and no 0.26.x patch exists, so this copy cannot be upgraded. Autumn
+    # drops this waiver when postgresql_embedded moves to webpki-roots 1.x.
+    # Review-by: 2026-11-04.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core -> postgresql_embedded (managed-pg-bundled); no patched 0.26.x; needs a postgresql_embedded bump; review-by 2026-11-04" },
     # <<< autumn:bundled-pg-waiver
 ]
 
