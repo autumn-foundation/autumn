@@ -20809,6 +20809,10 @@ mod tests {
             let sql1 = include_str!("../migrations/20260513000000_create_job_queue/up.sql");
             conn.batch_execute(sql1).await.unwrap();
 
+            let sql_trace =
+                include_str!("../migrations/20260519000000_add_trace_context_to_jobs/up.sql");
+            conn.batch_execute(sql_trace).await.unwrap();
+
             let sql2 =
                 include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
             conn.batch_execute(sql2).await.unwrap();
