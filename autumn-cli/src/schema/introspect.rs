@@ -2045,7 +2045,7 @@ mod sqlite {
     }
 
     /// Normalize a raw `SQLite` `dflt_value` into a [`ColumnDefault`]. Recovers the
-    /// Autumn `Timestamp` convention default (`CURRENT_TIMESTAMP` → [`Now`]) and
+    /// Autumn `Timestamp` convention default (`CURRENT_TIMESTAMP` → `Now`) and
     /// preserves anything else verbatim.
     ///
     /// `pragma_table_info.dflt_value` reports the literal keyword `NULL` (bareword,
@@ -2307,9 +2307,9 @@ mod sqlite {
     /// rebuild / `DropTable` rollback would produce illegal DDL. Instead a
     /// **single-column** inline `col TEXT UNIQUE` is folded into the column's
     /// `unique = true` flag: a matching `#[unique]` model is recognized as already
-    /// satisfied ([`baseline_unique_index_covers`], no `AddIndex` / no guard refusal),
+    /// satisfied (`baseline_unique_index_covers`, no `AddIndex` / no guard refusal),
     /// and the emitter renders it as inline `UNIQUE` on a rebuild/rollback
-    /// ([`render_create_table_body`]) so uniqueness is preserved. A **composite**
+    /// (`render_create_table_body`) so uniqueness is preserved. A **composite**
     /// table-level `UNIQUE(a, b)` has no single-column flag and no recreatable IR form,
     /// so it is skipped entirely (DEFERRED, #1975 — a rare brownfield shape; the live
     /// constraint is untouched).

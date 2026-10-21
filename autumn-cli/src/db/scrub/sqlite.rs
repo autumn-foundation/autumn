@@ -1,6 +1,6 @@
 //! `SQLite` targets for `autumn db scrub` (issue #2553).
 //!
-//! The classifier is [`super::build_plan`], unchanged. This module supplies what
+//! The classifier is `build_plan`, unchanged. This module supplies what
 //! is `SQLite`-shaped: how to read the facts the classifier needs, how to write
 //! the SQL, and how to apply it.
 //!
@@ -212,6 +212,17 @@ pub(super) fn auto_strategy(column: &Column) -> Result<Strategy, ScrubError> {
     })
 }
 
+/// Whether a column was declared with a type whose name holds one of `words`
+/// (`UUID`, `JSON`). `SQLite` gives such a name NUMERIC affinity, so it reaches
+/// the plan as `Opaque`.
+fn declared_as(ty: &ColumnType, words: &[&str]) -> bool {
+    let ColumnType::Opaque { pg_type } = ty else {
+        return false;
+    };
+    let decl = pg_type.to_ascii_lowercase();
+    words.iter().any(|word| decl.contains(word))
+}
+
 /// Whether a declared type is plainly a number or a boolean.
 fn is_plainly_numeric(decl: &str) -> bool {
     let decl = decl.to_ascii_lowercase();
@@ -276,7 +287,8 @@ pub(super) fn replacement_expr(
             require_type(
                 column,
                 strategy,
-                matches!(column.ty, ColumnType::Uuid | ColumnType::Text),
+                matches!(column.ty, ColumnType::Uuid | ColumnType::Text)
+                    || declared_as(&column.ty, &["uuid", "guid"]),
             )?;
             format!(
                 "substr({token}, 1, 8) || '-' || substr({token}, 9, 4) || '-' || \
@@ -292,7 +304,8 @@ pub(super) fn replacement_expr(
             if matches!(
                 column.ty,
                 ColumnType::Json | ColumnType::Attachment | ColumnType::Text
-            ) {
+            ) || declared_as(&column.ty, &["json"])
+            {
                 "'{\"scrubbed\": true}'".to_owned()
             } else {
                 return Err(mismatch());
@@ -1423,6 +1436,25 @@ mod tests {
         ));
         let blob = column("raw", ColumnType::Bytes);
         assert!(replacement_expr(Strategy::Zero, &blob, "t").is_err());
+    }
+
+    #[test]
+    fn a_declared_uuid_or_json_column_takes_its_explicit_strategy() {
+        let opaque = |decl: &str| {
+            column(
+                "ref",
+                ColumnType::Opaque {
+                    pg_type: decl.to_owned(),
+                },
+            )
+        };
+        assert!(replacement_expr(Strategy::Uuid, &opaque("UUID"), "tok").is_ok());
+        assert!(replacement_expr(Strategy::Json, &opaque("JSON"), "tok").is_ok());
+        assert!(replacement_expr(Strategy::Json, &opaque("JSONB"), "tok").is_ok());
+        // The strategy still has to fit the declared type.
+        assert!(replacement_expr(Strategy::Uuid, &opaque("JSON"), "tok").is_err());
+        assert!(replacement_expr(Strategy::Json, &opaque("UUID"), "tok").is_err());
+        assert!(replacement_expr(Strategy::Uuid, &opaque("DATE"), "tok").is_err());
     }
 
     #[test]
