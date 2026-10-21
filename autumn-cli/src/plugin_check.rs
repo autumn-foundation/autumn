@@ -29,7 +29,7 @@ use autumn_web::plugin_contract::{
     ContractVerdict, PLUGIN_CONTRACT_MARKER, PluginContract, SurfaceTier, evaluate, surface,
 };
 
-use crate::routes::{RouteInfo, compile_binary, find_binary};
+use crate::routes::{self, RouteInfo, compile_binary, find_binary};
 
 // ── Report types ───────────────────────────────────────────────────────────
 
@@ -217,9 +217,11 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
     // read off it (issue #1601). Everything the child wrote is relayed verbatim
     // afterwards, minus the marker line itself, so the operator still sees the
     // binary's own diagnostics.
-    let output = Command::new(&binary)
-        .env("AUTUMN_DUMP_ROUTES", "1")
-        .env("AUTUMN_DUMP_PLUGIN_CONTRACT", "1")
+    let mut command = Command::new(&binary);
+    command.env(routes::DUMP_ENV, "1");
+    command.env("AUTUMN_DUMP_PLUGIN_CONTRACT", "1");
+    routes::clear_other_dump_modes(&mut command, routes::DUMP_ENV);
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

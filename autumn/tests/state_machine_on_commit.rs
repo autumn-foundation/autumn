@@ -122,3 +122,27 @@ fn transition_effect_payload_is_public_and_serializable() {
     let round: autumn_web::TransitionEffect = serde_json::from_value(json).expect("round-trips");
     assert_eq!(round, effect);
 }
+
+// The generated effect enqueues the borrowed `__private::TransitionEffectRef`;
+// the payload must be the identical JSON (same keys, same order) so a
+// `TransitionEffect` job arg still deserializes it.
+#[test]
+fn borrowed_transition_effect_payload_is_byte_identical() {
+    let effect = autumn_web::TransitionEffect {
+        model: "Order".to_string(),
+        field: "status".to_string(),
+        record_id: "7".to_string(),
+        from_state: "processing".to_string(),
+        to_state: "shipped".to_string(),
+        idempotency_key: "Order:status:7:processing:shipped".to_string(),
+    };
+    let borrowed = autumn_web::__private::TransitionEffectRef::from(&effect);
+    assert_eq!(
+        serde_json::to_string(&borrowed).expect("serializes"),
+        serde_json::to_string(&effect).expect("serializes"),
+    );
+    let value = serde_json::to_value(&borrowed).expect("serializes");
+    assert_eq!(value, serde_json::to_value(&effect).expect("serializes"));
+    let round: autumn_web::TransitionEffect = serde_json::from_value(value).expect("round-trips");
+    assert_eq!(round, effect);
+}

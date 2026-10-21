@@ -350,6 +350,51 @@ pub fn registered_derivations() -> Vec<&'static DerivationDef> {
     defs
 }
 
+/// A fingerprint of the registered derivations: each name and definition
+/// hash. It changes when a derivation is added, removed, renamed or changed.
+/// `None` when this binary registers none. The fleet sweeper's.
+#[cfg(feature = "sqlite")]
+pub(crate) fn registry_fingerprint() -> Option<String> {
+    use sha2::Digest as _;
+
+    let defs = registered_derivations();
+    if defs.is_empty() {
+        return None;
+    }
+    let mut hasher = sha2::Sha256::new();
+    for def in defs {
+        push_component(&mut hasher, "name", def.name.as_bytes());
+        push_component(&mut hasher, "hash", def.definition_hash().as_bytes());
+    }
+    Some(hex_lower(hasher.finalize()))
+}
+
+/// Whether the backfill of every registered derivation is complete on this
+/// database, under the definition this binary has. Reads only.
+///
+/// # Errors
+///
+/// Returns an error when the state table cannot be read for a reason other
+/// than its absence.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn derivations_settled(conn: &mut RuntimeConnection) -> AutumnResult<bool> {
+    let defs = registered_derivations();
+    if defs.is_empty() {
+        return Ok(true);
+    }
+    let state = match load_state(conn).await {
+        Ok(state) => state,
+        Err(error) if is_missing_state_table(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(defs.iter().all(|def| {
+        state.get(def.name).is_some_and(|row| {
+            row.definition_hash == def.definition_hash()
+                && BackfillState::parse(&row.backfill_state) == Some(BackfillState::Complete)
+        })
+    }))
+}
+
 /// Whether this binary links any `#[derivation]` at all.
 ///
 /// Startup uses it to decide whether to apply the state-table migration and run

@@ -297,6 +297,7 @@ Everything a signature cannot express goes in `#[api_doc(...)]`:
 | `mcp` | flag / bool | Also expose the endpoint as an MCP tool (`mcp = false` force-excludes) — see [the MCP guide](./mcp.md) |
 | `stream` | flag / bool | Mark an `Sse`-returning MCP tool as streaming |
 | `task` | flag / bool | Let an MCP tool return a task handle (MCP Tasks extension) — see [the MCP guide](./mcp.md) §6 |
+| `core` | flag / bool | Mark a core MCP tool: a client loads it before any tool search — see [the MCP guide](./mcp.md#large-catalogs-core-tools-and-search) |
 
 Unknown keys are a compile error naming the supported set, so a typo never
 silently produces an undocumented operation.

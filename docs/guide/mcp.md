@@ -78,7 +78,7 @@ methods an MCP client needs:
 
 | Method | Purpose |
 |--------|---------|
-| `initialize` | Handshake; returns `serverInfo` and `capabilities.tools`. |
+| `initialize` | Handshake; returns `serverInfo`, `capabilities.tools` and the optional `instructions`. |
 | `tools/list` | The derived tool catalog. |
 | `tools/call` | Invoke a tool by name; dispatched through the real pipeline. |
 
@@ -116,7 +116,7 @@ In the modern era:
 
 | Method | Result |
 | --- | --- |
-| `server/discover` | `supportedVersions`, `capabilities`, and the caching hints `ttlMs` and `cacheScope`. |
+| `server/discover` | `supportedVersions`, `capabilities`, the optional `instructions`, and the caching hints `ttlMs` and `cacheScope`. |
 | `tools/list` | The catalog, with `ttlMs` and `cacheScope`. |
 | `tools/call` | As in the legacy era. |
 
@@ -299,6 +299,89 @@ follow for MCP specifically:
 
 See [The Agent Authority Envelope](agent-authority.md) for the grant grammar,
 the effect table, the escape hatches, the manifest and the audit record.
+
+### Large catalogs: core tools and search
+
+Each tool in `tools/list` costs the agent context before it does any work.
+Tool choice also gets worse past about 30 to 50 tools. Three settings help.
+
+**Core tools.** Mark the tools that most tasks need:
+
+```rust
+#[get("/api/todos")]
+#[api_doc(mcp, core, summary = "List all todos")]
+async fn list_todos() -> AutumnResult<Json<Vec<Todo>>> { /* ... */ }
+```
+
+A core tool carries `_meta: {"anthropic/alwaysLoad": true}`. A client that
+defers tools (Claude Code, for example) loads a core tool before any search.
+`Route::mcp_core()` does the same for a route built in code. `core` does not
+opt a route in. Use it with `mcp`, or under the whole-API hatch.
+
+**Instructions.** Tell the model what the server does and when to search:
+
+```rust
+autumn_web::app()
+    .routes(routes![list_todos])
+    .mcp_instructions("Todo and calendar tools. Search for calendar tools.")
+    .mount_mcp("/mcp")
+```
+
+`initialize` and `server/discover` return the text as `instructions`. Do not
+repeat the tool descriptions.
+
+**The progressive catalog.** For a large catalog, send only the core tools:
+
+```rust
+use autumn_web::mcp::McpCatalog;
+
+autumn_web::app()
+    .routes(routes![list_todos, create_todo])
+    .mcp_catalog(McpCatalog::Progressive)
+    .mount_mcp("/mcp")
+```
+
+Then `tools/list` holds two meta-tools and the core tools:
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `search_tools` | `query`, `detail` (`name`, `summary` or `full`), `limit` (1 to 50, default 10), `offset` (default 0) | `total` hits, and `tools`, one page of the best hits. `full` adds each `inputSchema`. |
+| `call_tool` | `name`, `arguments` | The result of the named tool. |
+
+- `search_tools` matches words against tool names, descriptions, tags and
+  argument names. An exact name word counts most. Equal scores keep the
+  catalog order. An empty query lists the tools in catalog order. Use
+  `offset` to get the next page. A query has at most 128 characters and 16
+  distinct words.
+- The `search_tools` description gives the tool count and the route tags, so
+  the model knows what it can find.
+- `call_tool` runs the tool through the same path as a direct `tools/call`.
+  Auth, guards, rate caps, the audit record, tasks and streaming all apply.
+  The audit record names the inner tool and adds `via = "call_tool"`.
+  `call_tool` refuses an unknown name and a meta-tool name with `-32602`.
+- A direct `tools/call` of a tool that the list does not show still works.
+- The server adds a short guidance text to the instructions.
+- The catalog does not change during a session, as revision `2026-07-28`
+  requires. `McpCatalog::Full`, the default, lists every tool.
+- In progressive mode, the server skips a route tool named `search_tools` or
+  `call_tool`, and logs a warning. Give the route a different
+  `operation_id`. The `autumn agents manifest` listing does not apply this
+  rule.
+
+The progressive catalog is not access control. An agent can find and call
+each tool. Know these limits of `call_tool`:
+
+- A client approves a tool call by its tool name. A rule that allows
+  `call_tool` allows each tool behind it.
+- `call_tool` has `destructiveHint: true`, because it can run any tool. A
+  client can then ask the user before the call. The annotations of the inner
+  tool do not reach the client.
+- A gateway that routes or authorizes on the `Mcp-Name` header sees
+  `call_tool`, not the inner tool. Such a gateway must read
+  `params.arguments.name`, or refuse `call_tool`.
+
+Mark a destructive tool `core`. It then keeps its own name and annotations in
+`tools/list`, and the client approves it on its own.
 
 ---
 
@@ -823,7 +906,7 @@ becomes a tool exactly like a user route.
 
 More often, a plugin author doesn't want to hard-wire the decision. The
 chainable `Route` toggles — `Route::mcp()`, `Route::mcp_exclude()`,
-`Route::mcp_stream()` and `Route::mcp_task()` — mirror the attribute forms at registration time, so
+`Route::mcp_stream()`, `Route::mcp_task()` and `Route::mcp_core()` — mirror the attribute forms at registration time, so
 a plugin can offer a fluent switch and let the **host** decide at install
 time:
 
@@ -866,7 +949,8 @@ The toggles follow the same semantics as the attributes: an explicit
 `mcp()` exposes any verb, `mcp_exclude()` always wins (even over
 `expose_all_as_mcp()`), `mcp_stream()` implies the opt-in while
 exempting an `Sse` route from the JSON-out gate, and `mcp_task()` implies the
-opt-in and makes the tool a task tool (§6). The flags are plain
+opt-in and makes the tool a task tool (§6). `mcp_core()` implies the opt-in
+and marks a core tool (§3). The flags are plain
 `ApiDoc` metadata, so a plugin crate can set them while compiling against
 base `autumn-web` — they take effect only when the host enables the `mcp`
 feature and calls `mount_mcp`.
@@ -969,6 +1053,9 @@ following remain **out of scope** and are tracked as follow-ups:
   carry no `ApiDoc`, so plugins must register typed routes to be
   MCP-exposable (§11).
 - **MCP resources, prompts, and sampling** — this slice is tools-only.
+- **A catalog per client** — `mcp_catalog` sets one catalog for the endpoint.
+  The endpoint does not serve `tools/list` pagination or
+  `notifications/tools/list_changed`.
 - **stdio transport** — agents target deployed apps, so HTTP only for v1.
 - **Non-JSON endpoints** (file upload/download, HTML).
 - **LLM-assisted tool descriptions** — descriptions come from `#[api_doc]`;

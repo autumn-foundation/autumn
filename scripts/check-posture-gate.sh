@@ -23,15 +23,29 @@
 # which is exactly what the diff — and not the byte comparison — measures.
 # Refresh the committed manifests with `--update` when they drift.
 #
-# Escape hatch, mirroring the product's: export AUTUMN_POSTURE_ACK with the
-# digest the diff prints to acknowledge a deliberate widening. It is recorded
-# in this script's output, and (in CI) in the job log.
+# Escape hatch: the same as in the product. Two variables acknowledge a
+# deliberate widening. The script prints each use. The CI job log keeps it.
+#
+#   AUTUMN_POSTURE_ACK      the marker the diff prints (digest and ceiling).
+#   AUTUMN_POSTURE_ACK_DIR  an absolute path to a directory with one file per
+#                           pull request comment. The diff scans each file
+#                           alone for `/ack-posture` markers. The scaffolded
+#                           gate does the same.
+#
+# In CI the `publish-gate` workflow sets them:
+#   - pull_request: the job reads the pull request comments. It keeps only
+#     comments from users with admin, write or maintain permission.
+#   - workflow_dispatch: the `posture_ack` input sets AUTUMN_POSTURE_ACK.
+#   - A comment does not re-run the workflow. Re-run the job after you comment.
+#   - tag push: no acknowledgment. A release tag has no pull request. Acknowledge
+#     and merge the widening first.
 #
 # Called from the `publish-gate` workflow. Run locally with:
 #
 #     ./scripts/check-posture-gate.sh
 #     ./scripts/check-posture-gate.sh --update      # refresh the baselines
 #     AUTUMN_POSTURE_ACK=<digest> ./scripts/check-posture-gate.sh
+#     AUTUMN_POSTURE_ACK_DIR=<dir> ./scripts/check-posture-gate.sh
 
 set -euo pipefail
 
@@ -77,6 +91,7 @@ case "${1:-}" in
 esac
 
 ACK="${AUTUMN_POSTURE_ACK:-}"
+ACK_DIR="${AUTUMN_POSTURE_ACK_DIR:-}"
 
 # The revision whose committed manifests count as the accepted posture. In CI
 # this is the pull request's base branch; locally it defaults to the upstream
@@ -207,6 +222,10 @@ for example in "${EXAMPLES[@]}"; do
     args+=(--ack "$ACK")
     note "$example: acknowledgment supplied via AUTUMN_POSTURE_ACK"
   fi
+  if [ -n "$ACK_DIR" ]; then
+    args+=(--ack-dir "$ACK_DIR")
+    note "$example: reading acknowledgments from AUTUMN_POSTURE_ACK_DIR ($ACK_DIR)"
+  fi
 
   set +e
   "$CLI" "${args[@]}"
@@ -217,8 +236,10 @@ for example in "${EXAMPLES[@]}"; do
     0) ok "$example: no unacknowledged widening" ;;
     1)
       echo "error: $example: this change widens the example's security surface." >&2
-      echo "       If that is intended, re-run with AUTUMN_POSTURE_ACK=<digest printed above>" >&2
-      echo "       and refresh the baseline with $0 --update in the same change." >&2
+      echo "       To accept it, comment the /ack-posture line printed above on the" >&2
+      echo "       pull request, then re-run the failed job (comments do not start a run). Locally, set" >&2
+      echo "       AUTUMN_POSTURE_ACK=<digest printed above>." >&2
+      echo "       Then refresh the baseline with $0 --update in the same change." >&2
       failed=1
       ;;
     *)

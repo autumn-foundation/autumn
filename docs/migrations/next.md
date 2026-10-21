@@ -1357,6 +1357,42 @@ that does not opt in behaves as before.
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### MCP: `ApiDoc` gains a `mcp_core` field
+
+**Why:** a core MCP tool (`#[api_doc(mcp, core)]`) needs a flag on the route
+metadata. A new public field breaks a struct literal, as for `mcp_task`. The
+route macros set the field for you.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::openapi::ApiDoc;
+
+let doc = ApiDoc {
+    method: "GET",
+    path: "/api/todos",
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::openapi::ApiDoc;
+
+let doc = ApiDoc {
+    method: "GET",
+    path: "/api/todos",
+    ..ApiDoc::default()
+};
+```
+
+The new field is `pub mcp_core: bool`. It is `false` by default, so a route
+that does not set it behaves as before.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+means to leave at their defaults.
+
 ### `StaticRouteMeta` has a `content_type` field
 
 **Why:** `#[static_get]` now takes `content_type = "..."` (#2403). The macro
@@ -1471,6 +1507,102 @@ Most apps need no change. Two cases need work:
   The `#[repository]` macro does this for you.
 
 **Automation:** `manual` — a flagged read needs a human decision.
+
+### Idempotency: `RouteIdempotency` has an `Off` variant
+
+**Why:** A route can now opt out of `.idempotent()` with
+`#[post("/x", idempotent = false)]`, for a route that dedupes by its own key
+(a durable workflow route, say). The macro records that as
+`RouteIdempotency::Off`. `RouteIdempotency` is not `#[non_exhaustive]`, so a
+new variant breaks an exhaustive `match`.
+
+**Before (`{X.Y}`):**
+
+```rust
+match route.idempotency {
+    RouteIdempotency::Direct => "fail closed",
+    RouteIdempotency::ReplayThroughInner => "replay",
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match route.idempotency {
+    RouteIdempotency::Direct => "fail closed",
+    RouteIdempotency::ReplayThroughInner => "replay",
+    RouteIdempotency::Off => "not cached",
+}
+```
+
+Code that only builds a `Route` with `Direct` or `ReplayThroughInner`, or
+that tests with `matches!`, needs no change.
+
+**Automation:** `manual` — a new enum variant needs a new match arm, and no
+safe rewrite can choose its body.
+
+### Idempotency: bearer-token requests get their own cache slot
+
+**Why:** A request with no cookie-backed session used to compute a storage key
+with no principal in it, so two token clients that sent the same
+`Idempotency-Key` and body to a route shared one cached response. The key now
+carries the principal `RequireApiToken` verified, or a SHA-256 digest of the
+raw `Authorization` header when the route checks the token itself. See
+[the idempotency guide](../guide/idempotency.md#bearer-token-clients).
+
+**Before (`{X.Y}`):**
+
+- Client B with client A's key and body was served A's stored response.
+- A retry with the `Authorization` header changed or dropped replayed.
+- `RequireApiToken` on `AppBuilder::layer` forced fail-closed replay app-wide:
+  every cache hit, a same-client retry included, answered `409`.
+
+**After (`{(X+1).0}`):**
+
+- Each bearer client replays only its own response.
+- A retry with a different raw `Authorization` header (on a route without
+  `RequireApiToken`) runs the handler again.
+- `RequireApiToken` registered directly with `AppBuilder::layer` or
+  `static_gate` no longer forces fail-closed replay: a retry replays. A
+  `ServiceBuilder` stack around it still fails closed.
+
+Most apps need no change. Two cases need a look:
+
+- A request in flight across the upgrade that carries `Authorization` and no
+  session gets a new key, so its retry runs the handler once more. Session-only
+  apps keep byte-identical keys.
+- A client that refreshes its token between retries, on a route that checks the
+  token in the handler, now runs the handler again. Mount `RequireApiToken` with
+  `AppBuilder::layer` to key on the principal instead of the token.
+
+**Automation:** `manual` — whether a retry may run twice is the app's call.
+
+### Graph: `served()` takes the app's `AppState`
+
+**Why:** The served architecture graph was process-global. A second application
+in one process served the graph of the first, with its paths and auth (issue
+#2520). Each application now keeps its own graph in its `AppState`.
+
+**Before (`{X.Y}`):**
+
+```rust
+let graph: Option<&'static ArchitectureGraph> = autumn_web::graph::served();
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let graph: Option<Arc<ArchitectureGraph>> = autumn_web::graph::served(&state);
+```
+
+A custom `ProvideActuatorState` gets a new `architecture_graph_json` method. Its
+default returns `None`, so `/actuator/graph` answers `503` for that state.
+`AppState` overrides it.
+
+The graph descriptor types in `autumn_web::graph` have a new `crate_version`
+field. The macros fill it. Do not build these types by hand.
+
+**Automation:** `manual` — pass the state to `served`.
 
 ## Plugin authors
 

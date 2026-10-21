@@ -211,6 +211,7 @@ pub fn stream_resumable(
     last_event_id: Option<EventId>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>> + use<>> {
     use futures::StreamExt as _;
+    use std::fmt::Write as _;
     use tokio::sync::broadcast::error::RecvError;
 
     let crate::channels::ResumeHandle {
@@ -251,22 +252,31 @@ pub fn stream_resumable(
     // of skipped messages (seqs are dense) and surface a gap sentinel so clients
     // can react.
     let live = futures::stream::unfold(
-        (subscriber, next_live_id),
-        move |(mut subscriber, next_seq)| async move {
+        (subscriber, next_live_id, String::new()),
+        move |(mut subscriber, next_seq, mut id)| async move {
             match subscriber.recv().await {
                 Ok(msg) => {
-                    let event = Event::default()
-                        .id(EventId {
+                    // One buffer for the stream's lifetime: `Event::id` copies
+                    // its argument, so a fresh `String` per event was
+                    // formatted only to be copied and dropped.
+                    id.clear();
+                    let _ = write!(
+                        id,
+                        "{}",
+                        EventId {
                             epoch,
                             seq: next_seq,
                         }
-                        .to_string())
-                        .data(msg.into_string());
-                    Some((Ok(event), (subscriber, next_seq.saturating_add(1))))
+                    );
+                    let event = Event::default().id(&id).data(msg.into_string());
+                    Some((Ok(event), (subscriber, next_seq.saturating_add(1), id)))
                 }
                 Err(RecvError::Lagged(skipped)) => {
                     let event = Event::default().event(GAP_EVENT).data(GAP_MARKER);
-                    Some((Ok(event), (subscriber, next_seq.saturating_add(skipped))))
+                    Some((
+                        Ok(event),
+                        (subscriber, next_seq.saturating_add(skipped), id),
+                    ))
                 }
                 Err(RecvError::Closed) => None,
             }
@@ -555,5 +565,19 @@ mod tests {
             raw.contains("data: e9") && raw.contains("data: e10"),
             "post-lag payloads must match the real published ids: {raw:?}"
         );
+
+        // The live tail formats every id into one reused buffer. Each `id:`
+        // line must be exactly one epoch-tagged id: a buffer not cleared
+        // between events would emit `E.9E.10`, which does not parse.
+        let seqs: Vec<u64> = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("id: "))
+            .map(|id| {
+                id.parse::<EventId>()
+                    .unwrap_or_else(|_| panic!("each id line is one epoch-tagged id: {id:?}"))
+                    .seq
+            })
+            .collect();
+        assert_eq!(seqs, [9, 10], "post-lag ids, in order: {raw:?}");
     }
 }

@@ -17,6 +17,18 @@
 //! while a candidate that resolves to nothing is simply dropped at link time.
 //! There is no stop-list of "obviously not a model" names for the same reason:
 //! a name an app is free to choose is a name this module must not discard.
+//!
+//! ## SQL scope
+//!
+//! A literal counts as SQL when a statement in it has a known shape. A literal
+//! may hold many statements, split on `;` outside quotes. Each one counts. The
+//! literal mutates if any statement mutates. Quoted text is blanked for the verb
+//! scan only. Table symbols keep every word.
+//!
+//! Data access is in scope: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+//! `TRUNCATE`, `WITH`, `COPY` and bare `TABLE name`. DDL is out by design:
+//! `CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` belong to migrations, not to
+//! data access. A route or job does not depend on a table through them.
 
 use proc_macro2::{Ident, Spacing, TokenStream, TokenTree};
 use quote::quote;
@@ -222,6 +234,10 @@ fn dollar_tag(chars: &[char], i: usize) -> Option<String> {
     if chars.get(i) != Some(&'$') {
         return None;
     }
+    // `a$b$` is one identifier. A quote cannot start right after a name char.
+    if i > 0 && (chars[i - 1].is_ascii_alphanumeric() || matches!(chars[i - 1], '_' | '$')) {
+        return None;
+    }
     let mut end = i + 1;
     // An empty tag (`$$`) is valid; a non-empty one may not start with a digit.
     if let Some(first) = chars.get(end)
@@ -396,20 +412,210 @@ fn is_truncate_operands(rest: &[&str]) -> bool {
     named_a_table
 }
 
-/// The SQL statement shape a literal matches, if any; `true` when it mutates.
+/// Split comment-free SQL into statements for the verb scan.
+///
+/// Splits on `;` outside quotes. Blanks the text inside single quotes and
+/// dollar quotes, so a verb word in a string is never read as a verb. Keeps
+/// double-quoted identifiers as they are. An unterminated quote runs to the end
+/// of the text.
+///
+/// Returns `(blanked, raw)` for each statement. Only the verb scan reads the
+/// blanked text. Table symbols come from the raw text, so a quoted word is still
+/// a candidate and no edge is lost.
+fn verb_statements(text: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == ';' {
+            statements.push((
+                std::mem::take(&mut current),
+                chars[start..i].iter().collect(),
+            ));
+            i += 1;
+            start = i;
+        } else if ch == '\'' {
+            current.push(' ');
+            i += 1;
+            while i < chars.len() {
+                // `''` is an escaped quote. Both halves stay inside the string.
+                let closes = chars[i] == '\'' && chars.get(i + 1) != Some(&'\'');
+                let escaped = chars[i] == '\'' && chars.get(i + 1) == Some(&'\'');
+                i += if escaped { 2 } else { 1 };
+                if closes {
+                    break;
+                }
+            }
+        } else if ch == '"' {
+            current.push(ch);
+            i += 1;
+            while i < chars.len() {
+                current.push(chars[i]);
+                i += 1;
+                if chars[i - 1] == '"' {
+                    if chars.get(i) == Some(&'"') {
+                        current.push('"');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if let Some(tag) = dollar_tag(&chars, i) {
+            let width = tag.chars().count();
+            current.push(' ');
+            i += width;
+            while i < chars.len() && !chars[i..].iter().take(width).copied().eq(tag.chars()) {
+                i += 1;
+            }
+            i = (i + width).min(chars.len());
+        } else {
+            current.push(ch);
+            i += 1;
+        }
+    }
+    statements.push((current, chars[start.min(chars.len())..].iter().collect()));
+    statements
+}
+
+/// Words that can follow the name in `TABLE name`, as in `SELECT * FROM name`.
+const TABLE_TRAILING_CLAUSES: &[&str] = &[
+    "EXCEPT",
+    "FETCH",
+    "FOR",
+    "INTERSECT",
+    "LIMIT",
+    "OFFSET",
+    "ORDER",
+    "UNION",
+];
+
+/// Whether the text after a leading `TABLE` is one table name.
+///
+/// The statement is `TABLE [ONLY] name`, with the clauses of a `SELECT` after
+/// it. A name has no space in it, and any word after it must be a clause
+/// keyword, so prose like "Table of contents" fails.
+fn is_table_operand(rest: &str) -> bool {
+    let rest = rest.trim();
+    let rest = match rest.strip_prefix("ONLY") {
+        Some(after) if after.starts_with(char::is_whitespace) => after.trim_start(),
+        _ => rest,
+    };
+    let (name, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let tail_ok = tail
+        .split_whitespace()
+        .next()
+        .is_none_or(|word| TABLE_TRAILING_CLAUSES.contains(&word));
+    name != "ONLY"
+        && tail_ok
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '"')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '"' | '*'))
+}
+
+/// Whether the text of a `COPY` statement reads as a statement, and if so
+/// whether it writes.
+///
+/// `COPY x FROM` loads rows into a table. `COPY x TO` and `COPY (query) TO`
+/// only read. The direction is the first top-level `FROM` or `TO`: words inside
+/// parentheses (a column list or a query) and inside double quotes do not
+/// count, because `COPY "to" FROM STDIN` is a load.
+fn copy_shape(rest_text: &str) -> Option<bool> {
+    let (writes, start, end) = copy_direction(rest_text)?;
+    // Prose ("Copy link from here") has no `COPY` target and no data source.
+    let target = rest_text[..start].split_whitespace().next()?;
+    let source = rest_text[end..].split_whitespace().next();
+    let valid_source = source.is_none_or(|w| {
+        matches!(
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric()),
+            "STDIN"
+                | "STDOUT"
+                | "PROGRAM"
+                | ""
+                | "WITH"
+                | "WHERE"
+                | "CSV"
+                | "BINARY"
+                | "TEXT"
+                | "DELIMITER"
+                | "NULL"
+                | "HEADER"
+                | "QUOTE"
+                | "ESCAPE"
+                | "FORMAT"
+                | "FREEZE"
+                | "ENCODING"
+        )
+    });
+    (valid_source && target != "TO" && target != "FROM").then_some(writes)
+}
+
+/// The direction of a `COPY` statement and where its keyword sits in the text.
+fn copy_direction(rest_text: &str) -> Option<(bool, usize, usize)> {
+    let mut depth = 0_u32;
+    let mut in_quote = false;
+    let mut word_start = 0;
+    let mut in_word = false;
+    // A trailing space ends the last word.
+    for (at, ch) in rest_text
+        .char_indices()
+        .chain(std::iter::once((rest_text.len(), ' ')))
+    {
+        if ch == '"' {
+            in_quote = !in_quote;
+            in_word = false;
+        } else if in_quote {
+            // Quoted identifier text never names the direction.
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
+            if depth == 0 && !in_word {
+                in_word = true;
+                word_start = at;
+            }
+        } else {
+            if in_word {
+                match &rest_text[word_start..at] {
+                    "FROM" => return Some((true, word_start, at)),
+                    "TO" => return Some((false, word_start, at)),
+                    _ => {}
+                }
+                in_word = false;
+            }
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// The shape of one statement; `true` when it mutates.
 ///
 /// Word-boundary aware in both directions, so `"selection"` is not a `SELECT`
 /// and `"Delete this post?"` is not a `DELETE` — it carries no `FROM`.
-fn sql_shape(literal: &str) -> Option<bool> {
-    let text = strip_sql_comments(&literal_text(literal)).to_ascii_uppercase();
+fn statement_shape(statement: &str) -> Option<bool> {
+    let text = statement.to_ascii_uppercase();
     let mut words = text
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|w| !w.is_empty());
     let first = words.next()?;
     let rest: Vec<&str> = words.collect();
-    // Two verbs are matched on their whole grammar rather than a companion.
+    // After the verb, in source form: `COPY` and `TABLE` read the raw text.
+    let rest_text = text.trim_start().get(first.len()..).unwrap_or("");
+    // Some verbs are matched on their grammar rather than a companion.
     if first == "TRUNCATE" {
         return is_truncate_operands(&rest).then_some(true);
+    }
+    if first == "COPY" {
+        return copy_shape(rest_text);
+    }
+    if first == "TABLE" {
+        return is_table_operand(rest_text).then_some(false);
     }
     if first == "WITH" {
         // A CTE statement writes if anything in it does — a CTE body and the
@@ -422,6 +628,108 @@ fn sql_shape(literal: &str) -> Option<bool> {
         first == *verb && companions.iter().all(|c| rest.contains(c))
     })?;
     Some(*mutating)
+}
+
+/// The SQL shape a literal matches, if any; `true` when it mutates.
+///
+/// Classifies each statement of the literal. The literal mutates if any
+/// recognised statement does. It reads as SQL if any statement has a shape.
+fn sql_shape(literal: &str) -> Option<bool> {
+    let text = strip_sql_comments(&literal_text(literal));
+    verb_statements(&text)
+        .iter()
+        .filter_map(|(blanked, _)| statement_shape(blanked))
+        .reduce(|a, b| a || b)
+}
+
+/// The tables each mutating statement writes, from a SQL literal.
+///
+/// Only the target of the write counts: `INSERT INTO audit SELECT * FROM users`
+/// writes `audit` and only reads `users`. Reads the raw text, so a quoted name
+/// is a symbol as it is for the candidate list. A mutating statement with no
+/// target found gives all its words, so a write is never lost. Empty when no
+/// statement mutates.
+fn mutating_statement_words(literal: &str) -> Vec<String> {
+    let text = strip_sql_comments(&literal_text(literal));
+    verb_statements(&text)
+        .iter()
+        .filter(|(blanked, _)| statement_shape(blanked) == Some(true))
+        .flat_map(|(blanked, raw)| {
+            // The blanked text has no quoted values, so `SET note = 'UPDATE x'`
+            // names no target.
+            let targets = write_targets(blanked);
+            if targets.is_empty() {
+                sql_words(raw)
+            } else {
+                targets
+            }
+        })
+        .collect()
+}
+
+/// Names that follow a write verb in one statement.
+///
+/// `INSERT INTO`, `UPDATE`, `DELETE FROM`, `MERGE INTO`, `COPY` (a load), and
+/// every name after `TRUNCATE`. A `WITH` statement can hold several. A
+/// schema-qualified name gives both parts.
+fn write_targets(statement: &str) -> Vec<String> {
+    // `public . posts` is one name: close the space around each dot.
+    let statement = statement
+        .split('.')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(".");
+    let tokens: Vec<&str> = statement
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '"')))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let upper = |i: usize| tokens.get(i).map(|t| t.to_ascii_uppercase());
+    let mut targets: Vec<String> = Vec::new();
+    let mut take = |i: usize| {
+        let mut i = i;
+        if upper(i).as_deref() == Some("ONLY") {
+            i += 1;
+        }
+        if let Some(name) = tokens.get(i) {
+            targets.extend(
+                name.split('.')
+                    .map(|part| part.trim_matches('"').to_owned())
+                    .filter(|part| !part.is_empty()),
+            );
+        }
+    };
+    for i in 0..tokens.len() {
+        let word = upper(i);
+        match word.as_deref() {
+            Some("INTO")
+                if matches!(
+                    upper(i.wrapping_sub(1)).as_deref(),
+                    Some("INSERT" | "MERGE")
+                ) =>
+            {
+                take(i + 1);
+            }
+            Some("FROM") if upper(i.wrapping_sub(1)).as_deref() == Some("DELETE") => take(i + 1),
+            Some("UPDATE" | "COPY") => take(i + 1),
+            Some("TRUNCATE") => {
+                let mut j = i + 1;
+                while let Some(next) = upper(j) {
+                    if TRUNCATE_CLAUSE_WORDS.contains(&next.as_str()) {
+                        j += 1;
+                        continue;
+                    }
+                    if next.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '"') {
+                        take(j);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    targets
 }
 
 /// Whether a string literal reads as a SQL statement.
@@ -510,8 +818,10 @@ pub fn signature_symbols(sig: &syn::Signature) -> Vec<String> {
     candidate_symbols(&stream)
 }
 
-/// Whether an already-flattened token stream carries evidence that the item
-/// mutates something.
+/// Whether an already-flattened token stream carries mutation evidence that
+/// names no symbol.
+///
+/// SQL evidence is not here: [`mutating_sql_symbols`] names its symbols.
 ///
 /// Takes the flattened form so a caller that needs both the symbols and this
 /// answer pays for one walk. See [`MUTATION_IDENTS`] for why the ambiguous
@@ -526,9 +836,95 @@ fn mutates(tokens: &[TokenTree]) -> bool {
                     && i >= 2
                     && is_path_sep(tokens, i - 2))
         }
-        TokenTree::Literal(literal) => sql_shape(&literal.to_string()) == Some(true),
+        // A mutating statement with a `{}` placeholder names its table at run
+        // time. No symbol can carry that write, so it counts for every edge.
+        TokenTree::Literal(literal) => has_placeholder_write(&literal.to_string()),
         TokenTree::Punct(_) | TokenTree::Group(_) => false,
     })
+}
+
+/// Whether a literal holds a mutating statement with a `{` placeholder.
+fn has_placeholder_write(literal: &str) -> bool {
+    let text = strip_sql_comments(&literal_text(literal));
+    verb_statements(&text)
+        .iter()
+        .any(|(blanked, _)| statement_shape(blanked) == Some(true) && blanked.contains('{'))
+}
+
+/// Symbols of the mutating SQL statements in a flattened stream.
+///
+/// An edge to one of them is a write. Other symbols of the item stay reads.
+fn mutating_sql_symbols(tokens: &[TokenTree]) -> Vec<String> {
+    let mut symbols: Vec<String> = tokens
+        .iter()
+        .filter_map(|tree| match tree {
+            TokenTree::Literal(literal) => Some(mutating_statement_words(&literal.to_string())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    symbols.sort();
+    symbols.dedup();
+    symbols
+}
+
+/// Names directly before `.create`, `.delete`, `.insert` or `.update`.
+///
+/// A name alone is no proof of a write: `HashMap::insert` has the same shape.
+/// The manifest keeps a name only when it is a parameter whose type is a
+/// declared repository. The macro cannot know that.
+fn dot_mutation_receivers(tokens: &[TokenTree]) -> Vec<String> {
+    let is_dot =
+        |i: usize| matches!(tokens.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '.');
+    let mut receivers: Vec<String> = Vec::new();
+    for (i, tree) in tokens.iter().enumerate() {
+        let TokenTree::Ident(verb) = tree else {
+            continue;
+        };
+        if i >= 2
+            && is_dot(i - 1)
+            && QUALIFIED_MUTATION_IDENTS.contains(&verb.to_string().as_str())
+            && let Some(TokenTree::Ident(receiver)) = tokens.get(i - 2)
+        {
+            receivers.push(receiver.to_string());
+        }
+    }
+    receivers.sort();
+    receivers.dedup();
+    receivers
+}
+
+/// The name a parameter pattern binds, if it binds exactly one.
+///
+/// `repo`, `mut repo` and `State(repo)` bind `repo`.
+fn bound_name(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+        syn::Pat::TupleStruct(tuple) if tuple.elems.len() == 1 => bound_name(&tuple.elems[0]),
+        syn::Pat::Reference(reference) => bound_name(&reference.pat),
+        syn::Pat::Paren(paren) => bound_name(&paren.pat),
+        _ => None,
+    }
+}
+
+/// `(parameter, type symbol)` pairs of a signature.
+///
+/// One pair for each candidate symbol of the parameter's type. The manifest
+/// uses them to tell whether a `.update` receiver is a repository.
+#[must_use]
+pub fn signature_bindings(sig: &syn::Signature) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for arg in &sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = arg
+            && let Some(name) = bound_name(&pat_type.pat)
+        {
+            let ty = &pat_type.ty;
+            for symbol in candidate_symbols(&quote! { #ty }) {
+                pairs.push((name.clone(), symbol));
+            }
+        }
+    }
+    pairs
 }
 
 /// Emit a `&'static [&'static str]` literal for a symbol list.
@@ -540,6 +936,12 @@ pub fn emit_symbol_slice(symbols: &[String]) -> TokenStream {
         let items = symbols.iter().map(String::as_str);
         quote! { &[#(#items),*] }
     }
+}
+
+/// Emit a `&'static [(&'static str, &'static str)]` literal for binding pairs.
+fn emit_binding_slice(pairs: &[(String, String)]) -> TokenStream {
+    let items = pairs.iter().map(|(a, b)| quote! { (#a, #b) });
+    quote! { &[#(#items),*] }
 }
 
 /// Emit the `inventory::submit!` for a `#[route]`/`#[static_get]` handler.
@@ -556,6 +958,7 @@ pub fn emit_route_descriptor(
     let body = emit_symbol_slice(&candidate_symbols(&body_tokens));
     let sql = emit_symbol_slice(&sql_candidate_symbols(&body_tokens));
     let handler = input_fn.sig.ident.to_string();
+    let crate_version = autumn_macros_support::graph::crate_version();
     quote! {
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::graph::RouteGraphDescriptor {
@@ -564,6 +967,7 @@ pub fn emit_route_descriptor(
                 method: #method,
                 path: #path,
                 static_route: #static_route,
+                crate_version: #crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
                 signature_symbols: #signature,
@@ -592,8 +996,12 @@ pub fn emit_job_descriptor(
     let body = emit_symbol_slice(&symbols_of(&flat));
     let sql = emit_symbol_slice(&sql_symbols_of(&flat));
     let mutating = mutates(&flat);
+    let mutating_symbols = emit_symbol_slice(&mutating_sql_symbols(&flat));
+    let receivers = emit_symbol_slice(&dot_mutation_receivers(&flat));
+    let bindings = emit_binding_slice(&signature_bindings(&input_fn.sig));
     let handler = input_fn.sig.ident.to_string();
     let kind_ident = syn::Ident::new(kind, proc_macro2::Span::call_site());
+    let crate_version = autumn_macros_support::graph::crate_version();
     quote! {
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::graph::JobGraphDescriptor {
@@ -603,9 +1011,13 @@ pub fn emit_job_descriptor(
                 module_path: ::core::module_path!(),
                 schedule: #schedule,
                 mutating: #mutating,
+                mutating_symbols: #mutating_symbols,
+                crate_version: #crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
                 signature_symbols: #signature,
+                signature_bindings: #bindings,
+                dot_mutation_receivers: #receivers,
                 body_symbols: #body,
                 sql_symbols: #sql,
             }
@@ -618,11 +1030,104 @@ mod tests {
     use super::*;
     use quote::quote;
 
-    /// [`mutates`] from a token stream, which is how every test spells it.
+    /// Any mutation evidence, attributed or not, from a token stream.
     fn is_mutating(stream: &TokenStream) -> bool {
         let mut tokens = Vec::new();
         flatten(stream, &mut tokens);
-        mutates(&tokens)
+        mutates(&tokens) || !mutating_sql_symbols(&tokens).is_empty()
+    }
+
+    fn flat(stream: &TokenStream) -> Vec<TokenTree> {
+        let mut tokens = Vec::new();
+        flatten(stream, &mut tokens);
+        tokens
+    }
+
+    #[test]
+    fn mutating_sql_names_the_symbols_of_the_writing_statement_only() {
+        let tokens = flat(&quote! {
+            batch_execute("SELECT * FROM users; INSERT INTO audit_events (kind) VALUES ('x')")
+        });
+        let symbols = mutating_sql_symbols(&tokens);
+        assert!(symbols.contains(&"audit_events".to_owned()), "{symbols:?}");
+        assert!(!symbols.contains(&"users".to_owned()), "{symbols:?}");
+        assert!(!mutates(&tokens), "SQL evidence is attributed, not loose");
+    }
+
+    #[test]
+    fn mutating_sql_keeps_quoted_words_of_the_writing_statement() {
+        let tokens = flat(&quote! { sql_query("UPDATE \"Posts\" SET a = 'b; c' WHERE x = 1") });
+        let symbols = mutating_sql_symbols(&tokens);
+        assert!(symbols.contains(&"Posts".to_owned()), "{symbols:?}");
+    }
+
+    #[test]
+    fn a_read_only_statement_names_no_mutating_symbols() {
+        let tokens = flat(&quote! { sql_query("SELECT * FROM users") });
+        assert!(mutating_sql_symbols(&tokens).is_empty());
+    }
+
+    #[test]
+    fn evidence_that_names_no_symbol_stays_unattributed() {
+        assert!(mutates(&flat(&quote! { repo.save(&post).await })));
+        assert!(mutates(&flat(&quote! { diesel::update(posts::table) })));
+    }
+
+    #[test]
+    fn dot_receivers_are_the_names_before_a_mutation_verb() {
+        let tokens = flat(&quote! {
+            repo.update(id, &patch).await?;
+            vars.insert("a", 1);
+            other.create(&b);
+            q.delete(1);
+            let x = repo.find(1);
+            div hx-delete=(paths::delete_post(&slug)) {}
+        });
+        let mut receivers = dot_mutation_receivers(&tokens);
+        receivers.sort();
+        assert_eq!(receivers, ["other", "q", "repo", "vars"]);
+    }
+
+    #[test]
+    fn signature_bindings_pair_a_parameter_with_each_type_symbol() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn run(mut repo: PgPostRepository, State(users): State<PgUserRepository>, n: u32)
+        };
+        let mut pairs = signature_bindings(&sig);
+        pairs.sort();
+        let pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("repo", "PgPostRepository"),
+                ("users", "PgUserRepository"),
+                ("users", "State"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_descriptor_carries_the_new_evidence() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            async fn go(repo: PgPostRepository) {
+                repo.update(1, &p).await;
+                sql_query("INSERT INTO audit_events (a) VALUES (1)");
+            }
+        };
+        let generated =
+            emit_job_descriptor(&item, &quote! { "go" }, "Job", &quote! { "" }).to_string();
+        for needle in [
+            "mutating_symbols",
+            "audit_events",
+            "signature_bindings",
+            "dot_mutation_receivers",
+            "\"repo\"",
+        ] {
+            assert!(generated.contains(needle), "{needle}: {generated}");
+        }
     }
 
     #[test]
@@ -1007,6 +1512,211 @@ mod tests {
         );
     }
 
+    /// Text inside single quotes or dollar quotes is data. A verb word in it
+    /// must not make a CTE statement a writer.
+    #[test]
+    fn a_cte_verb_inside_quoted_text_is_not_mutation_evidence() {
+        let single = "\"WITH a AS (SELECT 'DELETE' FROM posts) SELECT * FROM a\"";
+        assert_eq!(sql_shape(single), Some(false), "single quotes");
+        let dollar = "\"WITH a AS (SELECT $$UPDATE$$ FROM posts) SELECT * FROM a\"";
+        assert_eq!(sql_shape(dollar), Some(false), "dollar quotes");
+        let tagged = "\"WITH a AS (SELECT $t$ delete $t$ FROM posts) SELECT * FROM a\"";
+        assert_eq!(sql_shape(tagged), Some(false), "tagged dollar quotes");
+        let real = "\"WITH a AS (DELETE FROM posts RETURNING 'x') SELECT * FROM a\"";
+        assert_eq!(sql_shape(real), Some(true), "a real verb still counts");
+    }
+
+    /// Only the verb scan ignores quoted text. Symbols keep every word.
+    #[test]
+    fn quoted_words_stay_table_symbols() {
+        let literal = "\"SELECT 'tags' FROM posts\"";
+        let symbols = sql_symbols(literal);
+        assert!(symbols.contains(&"tags".to_owned()));
+        assert!(symbols.contains(&"posts".to_owned()));
+    }
+
+    /// An unterminated quote runs to the end of the text.
+    #[test]
+    fn an_unterminated_quote_is_treated_as_a_string() {
+        let literal = "\"WITH a AS (SELECT 'DELETE FROM posts) SELECT 1\"";
+        assert_eq!(sql_shape(literal), Some(false));
+        let dollar = "\"WITH a AS (SELECT $$ UPDATE x) SELECT 1\"";
+        assert_eq!(sql_shape(dollar), Some(false));
+    }
+
+    /// A literal can hold many statements. Each one counts.
+    #[test]
+    fn every_statement_of_a_multi_statement_literal_is_classified() {
+        let read_first = "\"SELECT id FROM posts; DELETE FROM comments\"";
+        assert_eq!(sql_shape(read_first), Some(true));
+        let wrapped = "\"BEGIN; UPDATE posts SET a = 1; COMMIT\"";
+        assert_eq!(sql_shape(wrapped), Some(true));
+        assert!(looks_like_sql(wrapped));
+        let reads = "\"SELECT 1; SELECT id FROM posts\"";
+        assert_eq!(sql_shape(reads), Some(false));
+        let commented = "\"-- note; more\nSELECT 1; DELETE FROM t\"";
+        assert_eq!(sql_shape(commented), Some(true));
+        assert!(is_mutating(
+            &quote! { sql_query("SELECT 1 FROM a; INSERT INTO b VALUES (1)") }
+        ));
+    }
+
+    /// A `;` inside a quote does not end a statement.
+    #[test]
+    fn a_semicolon_inside_a_quote_does_not_split() {
+        let single = "\"SELECT id FROM posts WHERE a = ';DELETE FROM x'\"";
+        assert_eq!(sql_shape(single), Some(false));
+        let dollar = "\"SELECT id FROM posts WHERE a = $$; DELETE FROM x$$\"";
+        assert_eq!(sql_shape(dollar), Some(false));
+        let ident = r##"r#"SELECT "a;b" FROM posts"#"##;
+        assert_eq!(sql_shape(ident), Some(false));
+    }
+
+    /// Prose with a `;` stays prose.
+    #[test]
+    fn prose_with_a_semicolon_is_not_sql() {
+        assert_eq!(
+            sql_shape("\"Delete this post; this cannot be undone\""),
+            None
+        );
+        assert!(!is_mutating(
+            &quote! { "Delete this post; this cannot be undone" }
+        ));
+    }
+
+    /// `COPY x FROM` writes. `COPY x TO` reads. Both name a table.
+    #[test]
+    fn copy_is_a_statement_and_mutates_only_from() {
+        let from = "\"COPY posts FROM STDIN\"";
+        assert_eq!(sql_shape(from), Some(true));
+        assert!(sql_symbols(from).contains(&"posts".to_owned()));
+        let cols = "\"COPY posts (id, title) FROM '/tmp/x.csv'\"";
+        assert_eq!(sql_shape(cols), Some(true));
+        let to = "\"COPY posts TO STDOUT\"";
+        assert_eq!(sql_shape(to), Some(false));
+        assert!(sql_symbols(to).contains(&"posts".to_owned()));
+        let query = "\"COPY (SELECT id FROM posts) TO STDOUT\"";
+        assert_eq!(sql_shape(query), Some(false));
+        assert!(sql_symbols(query).contains(&"posts".to_owned()));
+        assert_eq!(sql_shape("\"Copy the link\""), None);
+    }
+
+    /// Only the write target of a mutating statement is a write symbol.
+    #[test]
+    fn a_write_symbol_is_the_target_not_the_source() {
+        let words = |sql: &str| mutating_statement_words(&format!("{sql:?}"));
+        let insert = words("INSERT INTO audit_events SELECT id FROM users");
+        assert_eq!(insert, vec!["audit_events".to_owned()]);
+        let update = words("UPDATE posts SET n = 1 FROM users WHERE users.id = posts.uid");
+        assert_eq!(update, vec!["posts".to_owned()]);
+        assert_eq!(
+            words("DELETE FROM public.posts WHERE id = 1"),
+            vec!["public".to_owned(), "posts".to_owned()]
+        );
+        let cte = words("WITH r AS (DELETE FROM a RETURNING id) UPDATE b SET v = 0");
+        assert_eq!(cte, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(
+            words("TRUNCATE TABLE a, b CASCADE"),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert!(words("SELECT id FROM users").is_empty());
+        assert_eq!(
+            words("UPDATE public . posts SET n = 1"),
+            vec!["public".to_owned(), "posts".to_owned()]
+        );
+        let quoted = words("UPDATE posts SET note = 'UPDATE users'");
+        assert_eq!(quoted, vec!["posts".to_owned()]);
+    }
+
+    /// `TABLE name` may carry the clauses of a `SELECT`.
+    #[test]
+    fn a_table_statement_may_carry_select_clauses() {
+        let sql = "\"TABLE posts ORDER BY id LIMIT 10\"";
+        assert_eq!(sql_shape(sql), Some(false));
+        assert!(sql_symbols(sql).contains(&"posts".to_owned()));
+        assert_eq!(sql_shape("\"Table of contents\""), None);
+        assert_eq!(sql_shape("\"Table settings are saved\""), None);
+    }
+
+    /// A file `COPY` keeps its shape when options follow the blanked file name.
+    #[test]
+    fn copy_from_a_file_with_options_is_a_write() {
+        for sql in [
+            "COPY posts FROM '/tmp/posts.csv' WITH (FORMAT csv)",
+            "COPY posts FROM '/tmp/posts.csv' CSV HEADER",
+            "COPY posts (id) FROM '/tmp/p.csv' WHERE id > 1",
+        ] {
+            assert_eq!(sql_shape(&format!("{sql:?}")), Some(true), "{sql}");
+        }
+    }
+
+    /// UI prose that holds `from` or `to` is not a `COPY` statement.
+    #[test]
+    fn copy_prose_is_not_a_statement() {
+        for prose in [
+            "Copy from template",
+            "Copy link from here",
+            "Copy the file from a to b",
+            "Copy to clipboard",
+        ] {
+            assert_eq!(sql_shape(&format!("{prose:?}")), None, "{prose}");
+        }
+    }
+
+    /// A write whose table is a `{}` placeholder names no symbol, so the job
+    /// keeps the unattributed `mutating` bit.
+    #[test]
+    fn a_placeholder_write_is_unattributed_mutation() {
+        assert!(is_mutating(
+            &quote! { sql_query(format!("UPDATE {} SET hits = hits + 1", Post::TABLE)) }
+        ));
+        assert!(!is_mutating(
+            &quote! { sql_query("SELECT id FROM posts WHERE id = {}") }
+        ));
+    }
+
+    /// `$` inside a name does not open a dollar quote.
+    #[test]
+    fn a_dollar_inside_an_identifier_is_not_a_quote() {
+        assert_eq!(
+            sql_shape("\"SELECT a$b$ FROM posts; DELETE FROM q\""),
+            Some(true)
+        );
+        assert!(sql_symbols("\"SELECT a$b$ FROM posts\"").contains(&"posts".to_owned()));
+    }
+
+    /// A quoted identifier or a column named `to`/`from` is not the direction.
+    #[test]
+    fn copy_direction_ignores_quoted_and_parenthesised_words() {
+        assert_eq!(sql_shape(r#""COPY "to" FROM STDIN""#), Some(true));
+        assert_eq!(sql_shape(r#""COPY posts ("from") TO STDOUT""#), Some(false));
+        assert_eq!(
+            sql_shape("\"COPY posts (\\\"to\\\") FROM STDIN\""),
+            Some(true)
+        );
+    }
+
+    /// Bare `TABLE name` is a read. Prose that starts with "Table" is not SQL.
+    #[test]
+    fn a_bare_table_statement_is_a_read() {
+        let plain = "\"TABLE posts\"";
+        assert_eq!(sql_shape(plain), Some(false));
+        assert!(sql_symbols(plain).contains(&"posts".to_owned()));
+        assert_eq!(sql_shape("\"TABLE ONLY posts\""), Some(false));
+        assert_eq!(sql_shape("\"TABLE public.posts\""), Some(false));
+        assert_eq!(sql_shape("\"Table of contents\""), None);
+        assert_eq!(sql_shape("\"Table\""), None);
+        assert_eq!(sql_shape("\"Table 1\""), None);
+    }
+
+    /// DDL is out by design. It is migration, not data access.
+    #[test]
+    fn ddl_is_not_a_statement() {
+        assert_eq!(sql_shape("\"CREATE TABLE posts (id int)\""), None);
+        assert_eq!(sql_shape("\"ALTER TABLE posts ADD COLUMN a int\""), None);
+        assert_eq!(sql_shape("\"DROP TABLE posts\""), None);
+    }
+
     #[test]
     fn mutation_is_detected_from_raw_sql() {
         assert!(is_mutating(&quote! { sql_query("UPDATE posts SET x = 1") }));
@@ -1067,7 +1777,11 @@ mod tests {
         assert!(generated.contains("JobGraphDescriptor"), "{generated}");
         assert!(generated.contains("JobKind :: Scheduled"), "{generated}");
         assert!(generated.contains(r#"schedule : "15m""#), "{generated}");
-        assert!(generated.contains("mutating : true"), "{generated}");
-        assert!(generated.contains(r#""posts""#), "{generated}");
+        // SQL evidence names its symbols, so the job-wide bit stays off.
+        assert!(generated.contains("mutating : false"), "{generated}");
+        assert!(
+            generated.contains(r#"mutating_symbols : & ["posts"]"#),
+            "{generated}"
+        );
     }
 }

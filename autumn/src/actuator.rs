@@ -414,6 +414,15 @@ pub trait ProvideActuatorState {
         None
     }
 
+    /// Returns the serialized architecture graph served at `/actuator/graph`.
+    ///
+    /// The default returns `None`, and the endpoint answers `503`.
+    /// [`crate::AppState`] overrides this to return the graph that the
+    /// framework installed when it built this application's router.
+    fn architecture_graph_json(&self) -> Option<bytes::Bytes> {
+        None
+    }
+
     /// Returns the shadow-mirroring handle, when this replica assembled a
     /// mirror (`[shadow] enabled = true` with a reachable target configured).
     ///
@@ -910,6 +919,27 @@ struct QueueGaugeState {
     pg_marks_seq_order: std::collections::BTreeMap<u64, String>,
 }
 
+impl QueueGaugeState {
+    /// The queue `name` drains from (`default` when unregistered), borrowed
+    /// from the registration map rather than copied out per lookup.
+    fn queue_of(&self, name: &str) -> &str {
+        self.name_to_queue
+            .get(name)
+            .map_or("default", String::as_str)
+    }
+
+    /// The waiting marks of `name`'s queue, when that queue has an entry.
+    fn waiting_for_mut(&mut self, name: &str) -> Option<&mut std::collections::VecDeque<u64>> {
+        // Disjoint fields: `name_to_queue` is read while `waiting` is borrowed
+        // mutably, so the queue name is never copied out.
+        let queue = self
+            .name_to_queue
+            .get(name)
+            .map_or("default", String::as_str);
+        self.waiting.get_mut(queue)
+    }
+}
+
 /// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
 /// realistic count of Postgres jobs sitting `enqueued` at once — enough that
 /// a job an operator wants to cancel is essentially always still tracked —
@@ -1115,15 +1145,6 @@ impl JobRegistry {
         }
     }
 
-    /// The queue a job name drains from (defaults to `default`).
-    fn queue_for(&self, name: &str) -> String {
-        self.queues
-            .read()
-            .ok()
-            .and_then(|g| g.name_to_queue.get(name).cloned())
-            .unwrap_or_else(|| "default".to_string())
-    }
-
     /// Snapshot per-queue depth and oldest-waiting-job age.
     ///
     /// On the durable backends a periodic survey has populated an authoritative
@@ -1245,17 +1266,34 @@ impl JobRegistry {
     /// Shared enqueue bookkeeping: bump the per-name `queued` counter and push a
     /// per-queue waiting mark stamped with the job's ready-at time.
     fn record_enqueue_at(&self, name: &str, ready_at_ms: u64) {
+        // Probe both maps by borrow: the name is registered at runtime start,
+        // so owned keys are only built for a never-seen name or queue.
         if let Ok(mut guard) = self.inner.write() {
-            let status = guard.entry(name.to_string()).or_insert(JobStatus::empty());
-            status.queued = status.queued.saturating_add(1);
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            if let Some(status) = guard.get_mut(name) {
+                status.queued = status.queued.saturating_add(1);
+            } else {
+                guard.insert(
+                    name.to_owned(),
+                    JobStatus {
+                        queued: 1,
+                        ..JobStatus::empty()
+                    },
+                );
+            }
         }
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write() {
-            guard
-                .waiting
-                .entry(queue)
-                .or_default()
-                .push_back(ready_at_ms);
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            if let Some(waiting) = guard.waiting_for_mut(name) {
+                waiting.push_back(ready_at_ms);
+            } else {
+                let queue = guard.queue_of(name).to_owned();
+                guard
+                    .waiting
+                    .entry(queue)
+                    .or_default()
+                    .push_back(ready_at_ms);
+            }
         }
     }
 
@@ -1637,10 +1675,11 @@ impl JobRegistry {
     /// one. If no mark in the preferred category exists we fall back to the
     /// oldest mark so every enqueue still has a matching removal (no leak).
     fn pop_waiting(&self, name: &str, prefer_ready: bool) {
-        let queue = self.queue_for(name);
         let now = self.now_ms();
+        // The queue is looked up by borrow under the write lock taken here
+        // anyway, instead of copied out under a separate read lock first.
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
         {
             let idx = waiting
                 .iter()
@@ -1656,9 +1695,8 @@ impl JobRegistry {
     /// on whatever timeline the caller resolved it against. A queue with no
     /// marks removes nothing — there is nothing to leak.
     fn pop_waiting_nearest(&self, name: &str, candidates: &[u64]) {
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
         {
             let idx = waiting
                 .iter()
@@ -1682,9 +1720,8 @@ impl JobRegistry {
     /// removed — so the caller can fall back to a heuristic guess rather
     /// than silently leaving the job's real, current mark in place.
     fn pop_waiting_exact(&self, name: &str, exact_ms: u64) -> bool {
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
             && let Some(idx) = waiting.iter().position(|mark| *mark == exact_ms)
         {
             waiting.remove(idx);
@@ -1701,11 +1738,14 @@ impl JobRegistry {
     /// timeline would otherwise contaminate.
     #[cfg(test)]
     pub(crate) fn waiting_marks_for_test(&self, name: &str) -> Vec<u64> {
-        let queue = self.queue_for(name);
         self.queues
             .read()
             .ok()
-            .and_then(|g| g.waiting.get(&queue).map(|w| w.iter().copied().collect()))
+            .and_then(|g| {
+                g.waiting
+                    .get(g.queue_of(name))
+                    .map(|w| w.iter().copied().collect())
+            })
             .unwrap_or_default()
     }
 
@@ -4773,26 +4813,29 @@ fn derivation_report(
 /// route, its auth requirement, and which table each one touches -- a map of
 /// exactly where an attacker would look first, so it is not a public surface.
 ///
-/// A build that never installed a graph answers `503` with an explanation
-/// rather than `404`, so an operator can tell "this process has not published
-/// one" apart from "this build has no such endpoint".
-pub(crate) async fn graph_endpoint() -> axum::response::Response {
-    graph_response(crate::graph::served_json())
+/// The handler reads the graph from the state. Each application serves its
+/// own graph (#2520 item 17).
+///
+/// The endpoint answers `503`, not `404`, when the state has no graph. An
+/// operator can then tell "this app published no graph" from "this build has
+/// no such endpoint".
+pub(crate) async fn graph_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> axum::response::Response {
+    graph_response(state.architecture_graph_json())
 }
 
 /// Render the `/actuator/graph` response for a given installed graph.
 ///
-/// Split from the handler because the installed graph is a process-wide
-/// `OnceLock`: a test that installed one to exercise the "present" branch would
-/// decide the answer for every other test in the process. The branch is the
-/// behaviour worth testing, and it is testable here without that coupling.
-fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
+/// This function is separate from the handler. Tests use it to examine the
+/// two branches.
+fn graph_response(graph: Option<bytes::Bytes>) -> axum::response::Response {
     graph.map_or_else(
         || {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "error": "no architecture graph is installed in this process",
+                    "error": "no architecture graph is installed for this application",
                     "hint": "the graph is published when the application router is built; a \
                              process that serves requests without building one (a bare \
                              `axum::Router` in a test, say) has none to report",
@@ -5512,7 +5555,7 @@ pub(crate) fn actuator_router_with_prefix<
             )
             .route(
                 &actuator_route_path(prefix, "/graph"),
-                axum::routing::get(graph_endpoint),
+                axum::routing::get(graph_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/capsules/export"),
@@ -5729,6 +5772,48 @@ mod tests {
         assert_eq!(drained.get("critical").unwrap().depth, 0);
         assert_eq!(drained.get("critical").unwrap().oldest_waiting_age_ms, 0);
         assert_eq!(drained.get("bulk").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn job_registry_unregistered_name_counts_on_the_default_queue() {
+        // Never registered: the first enqueue inserts the name's status and
+        // the `default` queue's marks; later ones hit both by borrow.
+        let registry = JobRegistry::new();
+        registry.record_enqueue("ghost");
+        registry.record_enqueue("ghost");
+        assert_eq!(registry.snapshot().get("ghost").unwrap().queued, 2);
+        assert_eq!(registry.queue_snapshot().get("default").unwrap().depth, 2);
+        assert_eq!(registry.waiting_marks_for_test("ghost").len(), 2);
+        registry.record_start("ghost");
+        assert_eq!(registry.queue_snapshot().get("default").unwrap().depth, 1);
+        let status = registry.snapshot().get("ghost").cloned().unwrap();
+        assert_eq!((status.queued, status.in_flight), (1, 1));
+        // A first enqueue lands as exactly one queued job, all else empty.
+        registry.record_enqueue("fresh");
+        let fresh = registry.snapshot().get("fresh").cloned().unwrap();
+        assert_eq!(fresh.queued, 1);
+        assert_eq!(fresh.in_flight, 0);
+        assert_eq!(fresh.total_successes, 0);
+        assert!(fresh.last_error.is_none());
+    }
+
+    #[test]
+    fn job_registry_registered_queue_marks_stay_on_that_queue() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("send_email", "mail");
+        // The queue's mark list exists from registration, so every enqueue is
+        // a borrowed hit, and nothing leaks onto `default`.
+        for _ in 0..3 {
+            registry.record_enqueue("send_email");
+        }
+        let queues = registry.queue_snapshot();
+        assert_eq!(queues.get("mail").unwrap().depth, 3);
+        assert!(!queues.contains_key("default"));
+        assert_eq!(registry.waiting_marks_for_test("send_email").len(), 3);
+        registry.record_start("send_email");
+        registry.record_start("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 1);
+        assert_eq!(registry.snapshot().get("send_email").unwrap().in_flight, 2);
     }
 
     /// Clones share marks, so they must share the clock that judges them.
@@ -7782,22 +7867,10 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[tokio::test]
-    async fn actuator_graph_serves_the_installed_graph_over_http() {
-        // The one test that proves the endpoint works end to end: install a
-        // graph, mount the real sensitive actuator router, and GET it. The
-        // `graph_response` unit tests below cannot catch a missing or misplaced
-        // `crate::graph::install` call — Codex round 1 found exactly that, with
-        // every unit test passing while a running app answered 503 forever.
-        //
-        // Sole installer in this test binary, on purpose: the installed graph
-        // is a process-wide `OnceLock`, so a second test installing its own
-        // would decide this one's answer. The install-site guard lives in
-        // `app::tests::graph_installed_before_every_router_build`.
-        crate::graph::install(crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]));
-
-        let app = actuator_router(true).with_state(test_state());
-        let resp = app
+    /// GET `/actuator/graph` on a real sensitive router over `state`.
+    async fn get_graph(state: crate::AppState) -> axum::response::Response {
+        actuator_router(true)
+            .with_state(state)
             .oneshot(
                 Request::builder()
                     .uri("/actuator/graph")
@@ -7805,7 +7878,21 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
                     .unwrap(),
             )
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_serves_the_installed_graph_over_http() {
+        // End to end: install a graph, mount the real sensitive router, GET it.
+        // The install-site guard is
+        // `app::tests::graph_installed_before_every_router_build`.
+        let state = crate::AppState::test_default();
+        crate::graph::install(
+            &state,
+            crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]),
+        );
+
+        let resp = get_graph(state).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -7824,11 +7911,57 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         );
     }
 
+    /// Item 17 of #2520: the second app in a process serves its own graph,
+    /// not the first app's.
+    #[tokio::test]
+    async fn two_apps_in_one_process_serve_their_own_graphs() {
+        let graph_with = |jobs: usize| {
+            let mut graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
+            graph.completeness.jobs = jobs;
+            graph
+        };
+        let first = crate::AppState::test_default();
+        let second = crate::AppState::test_default();
+        crate::graph::install(&first, graph_with(1));
+        crate::graph::install(&second, graph_with(2));
+
+        for (state, jobs) in [(first, 1), (second, 2)] {
+            let resp = get_graph(state).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let decoded: crate::graph::manifest::ArchitectureGraph =
+                serde_json::from_slice(&body).expect("graph document");
+            assert_eq!(decoded.completeness.jobs, jobs);
+        }
+    }
+
+    /// A state with no installed graph answers 503. This includes a custom
+    /// `ProvideActuatorState` that keeps the default method.
+    #[tokio::test]
+    async fn actuator_graph_is_unavailable_for_a_state_with_no_graph() {
+        let resp = get_graph(crate::AppState::test_default()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = actuator_router(true)
+            .with_state(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test]
     async fn actuator_graph_serves_the_installed_graph() {
         let graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
         let json = serde_json::to_vec(&graph).expect("serialize");
-        let resp = graph_response(Some(json.leak()));
+        let resp = graph_response(Some(bytes::Bytes::from(json)));
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -7844,7 +7977,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a process with no graph must say so rather than 404, which would read as \
+            "an app with no graph must say so rather than 404, which would read as \
              'this build has no such endpoint'"
         );
     }

@@ -357,6 +357,47 @@ pub fn generation_of_key(root: &str, key: &str) -> Option<String> {
     }
 }
 
+/// Name prefix of a generation's epoch marker (issue #3233).
+pub const GENERATION_EPOCH_PREFIX: &str = "epoch-";
+
+/// Key of a generation's epoch marker: `{root}/generations/{generation}/epoch-{epoch:020}`.
+///
+/// Written before `snapshot.json`, so a complete generation shows its epoch in
+/// the key listing. A restore takes the newest epoch first, then the newest
+/// time. A generation with no marker has epoch `0`.
+#[must_use]
+pub fn generation_epoch_key(root: &str, generation: &str, epoch: u64) -> String {
+    format!("{root}/generations/{generation}/{GENERATION_EPOCH_PREFIX}{epoch:020}")
+}
+
+/// The generation and epoch of a key made by [`generation_epoch_key`].
+#[must_use]
+pub fn parse_generation_epoch_key(root: &str, key: &str) -> Option<(String, u64)> {
+    let generation = generation_of_key(root, key)?;
+    let name = key.rsplit('/').next()?;
+    let epoch = name.strip_prefix(GENERATION_EPOCH_PREFIX)?.parse().ok()?;
+    Some((generation, epoch))
+}
+
+/// Key prefix of the epoch markers of `root`: one per epoch that wrote here.
+#[must_use]
+pub fn epochs_prefix(root: &str) -> String {
+    format!("{root}/epochs/")
+}
+
+/// Key of the marker that says `epoch` wrote under `root`. A replicator lists
+/// [`epochs_prefix`] to see whether a newer epoch took over.
+#[must_use]
+pub fn epoch_marker_key(root: &str, epoch: u64) -> String {
+    format!("{root}/epochs/{epoch:020}")
+}
+
+/// The epoch of a key made by [`epoch_marker_key`].
+#[must_use]
+pub fn parse_epoch_marker_key(root: &str, key: &str) -> Option<u64> {
+    key.strip_prefix(&epochs_prefix(root))?.parse().ok()
+}
+
 /// Lowercase hex SHA-256 of `data`.
 ///
 /// Re-exported from [`crate::sigv4`] so the whole crate hashes through one

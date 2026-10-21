@@ -1455,6 +1455,7 @@ pub fn cached_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `mcp` | flag / bool | Expose this endpoint as an MCP tool (`mcp = false` force-excludes it). Requires the `mcp` feature and a `mount_mcp` call. |
 /// | `stream` | flag / bool | With `mcp`: the tool returns an `Sse` stream, sent as MCP progress. |
 /// | `task` | flag / bool | With `mcp`: the tool can return a task handle (MCP Tasks extension). |
+/// | `core` | flag / bool | With `mcp`: a core tool. A client that defers tools loads it first. |
 ///
 /// # Examples
 ///

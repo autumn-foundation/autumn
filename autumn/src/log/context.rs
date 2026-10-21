@@ -107,9 +107,31 @@ pub struct LogContext {
     span: tracing::Span,
 }
 
+/// The request id a context carries.
+///
+/// The framework seeds every request's context with the request's own
+/// [`RequestId`](crate::middleware::RequestId) (a few bytes, no heap) and
+/// renders it to text only when a reader asks; most requests never read it
+/// back. An id passed to the public constructors as text keeps that text.
+enum ContextRequestId {
+    Id(crate::middleware::RequestId),
+    Text(String),
+}
+
+impl ContextRequestId {
+    /// The id as text: what `RequestId`'s `Display` writes, i.e. exactly what
+    /// the context stored before it kept the id itself.
+    fn to_text(&self) -> String {
+        match self {
+            Self::Id(id) => id.to_string(),
+            Self::Text(text) => text.clone(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Inner {
-    request_id: Option<String>,
+    request_id: Option<ContextRequestId>,
     user_id: Option<String>,
     tenant_id: Option<String>,
     fields: BTreeMap<String, String>,
@@ -127,6 +149,21 @@ impl LogContext {
     /// [`ParameterFilter`] used to scrub sensitive custom fields.
     #[must_use]
     pub fn with_filter(request_id: Option<String>, filter: Arc<ParameterFilter>) -> Self {
+        Self::seeded(request_id.map(ContextRequestId::Text), filter)
+    }
+
+    /// The per-request constructor `LogContextLayer` uses: it keeps the
+    /// [`RequestId`](crate::middleware::RequestId) itself, so seeding the
+    /// context copies no text.
+    #[must_use]
+    pub(crate) fn for_request(
+        request_id: Option<crate::middleware::RequestId>,
+        filter: Arc<ParameterFilter>,
+    ) -> Self {
+        Self::seeded(request_id.map(ContextRequestId::Id), filter)
+    }
+
+    fn seeded(request_id: Option<ContextRequestId>, filter: Arc<ParameterFilter>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 request_id,
@@ -217,7 +254,7 @@ impl LogContext {
         self.inner.read().map_or_else(
             |_| LogFields::default(),
             |guard| LogFields {
-                request_id: guard.request_id.clone(),
+                request_id: guard.request_id.as_ref().map(ContextRequestId::to_text),
                 user_id: guard.user_id.clone(),
                 tenant_id: guard.tenant_id.clone(),
                 fields: guard.fields.clone(),
@@ -270,7 +307,14 @@ pub fn current() -> Option<LogContext> {
 #[must_use]
 pub fn current_request_id() -> Option<String> {
     CURRENT
-        .try_with(|ctx| ctx.inner.read().ok()?.request_id.clone())
+        .try_with(|ctx| {
+            ctx.inner
+                .read()
+                .ok()?
+                .request_id
+                .as_ref()
+                .map(ContextRequestId::to_text)
+        })
         .ok()
         .flatten()
 }
@@ -377,6 +421,41 @@ mod tests {
             let snap = snapshot().expect("context should be installed");
             assert_eq!(snap.request_id.as_deref(), Some("req-123"));
             assert_eq!(snap.user_id, None);
+        })
+        .await;
+    }
+
+    /// The framework seeds the context with the `RequestId` itself and renders
+    /// it only when read: every reader gets the id as the proxy sent it, case
+    /// and form included, exactly as when the context stored the text.
+    #[tokio::test]
+    async fn request_id_seed_renders_the_id_as_sent() {
+        for sent in [
+            "0E4F1C2A-9B3D-4E5F-8A6B-7C8D9E0F1A2B",
+            "0e4f1c2a9b3d4e5f8a6b7c8d9e0f1a2b",
+        ] {
+            let id = crate::middleware::RequestId::parse_inbound(sent).expect("uuid");
+            let ctx = LogContext::for_request(Some(id), Arc::new(ParameterFilter::default()));
+            assert_eq!(ctx.snapshot().request_id.as_deref(), Some(sent));
+            // The serialized shape is unchanged: a plain string field.
+            let v = serde_json::to_value(ctx.snapshot()).unwrap();
+            assert_eq!(v["request_id"], sent);
+            scope(ctx, async {
+                assert_eq!(current_request_id().as_deref(), Some(sent));
+                assert_eq!(snapshot().and_then(|s| s.request_id).as_deref(), Some(sent));
+            })
+            .await;
+        }
+    }
+
+    /// A request context seeded with no id reads back none, from every
+    /// accessor.
+    #[tokio::test]
+    async fn an_unseeded_request_context_has_no_request_id() {
+        let ctx = LogContext::for_request(None, Arc::new(ParameterFilter::default()));
+        assert_eq!(ctx.snapshot().request_id, None);
+        scope(ctx, async {
+            assert_eq!(current_request_id(), None);
         })
         .await;
     }

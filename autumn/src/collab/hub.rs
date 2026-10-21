@@ -327,6 +327,19 @@ pub enum CollabServerMessage {
     },
 }
 
+/// [`CollabServerMessage::Ops`]'s wire form, borrowed.
+///
+/// `handle` and `apply_remote` broadcast the operations they also return, so
+/// building the owned message copied every operation (two actor strings
+/// apiece) only to encode the copy. Same tag and casing as
+/// [`CollabServerMessage`], which every editor decodes it as;
+/// `an_ops_frame_encodes_like_the_server_message` pins that.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpsFrame<'a> {
+    Ops { ops: &'a [CollabOp] },
+}
+
 /// One editor of a document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollabParticipant {
@@ -440,6 +453,19 @@ fn seated_actor(name: &str, seat: u64) -> String {
         cut -= 1;
     }
     format!("{}{suffix}", &name[..cut])
+}
+
+/// Record `actor`'s caret, copying the actor id only the first time.
+///
+/// The reference client reports its caret on every keyup, so after an
+/// editor's first move its key is always present; `insert` copied the id
+/// to find it anyway.
+fn set_cursor(cursors: &mut BTreeMap<String, usize>, actor: &str, index: usize) {
+    if let Some(caret) = cursors.get_mut(actor) {
+        *caret = index;
+        return;
+    }
+    cursors.insert(actor.to_owned(), index);
 }
 
 /// How often [`serve_socket`] renews an editor's presence lease. Comfortably
@@ -697,6 +723,7 @@ impl CollabHub {
     fn handle_for(&self, key: &str, state: Arc<Mutex<DocState>>) -> CollabDoc {
         CollabDoc {
             key: key.to_owned(),
+            topic: std::sync::OnceLock::new(),
             state,
             channels: self.inner.channels.clone(),
             presence: self.inner.presence.clone(),
@@ -946,6 +973,11 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for CollabHub {
 #[derive(Clone)]
 pub struct CollabDoc {
     key: String,
+    /// `collab:{key}`, built the first time this handle broadcasts or
+    /// subscribes and shared by every clone made after. Every keystroke
+    /// publishes on it; formatting it per publish allocated a fresh copy of
+    /// a string that never changes for the life of the handle.
+    topic: std::sync::OnceLock<Arc<str>>,
     state: Arc<Mutex<DocState>>,
     channels: Channels,
     presence: Presence,
@@ -977,7 +1009,12 @@ impl CollabDoc {
     /// The channel and presence topic this document broadcasts on.
     #[must_use]
     pub fn topic(&self) -> String {
-        topic_for(&self.key)
+        String::from(self.topic_name())
+    }
+
+    /// [`topic`](Self::topic), borrowed from the handle's cached copy.
+    fn topic_name(&self) -> &str {
+        self.topic.get_or_init(|| topic_for(&self.key).into())
     }
 
     /// The visible text.
@@ -1003,7 +1040,7 @@ impl CollabDoc {
     /// Subscribe to this document's server messages.
     #[must_use]
     pub fn subscribe(&self) -> Subscriber {
-        self.channels.subscribe(&self.topic())
+        self.channels.subscribe(self.topic_name())
     }
 
     /// The opening message for a joining editor.
@@ -1075,15 +1112,16 @@ impl CollabDoc {
     /// Panics if the internal document mutex is poisoned.
     #[must_use]
     pub fn participants(&self) -> Vec<CollabParticipant> {
-        let cursors = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.cursors.clone()
-        };
-        self.presence
-            .list(&self.topic())
+        // Membership first, then each caret read in place under the document
+        // lock: the two locks are still never held together, and the whole
+        // caret map is no longer copied out (one actor string per editor, on
+        // every cursor move) to read one `usize` per editor.
+        let entries = self.presence.list(self.topic_name());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let participants: Vec<CollabParticipant> = entries
             .into_iter()
             .map(|entry| {
                 let label = entry
@@ -1094,12 +1132,14 @@ impl CollabDoc {
                     .unwrap_or(entry.key.as_str())
                     .to_owned();
                 CollabParticipant {
-                    cursor: cursors.get(&entry.key).copied(),
+                    cursor: state.cursors.get(&entry.key).copied(),
                     actor: entry.key,
                     label,
                 }
             })
-            .collect()
+            .collect();
+        drop(state);
+        participants
     }
 
     /// Apply one client message as `actor` and broadcast the result.
@@ -1229,7 +1269,7 @@ impl CollabDoc {
             CollabClientMessage::Cursor { index } => {
                 {
                     let mut state = self.state.lock().expect("collab document lock poisoned");
-                    state.cursors.insert(actor.to_owned(), index);
+                    set_cursor(&mut state.cursors, actor, index);
                 }
                 self.broadcast_presence();
                 Ok(Vec::new())
@@ -1297,7 +1337,7 @@ impl CollabDoc {
                     if state.doc.already_applied(op) || state.doc.holds_pending(op) {
                         return false;
                     }
-                    let integrated = state.edit(|doc| doc.apply((*op).clone()));
+                    let integrated = state.edit(|doc| doc.apply_ref(op));
                     integrated || state.doc.holds_pending(op)
                 })
                 .cloned()
@@ -1343,7 +1383,14 @@ impl CollabDoc {
             });
         }
         Self::check_pending(&state.doc, ops, novel)?;
-        state.edit(|doc| doc.apply_all(ops.iter().cloned()));
+        // Borrowed: on the authority these are its own operations coming back
+        // to every editor's socket loop, and they integrate as no-ops, so a
+        // copy of each was made only to be dropped.
+        state.edit(|doc| {
+            for op in ops {
+                doc.apply_ref(op);
+            }
+        });
         drop(state);
         Ok(())
     }
@@ -1390,7 +1437,7 @@ impl CollabDoc {
         if ops.is_empty() {
             return;
         }
-        self.publish(&CollabServerMessage::Ops { ops: ops.to_vec() });
+        self.publish(&OpsFrame::Ops { ops });
     }
 
     fn broadcast_presence(&self) {
@@ -1413,19 +1460,25 @@ impl CollabDoc {
     /// publish falls back to the local topic directly. Editors on other nodes
     /// still miss it until they reconnect, which is what a broken Redis
     /// means; the node that applied the operation at least agrees with itself.
-    fn publish(&self, message: &CollabServerMessage) {
+    fn publish(&self, message: &impl Serialize) {
         let Ok(json) = serde_json::to_string(message) else {
             tracing::warn!(key = %self.key, "collab: failed to encode server message");
             return;
         };
-        let topic = self.topic();
-        if let Err(error) = self.channels.publish(&topic, json.clone()) {
-            let delivered = self
-                .channels
-                .backend()
-                .ensure_topic(&topic)
-                .send(json.into())
-                .unwrap_or(0);
+        let topic = self.topic_name();
+        if let Err(error) = self.channels.publish(topic, json) {
+            // Encoded again rather than cloned up front: the publish took
+            // the first copy, and only a full or closed Redis queue (or an
+            // interceptor's refusal) lands here, so a clone kept for it
+            // charged every keystroke for a path almost none take. The
+            // encoding is deterministic: the same bytes go out.
+            let delivered = serde_json::to_string(message).map_or(0, |json| {
+                self.channels
+                    .backend()
+                    .ensure_topic(topic)
+                    .send(json.into())
+                    .unwrap_or(0)
+            });
             tracing::warn!(
                 key = %self.key,
                 ?error,
@@ -1664,8 +1717,9 @@ pub async fn serve_socket(
                         // Locally-produced operations arrive here too and
                         // re-apply as no-ops, which is what idempotence is
                         // for.
-                        let refused = if let Ok(CollabServerMessage::Ops { ops }) =
-                            serde_json::from_str::<CollabServerMessage>(&text)
+                        let refused = if may_be_ops_frame(&text)
+                            && let Ok(CollabServerMessage::Ops { ops }) =
+                                serde_json::from_str::<CollabServerMessage>(&text)
                         {
                             doc.merge_delivered(&ops)
                                 .inspect_err(|error| {
@@ -1724,6 +1778,28 @@ pub async fn serve_socket(
     drop(session);
 }
 
+/// Whether a channel frame could be an `Ops` message, read from its tag
+/// alone.
+///
+/// Every editor's socket loop sees every frame on the topic, and most are
+/// not operations: the reference client reports its caret on every keyup,
+/// so a `Presence` frame follows nearly every keystroke. Decoding each in
+/// full built every participant's strings in every editor's task only to
+/// throw them away. The tag is read borrowed and the rest is skipped.
+///
+/// Only a frame that reads as tagged with something else answers `false`.
+/// One this cannot read goes on to the full decode, which reaches the
+/// verdict it always did, so skipping can never cost the merge a frame the
+/// full decode would have taken as operations.
+fn may_be_ops_frame(text: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Tag<'a> {
+        #[serde(borrow, rename = "type")]
+        kind: std::borrow::Cow<'a, str>,
+    }
+    !serde_json::from_str::<Tag<'_>>(text).is_ok_and(|tag| tag.kind != "ops")
+}
+
 /// Send one server message, or report that the socket is gone.
 async fn send_json(
     socket: &mut crate::ws::WebSocket,
@@ -1734,4 +1810,194 @@ async fn send_json(
         .send(crate::ws::Message::Text(json.into()))
         .await
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hub() -> CollabHub {
+        let channels = Channels::new(64);
+        let presence = Presence::new(channels.clone());
+        CollabHub::new(channels, presence)
+    }
+
+    /// Every editor decodes the borrowed frame as a `CollabServerMessage`,
+    /// so the two must encode to the same bytes.
+    #[test]
+    fn an_ops_frame_encodes_like_the_server_message() {
+        let mut doc = CollabText::new();
+        let mut ops = doc.insert("ada#1", 0, "hi").expect("collab edit refused");
+        ops.extend(doc.remove(0, 1));
+        let borrowed = serde_json::to_string(&OpsFrame::Ops { ops: &ops }).expect("encode");
+        let owned = serde_json::to_string(&CollabServerMessage::Ops { ops }).expect("encode");
+        assert_eq!(borrowed, owned);
+    }
+
+    /// The socket loop broadcasts the frame `handle` encoded from its
+    /// borrowed operations; it must be exactly the owned message's encoding.
+    #[test]
+    fn an_edit_broadcasts_exactly_the_operations_it_returns() {
+        let hub = hub();
+        let doc = hub
+            .open_with("notes:40:body", || {
+                CollabText::from_text("seed", "hi").expect("collab edit refused")
+            })
+            .expect("open the document");
+        let mut watcher = doc.subscribe();
+
+        let ops = doc
+            .handle(
+                "ada",
+                CollabClientMessage::Insert {
+                    after: doc.document().id_at(1),
+                    text: "!".to_owned(),
+                },
+            )
+            .expect("insert");
+
+        let frame = watcher.try_recv().expect("the edit was broadcast");
+        assert_eq!(
+            frame.as_str(),
+            serde_json::to_string(&CollabServerMessage::Ops { ops }).expect("encode")
+        );
+    }
+
+    /// A handle caches its topic on first use. A clone taken before that
+    /// builds its own, and one taken after shares it; all of them broadcast
+    /// on the document's topic.
+    #[test]
+    fn every_handle_broadcasts_on_the_documents_topic() {
+        let channels = Channels::new(64);
+        let presence = Presence::new(channels.clone());
+        let hub = CollabHub::new(channels.clone(), presence);
+        let first = hub.document("notes:41:body").expect("open the document");
+        // Cloned before either handle built its topic.
+        let second = first.clone();
+        let mut rx = channels.subscribe(&topic_for("notes:41:body"));
+
+        second
+            .handle(
+                "ada",
+                CollabClientMessage::Insert {
+                    after: None,
+                    text: "x".to_owned(),
+                },
+            )
+            .expect("insert");
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "the clone publishes on the document's topic"
+        );
+        assert_eq!(first.topic(), "collab:notes:41:body");
+        assert_eq!(second.topic(), first.topic());
+        // Cloned after the cache was built.
+        let third = second.clone();
+        assert_eq!(third.topic_name(), "collab:notes:41:body");
+        assert_eq!(third.topic_name(), second.topic_name());
+    }
+
+    /// The tag check skips only what the full decode would not have merged.
+    #[test]
+    fn only_a_frame_tagged_as_something_else_skips_the_full_decode() {
+        let ops =
+            serde_json::to_string(&CollabServerMessage::Ops { ops: Vec::new() }).expect("encode");
+        let presence = serde_json::to_string(&CollabServerMessage::Presence {
+            participants: vec![CollabParticipant {
+                actor: "ada#1".to_owned(),
+                label: "Ada".to_owned(),
+                cursor: Some(2),
+            }],
+        })
+        .expect("encode");
+
+        assert!(may_be_ops_frame(&ops));
+        assert!(!may_be_ops_frame(&presence));
+        assert!(!may_be_ops_frame(r#"{"type":"error","message":"no"}"#));
+        assert!(
+            may_be_ops_frame(r#"{"ops":[],"type":"ops"}"#),
+            "the tag need not come first"
+        );
+        assert!(
+            may_be_ops_frame(r#"{"type":"\u006fps","ops":[]}"#),
+            "an escaped tag reads as what it spells"
+        );
+        assert!(
+            !may_be_ops_frame(r#"{"type":"pr\u0065sence","participants":[]}"#),
+            "an escaped tag reads as what it spells"
+        );
+        // Unreadable here is not a verdict: the full decode still decides.
+        assert!(may_be_ops_frame("not json"));
+        assert!(may_be_ops_frame(r#"{"ops":[]}"#));
+        assert!(may_be_ops_frame(r#"["ops",[]]"#));
+
+        // Whatever the full decode takes as operations, the check lets in.
+        for frame in [
+            ops.as_str(),
+            presence.as_str(),
+            r#"{"ops":[],"type":"ops"}"#,
+            r#"{"type":"\u006fps","ops":[]}"#,
+            r#"{"type":"pr\u0065sence","participants":[]}"#,
+            r#"["ops",[]]"#,
+            r#"{"ops":[]}"#,
+            "not json",
+        ] {
+            let merged = matches!(
+                serde_json::from_str::<CollabServerMessage>(frame),
+                Ok(CollabServerMessage::Ops { .. })
+            );
+            assert!(
+                !merged || may_be_ops_frame(frame),
+                "skipped an ops frame: {frame}"
+            );
+        }
+    }
+
+    /// A repeat caret report overwrites the editor's entry in place.
+    #[test]
+    fn set_cursor_overwrites_a_known_caret_and_adds_a_new_one() {
+        let mut cursors = BTreeMap::new();
+        set_cursor(&mut cursors, "ada#1", 1);
+        set_cursor(&mut cursors, "linus#2", 5);
+        set_cursor(&mut cursors, "ada#1", 4);
+        assert_eq!(
+            cursors.into_iter().collect::<Vec<_>>(),
+            vec![("ada#1".to_owned(), 4), ("linus#2".to_owned(), 5)]
+        );
+    }
+
+    /// Through the session: the participant list shows the latest caret.
+    #[test]
+    fn a_repeated_cursor_move_updates_the_caret_in_place() {
+        let hub = hub();
+        let doc = hub.document("notes:42:body").expect("open the document");
+        let ada = doc.join("ada", "Ada");
+        for index in [1, 4, 2] {
+            ada.handle(CollabClientMessage::Cursor { index })
+                .expect("cursor");
+        }
+        let cursors: Vec<Option<usize>> =
+            doc.participants().into_iter().map(|p| p.cursor).collect();
+        assert_eq!(cursors, vec![Some(2)]);
+    }
+
+    /// `participants` reads each caret in place: presence order, each
+    /// editor's own caret, and none for an editor that never reported one.
+    #[test]
+    fn participants_pair_each_editor_with_its_own_caret() {
+        let hub = hub();
+        let doc = hub.document("notes:43:body").expect("open the document");
+        let ada = doc.join("ada", "Ada");
+        let _linus = doc.join("linus", "Linus");
+        ada.handle(CollabClientMessage::Cursor { index: 3 })
+            .expect("cursor");
+
+        let participants = doc.participants();
+        let seen: Vec<(&str, Option<usize>)> = participants
+            .iter()
+            .map(|p| (p.label.as_str(), p.cursor))
+            .collect();
+        assert_eq!(seen, vec![("Ada", Some(3)), ("Linus", None)]);
+    }
 }

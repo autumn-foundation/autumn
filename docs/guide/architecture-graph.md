@@ -92,22 +92,40 @@ and dev endpoints as well as the app's `#[ws]` handlers. Naming them is what
 stops the completeness section reading as a complete account of the served
 surface when it is not.
 
+A plugin mount declared with `declare_plugin_routes` is different: its auth is
+known. It is listed in `completeness.declared_mounts` as `{method, path, auth}`
+and not as a bare name in `unmodelled_mounted_routes`. The field is omitted when
+empty and `schema_version` stays 1. A change from gated to public with the same
+method and path changes the document, so `--check` can see it. Framework
+endpoints and raw `merge`/`nest` routes keep name-only entries.
+
 It is **sensitive-gated**, like `/actuator/env`: the document names every route,
 its auth requirement, and the table each one touches — a map of exactly where an
 attacker would look first. It is available when `actuator.sensitive = true`
 (the default in dev), and absent in production unless you opt in.
 
-A process that never built an application router answers `503` with an
-explanation rather than `404`, so "this process published no graph" reads
-differently from "this build has no such endpoint".
+Each application serves its own graph. When `AppBuilder` builds the router, it
+keeps the graph in the app's `AppState`. Two such applications in one process
+(an embedded host, say) each serve their own paths and auth. Read the graph in
+code with `autumn_web::graph::served(&state)`.
+
+A state with no installed graph gets `503` from `/actuator/graph`, with an
+explanation, not `404`. Then "this app published no graph" reads differently
+from "this build has no such endpoint". A `TestApp` installs no graph.
 
 A **worker** (`AUTUMN_ROLE=worker`) serves the probe-only router and mounts no
 application route, so its graph reports every declared route as
 `mounted: false` and names them under `unmounted_routes`. That is the honest
 answer to "what does *this process* serve" — the elements are still compiled
 in, they are just not being served here. Its
-`unmodelled_mounted_routes` is empty rather than listing the probes and
-actuator it does serve; that gap is tracked separately.
+`unmodelled_mounted_routes` names the probes and actuator it does serve, and
+nothing else. `autumn graph` reads `role` from the app's configuration and
+shows the same worker view.
+
+The dump reads configuration through the loader the app installs with
+`.with_config_loader(...)`, as normal startup does. It starts no telemetry,
+opens no database and binds no port. A configuration that fails to load falls
+back to defaults.
 
 One number can legitimately differ between `autumn graph show` and
 `/actuator/graph`: `opaque_mounted_routers`. The dump exits before startup
@@ -182,18 +200,35 @@ read as more than it is:
   them. (Without this, `autumn graph touches votes` would miss every upvote
   route, because none of them names `votes`.)
 * **Access is declared intent.** A route's access is its HTTP method — safe
-  methods read, everything else writes. A job's is whether its tokens carry
-  mutation evidence. Neither is an executed statement.
+  methods read, everything else writes. A job's is set for each edge. An edge
+  is a write when its symbol names a mutating SQL statement, or when the job
+  calls `.create`, `.delete`, `.insert` or `.update` on a parameter whose type
+  is a declared repository. Mutation evidence that names no symbol (`save`,
+  `upsert`, `diesel::update(..)`) makes every edge of the job a write. A route
+  needs no such evidence: its method decides. None of this is an executed
+  statement.
 * **Routes mounted by other mechanisms.** A `#[ws]` handler or a framework
   endpoint is not a `#[route]` and is not a node; those mounts are *named* in
-  `completeness.unmodelled_mounted_routes` — with two exceptions still to
-  close: the OpenAPI JSON and Swagger routes an app enables with
-  `.openapi(...)`, and a worker's own probe and actuator mounts. A raw `merge`/`nest` router is
+  `completeness.unmodelled_mounted_routes`. This includes the OpenAPI JSON and
+  Swagger routes an app enables with `.openapi(...)`, when OpenAPI is enabled
+  at runtime. A raw `merge`/`nest` router is
   worse than unmodelled — it exposes no API to list its endpoints at all, so
   they cannot be named, only counted, in
   `completeness.opaque_mounted_routers` (the same count `autumn routes audit`
   hard-fails its coverage gate on). Either way the document says what it could
   not see rather than reading as a complete account of the served surface.
+* **Duplicate crate versions.** Node ids come from `module_path!()`. If a binary
+  links two versions of one crate, each id they share ends in `@<version>`, for
+  example `model:plugin::models::Post@1.2.0`. Other ids do not change. A query
+  by model path (`plugin::models::Post`) or by the id with no version finds
+  every version. A mounted route records only its module and handler, so the
+  route node of each version shows the mounts of both versions. An auto-API
+  route links to the repository of each version. Two copies of one version
+  (from two sources) still share one node.
+* **Name-only matching.** It applies only where no qualified identity exists. A
+  repository edge uses the model name and table. An auto-API route is matched to
+  its repository by prefix and model name. If two repositories share both, the
+  route goes to the first by node id.
 * **Cross-module `use`.** Only an item's own tokens are read, so a
   module-level `use crate::schema::posts::dsl::*` followed by a bare
   `posts.filter(…)` names no candidate. Write `posts::table` or the model type

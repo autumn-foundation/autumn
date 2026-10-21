@@ -158,8 +158,9 @@ impl RequestId {
     }
 
     /// Write the id text into `buf`: the inbound text as sent, or the
-    /// hyphenated lowercase form of a new id. No heap allocation.
-    fn encode<'a>(&self, buf: &'a mut [u8; uuid::fmt::Hyphenated::LENGTH]) -> &'a str {
+    /// hyphenated lowercase form of a new id. No heap allocation. The access
+    /// log uses it to record the id as a `&str` without copying it.
+    pub(crate) fn encode<'a>(&self, buf: &'a mut [u8; uuid::fmt::Hyphenated::LENGTH]) -> &'a str {
         let Some(form) = self.inbound else {
             return self.uuid.as_hyphenated().encode_lower(buf);
         };

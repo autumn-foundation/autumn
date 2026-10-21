@@ -22,7 +22,13 @@ use std::process::Command;
 
 use autumn_web::openapi::{OpaqueSchema, OpenApiSpec, opaque_component_schemas};
 
-use crate::routes::{CargoFeatures, CargoProfile, compile_binary_with, find_binary_in_profile};
+use crate::routes::{
+    CargoFeatures, CargoProfile, clear_other_dump_modes, compile_binary_with,
+    find_binary_in_profile,
+};
+
+/// The env var selecting the app binary's OpenAPI-document dump mode.
+pub const DUMP_ENV: &str = "AUTUMN_DUMP_OPENAPI";
 
 /// Options controlling `autumn openapi export`.
 pub struct ExportOptions<'a> {
@@ -76,26 +82,6 @@ pub fn run(opts: &ExportOptions<'_>) {
     }
 }
 
-/// The other no-boot protocol modes `AppBuilder::run` recognises.
-///
-/// They are cleared from the export child's environment because `run` checks
-/// them in a fixed ORDER and two of them — `AUTUMN_BUILD_STATIC` and
-/// `AUTUMN_DUMP_ROUTES` — come BEFORE the `OpenAPI` mode, so a caller whose
-/// environment already carries one (a build-oriented CI job, say) would get
-/// static assets or route JSON out of the child instead of a spec.
-///
-/// The whole set is listed rather than only the two that currently win, so this
-/// stays correct if that ordering changes or a mode is added ahead of ours.
-const COMPETING_DUMP_MODES: [&str; 7] = [
-    "AUTUMN_BUILD_STATIC",
-    "AUTUMN_DUMP_ROUTES",
-    "AUTUMN_DUMP_CACHE_COHERENCE",
-    "AUTUMN_DUMP_DATA_FLOW",
-    "AUTUMN_DUMP_AGENT_AUTHORITY",
-    "AUTUMN_DUMP_GRAPH",
-    "AUTUMN_DUMP_JOBS",
-];
-
 /// Build the app and read its `OpenAPI` dump, exiting with an actionable message
 /// when the binary has no spec to give.
 fn dump_spec(opts: &ExportOptions<'_>) -> String {
@@ -107,20 +93,14 @@ fn dump_spec(opts: &ExportOptions<'_>) -> String {
 
     // `AppBuilder::run` checks its no-boot protocol modes in a fixed ORDER, and
     // `AUTUMN_BUILD_STATIC` / `AUTUMN_DUMP_ROUTES` are both checked BEFORE the
-    // OpenAPI one (`app.rs:3301`, `:3309`, `:3318`). A caller whose environment
-    // already carries one of them — a build-oriented CI job is the obvious case
-    // — would have the child render static assets or print route JSON instead,
-    // and this command would then fail to parse an OpenAPI document out of it.
-    //
-    // Cleared rather than merely ordered around: every sibling mode is removed,
-    // not just the two that currently win, so this stays correct if that
-    // ordering ever changes or a new mode is added ahead of ours.
+    // OpenAPI one. A caller whose environment already carries one of them — a
+    // build-oriented CI job is the obvious case — would have the child render
+    // static assets or print route JSON instead, and this command would then
+    // fail to parse an OpenAPI document out of it (issue #2370).
     let mut command = Command::new(&binary);
-    for mode in COMPETING_DUMP_MODES {
-        command.env_remove(mode);
-    }
+    command.env(DUMP_ENV, "1");
+    clear_other_dump_modes(&mut command, DUMP_ENV);
     let output = command
-        .env("AUTUMN_DUMP_OPENAPI", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

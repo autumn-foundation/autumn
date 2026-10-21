@@ -71,14 +71,54 @@ pub struct RoutesOptions<'a> {
     pub user_only: bool,
 }
 
+/// The env var selecting the app binary's route-listing dump mode.
+pub const DUMP_ENV: &str = "AUTUMN_DUMP_ROUTES";
+
+/// Every one-shot, no-boot mode `AppBuilder::run` dispatches before starting
+/// the server, in the exact order it checks them (see `autumn/src/app.rs::run`).
+///
+/// `Command` inherits the parent's environment, so any of these left over
+/// from an unrelated ambient export (a build-oriented CI job, a previous
+/// manual `export AUTUMN_DUMP_…=1`) would silently win over the mode a given
+/// command actually asked for and hand it a marker-less or wrong-manifest
+/// stdout (issue #2370). Every call site that spawns the app binary into one
+/// of these modes must clear every other entry via [`clear_other_dump_modes`]
+/// before setting its own.
+pub const ALL_DUMP_MODE_ENVS: &[&str] = &[
+    crate::build::BUILD_STATIC_ENV,
+    DUMP_ENV,
+    crate::openapi::DUMP_ENV,
+    crate::cache_audit::DUMP_ENV,
+    crate::data_flow::DUMP_ENV,
+    crate::agents::DUMP_ENV,
+    crate::graph::DUMP_ENV,
+    crate::jobs::DUMP_ENV,
+];
+
+/// Clear every [`ALL_DUMP_MODE_ENVS`] entry except `own` from `command`'s
+/// environment, so an unrelated ambient export can't silently win (#2370).
+///
+/// `own` need not itself be one of these modes — a one-shot mode dispatched
+/// even later than all of them (e.g. `autumn task`) still needs every one of
+/// them cleared, and simply never matches an entry to skip.
+pub fn clear_other_dump_modes(command: &mut Command, own: &str) {
+    for mode in ALL_DUMP_MODE_ENVS {
+        if *mode != own {
+            command.env_remove(mode);
+        }
+    }
+}
+
 /// Run `autumn routes`.
 pub fn run(opts: &RoutesOptions<'_>) {
     eprintln!("\u{1F342} autumn routes\n");
     compile_binary(opts.package, opts.bin);
     let binary = find_binary(opts.package, opts.bin);
 
-    let output = Command::new(&binary)
-        .env("AUTUMN_DUMP_ROUTES", "1")
+    let mut command = Command::new(&binary);
+    command.env(DUMP_ENV, "1");
+    clear_other_dump_modes(&mut command, DUMP_ENV);
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()
@@ -690,6 +730,48 @@ impl CargoFeatures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_dump_mode_envs_has_no_duplicate_entries() {
+        // A repeated entry would mean a mode is checked twice at different
+        // priorities, or (more likely) a copy-paste mistake that silently
+        // drops a distinct mode from the clearable set.
+        let mut seen = std::collections::HashSet::new();
+        for mode in ALL_DUMP_MODE_ENVS {
+            assert!(seen.insert(*mode), "{mode} appears more than once");
+        }
+    }
+
+    #[test]
+    fn clear_other_dump_modes_preserves_own_and_clears_every_other_entry() {
+        for &own in ALL_DUMP_MODE_ENVS {
+            let mut command = Command::new("true");
+            for mode in ALL_DUMP_MODE_ENVS {
+                command.env(mode, "1");
+            }
+
+            clear_other_dump_modes(&mut command, own);
+
+            for &mode in ALL_DUMP_MODE_ENVS {
+                let value = command
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(mode));
+                if mode == own {
+                    assert_eq!(
+                        value,
+                        Some((std::ffi::OsStr::new(mode), Some(std::ffi::OsStr::new("1")))),
+                        "own mode {mode} must survive clearing: {value:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        value,
+                        Some((std::ffi::OsStr::new(mode), None)),
+                        "{mode} must be cleared when own is {own}: {value:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn make_route(method: &str, path: &str, source: &str) -> RouteInfo {
         RouteInfo {

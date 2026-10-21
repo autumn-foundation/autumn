@@ -84,6 +84,15 @@ pub enum RouteIdempotency {
     /// [`crate::idempotency::IdempotencyReplayLayer`] after those checks and
     /// before the mutating handler.
     ReplayThroughInner,
+    /// The route opted out with `#[post("/x", idempotent = false)]`: the
+    /// app-level layer is not mounted on it at all, so it neither stores nor
+    /// replays, and the handler runs on every request.
+    ///
+    /// For a route that dedupes by its own key — a durable workflow route
+    /// keyed by `Idempotency-Key` and the caller's scope, say — where a second
+    /// cache in front of it would only answer before the route's own check
+    /// runs.
+    Off,
 }
 
 /// Per-route override for the global inbound request timeout
@@ -268,6 +277,20 @@ impl Route {
     pub const fn mcp_task(mut self) -> Self {
         self.api_doc.mcp_tool = true;
         self.api_doc.mcp_task = true;
+        self
+    }
+
+    /// Opt this route in as a *core* MCP tool, equivalent to
+    /// `#[api_doc(mcp, core)]`.
+    ///
+    /// Implies [`mcp()`](Self::mcp). A core tool carries
+    /// `_meta["anthropic/alwaysLoad"]`, so a client that defers tools loads
+    /// it first. In the progressive catalog, `tools/list` holds the core tools
+    /// and the two meta-tools.
+    #[must_use]
+    pub const fn mcp_core(mut self) -> Self {
+        self.api_doc.mcp_tool = true;
+        self.api_doc.mcp_core = true;
         self
     }
 }

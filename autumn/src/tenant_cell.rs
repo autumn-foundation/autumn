@@ -1278,7 +1278,9 @@ impl TenantCellRegistry {
 #[derive(Clone)]
 pub struct TenantCellHandle {
     registry: TenantCellRegistry,
-    tenant_id: String,
+    /// Shared by every clone: the middleware clones the handle for the body,
+    /// and the body clones it again for each frame, so a clone copies no id.
+    tenant_id: Arc<str>,
     quota_bytes: usize,
     /// Per-request cache of the first materialized cell. Wrapped in an `Arc` so
     /// every clone of the same handle (the task-local copy and the copy held by
@@ -1306,6 +1308,16 @@ impl TenantCellHandle {
     /// handle does not touch the registry.
     #[must_use]
     pub fn new(registry: TenantCellRegistry, tenant_id: String, quota_bytes: usize) -> Self {
+        Self::from_shared(registry, Arc::from(tenant_id), quota_bytes)
+    }
+
+    /// [`Self::new`] from an id that is already shared.
+    #[must_use]
+    pub(crate) fn from_shared(
+        registry: TenantCellRegistry,
+        tenant_id: Arc<str>,
+        quota_bytes: usize,
+    ) -> Self {
         Self {
             registry,
             tenant_id,

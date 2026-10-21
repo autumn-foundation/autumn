@@ -197,18 +197,151 @@ destination as the control database:
 - health reports the databases this process has open but does not own under
   `unowned`.
 
-Taking over a slot range needs the old owner stopped first (a fencing epoch is
-roadmap item 2).
+Section 7 fences the old owner when another host takes over a slot range.
 
-### 6. What stays on the control database
+### 6. Background work: the fleet sweeper
 
-The outbox relay, derivation backfill, the job dashboard and shard-local jobs
-enumerate configured shards at boot and do not visit fleet databases. The
-commit-hook queue does: each open database runs its own commit-hook worker,
-which stops when the database closes and resumes on the next open. It runs in
-every process role, `web` included, because only a process that has the
-database open can drain its queue; rows are claimed under `BEGIN IMMEDIATE`
-with a lease, so two processes draining one database is safe.
+A fleet database runs background work only while it is open. The fleet
+sweeper (`autumn_web::db::fleet_sweeper`, issue 3234) does the work of
+databases that nobody asks for:
+
+- **Index.** `_autumn_fleet_pending(key, kind, since)` on the control
+  database lists the databases with work. `kind` is `outbox`, `hooks` or
+  `backfill`. The sweeper never opens a file to find work. Two more columns
+  hold the backoff of a database (`visit_after`, `attempts`).
+- **Mark.** An outbox write and a commit-hook enqueue write a row for their
+  database after the insert and before the commit, while they hold the
+  tenant write lock. Enqueue code has only a connection: it finds its fleet
+  by the file of the connection (`pragma_database_list`) and its key by the
+  identity row. When the row cannot be written, the write fails.
+- **Clear.** A visit removes a row only under the tenant write lock
+  (`BEGIN IMMEDIATE`), after it finds no work of that kind. Marks and clears
+  therefore never interleave, and committed work always has a row. The lock
+  order is always tenant database, then control database. A rolled-back
+  write can leave a row with no work; the next visit removes it.
+- **Open.** When a database opens, it gets a row for each kind of work it
+  holds. This covers work that an earlier process left without a row. If
+  the row cannot be written, the open fails.
+- **Derivations.** `_autumn_fleet_derivation_epochs` on the control database
+  records each derivation fingerprint a worker has seen, in order. A worker
+  with a new fingerprint records it, then lists the files and marks each
+  database `backfill`. It opens none to do this. Only the binary with the
+  newest fingerprint runs a backfill (checked before each database) or
+  removes a `backfill` row (checked in the same `DELETE`). When a newer
+  fingerprint lands during a backfill, the old binary marks the database
+  again, so the new one reconciles it. A fingerprint seen before is never recorded again, so an
+  old binary that restarts in a rolling deploy cannot undo the new
+  definitions. A rollback to older derivations needs a `resweep`. When a
+  database opens, the current binary runs up to 8 backfill batches before
+  the first request; the sweeper does the rest.
+- **Visit.** A worker process (its `role` runs workers) opens each listed
+  database with `DatabaseFleet::open_background`. That open never creates a
+  file, never restores one from a replica, and never takes the fleet past
+  `max_open`: with no room, the database waits for the next pass. It does
+  not count as a use, so the database is the first LRU victim. The visit
+  drains hooks, sends the outbox (in a tenant fleet, handlers run in the
+  tenant's scope), purges old outbox rows and runs the backfill. Then
+  `close_if_unused` closes the database, but only when nobody used it and
+  nobody holds a lease on it. A deleted database loses its rows at its next
+  visit.
+- **Roles.** Every role installs the index and the marks; a failed install
+  stops the process. A `web` process visits only the databases it has open
+  with hook rows: it drains the hooks and clears the rows. A worker leaves
+  the hook rows of a closed database alone for `hook_grace` (5 s), as the
+  process that has it open drains them.
+- **Bounds.** Each pass visits at most 64 databases, 4 at a time, with 256
+  messages and 4 backfill rounds each. When a visit leaves work and does
+  nothing, the database waits 1 s, then twice as long each time, up to
+  5 min. New work of the same kind ends the wait. A visit that made
+  progress and left work moves the database behind the others that are
+  due, so busy databases take turns. A pass reads the due rows of the open
+  databases and the 256 rows due first, and puts them in one order: by due
+  time, then by age. When both are the same, an open database goes first,
+  because its visit opens no file. A new row is due at the time of its mark.
+  A row with no backoff is due on every clock, so clock skew between hosts
+  changes only its place. Half of each pass goes first to the open
+  databases, so a backfill of the whole fleet does not stop their outbox.
+  The rest goes in that order to all databases. A pass takes no more closed
+  databases than the fleet has room for, and no database of another host.
+  A closed database therefore waits only behind the rows that were due
+  before it (issue 3350). A worker runs its first pass when it
+  starts, before it waits for the interval. The index stores this wait, so a stuck database never hides the
+  others. `/actuator/health` reports `fleet:sweeper`: the backlog
+  (databases), the oldest pending age, and the counts of the last pass.
+
+The sweeper opens and closes databases through the normal fleet paths, so
+the rules of #3231 (workers stop before the pool closes) and #3230 (one
+replicator per database across processes) hold for its opens too.
+
+### 7. Slot ownership: epochs and fencing (issue #3233)
+
+`restore_missing` lets a host with an empty volume take over a range. Without
+fencing, the old owner can still write and ship, and the two copies diverge.
+`[database.fleet.ownership]` adds a per-range ownership epoch. The open path
+and the replication path both check it.
+
+- **Table.** `_autumn_fleet_slot_owners(range_start, range_end, owner_id,
+  epoch, lease_expires_at)` on the control database, and a one-row epoch
+  counter. Ranges use the slot hash of `sharding.rs` and `cell_router.rs`.
+  Rows never overlap.
+- **Decisions.** `OwnershipTable` is a pure state machine. A store loads the
+  rows, applies one decision and writes the result in one `BEGIN IMMEDIATE`
+  transaction. So when two processes race a claim, one wins.
+  - Claim: the range is free or each lease on it ended, or it is the
+    claimer's own row with the same bounds. A live row of another shape
+    refuses the claim, also for its own owner: an old process of that owner
+    can still serve the rest of the row. A new epoch is above the counter
+    and above the newest epoch a replicator found (`claim_above`). The own
+    row with the same bounds keeps its epoch (a restart, or a second process
+    on the volume).
+  - Renew: same owner and epoch, else the range is lost.
+  - Release: the lease ends now. The epoch stays. Only the last process on
+    the volume releases (a shared OS lock on the root tells), and only when
+    nothing is unshipped.
+- **Open path.** `DatabaseFleet::open`, `provision` and `open_background`
+  check the slot before anything touches the disk. If the host does not own
+  it: `FleetError::NotOwner`, `421`. So `restore_missing` runs only for an
+  owned key. Each `FleetDatabase` carries its epoch. After an open, the fleet
+  reads the epoch again; a database of another epoch is fenced, not served.
+- **Stale files.** Each file records the newest epoch it was opened under
+  (`_autumn_fleet_epoch`). A host can get a range back after another host
+  held it. Its files on disk are then older than the replica. So an open under
+  a newer epoch than the file's lists `<root>/epochs/`. If the replica holds a
+  newer epoch than the file, the file is restored from the replica first.
+- **Lose.** A lost range closes its open databases without a worker settle.
+  The close still waits for connections in use. The sweeper and the fan-outs
+  skip slots this host does not own.
+- **Local lease.** A holder serves until it sent its last renew plus
+  `ttl - ttl/3`, on its monotonic clock. That is before the lease in the
+  table ends. The ownership loop closes lapsed ranges before it renews, and
+  while a renew hangs. Clock skew plus the longest request must be less than
+  `ttl/3`.
+- **Replication.** A replicator ships under its database's epoch. It writes
+  `<root>/epochs/<epoch>` and, before the snapshot upload,
+  `generations/<id>/epoch-<epoch>`. A restore and the retention sweep order
+  generations by (epoch, time). The sweep never removes a generation without
+  `snapshot.json` that is newer than the floor (an upload in progress). A
+  replicator with no epoch records the newest epoch at the destination, so
+  turning ownership off does not order new generations below old ones. The
+  replicator lists `<root>/epochs/` at each new generation and every 60 s. A
+  newer epoch stops it (`ReplicationError::Fenced`), and the host loses the
+  range. A replica with no markers is epoch 0, so old replicas restore as
+  before.
+- **One replicator per database (#3230).** The epoch is the election token
+  across hosts: only the owner of the current epoch opens the database. An
+  old replicator can still ship for up to 60 s, into its old epoch's
+  generation; the restore order makes that harmless. The lock file still
+  elects one process inside the host. A parked replicator that reopens under
+  a new epoch starts a new generation.
+
+This mirrors the `FencingToken` of `lock.rs` (#3053), CloudKit's incarnation
+counter and Notion's logical-shard moves. The model and its proofs are in
+`verification/fleet_slot_ownership.rs`.
+
+All hosts must use one ownership table. The built-in store is the control
+database, a local SQLite file, so it fences the processes of one host only.
+Hosts on different machines need a `SlotOwnershipStore` on a store they all
+reach.
 
 ## Consequences
 
@@ -228,8 +361,17 @@ with a lease, so two processes draining one database is safe.
 
 - Cross-tenant reads (`CrossShard`, `each_shard`, `across_tenants()`) open every
   database on disk. That is admin-path work, not a hot path.
-- Outbox rows and derivation backfill are not supported on fleet databases
-  yet (roadmap item 3). Enqueue through the control database.
+- Each outbox write and commit-hook enqueue on a fleet database adds three
+  reads on the tenant database and one on the control database, and one
+  control write when the database has no row yet.
+- Do not enqueue on a fleet database while you hold a write transaction on
+  the control database. The mark needs the control write lock, so it waits
+  for `busy_timeout` and then fails.
+- An outbox row written outside a transaction commits before its mark. If
+  the mark then fails, the call returns an error for a committed row: do not
+  retry it. The next open of the database writes the row.
+- The first pass of a worker after a derivation change marks every database.
+  The sweeper then opens each once.
 - A replicated database pays one base snapshot per open/close cycle, because
   the replicator's generation state lives in memory. Size `max_open` so hot
   tenants stay open.
@@ -241,14 +383,13 @@ with a lease, so two processes draining one database is safe.
 
 ## Roadmap
 
-1. **CLI.** `autumn fleet list | migrate | backup | delete | restore`.
-2. **Slot ownership and fencing.** A control-table epoch per slot range, so a
-   host that takes over a range fences the old owner before
-   `restore_missing` serves it (CloudKit's incarnation counter, Notion's
-   logical-shard moves). This joins `cell_router.rs` (tenant → cell by the
-   same slot hash) to the fleet.
-3. **Fleet sweeper.** Visit databases with pending outbox rows, commit hooks
-   or derivation backfill without waiting for traffic.
+1. **CLI.** `autumn fleet list | migrate | backup | delete | restore`
+   ([#3232](https://github.com/autumn-foundation/autumn/issues/3232)). See
+   [Operating the fleet](../guide/sqlite-fleet.md#operating-the-fleet).
+2. **Slot ownership and fencing.** Done: see section 7
+   ([#3233](https://github.com/autumn-foundation/autumn/issues/3233)).
+3. **Fleet sweeper.** Done: see section 6
+   ([#3234](https://github.com/autumn-foundation/autumn/issues/3234)).
 4. **Replica lifecycle.** Delete a database's replica with it; verify
    restores by sampling.
 5. **Query the lake.** Cross-tenant analytics over the replicas in object
@@ -275,6 +416,24 @@ with a lease, so two processes draining one database is safe.
 - `autumn/src/db/fleet.rs` tests: single-flight open, LRU and idle eviction,
   busy databases never evicted, delete and tombstone, misplaced-file refusal,
   `VACUUM INTO` backup, refusal of pending migrations, lifecycle hooks.
+- `autumn-cli/tests/integration/fleet_cli.rs`: each `autumn fleet` subcommand
+  against a temporary fleet root; `restore` from a local replica.
+- `autumn/src/db/fleet_sweeper.rs` tests: index marks and clears, marks from
+  a connection, two fleets in one process, the pass order (issue 3350).
+- `autumn/tests/sqlite_fleet_sweeper.rs`: an outbox row relayed after its
+  database closes, hooks drained without a request, a derivation added in a
+  migration backfilled in a closed tenant, `max_open` and leases respected,
+  the `fleet:sweeper` health indicator, a closed database not held back by
+  busy open ones, and a full fleet that still relays its open ones
+  (issue 3350).
+- `autumn/src/db/fleet_ownership.rs` tests: the state machine (claim, renew,
+  lapse, release, re-shape) and a proptest of its invariants; two hosts
+  racing a claim on one store; the open path's `421`; an old owner closed
+  after it lost the epoch; a fenced replicator; fan-out of owned slots only.
+- `autumn/src/replication/restore.rs` tests: a restore takes the newest
+  epoch's generation before the newest time.
+- `autumn/tests/sim_fleet_ownership.rs`: a partitioned old owner in virtual
+  time stops serving before the new owner claims.
 - `autumn/tests/sqlite_fleet.rs`: `ShardedDb`, a `#[repository(tenant_scoped,
   sharded)]` repository, `CrossShard` and `each_shard` against a tenant fleet
   and a slot fleet over HTTP; `400` / `404` / `409` paths; `db:fleet` health.

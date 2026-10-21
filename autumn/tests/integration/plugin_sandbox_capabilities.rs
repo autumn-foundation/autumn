@@ -203,6 +203,9 @@ slots = []
 
 [limits]
 max_response_bytes = 512
+
+[quotas]
+kv_value_bytes = 1024
 ",
     );
     // Comfortably past `2 * 512 + 4096`, and inside one 64 KiB host chunk, so

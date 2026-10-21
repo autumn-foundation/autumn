@@ -142,15 +142,23 @@ fn current_tenant_scope() -> Option<String> {
 /// tenant A's key would be served tenant A's stored response with the handler —
 /// and every `tenant_scoped` repository predicate inside it — never running.
 ///
-/// Request headers, including `Authorization` *and* the configured tenant
-/// header, are intentionally excluded: client-controlled headers must not let a
-/// retry force a fresh miss after a successful mutation. That is exactly why
-/// the tenant is taken from the middleware's task-local resolution rather than
-/// from the wire. Opaque route layers that resolve their own tenants, bearer
-/// principals, or policy state must still use the fail-closed replay path
-/// instead of storage-key partitioning. Each component is length-delimited
-/// inside a SHA-256 digest so raw `:` bytes in paths or client-controlled keys
-/// cannot synthesize another storage key.
+/// Bearer clients are scoped too (see [`BearerScope`]). A token client has no
+/// cookie-backed session, so without this every token client of one route
+/// shared a single slot: client B sending client A's key and body was served
+/// A's stored response, and the handler — with whatever principal check it
+/// does — never ran. The verified principal from
+/// [`RequireApiToken`](crate::auth::RequireApiToken) is preferred, because it
+/// survives token rotation; a request with no verified principal and no
+/// session falls back to a digest of its raw `Authorization` header, which
+/// covers routes that check the credential inside the handler.
+///
+/// The configured tenant *header* is intentionally excluded: the tenant is
+/// taken from the middleware's task-local resolution rather than from the
+/// wire. Opaque route layers that resolve their own tenants or policy state
+/// must still use the fail-closed replay path instead of storage-key
+/// partitioning. Each component is length-delimited inside a SHA-256 digest so
+/// raw `:` bytes in paths or client-controlled keys cannot synthesize another
+/// storage key.
 #[derive(Clone)]
 struct StorageKeyContext {
     idempotency_key: String,
@@ -161,6 +169,39 @@ struct StorageKeyContext {
     /// (see [`DeferredIdempotencyCommit::add_session_alias`]) must land in the
     /// same tenant's namespace as the primary key.
     tenant: Option<String>,
+    /// Captured once from the original request, so alias keys computed later
+    /// carry the same bearer scope as the primary key.
+    bearer: Option<BearerScope>,
+}
+
+/// The bearer credential an idempotency storage key is scoped by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BearerScope {
+    /// The principal [`RequireApiToken`](crate::auth::RequireApiToken)
+    /// verified before this layer ran. A client cannot forge it, and it stays
+    /// the same when the client rotates its token, so a retry with a fresh
+    /// token still replays. Scopes the key whether or not a session exists.
+    Verified(String),
+    /// A SHA-256 digest of the raw `Authorization` header, for a request with
+    /// no verified principal. Scopes the key only when the request has no
+    /// cookie-backed session, so session clients keep the keys they had.
+    ///
+    /// A client that changes its header between attempts — a refreshed token,
+    /// or none at all — misses and runs the handler again. That is the safe
+    /// direction: the alternative is serving one client's stored response to
+    /// another.
+    Header(String),
+}
+
+/// The bearer scope for a request, read before the handler runs.
+fn bearer_scope_for_parts(parts: &axum::http::request::Parts) -> Option<BearerScope> {
+    if let Some(principal) = parts.extensions.get::<crate::auth::ApiTokenPrincipal>() {
+        return Some(BearerScope::Verified(principal.0.clone()));
+    }
+    let header = parts.headers.get(axum::http::header::AUTHORIZATION)?;
+    Some(BearerScope::Header(hex_lower(sha2::Sha256::digest(
+        header.as_bytes(),
+    ))))
 }
 
 impl StorageKeyContext {
@@ -174,6 +215,7 @@ impl StorageKeyContext {
             method: parts.method.clone(),
             target,
             tenant: current_tenant_scope(),
+            bearer: bearer_scope_for_parts(parts),
         }
     }
 
@@ -184,6 +226,7 @@ impl StorageKeyContext {
             &self.target,
             session_id,
             tenant_override.or(self.tenant.as_deref()),
+            self.bearer.as_ref(),
         )
     }
 }
@@ -194,6 +237,7 @@ fn build_storage_key(
     target: &str,
     session_id: Option<&str>,
     tenant: Option<&str>,
+    bearer: Option<&BearerScope>,
 ) -> String {
     let principal = principal_scope_digest(session_id);
     let mut hasher = sha2::Sha256::new();
@@ -201,6 +245,18 @@ fn build_storage_key(
     push_storage_key_component(&mut hasher, "target", target.as_bytes());
     push_storage_key_component(&mut hasher, "scope-header-count", b"0");
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
+    // Pushed only when the request carried a bearer credential, so a
+    // session-only app keeps the exact keys it had before, like the tenant
+    // component below.
+    match bearer {
+        Some(BearerScope::Verified(principal_id)) => {
+            push_storage_key_component(&mut hasher, "bearer-principal", principal_id.as_bytes());
+        }
+        Some(BearerScope::Header(digest)) if session_id.is_none() => {
+            push_storage_key_component(&mut hasher, "authorization", digest.as_bytes());
+        }
+        Some(BearerScope::Header(_)) | None => {}
+    }
     // Pushed only when a tenant was resolved, so an app that does not use
     // tenancy keeps the exact keys it had before — no cache-wide miss, and no
     // duplicate execution of a mutation retried across an upgrade.
@@ -2819,13 +2875,137 @@ mod tests {
         format!("v2:{}", hex_lower(hasher.finalize()))
     }
 
+    /// The key a request with a raw `Authorization` header and no session
+    /// gets: the session-less key plus the header's digest.
+    fn expected_authorization_storage_key(
+        method: &str,
+        path: &str,
+        authorization: &str,
+        idempotency_key: &str,
+    ) -> String {
+        use sha2::Digest as _;
+        let principal = expected_principal_digest(None);
+        let digest = hex_lower(sha2::Sha256::digest(authorization.as_bytes()));
+        let mut hasher = sha2::Sha256::new();
+        push_storage_key_component(&mut hasher, "method", method.as_bytes());
+        push_storage_key_component(&mut hasher, "target", path.as_bytes());
+        push_storage_key_component(&mut hasher, "scope-header-count", b"0");
+        push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
+        push_storage_key_component(&mut hasher, "authorization", digest.as_bytes());
+        push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
+        format!("v2:{}", hex_lower(hasher.finalize()))
+    }
+
+    fn header_scope(authorization: &str) -> BearerScope {
+        use sha2::Digest as _;
+        BearerScope::Header(hex_lower(sha2::Sha256::digest(authorization.as_bytes())))
+    }
+
+    /// Two token clients with no session must not share a cache slot. Before
+    /// the bearer component existed both computed the session-less key, so
+    /// client B replayed client A's stored response.
+    #[test]
+    fn storage_key_partitions_by_authorization_header() {
+        let a = header_scope("Bearer token-a");
+        let b = header_scope("Bearer token-b");
+        let key_a = build_storage_key("pay-once", "POST", "/payments", None, None, Some(&a));
+        let key_b = build_storage_key("pay-once", "POST", "/payments", None, None, Some(&b));
+        let anonymous = build_storage_key("pay-once", "POST", "/payments", None, None, None);
+
+        assert_ne!(
+            key_a, key_b,
+            "two bearer clients must not share a storage key"
+        );
+        assert_ne!(
+            key_a, anonymous,
+            "a bearer client must not share the anonymous slot"
+        );
+        assert_eq!(
+            key_a,
+            expected_authorization_storage_key("POST", "/payments", "Bearer token-a", "pay-once")
+        );
+    }
+
+    /// A cookie-backed session already names the principal, so a raw header
+    /// does not split it: session clients keep the keys they had.
+    #[test]
+    fn storage_key_ignores_raw_authorization_when_a_session_scopes_it() {
+        let a = header_scope("Bearer token-a");
+        assert_eq!(
+            build_storage_key("pay-once", "POST", "/payments", Some("sid"), None, Some(&a)),
+            build_storage_key("pay-once", "POST", "/payments", Some("sid"), None, None),
+        );
+    }
+
+    /// A verified principal scopes the key with or without a session, and two
+    /// verified principals never share a slot.
+    #[test]
+    fn storage_key_partitions_by_verified_principal() {
+        let a = BearerScope::Verified("customer-a".to_owned());
+        let b = BearerScope::Verified("customer-b".to_owned());
+        for session in [None, Some("sid")] {
+            let key_a = build_storage_key("pay-once", "POST", "/payments", session, None, Some(&a));
+            let key_b = build_storage_key("pay-once", "POST", "/payments", session, None, Some(&b));
+            let unscoped = build_storage_key("pay-once", "POST", "/payments", session, None, None);
+            assert_ne!(key_a, key_b, "session {session:?}");
+            assert_ne!(key_a, unscoped, "session {session:?}");
+        }
+    }
+
+    /// A verified principal and a header digest that happen to share bytes
+    /// land under different labels, so neither can spell the other's slot.
+    #[test]
+    fn storage_key_bearer_components_are_labelled() {
+        let verified = BearerScope::Verified("same".to_owned());
+        let header = BearerScope::Header("same".to_owned());
+        assert_ne!(
+            build_storage_key("k", "POST", "/p", None, None, Some(&verified)),
+            build_storage_key("k", "POST", "/p", None, None, Some(&header)),
+        );
+    }
+
+    /// The verified principal wins over the raw header, so a client that
+    /// rotates its token keeps replaying its own response.
+    #[test]
+    fn bearer_scope_prefers_the_verified_principal() {
+        let (mut parts, ()) = Request::builder()
+            .method(Method::POST)
+            .uri("/payments")
+            .header(axum::http::header::AUTHORIZATION, "Bearer rotated-token")
+            .body(())
+            .expect("request builder should be valid")
+            .into_parts();
+        assert_eq!(
+            bearer_scope_for_parts(&parts),
+            Some(header_scope("Bearer rotated-token"))
+        );
+        parts
+            .extensions
+            .insert(crate::auth::ApiTokenPrincipal("customer-a".to_owned()));
+        assert_eq!(
+            bearer_scope_for_parts(&parts),
+            Some(BearerScope::Verified("customer-a".to_owned()))
+        );
+    }
+
+    #[test]
+    fn bearer_scope_is_none_without_a_credential() {
+        let (parts, ()) = Request::builder()
+            .method(Method::POST)
+            .uri("/payments")
+            .body(())
+            .expect("request builder should be valid")
+            .into_parts();
+        assert_eq!(bearer_scope_for_parts(&parts), None);
+    }
+
     /// An app that does not use tenancy must keep byte-identical storage keys,
     /// so upgrading cannot turn an in-flight client retry into a second
     /// execution of an already-committed mutation.
     #[test]
     fn storage_key_without_a_resolved_tenant_is_unchanged() {
         assert_eq!(
-            build_storage_key("pay-once", "POST", "/payments", None, None),
+            build_storage_key("pay-once", "POST", "/payments", None, None, None),
             expected_storage_key("POST", "/payments", None, "pay-once")
         );
     }
@@ -2834,9 +3014,23 @@ mod tests {
     /// an empty session scope must not share a cache slot.
     #[test]
     fn storage_key_partitions_by_resolved_tenant() {
-        let tenant_a = build_storage_key("pay-once", "POST", "/payments", None, Some("tenant-a"));
-        let tenant_b = build_storage_key("pay-once", "POST", "/payments", None, Some("tenant-b"));
-        let untenanted = build_storage_key("pay-once", "POST", "/payments", None, None);
+        let tenant_a = build_storage_key(
+            "pay-once",
+            "POST",
+            "/payments",
+            None,
+            Some("tenant-a"),
+            None,
+        );
+        let tenant_b = build_storage_key(
+            "pay-once",
+            "POST",
+            "/payments",
+            None,
+            Some("tenant-b"),
+            None,
+        );
+        let untenanted = build_storage_key("pay-once", "POST", "/payments", None, None, None);
 
         assert_ne!(tenant_a, tenant_b, "tenants must not share a storage key");
         assert_ne!(tenant_a, untenanted);
@@ -2847,8 +3041,8 @@ mod tests {
     /// tenant id carrying the separator cannot spell another tenant's slot.
     #[test]
     fn storage_key_tenant_component_is_length_delimited() {
-        let split = build_storage_key("pay-once", "POST", "/payments", None, Some("a:b"));
-        let shifted = build_storage_key("pay-once:a", "POST", "/payments", None, Some("b"));
+        let split = build_storage_key("pay-once", "POST", "/payments", None, Some("a:b"), None);
+        let shifted = build_storage_key("pay-once:a", "POST", "/payments", None, Some("b"), None);
         assert_ne!(split, shifted);
     }
 
@@ -3095,7 +3289,12 @@ mod tests {
         let storage_key = keys.first().expect("storage key should be recorded");
         assert_eq!(
             storage_key,
-            &expected_storage_key("POST", "/payments", None, "pay-once")
+            &expected_authorization_storage_key(
+                "POST",
+                "/payments",
+                "Bearer stable-token",
+                "pay-once"
+            )
         );
         assert!(!storage_key.contains("/payments"));
         assert!(!storage_key.contains("pay-once"));
@@ -3145,7 +3344,12 @@ mod tests {
         assert_eq!(observed.0, "pay-once");
         assert_eq!(
             observed.1,
-            expected_storage_key("POST", "/payments", None, "pay-once")
+            expected_authorization_storage_key(
+                "POST",
+                "/payments",
+                "Bearer stable-token",
+                "pay-once"
+            )
         );
     }
 
@@ -3466,6 +3670,7 @@ mod tests {
                 method: Method::POST,
                 target: "/switch".to_owned(),
                 tenant: None,
+                bearer: None,
             },
             alias_storage_keys: vec!["alias".to_owned()],
             locked_alias_keys: Vec::new(),
@@ -3508,6 +3713,7 @@ mod tests {
             method: Method::POST,
             target: "/switch".to_owned(),
             tenant: None,
+            bearer: None,
         };
         let alias = key_context.storage_key(Some("sid"), None);
         let commit = DeferredIdempotencyCommit::new(DeferredIdempotencyState {
