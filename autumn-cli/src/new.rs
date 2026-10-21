@@ -3501,6 +3501,12 @@ mod tests {
                 "the managed-pg-bundled waiver belongs to exactly the flavor whose \
                  tree can reach it"
             );
+            assert_eq!(
+                policy.contains("RUSTSEC-2026-0381"),
+                opts.with_bundled_pg,
+                "the webpki-roots 0.26 shim arrives only through the \
+                 managed-pg-bundled stack"
+            );
             assert!(
                 policy.contains("RUSTSEC-2023-0071"),
                 "every flavor's tree reaches rsa through jsonwebtoken"

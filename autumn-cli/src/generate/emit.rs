@@ -9,10 +9,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use autumn_web::config::DatabaseBackend;
 
-use super::{Flags, GenerateError, provenance};
+use super::{Flags, GenerateError, provenance, sweep};
 
 /// One filesystem operation the generator wants to perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,6 +595,9 @@ pub struct Plan {
     /// `autumn-web` features this run no longer needs (issue #2328).
     /// [`Plan::settle_released_features`] resolves this list.
     released_features: Vec<ReleasedFeature>,
+    /// Whether this plan is the sole resource of its invocation (issue
+    /// #2557). Set by [`Plan::claim_sole_resource`].
+    sole_resource: bool,
 }
 
 /// An `autumn-web` feature a regenerate run no longer needs.
@@ -618,7 +622,30 @@ impl Plan {
             warnings: Vec::new(),
             reverts: Vec::new(),
             released_features: Vec::new(),
+            sole_resource: false,
         }
+    }
+
+    /// Claim that this plan is the sole resource of its invocation (issue
+    /// #2557).
+    ///
+    /// A claimed plan records a [`provenance::Scope`] for each file it writes,
+    /// and its `revert` sweeps files of this invocation that the plan no longer
+    /// names. That is correct only when no other plan of this process shares
+    /// the invocation. So one claim succeeds in each process, and later claims
+    /// return `false` and leave the plan unclaimed.
+    ///
+    /// Call it only from a caller that applies one plan in its process (the
+    /// CLI dispatcher). Do not call it from a caller that applies many plans.
+    pub fn claim_sole_resource(&mut self) -> bool {
+        static CLAIMED: AtomicBool = AtomicBool::new(false);
+        self.claim_with(&CLAIMED)
+    }
+
+    /// [`Self::claim_sole_resource`] against `claimed`.
+    fn claim_with(&mut self, claimed: &AtomicBool) -> bool {
+        self.sole_resource = !claimed.swap(true, Ordering::SeqCst);
+        self.sole_resource
     }
 
     /// Record an advisory message, printed by [`Plan::execute`] but never
@@ -818,16 +845,16 @@ impl Plan {
         // against once the template has moved on (issue #1835). Recorded even
         // when a later action fails: the files already written are ours, and a
         // later `destroy` still has to recognise them.
-        let mut written: Vec<(PathBuf, String)> = Vec::new();
+        let mut written: Vec<Written> = Vec::new();
         let result = self.write_actions(&mut written);
         self.record_provenance(written);
         result
     }
 
-    /// Write every action, collecting `(path, digest)` for each file this plan
-    /// owns. Split out of [`Self::execute`] so provenance is recorded on the
+    /// Write every action, collecting `(path, digest, scope)` for each file
+    /// this plan creates. Split out of [`Self::execute`] so provenance is recorded on the
     /// error path too.
-    fn write_actions(&self, written: &mut Vec<(PathBuf, String)>) -> Result<(), GenerateError> {
+    fn write_actions(&self, written: &mut Vec<Written>) -> Result<(), GenerateError> {
         for action in &self.actions {
             let path = action.path();
             match action {
@@ -841,13 +868,21 @@ impl Plan {
                     // A `Modify` target is shared — other resources and the
                     // developer write to it too — so this plan never owns it.
                     if matches!(action, Action::Create { .. }) {
-                        written.push((path.to_path_buf(), provenance::text_digest(contents)));
+                        written.push((
+                            path.to_path_buf(),
+                            provenance::text_digest(contents),
+                            provenance::Scope::Owned,
+                        ));
                     }
                     println!("  {label} {}", relative_display(path, &self.project_root));
                 }
                 Action::CreateBytes { bytes, .. } => {
                     fs::write(path, bytes)?;
-                    written.push((path.to_path_buf(), provenance::bytes_digest(bytes)));
+                    written.push((
+                        path.to_path_buf(),
+                        provenance::bytes_digest(bytes),
+                        provenance::Scope::Owned,
+                    ));
                     println!("  Created {}", relative_display(path, &self.project_root));
                 }
                 Action::CreateIfAbsent { contents, .. } => {
@@ -863,7 +898,11 @@ impl Plan {
                                 let _ = fs::remove_file(path);
                                 return Err(GenerateError::Io(e));
                             }
-                            written.push((path.to_path_buf(), provenance::text_digest(contents)));
+                            written.push((
+                                path.to_path_buf(),
+                                provenance::text_digest(contents),
+                                provenance::Scope::Shared,
+                            ));
                             println!("  Created {}", relative_display(path, &self.project_root));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -886,13 +925,15 @@ impl Plan {
     /// comparing against the current render alone — the behaviour before this
     /// existed — so it warns rather than failing a generator run that has
     /// already written every file it promised.
-    fn record_provenance(&self, written: Vec<(PathBuf, String)>) {
+    fn record_provenance(&self, written: Vec<Written>) {
         if written.is_empty() {
             return;
         }
         let mut recorded = provenance::Provenance::load(&self.project_root);
-        for (path, digest) in written {
-            recorded.record(&self.project_root, &path, digest, &self.invocation);
+        for (path, digest, scope) in written {
+            // Only a claimed plan may mark a file as sweepable (issue #2557).
+            let scope = self.sole_resource.then_some(scope);
+            recorded.record(&self.project_root, &path, digest, &self.invocation, scope);
         }
         if let Err(e) = recorded.save(&self.project_root) {
             eprintln!(
@@ -958,8 +999,12 @@ impl Plan {
     /// the original directory, and are removed only when not yet applied to
     /// a configured database — destroy never touches the database itself.
     ///
-    /// Honours `--dry-run` (prints a `Removed:`/`Reverted:` plan, touches
-    /// nothing) exactly like [`Plan::execute`].
+    /// A claimed plan (see [`Plan::claim_sole_resource`]) also sweeps files
+    /// this invocation wrote that the plan no longer names (issue #2557). See
+    /// `sweep::plan_sweep`.
+    ///
+    /// Honours `--dry-run` (prints `Would remove`/`Would revert` lines,
+    /// touches nothing) exactly like [`Plan::execute`].
     ///
     /// # Errors
     /// Returns [`GenerateError::Diverged`] when any targeted file's content
@@ -972,8 +1017,9 @@ impl Plan {
             println!("Dry run — no files removed.");
             for path in &plan.files_to_remove {
                 println!(
-                    "  Would remove {}",
-                    relative_display(path, &self.project_root)
+                    "  Would remove {}{}",
+                    relative_display(path, &self.project_root),
+                    plan.sweep_note(path)
                 );
             }
             for dir in &plan.migrations_to_remove {
@@ -1018,7 +1064,10 @@ impl Plan {
         let mut touched_dirs: Vec<PathBuf> = Vec::new();
         // What was actually removed, so the manifest is pruned to match even
         // when a later removal fails part-way (issue #1835).
-        let mut removed = Removed::default();
+        let mut removed = Removed {
+            stale: plan.stale.clone(),
+            ..Removed::default()
+        };
         let result = self.apply_revert(&plan, &mut touched_dirs, &mut removed);
 
         for dir in touched_dirs {
@@ -1053,10 +1102,40 @@ impl Plan {
         touched_dirs: &mut Vec<PathBuf>,
         removed: &mut Removed,
     ) -> Result<(), GenerateError> {
+        // The reverts below were computed with every swept file gone (the
+        // dependency scans skip them). If one changed since the plan was
+        // made, those reverts are wrong for it, so change nothing at all.
+        let changed: Vec<PathBuf> = plan
+            .swept
+            .iter()
+            .filter(|(path, digest)| !sweep::still_sweepable(&self.project_root, path, digest))
+            .map(|(path, _)| path.clone())
+            .collect();
+        if !changed.is_empty() {
+            return Err(GenerateError::Diverged(changed));
+        }
         for path in &plan.files_to_remove {
-            fs::remove_file(path)?;
+            let expected = plan.swept.get(path);
+            let swept = expected.is_some();
+            // Check a swept path once more just before its delete. A change
+            // since the check above makes the reverts below wrong for it, so
+            // stop here and apply none of them.
+            if expected
+                .is_some_and(|digest| !sweep::still_sweepable(&self.project_root, path, digest))
+            {
+                return Err(GenerateError::Diverged(vec![path.clone()]));
+            }
+            match fs::remove_file(path) {
+                // Two manifest spellings of one file: the first removal won.
+                Err(e) if swept && e.kind() == std::io::ErrorKind::NotFound => continue,
+                other => other?,
+            }
             removed.files.push(path.clone());
-            println!("  Removed {}", relative_display(path, &self.project_root));
+            println!(
+                "  Removed {}{}",
+                relative_display(path, &self.project_root),
+                plan.sweep_note(path)
+            );
             if let Some(parent) = path.parent() {
                 touched_dirs.push(parent.to_path_buf());
             }
@@ -1090,14 +1169,14 @@ impl Plan {
     /// Best effort, like [`Self::record_provenance`]: the files are already
     /// gone, and failing here would report a destroy that in fact succeeded.
     fn forget_provenance(&self, removed: &Removed) {
-        if removed.files.is_empty() && removed.dirs.is_empty() {
+        if removed.files.is_empty() && removed.dirs.is_empty() && removed.stale.is_empty() {
             return;
         }
         let mut recorded = provenance::Provenance::load(&self.project_root);
         if recorded.is_empty() {
             return;
         }
-        for path in &removed.files {
+        for path in removed.files.iter().chain(&removed.stale) {
             recorded.forget(&self.project_root, path);
         }
         for dir in &removed.dirs {
@@ -1167,9 +1246,24 @@ impl Plan {
             }
         }
 
-        let mut files_to_remove = Vec::new();
+        // Files this invocation wrote that the plan no longer names (issue
+        // #2557). Only a claimed plan sweeps. A swept file joins
+        // `files_to_remove` first, so every scan below treats it as leaving.
+        let sweep = if self.sole_resource {
+            let revert_targets: Vec<&Path> = self.reverts.iter().map(Revert::path).collect();
+            sweep::plan_sweep(
+                &self.project_root,
+                &recorded,
+                &self.invocation,
+                &self.actions,
+                &revert_targets,
+            )
+        } else {
+            sweep::Sweep::default()
+        };
+        let mut files_to_remove = sweep.remove.clone();
         let mut diverged = Vec::new();
-        let mut warnings = Vec::new();
+        let mut warnings = sweep.warnings;
         for action in normal_actions {
             let path = action.path();
             if !path.exists() {
@@ -1354,9 +1448,15 @@ impl Plan {
             modifies,
             diverged,
             warnings,
+            swept: sweep.digests,
+            stale: sweep.forget,
         }
     }
 }
+
+/// One file [`Plan::execute`] wrote: path, digest, scope.
+/// [`Plan::record_provenance`] keeps the scope only for a claimed plan.
+type Written = (PathBuf, String, provenance::Scope);
 
 /// What a real [`Plan::revert`] actually deleted — the plan minus whatever a
 /// mid-run failure stopped it from reaching. The provenance manifest is pruned
@@ -1365,6 +1465,8 @@ impl Plan {
 struct Removed {
     files: Vec<PathBuf>,
     dirs: Vec<PathBuf>,
+    /// Entries for files that were already gone (issue #2557).
+    stale: Vec<PathBuf>,
 }
 
 /// The concrete result of [`Plan::compute_revert_plan`] — everything
@@ -1378,6 +1480,22 @@ struct RevertPlan {
     modifies: Vec<(PathBuf, Option<String>)>,
     diverged: Vec<PathBuf>,
     warnings: Vec<String>,
+    /// Files the orphan sweep removes, with their recorded digests (issue
+    /// #2557). Also in `files_to_remove`.
+    swept: HashMap<PathBuf, String>,
+    /// Entries whose file is already gone. Dropped from the manifest.
+    stale: Vec<PathBuf>,
+}
+
+impl RevertPlan {
+    /// The note printed after a swept path.
+    fn sweep_note(&self, path: &Path) -> &'static str {
+        if self.swept.contains_key(path) {
+            " (no longer generated)"
+        } else {
+            ""
+        }
+    }
 }
 
 /// Group `reverts` by target path, preserving push order both across groups
@@ -2000,7 +2118,7 @@ fn text_matches(on_disk: &str, expected: &str) -> bool {
 /// Split a migration directory name into its leading numeric timestamp
 /// ("version") and the remaining suffix, e.g.
 /// `"20260706120000_create_posts"` → `("20260706120000", "create_posts")`.
-fn split_migration_dir_name(name: &str) -> (&str, &str) {
+pub(super) fn split_migration_dir_name(name: &str) -> (&str, &str) {
     let digit_len = name
         .bytes()
         .position(|b| !b.is_ascii_digit())
@@ -3978,5 +4096,262 @@ mod tests {
         // under-retaining strips a dependency out from under code that still
         // compiles against it. The tie goes to the build.
         assert!(matches("use autumn_admin_plugin_extras::Thing;"));
+    }
+
+    // ---- issue #2557: sweep files the templates no longer name ------------
+    //
+    // A newer template can rename or drop a generated file. The recomputed
+    // plan then names no action for the old path. A claimed plan sweeps it.
+
+    /// A plan claimed as the sole resource of its invocation.
+    fn sole(mut plan: Plan) -> Plan {
+        plan.sole_resource = true;
+        plan
+    }
+
+    /// Generate `old.rs` + `kept.rs` under a claimed plan.
+    fn generated_v1(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let old = tmp.path().join("src/widgets/old.rs");
+        let kept = tmp.path().join("src/kept.rs");
+        let mut v1 = sole(Plan::new(tmp.path()));
+        v1.create(old.clone(), "// v1 old\n");
+        v1.create(kept.clone(), "// kept\n");
+        v1.execute(Flags::default()).unwrap();
+        (old, kept)
+    }
+
+    /// The plan a newer CLI builds: `old.rs` is now `new.rs`.
+    fn renamed_v2(tmp: &tempfile::TempDir) -> Plan {
+        let mut v2 = sole(Plan::new(tmp.path()));
+        v2.create(tmp.path().join("src/widgets/new.rs"), "// v2 new\n");
+        v2.create(tmp.path().join("src/kept.rs"), "// kept\n");
+        v2
+    }
+
+    #[test]
+    fn a_claimed_execute_records_owned_and_shared_scopes() {
+        let (tmp, plan) = fixture();
+        let mut plan = sole(plan);
+        plan.create(tmp.path().join("a.rs"), "a");
+        plan.create_bytes(tmp.path().join("b.png"), vec![1]);
+        plan.create_if_absent(tmp.path().join("c.html"), "c");
+        plan.execute(Flags::default()).unwrap();
+
+        let recorded = provenance::Provenance::load(tmp.path());
+        let mut scopes: Vec<_> = recorded
+            .recorded_by(&plan.invocation)
+            .map(|r| (r.key.to_owned(), r.scope))
+            .collect();
+        scopes.sort();
+        assert_eq!(
+            scopes,
+            vec![
+                ("a.rs".to_owned(), Some(provenance::Scope::Owned)),
+                ("b.png".to_owned(), Some(provenance::Scope::Owned)),
+                ("c.html".to_owned(), Some(provenance::Scope::Shared)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_execute_records_no_scope() {
+        let (tmp, mut plan) = fixture();
+        plan.create(tmp.path().join("a.rs"), "a");
+        plan.execute(Flags::default()).unwrap();
+
+        let recorded = provenance::Provenance::load(tmp.path());
+        let scopes: Vec<_> = recorded
+            .recorded_by(&plan.invocation)
+            .map(|r| r.scope)
+            .collect();
+        assert_eq!(scopes, vec![None]);
+    }
+
+    #[test]
+    fn destroy_removes_a_file_the_templates_have_since_renamed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, kept) = generated_v1(&tmp);
+
+        renamed_v2(&tmp).revert(Flags::default()).unwrap();
+
+        assert!(!old.exists(), "the stranded file must go");
+        assert!(!kept.exists());
+        assert!(
+            !tmp.path().join("src/widgets").exists(),
+            "the emptied directory is pruned"
+        );
+        assert!(
+            !tmp.path().join(provenance::MANIFEST_PATH).exists(),
+            "no entry outlives its file"
+        );
+    }
+
+    #[test]
+    fn destroy_keeps_an_edited_renamed_file_even_with_force() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, _) = generated_v1(&tmp);
+        fs::write(&old, "// mine\n").unwrap();
+
+        renamed_v2(&tmp)
+            .revert(Flags {
+                force: true,
+                dry_run: false,
+            })
+            .unwrap();
+
+        assert!(old.exists(), "an edit is never swept");
+        assert!(provenance::Provenance::load(tmp.path()).contains("src/widgets/old.rs"));
+    }
+
+    #[test]
+    fn a_dry_run_lists_the_sweep_and_touches_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, _) = generated_v1(&tmp);
+        let v2 = renamed_v2(&tmp);
+
+        let plan = v2.compute_revert_plan(false);
+        assert_eq!(plan.swept.keys().collect::<Vec<_>>(), vec![&old]);
+
+        v2.revert(Flags {
+            dry_run: true,
+            force: false,
+        })
+        .unwrap();
+        assert!(old.exists());
+        assert!(provenance::Provenance::load(tmp.path()).contains("src/widgets/old.rs"));
+    }
+
+    #[test]
+    fn a_swept_file_edited_after_planning_refuses_the_whole_destroy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, kept) = generated_v1(&tmp);
+        let v2 = renamed_v2(&tmp);
+        let plan = v2.compute_revert_plan(false);
+        fs::write(&old, "// saved late\n").unwrap();
+
+        let mut touched = Vec::new();
+        let mut removed = Removed::default();
+        let err = v2
+            .apply_revert(&plan, &mut touched, &mut removed)
+            .unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(ref paths) if paths == &vec![old.clone()]));
+        assert!(old.exists() && kept.exists(), "nothing is changed");
+    }
+
+    #[test]
+    fn a_refused_destroy_sweeps_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, kept) = generated_v1(&tmp);
+        fs::write(&kept, "// mine\n").unwrap();
+
+        let err = renamed_v2(&tmp).revert(Flags::default()).unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(old.exists(), "a refused destroy removes nothing");
+    }
+
+    #[test]
+    fn an_unclaimed_destroy_never_sweeps() {
+        // The shape of the "destroying one of two resources" tests: two
+        // resources from one process share one argv.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut first = Plan::new(tmp.path());
+        first.create(tmp.path().join("src/jobs/a.rs"), "a");
+        first.execute(Flags::default()).unwrap();
+        let mut second = Plan::new(tmp.path());
+        second.create(tmp.path().join("src/jobs/b.rs"), "b");
+        second.execute(Flags::default()).unwrap();
+
+        second.revert(Flags::default()).unwrap();
+
+        assert!(tmp.path().join("src/jobs/a.rs").exists());
+    }
+
+    #[test]
+    fn a_claimed_destroy_never_sweeps_an_unclaimed_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut first = Plan::new(tmp.path());
+        first.create(tmp.path().join("src/jobs/a.rs"), "a");
+        first.execute(Flags::default()).unwrap();
+        let mut second = sole(Plan::new(tmp.path()));
+        second.create(tmp.path().join("src/jobs/b.rs"), "b");
+
+        second.revert(Flags::default()).unwrap();
+
+        assert!(tmp.path().join("src/jobs/a.rs").exists());
+    }
+
+    #[test]
+    fn a_missing_orphan_loses_its_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, _) = generated_v1(&tmp);
+        fs::remove_file(&old).unwrap();
+
+        renamed_v2(&tmp).revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join(provenance::MANIFEST_PATH).exists());
+    }
+
+    #[test]
+    fn a_stale_entry_alone_is_still_pruned() {
+        // Nothing to remove, but the entry for a missing file must go.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old = tmp.path().join("src/old.rs");
+        let mut v1 = sole(Plan::new(tmp.path()));
+        v1.create(old.clone(), "x");
+        v1.execute(Flags::default()).unwrap();
+        fs::remove_file(&old).unwrap();
+
+        sole(Plan::new(tmp.path()))
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join(provenance::MANIFEST_PATH).exists());
+    }
+
+    #[test]
+    fn a_swept_file_no_longer_keeps_a_dependency_alive() {
+        // `old.rs` used the crate. It goes with this destroy, so it is not
+        // evidence that the crate is still needed.
+        no_db_env(|| {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cargo = tmp.path().join("Cargo.toml");
+            fs::write(
+                &cargo,
+                "[package]\nname = \"app\"\n\n[dependencies]\nfoo-crate = \"1\"\n",
+            )
+            .unwrap();
+            let mut v1 = sole(Plan::new(tmp.path()));
+            v1.create(tmp.path().join("src/old.rs"), "use foo_crate::X;\n");
+            v1.execute(Flags::default()).unwrap();
+
+            let mut v2 = sole(Plan::new(tmp.path()));
+            v2.create(tmp.path().join("src/new.rs"), "// v2\n");
+            v2.push_revert(Revert::CargoDeps {
+                path: cargo.clone(),
+                names: vec!["foo-crate".to_owned()],
+                owner_dir: tmp.path().join("src/models"),
+            });
+            v2.revert(Flags::default()).unwrap();
+
+            assert!(!tmp.path().join("src/old.rs").exists());
+            assert!(
+                !fs::read_to_string(&cargo).unwrap().contains("foo-crate"),
+                "the dependency must go with its last user"
+            );
+        });
+    }
+
+    #[test]
+    fn only_the_first_claim_in_a_process_is_sole() {
+        let claimed = AtomicBool::new(false);
+        let (_tmp, mut first) = fixture();
+        let (_tmp2, mut second) = fixture();
+
+        assert!(first.claim_with(&claimed));
+        assert!(first.sole_resource);
+        assert!(!second.claim_with(&claimed), "one plan per process");
+        assert!(!second.sole_resource);
     }
 }
