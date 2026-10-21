@@ -12697,32 +12697,6 @@ struct PgPayloadRow {
     payload: String,
 }
 
-/// Operator retry of a failed row.
-///
-/// A claim moved a `pending`-window key to `pending_unique_key`. This UPDATE
-/// moves it back, unless a live duplicate holds the key. Thus, an equal enqueue
-/// stays deduplicated while the retry waits. This follows `pg_nack_failure`.
-#[cfg(feature = "db")]
-const PG_RETRY_FAILED_SQL: &str = "UPDATE autumn_jobs \
-     SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
-         started_at = NULL, finished_at = NULL, \
-         claimed_by = NULL, claimed_at = NULL, last_error = NULL, \
-         unique_key = CASE \
-           WHEN pending_unique_key IS NOT NULL \
-                AND NOT EXISTS ( \
-                  SELECT 1 FROM autumn_jobs dup \
-                  WHERE dup.name = autumn_jobs.name \
-                    AND dup.unique_key = autumn_jobs.pending_unique_key \
-                    AND dup.id != autumn_jobs.id \
-                    AND dup.status IN ('enqueued', 'running') \
-                ) \
-           THEN pending_unique_key \
-           ELSE unique_key \
-         END, \
-         pending_unique_key = NULL \
-     WHERE id = $1 AND status = 'failed' \
-     RETURNING payload::TEXT AS payload";
-
 #[cfg(feature = "db")]
 impl PgJobAdminBackend {
     async fn pg_snapshot(&self, query: &JobAdminQuery) -> AutumnResult<JobAdminSnapshot> {
@@ -12812,23 +12786,48 @@ impl PgJobAdminBackend {
             }
             None => None,
         };
-        let updated = diesel::sql_query(PG_RETRY_FAILED_SQL)
-            .bind::<diesel::sql_types::Text, _>(id)
-            .get_result::<PgPayloadRow>(&mut *conn)
-            .await
-            .optional()
-            .map_err(|e| {
-                // A live twin trips the partial unique index. Report it as a
-                // conflict. Do not drop uniqueness.
-                if e.to_string().contains("idx_autumn_jobs_unique_inflight") {
-                    AutumnError::bad_request_msg(
-                        "an equivalent unique job is already pending or running; \
+        // The UPDATE also restores a `pending`-window dedup key: a claim moved
+        // it to `pending_unique_key`. The `NOT EXISTS` guard leaves it alone
+        // when a live twin holds the key. Same rule as `pg_nack_failure`.
+        let updated = diesel::sql_query(
+            "UPDATE autumn_jobs \
+             SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
+                 started_at = NULL, finished_at = NULL, \
+                 claimed_by = NULL, claimed_at = NULL, last_error = NULL, \
+                 unique_key = CASE \
+                   WHEN pending_unique_key IS NOT NULL \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM autumn_jobs dup \
+                            WHERE dup.name = autumn_jobs.name \
+                              AND dup.unique_key = autumn_jobs.pending_unique_key \
+                              AND dup.id != autumn_jobs.id \
+                              AND dup.status IN ('enqueued', 'running') \
+                        ) \
+                   THEN pending_unique_key \
+                   ELSE unique_key \
+                   END, \
+                 pending_unique_key = NULL \
+             WHERE id = $1 AND status = 'failed' \
+             RETURNING payload::TEXT AS payload",
+        )
+        .bind::<diesel::sql_types::Text, _>(id)
+        .get_result::<PgPayloadRow>(&mut *conn)
+        .await
+        .optional()
+        .map_err(|e| {
+            // The retried row keeps its unique_key, so re-enqueueing while an
+            // equivalent job is already in flight trips the partial unique
+            // index — surface that as an operator-actionable conflict rather
+            // than silently dropping uniqueness for the retried job.
+            if e.to_string().contains("idx_autumn_jobs_unique_inflight") {
+                AutumnError::bad_request_msg(
+                    "an equivalent unique job is already pending or running; \
                      retry after it settles",
-                    )
-                } else {
-                    AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
-                }
-            })?;
+                )
+            } else {
+                AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
+            }
+        })?;
         let Some(row) = updated else {
             return Err(AutumnError::not_found_msg(format!(
                 "job '{id}' not found or not in failed state"
@@ -22601,24 +22600,6 @@ mod tests {
                 .await
                 .unwrap(),
                 EnqueueOutcome::Deduplicated
-            );
-        }
-
-        #[test]
-        fn pg_admin_retry_sql_restores_pending_window_unique_key() {
-            let sql = PG_RETRY_FAILED_SQL
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            assert!(
-                sql.contains(
-                    "unique_key = CASE WHEN pending_unique_key IS NOT NULL AND NOT EXISTS"
-                ),
-                "{sql}"
-            );
-            assert!(
-                sql.contains("dup.status IN ('enqueued', 'running') ) THEN pending_unique_key ELSE unique_key END, pending_unique_key = NULL"),
-                "a live duplicate must keep the key: {sql}"
             );
         }
 
