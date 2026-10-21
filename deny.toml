@@ -54,6 +54,16 @@ unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
+    # RUSTSEC-2026-0381 — webpki-roots bundles the emSign ECC Root CA - G3, which
+    # accepts distrusted emSign intermediates. Fixed in webpki-roots >=1.0.10.
+    # The workspace's own copy moved 1.0.9 -> 1.0.10. This entry covers only the
+    # 0.26.11 copy, which arrives through sqlx-core 0.8.6 <- postgresql_embedded
+    # 0.19 <- autumn-web's optional embedded-Postgres feature. No 0.26.x release
+    # carries the fix. That copy verifies TLS only when postgresql_embedded
+    # downloads a Postgres archive for local development. It is not on any
+    # production request path. Review-by: 2026-11-03 (or when postgresql_embedded
+    # moves to a sqlx that uses webpki-roots 1.x).
+    { id = "RUSTSEC-2026-0381", reason = "fixed in the workspace copy (1.0.10); remaining 0.26.11 copy only via postgresql_embedded dev-time download; no 0.26.x fix; review-by 2026-11-03" },
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
     # No patched rsa release exists (advisory: "no safe upgrade available").
     # Ingress: rsa 0.9.10 -> jsonwebtoken -> autumn-web, i.e. only the RSA-family
@@ -102,6 +112,13 @@ ignore = [
     # default. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), or whenever the MSRV floor rises far enough
     # to take an aws-sdk-s3 that resolves a fixed `lru`.
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0381 — `webpki-roots` bundles a root that allows distrusted
+    # emSign intermediates. Fixed in 1.0.10, and the workspace copy is bumped
+    # there. This entry covers only webpki-roots 0.26.11, pulled in by
+    # sqlx-core 0.8.6 under (build) postgresql_embedded (managed-pg-bundled
+    # feature). There is no patched 0.26.x. That sqlx talks to a local embedded
+    # Postgres, so it trusts no public CA chain. Review-by: 2026-11-20.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 under build-time postgresql_embedded; no patched 0.26.x; workspace copy fixed at 1.0.10; local embedded Postgres only; review-by 2026-11-20" },
 ]
 
 [licenses]
