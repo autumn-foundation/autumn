@@ -1568,6 +1568,9 @@ mod tests {
         }
     }
 
+    /// A step that runs once, inside a store call.
+    type AsyncStep = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
+
     /// A store a test can script: hang every call, or run a step inside one.
     struct Scripted {
         inner: SqlSlotOwnership,
@@ -1579,7 +1582,7 @@ mod tests {
         /// Runs once, before the next renew reaches the store.
         before_renew: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// Runs once, after the next claim reached the store.
-        after_claim: Mutex<Option<Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>>>,
+        after_claim: Mutex<Option<AsyncStep>>,
     }
 
     impl Scripted {
