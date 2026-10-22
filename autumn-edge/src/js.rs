@@ -109,7 +109,7 @@ mod tests {
     /// Line endings are normalized first: a Windows checkout with
     /// `core.autocrlf` embeds the file with `\r\n`.
     fn js_wasi_imports(source: &str) -> Vec<String> {
-        let source = source.replace("\r\n", "\n");
+        let source = source.replace('\r', "");
         let body = source
             .split_once("function wasiImports(")
             .and_then(|(_, rest)| rest.split_once("\n  return {\n"))
@@ -137,8 +137,10 @@ mod tests {
             .map(|name| (*name).to_owned())
             .collect();
         listed.sort();
-        // The checked-out source, and the same source with CRLF endings.
-        for source in [HOST.to_owned(), HOST.replace('\n', "\r\n")] {
+        // The source with LF and with CRLF endings, whichever the checkout
+        // embedded.
+        let lf = HOST.replace("\r\n", "\n");
+        for source in [lf.clone(), lf.replace('\n', "\r\n")] {
             let mut provided = js_wasi_imports(&source);
             provided.sort();
             assert_eq!(provided, listed);
