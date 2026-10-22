@@ -3485,7 +3485,9 @@ checksum = "8f0346d7a342ab90f405cfc08f25d15075f944f42fcabbc5eac923829fa6d228"
 dependencies = [
  "form_urlencoded",
  "indexmap",
+ "itoa",
  "serde_core",
+ "zmij",
 ]
 
 [[package]]
