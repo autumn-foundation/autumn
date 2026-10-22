@@ -833,7 +833,10 @@ Notes:
 - A fixed-size array (`[i64; 2]`) and a newtype around a `Vec` take one value.
   Use a plain `Vec`.
 - `Changeset::field_values("tags")` returns every element as a string, to
-  re-render the checked boxes or the selected options.
+  re-render the checked boxes or the selected options. In a
+  [nested form](./nested-forms.md) row, `row.values("tags")` returns every
+  submitted value of that subfield. `row.value("tags")` returns only the last
+  one.
 - `field_from_urlencoded` reads one raw value for a preview. It is lenient and
   returns the first value.
 - `Form<T>` still uses `serde_urlencoded`. It rejects a repeated key on a

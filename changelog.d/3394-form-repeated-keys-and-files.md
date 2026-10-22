@@ -5,7 +5,9 @@
   and tag inputs work with `ChangesetForm`, `NestedChangesetForm` and the
   multipart path. The new `autumn_web::form::from_urlencoded` applies the same
   rules to a raw body. `Changeset::field_values` returns every element of a
-  sequence field for re-render. See `docs/guide/forms.md`.
+  sequence field for re-render, and `NestedRow::values` / `RowScope::values`
+  return every submitted value of a nested row's subfield. See
+  `docs/guide/forms.md`.
 - **forms:** `ChangesetForm` keeps the file parts of a `multipart/form-data`
   body: `form.file(..)`, `form.files(..)` and `form.take_files()`.
   `FormFile::new` and `ChangesetForm::with_files` build one in a test.
