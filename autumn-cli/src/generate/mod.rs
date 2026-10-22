@@ -45,6 +45,7 @@ pub mod teams;
 pub mod webhook;
 pub mod wizard;
 
+use provenance::RevertAnchor;
 use std::path::{Path, PathBuf};
 
 /// Errors that can occur during code generation.
@@ -102,6 +103,27 @@ pub enum GenerateError {
         format_collisions(.0)
     )]
     Diverged(Vec<PathBuf>),
+
+    /// `autumn destroy` would leave a shared-file edit behind (issue #2560).
+    /// `generate` recorded a revert for a file that still exists. The new plan
+    /// holds a revert of the same kind with different values. A project setting
+    /// that the arguments do not show (for example `[i18n]`) has changed.
+    #[error(
+        "refusing to destroy — it would leave edits behind. `generate` made the edit(s) \
+         below. A project setting has changed since, so this destroy does not revert \
+         them. Undo the setting change and run destroy again, or check the files by \
+         hand and pass --force:\n{}",
+        format_anchors(.0)
+    )]
+    RevertsDropped(Vec<RevertAnchor>),
+}
+
+fn format_anchors(anchors: &[RevertAnchor]) -> String {
+    anchors
+        .iter()
+        .map(|a| format!("  {a}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// ⚡ Bolt optimization: Formats collision paths directly into a pre-allocated
