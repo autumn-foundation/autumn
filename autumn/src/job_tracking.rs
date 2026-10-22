@@ -413,6 +413,41 @@ impl JobContext {
     }
 }
 
+/// A terminal tracking write that waits for the queue ack (issue #2583).
+///
+/// Only the claim owner may settle the record. The queue ack checks the
+/// claim, so a durable backend applies this after the ack succeeds. If the
+/// ack is rejected, drop it: another attempt owns the job.
+#[must_use = "apply it after the queue ack, or drop it when the ack fails"]
+pub(crate) enum PendingSettle {
+    /// Nothing to write: the job is untracked or a retry is pending.
+    None,
+    /// Write the success result.
+    Success(JobContext),
+    /// Write the failure.
+    Failure(JobContext),
+}
+
+impl PendingSettle {
+    /// Write the held terminal status, bounded by [`TRACKING_SETTLE_CAP`].
+    pub(crate) async fn apply(self) {
+        let write = async {
+            match &self {
+                Self::None => {}
+                Self::Success(ctx) => ctx.settle_success().await,
+                Self::Failure(ctx) => ctx.settle_failure(GENERIC_FAILURE_MESSAGE).await,
+            }
+        };
+        if tokio::time::timeout(TRACKING_SETTLE_CAP, write)
+            .await
+            .is_err()
+        {
+            let cap_ms = TRACKING_SETTLE_CAP.as_millis();
+            tracing::warn!(cap_ms, "tracking settle timed out");
+        }
+    }
+}
+
 /// Run `future` with `ctx` as the ambient [`JobContext`], so
 /// [`JobContext::current`] resolves it from anywhere inside `future`
 /// (including across `.await` points and nested async calls).
@@ -2788,6 +2823,27 @@ mod tests {
             record.result,
             Some(serde_json::json!({"download_url": "/blob/abc.csv"}))
         );
+    }
+
+    #[tokio::test]
+    async fn pending_settle_writes_only_when_applied() {
+        let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
+        for key in ["dropped", "applied", "failed", "none"] {
+            store.create(key, TrackedJobOwner::Anonymous).await.unwrap();
+        }
+        let ctx = |key: &str| JobContext::tracked(key.to_owned(), store.clone());
+
+        // A rejected ack drops the held write.
+        drop(PendingSettle::Success(ctx("dropped")));
+        PendingSettle::Success(ctx("applied")).apply().await;
+        PendingSettle::Failure(ctx("failed")).apply().await;
+        PendingSettle::None.apply().await;
+
+        let status = async |key: &str| store.get(key).await.unwrap().expect("record").status;
+        assert_eq!(status("dropped").await, TrackedJobStatus::Pending);
+        assert_eq!(status("applied").await, TrackedJobStatus::Succeeded);
+        assert_eq!(status("failed").await, TrackedJobStatus::Failed);
+        assert_eq!(status("none").await, TrackedJobStatus::Pending);
     }
 
     #[tokio::test]

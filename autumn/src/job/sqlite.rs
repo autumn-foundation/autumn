@@ -66,10 +66,11 @@ use super::{
     QueueSlots, ResolvedJobConstraints, build_per_job_settings, collect_declared_queues,
     format_job_admin_time, install_job_client, is_final_attempt, job_admin_backend,
     job_payload_identity, job_unique_key, normalize_queue_name, record_pg_cancel_after_ack,
-    record_pg_lifecycle_ack_result, run_job_handler, should_warn_pin_coverage,
+    record_pg_lifecycle_ack_result, run_claimed_job_handler, should_warn_pin_coverage,
     sql_row_retry_delay_ms, validate_unique_job_names, warn_pinned_uncovered_queues,
 };
 use crate::db::RuntimeConnection;
+use crate::job_tracking::PendingSettle;
 use crate::state::AppState;
 use crate::{AutumnError, AutumnResult};
 
@@ -1336,8 +1337,8 @@ async fn execute_job(
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
     };
-    let outcome = tracing::Instrument::instrument(
-        run_job_handler(
+    let (outcome, pending) = tracing::Instrument::instrument(
+        run_claimed_job_handler(
             &row.name,
             handler,
             state.clone(),
@@ -1352,6 +1353,7 @@ async fn execute_job(
     heartbeat
         .stop_after(settle_outcome(
             outcome,
+            pending,
             &row,
             pool,
             worker_id,
@@ -1364,9 +1366,12 @@ async fn execute_job(
 }
 
 /// Write a finished attempt back to the queue table and record it.
+///
+/// The tracked record settles only when the ack applies (issue #2583).
 #[allow(clippy::too_many_arguments)]
 async fn settle_outcome(
     outcome: JobExecutionOutcome,
+    pending: PendingSettle,
     row: &SqliteJobRow,
     pool: &SqlitePool,
     worker_id: &str,
@@ -1382,7 +1387,7 @@ async fn settle_outcome(
         }
         JobExecutionOutcome::Succeeded => {
             let ack = ack_success(pool, now_ms(state), &row.id, worker_id).await;
-            record_pg_lifecycle_ack_result(
+            let applied = record_pg_lifecycle_ack_result(
                 ack,
                 &row.name,
                 &row.id,
@@ -1392,6 +1397,9 @@ async fn settle_outcome(
                 state,
                 job_admin,
             );
+            if applied {
+                pending.apply().await;
+            }
         }
         JobExecutionOutcome::Failed(error) => {
             // One draw for the gauge and the retry UPDATE, so both agree.
@@ -1424,16 +1432,19 @@ async fn settle_outcome(
                 delay_ms,
             )
             .await;
-            record_pg_lifecycle_ack_result(
+            let applied = record_pg_lifecycle_ack_result(
                 ack, &row.name, &row.id, attempt, "failure", lifecycle, state, job_admin,
             );
+            if applied {
+                pending.apply().await;
+            }
         }
         // A panic dead-letters at once whatever the remaining attempts, as on
         // every other backend.
         JobExecutionOutcome::Panicked(error) => {
             tracing::error!(job = %row.name, error = %error, "sqlite job handler panicked");
             let ack = ack_dead_letter(pool, now_ms(state), &row.id, worker_id, &error).await;
-            record_pg_lifecycle_ack_result(
+            let applied = record_pg_lifecycle_ack_result(
                 ack,
                 &row.name,
                 &row.id,
@@ -1443,6 +1454,9 @@ async fn settle_outcome(
                 state,
                 job_admin,
             );
+            if applied {
+                pending.apply().await;
+            }
         }
     }
 }

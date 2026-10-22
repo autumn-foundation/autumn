@@ -2465,6 +2465,192 @@ async fn sqlite_worker_that_loses_its_claim_stops_the_handler_and_leaves_the_row
     job::clear_global_job_client();
 }
 
+// ── Tracking follows the claim (issue #2583) ─────────────────────────────────
+
+static STALE_RUNS: AtomicUsize = AtomicUsize::new(0);
+static STALE_GATE: AtomicBool = AtomicBool::new(false);
+static STALE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// A claim-fenced config. The heartbeat period is a third of the visibility
+/// timeout, so a long timeout keeps it from noticing the lost claim in time.
+fn fenced_job_config() -> JobConfig {
+    let mut config = lease_job_config(1);
+    config.sqlite.visibility_timeout_ms = 60_000;
+    config
+}
+
+/// Read a tracked record by its raw polling token.
+async fn tracked_status(
+    pool: &SqlitePool,
+    token: &str,
+) -> autumn_web::job_tracking::TrackedJobRecord {
+    let store = SqliteJobTrackingStore::new(pool.clone(), 3_600);
+    store
+        .get(&autumn_web::auth::hash_api_token(token))
+        .await
+        .expect("get tracked record")
+        .expect("the tracked record is live")
+}
+
+/// A stale attempt must not publish a terminal status the queue rejects.
+///
+/// The first attempt fails after another worker took its claim. The queue
+/// rejects that ack, so the record must stay `running`, and the new owner's
+/// result must still be able to settle it.
+#[tokio::test]
+async fn sqlite_stale_attempt_does_not_publish_a_terminal_tracked_status() {
+    use autumn_web::job_tracking::TrackedJobStatus;
+
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    STALE_RUNS.store(0, Ordering::SeqCst);
+    STALE_GATE.store(false, Ordering::SeqCst);
+    STALE_DONE.store(false, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![job_info("sqlite_stale_tracked", 1, |_state, _payload| {
+            Box::pin(async move {
+                STALE_RUNS.fetch_add(1, Ordering::SeqCst);
+                while !STALE_GATE.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                STALE_DONE.store(true, Ordering::SeqCst);
+                Err(autumn_web::AutumnError::internal_server_error_msg(
+                    "stale attempt failed",
+                ))
+            })
+        })],
+        &state,
+        &shutdown,
+        &fenced_job_config(),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    let handle =
+        autumn_web::job_tracking::enqueue_tracked("sqlite_stale_tracked", serde_json::json!({}))
+            .await
+            .expect("tracked enqueue");
+    eventually(400, "the first attempt to start", async || {
+        STALE_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // Another worker takes the claim before the first attempt ends.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        diesel::sql_query(
+            "UPDATE autumn_jobs SET claimed_by = 'other-worker', claimed_at = 4102444800000",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("move the claim");
+    }
+    STALE_GATE.store(true, Ordering::SeqCst);
+    eventually(400, "the stale attempt to finish", async || {
+        STALE_DONE.load(Ordering::SeqCst)
+    })
+    .await;
+    // Give a wrong settle time to show.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let record = tracked_status(&pool, &handle.token).await;
+    assert!(
+        matches!(record.status, TrackedJobStatus::Running),
+        "a disowned attempt must not settle the record, got {:?}",
+        record.status
+    );
+
+    // The new owner's result is not refused.
+    let store = SqliteJobTrackingStore::new(pool.clone(), 3_600);
+    store
+        .complete(
+            &autumn_web::auth::hash_api_token(&handle.token),
+            serde_json::json!({ "owner": "second" }),
+        )
+        .await
+        .expect("complete");
+    let record = tracked_status(&pool, &handle.token).await;
+    assert!(
+        matches!(record.status, TrackedJobStatus::Succeeded),
+        "the authoritative attempt settles the record, got {:?}",
+        record.status
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+static OWNED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// The fix must not lose the settle: an attempt that still owns its claim
+/// publishes its terminal status once the queue ack applies.
+#[tokio::test]
+async fn sqlite_owned_attempt_settles_the_tracked_status_after_the_ack() {
+    use autumn_web::job_tracking::TrackedJobStatus;
+
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    OWNED_RUNS.store(0, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![
+            job_info("sqlite_owned_ok", 1, |_state, _payload| {
+                Box::pin(async move {
+                    OWNED_RUNS.fetch_add(1, Ordering::SeqCst);
+                    job::JobContext::current().set_result(serde_json::json!({ "ok": true }));
+                    Ok(())
+                })
+            }),
+            job_info("sqlite_owned_err", 1, |_state, _payload| {
+                Box::pin(async move {
+                    OWNED_RUNS.fetch_add(1, Ordering::SeqCst);
+                    Err(autumn_web::AutumnError::internal_server_error_msg("boom"))
+                })
+            }),
+        ],
+        &state,
+        &shutdown,
+        &fenced_job_config(),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    let ok = autumn_web::job_tracking::enqueue_tracked("sqlite_owned_ok", serde_json::json!({}))
+        .await
+        .expect("tracked enqueue");
+    let err = autumn_web::job_tracking::enqueue_tracked("sqlite_owned_err", serde_json::json!({}))
+        .await
+        .expect("tracked enqueue");
+
+    eventually(400, "both records to settle", async || {
+        let a = tracked_status(&pool, &ok.token).await.status;
+        let b = tracked_status(&pool, &err.token).await.status;
+        matches!(a, TrackedJobStatus::Succeeded) && matches!(b, TrackedJobStatus::Failed)
+    })
+    .await;
+    assert_eq!(
+        tracked_status(&pool, &ok.token).await.result,
+        Some(serde_json::json!({ "ok": true }))
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
 /// Issue #3052: a fixed-delay tick stays claimed for its whole delay, even
 /// when the delay is longer than `lease_ttl_secs`. A tick claimed with no
 /// period frees after the TTL.

@@ -49,6 +49,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::job_tracking::PendingSettle;
 use crate::{AppState, AutumnError, AutumnResult};
 
 pub use crate::job_tracking::{
@@ -3036,8 +3037,10 @@ fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
     tracing::info_span!("job.execute", "otel.kind" = "consumer", job.name = %name, job.attempt = attempt)
 }
 
-/// Run one job attempt, metered as one job run (issue #1720). All job
-/// backends run their handlers through here.
+/// Run one job attempt and settle its tracked record at once.
+///
+/// For a queue with no claim to check, such as the in-process one. A claimed
+/// queue uses [`run_claimed_job_handler`] and settles after its ack.
 async fn run_job_handler(
     name: &str,
     handler: JobHandler,
@@ -3047,6 +3050,27 @@ async fn run_job_handler(
     bounds: ExecutionBounds,
     run: crate::cost::WorkRun,
 ) -> JobExecutionOutcome {
+    let (outcome, pending) =
+        run_claimed_job_handler(name, handler, state, payload, final_attempt, bounds, run).await;
+    pending.apply().await;
+    outcome
+}
+
+/// Run one job attempt, metered as one job run (issue #1720). All job
+/// backends run their handlers through here.
+///
+/// The tracked record is not settled. The caller applies the returned
+/// [`PendingSettle`] only after the queue ack succeeds (issue #2583): a
+/// rejected ack means another attempt owns the job.
+async fn run_claimed_job_handler(
+    name: &str,
+    handler: JobHandler,
+    state: AppState,
+    payload: Value,
+    final_attempt: bool,
+    bounds: ExecutionBounds,
+    run: crate::cost::WorkRun,
+) -> (JobExecutionOutcome, PendingSettle) {
     use crate::cost::WrapMetered as _;
     crate::cost::WorkMeter::start(&state, crate::cost::WorkKind::Job, name, run)
         .wrap(run_job_handler_unmetered(
@@ -3111,7 +3135,7 @@ async fn run_job_handler_unmetered(
     payload: Value,
     final_attempt: bool,
     bounds: ExecutionBounds,
-) -> JobExecutionOutcome {
+) -> (JobExecutionOutcome, PendingSettle) {
     // A job is a second entry point into the application, so a failure in one
     // gets the same capsule a failing request does (#1634). The scope wraps
     // the *whole* execution, so the clock, entropy, database and effect seams
@@ -3157,7 +3181,7 @@ async fn run_job_handler_unmetered(
                 }
                 run.await
             },
-            |outcome| job_capsule_outcome(outcome, final_attempt),
+            |(outcome, _)| job_capsule_outcome(outcome, final_attempt),
         )
         .await;
     }
@@ -3220,7 +3244,7 @@ async fn run_job_handler_inner(
     payload: Value,
     final_attempt: bool,
     bounds: ExecutionBounds,
-) -> JobExecutionOutcome {
+) -> (JobExecutionOutcome, PendingSettle) {
     // A job run is work a sim drain must see (issue #2967).
     crate::sim::note_drain_progress();
     // Tracked jobs carry their args wrapped in an envelope keyed by a hash of
@@ -3313,37 +3337,23 @@ async fn run_job_handler_inner(
         Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
-    if tracked_key.is_some() {
-        let settle = async {
-            match &outcome {
-                JobExecutionOutcome::Succeeded => ctx.settle_success().await,
-                // Panics always dead-letter regardless of remaining attempts
-                // (matching every backend's worker loop), so they are always
-                // terminal for tracking purposes too.
-                JobExecutionOutcome::Panicked(_) => {
-                    ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
-                        .await;
-                }
-                JobExecutionOutcome::Failed(_) if final_attempt => {
-                    ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
-                        .await;
-                }
-                // A retry is pending, or another worker owns the job now. Leave
-                // the record running so progress persists across attempts.
-                JobExecutionOutcome::Failed(_) | JobExecutionOutcome::LeaseLost => {}
-            }
-        };
-        // A stalled store must not hold the worker. The record expires by TTL.
-        if tokio::time::timeout(crate::job_tracking::TRACKING_SETTLE_CAP, settle)
-            .await
-            .is_err()
-        {
-            let cap_ms = crate::job_tracking::TRACKING_SETTLE_CAP.as_millis();
-            tracing::warn!(job = name, cap_ms, "tracking settle timed out");
+    let pending = if tracked_key.is_none() {
+        PendingSettle::None
+    } else {
+        match &outcome {
+            JobExecutionOutcome::Succeeded => PendingSettle::Success(ctx),
+            // Panics always dead-letter regardless of remaining attempts
+            // (matching every backend's worker loop), so they are always
+            // terminal for tracking purposes too.
+            JobExecutionOutcome::Panicked(_) => PendingSettle::Failure(ctx),
+            JobExecutionOutcome::Failed(_) if final_attempt => PendingSettle::Failure(ctx),
+            // A retry is pending, or another worker owns the job now. Leave
+            // the record running so progress persists across attempts.
+            JobExecutionOutcome::Failed(_) | JobExecutionOutcome::LeaseLost => PendingSettle::None,
         }
-    }
+    };
 
-    outcome
+    (outcome, pending)
 }
 
 fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
@@ -10017,6 +10027,7 @@ fn spawn_redis_worker(
 
 #[cfg(feature = "redis")]
 #[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_arguments)]
 async fn settle_failed_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
@@ -10025,6 +10036,7 @@ async fn settle_failed_redis_job(
     error: String,
     outcome: &str,
     job_admin: &JobAdminMemoryBackend,
+    pending: PendingSettle,
 ) {
     let action = prepare_redis_failure_action(
         record.clone(),
@@ -10098,6 +10110,7 @@ async fn settle_failed_redis_job(
                         .record_failure(&dead.name, error.clone(), true);
                     crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
+                    pending.apply().await;
                 }
                 Ok(false) => {
                     settle_redis_record(state, job_admin, record, false);
@@ -10128,6 +10141,7 @@ async fn dead_letter_panicked_redis_job(
     record: &RedisJobRecord,
     error: String,
     job_admin: &JobAdminMemoryBackend,
+    pending: PendingSettle,
 ) {
     let dead = prepare_redis_panic_dead_letter(
         record.clone(),
@@ -10150,6 +10164,7 @@ async fn dead_letter_panicked_redis_job(
                 .record_failure(&dead.name, error.clone(), true);
             crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
             job_admin.record_failure(&dead.id, error);
+            pending.apply().await;
         }
         Ok(false) => {
             settle_redis_record(state, job_admin, record, false);
@@ -10309,7 +10324,7 @@ async fn process_redis_job_record(
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
     };
-    let f = run_job_handler(
+    let f = run_claimed_job_handler(
         &record.name,
         handler,
         state.clone(),
@@ -10321,7 +10336,7 @@ async fn process_redis_job_record(
             record.enqueued_at_ms.and_then(|ms| i64::try_from(ms).ok()),
         ),
     );
-    let outcome = tracing::Instrument::instrument(f, job_span).await;
+    let (outcome, pending) = tracing::Instrument::instrument(f, job_span).await;
     heartbeat
         .stop_after(async {
         match outcome {
@@ -10334,6 +10349,7 @@ async fn process_redis_job_record(
                         settle_redis_record(state, job_admin, &record, true);
                         state.job_registry.record_success(&record.name);
                         job_admin.record_success(&record.id);
+                        pending.apply().await;
                     }
                     Ok(false) => {
                         settle_redis_record(state, job_admin, &record, false);
@@ -10360,6 +10376,7 @@ async fn process_redis_job_record(
                     error,
                     "failed",
                     job_admin,
+                    pending,
                 )
                 .await;
             }
@@ -10372,6 +10389,7 @@ async fn process_redis_job_record(
                     &record,
                     error,
                     job_admin,
+                    pending,
                 )
                 .await;
             }
@@ -12263,7 +12281,7 @@ async fn pg_execute_job(
         // `pg_nack_failure` reuses the ordinary retry-vs-dead-letter decision
         // even for a cancellation, so only settle the tracked record here
         // when this really was the terminal attempt; otherwise the job is
-        // about to be retried and `run_job_handler` will settle it later.
+        // about to be retried and the retry will settle it later.
         if is_final_attempt(&attempt, &max_attempts) {
             let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
             crate::job_tracking::settle_tracked_payload_as_failed(
@@ -12323,7 +12341,7 @@ async fn pg_execute_job(
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
     };
-    let f = run_job_handler(
+    let f = run_claimed_job_handler(
         &row.name,
         handler,
         state.clone(),
@@ -12332,10 +12350,11 @@ async fn pg_execute_job(
         bounds,
         durable_work_run(state, row.run_at.map(|at| at.timestamp_millis())),
     );
-    let outcome = tracing::Instrument::instrument(f, job_span).await;
+    let (outcome, pending) = tracing::Instrument::instrument(f, job_span).await;
     heartbeat
         .stop_after(pg_settle_outcome(
             outcome,
+            pending,
             &row,
             pool,
             worker_id,
@@ -12347,9 +12366,13 @@ async fn pg_execute_job(
 }
 
 /// Write a finished attempt back to `autumn_jobs` and record it.
+///
+/// The tracked record settles only when the ack applies (issue #2583).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn pg_settle_outcome(
     outcome: JobExecutionOutcome,
+    pending: PendingSettle,
     row: &PgJobRow,
     pool: &PgPool,
     worker_id: &str,
@@ -12365,7 +12388,7 @@ async fn pg_settle_outcome(
         }
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
-            record_pg_row_lifecycle_ack_result(
+            let applied = record_pg_row_lifecycle_ack_result(
                 ack,
                 row,
                 "success",
@@ -12373,6 +12396,9 @@ async fn pg_settle_outcome(
                 state,
                 job_admin,
             );
+            if applied {
+                pending.apply().await;
+            }
         }
         JobExecutionOutcome::Failed(error) => {
             // One draw for the gauge and the nack UPDATE, so both agree.
@@ -12403,7 +12429,12 @@ async fn pg_settle_outcome(
                 delay_ms,
             )
             .await;
-            record_pg_row_lifecycle_ack_result(ack, row, "failure", lifecycle, state, job_admin);
+            let applied = record_pg_row_lifecycle_ack_result(
+                ack, row, "failure", lifecycle, state, job_admin,
+            );
+            if applied {
+                pending.apply().await;
+            }
         }
         // Panics dead-letter immediately regardless of remaining attempts,
         // matching the local and redis backend behaviour.
@@ -12411,7 +12442,11 @@ async fn pg_settle_outcome(
             tracing::error!(job = %row.name, error = %error, "postgres job handler panicked");
             let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
             let lifecycle = PgLifecycleRecord::Failure { error: &error };
-            record_pg_row_lifecycle_ack_result(ack, row, "panic", lifecycle, state, job_admin);
+            let applied =
+                record_pg_row_lifecycle_ack_result(ack, row, "panic", lifecycle, state, job_admin);
+            if applied {
+                pending.apply().await;
+            }
         }
     }
 }
