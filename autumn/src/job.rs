@@ -27935,6 +27935,7 @@ mod lease_tests {
         store.complete("k", Value::Null).await.unwrap();
         store.fail("k", "e".to_owned()).await.unwrap();
         assert!(store.get("k").await.unwrap().is_none());
+        assert!(store.get_with_token("k").await.unwrap().is_none());
         store
             .reset_for_retry(
                 "k",

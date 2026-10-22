@@ -2441,6 +2441,12 @@ jobs:
             --test integration_tests -- --ignored pg_clock_skew:: \
             | tee "$RUNNER_TEMP/tracking-clock-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-clock-cov.log"
+          # Issue #2581: the Redis tracking store's write counter and
+          # compare-and-swap run only in this Docker test. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored redis_retry_reset_ \
+            | tee "$RUNNER_TEMP/tracking-redis-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-redis-cov.log"
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --lib -- --ignored pg_tracking_cleanup_deletes_expired_rows \
             | tee "$RUNNER_TEMP/tracking-cleanup-cov.log"
