@@ -2312,6 +2312,22 @@ decode the flat submission back into parent + children with
 `decode_nested_urlencoded`, so the parent and its children validate and persist
 as one transaction.
 
+**Multi-value fields and file parts (issue #3394).** Don't hand-parse repeated
+keys (a `parse_bulk_ids`-style helper over the raw body). A repeated key fills a
+`Vec<T>`, `HashSet<T>` or `Option<Vec<T>>` field of a `ChangesetForm` /
+`NestedChangesetForm` target, so checkbox groups, `<select multiple>` and tag
+inputs decode directly. Give the field `#[serde(default)]` so "none checked"
+decodes as empty, and `#[serde(alias = "ids[]")]` to accept the bracketed
+spelling (brackets are part of the key). A repeated key on a single-value field
+is a 422 naming the field, never "last value wins". A blank element of a typed
+list (`ids=`) is dropped. For a raw `Bytes` body, `form::from_urlencoded::<T>`
+applies the same rules and returns a `FormDecodeError` (`status()` is 422 or
+400). `Changeset::field_values(field)` re-renders every element of a sequence
+field; in a nested row, `row.values(sub)` does the same. On a `multipart/form-data` body, file parts reach the handler through
+`form.file(name)`, `form.files(name)` and `form.take_files()` (`FormFile`), under
+the `security.upload` policy. In a test, build one with `FormFile::new` and
+`ChangesetForm::with_files`. See `docs/guide/forms.md`.
+
 ## Service-to-service wire contracts (0.8.0, issue #1755)
 
 Don't hand-write an HTTP client to call another Autumn service in the same

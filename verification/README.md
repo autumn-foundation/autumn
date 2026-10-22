@@ -299,3 +299,24 @@ autumn-protocol-models` runs `tests/tla_checks.rs`, with no Java: it fails
 when a Stateright seeded bug has no line in `checks.txt`, or when a spec has
 no correct or seeded check. When a protocol changes, change its Stateright
 model and its TLA+ spec in the same PR.
+
+## Form decode retry
+
+`form_decode.rs` models one step of the retry loop in
+`decode_pairs_dropping_blank_optional_fields` (`autumn/src/form.rs`, issue
+#3394, ADR 0022). Verify it with:
+
+```sh
+verus verification/form_decode.rs
+```
+
+It proves these properties:
+
+- A repeated key on a single-value field always stops the loop (a 422). The
+  loop never removes one copy and accepts the other.
+- A field retry removes exactly one pair, and that pair is blank. The other
+  pairs stay in order.
+- A sequence retry removes the blank pairs of one key. Every other pair stays.
+- Each retry makes the input shorter, so the loop stops.
+
+The unit tests and the proptest in `form.rs` check the runtime index choice.

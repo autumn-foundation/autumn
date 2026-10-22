@@ -602,7 +602,10 @@ So prefer a real nested type over the comma-separated-string and
 JSON-in-a-string workarounds. This is the same bracket syntax `ListQuery`'s
 `?filter[<col>]=<val>` already used, generalized to arbitrary objects,
 sequences and depths — and it applies to the **query string only**: `Form<T>`
-still decodes bodies through `serde_urlencoded`.
+still decodes bodies through `serde_urlencoded`. `ChangesetForm` and
+`NestedChangesetForm` bodies decode through `form::from_urlencoded` (issue
+#3394): a repeated key fills a `Vec`/`HashSet`/`Option<Vec>`, a repeat on a
+single-value field is a 422, and brackets stay part of the key.
 
 Behaviour worth knowing when writing handlers:
 

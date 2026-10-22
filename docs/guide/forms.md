@@ -162,9 +162,11 @@ validation error, the handler decides what to render, and the user gets their
 input back. This is the right choice for every server-rendered HTML form.
 
 **It can still reject a body it cannot decode.** `decode_form_body` returns 415
-for the wrong `Content-Type` and 400 when a field will not deserialize into its
-declared type — before the handler runs, so there is nothing to re-render with.
-The round-trip covers *invalid* values, not *unparseable* ones.
+for the wrong `Content-Type`, 400 when a field will not deserialize into its
+declared type, and 422 when a single-value field arrives more than once (see
+[multi-value fields](#multi-value-fields)) — before the handler runs, so there
+is nothing to re-render with. The round-trip covers *invalid* values, not
+*unparseable* ones.
 
 That distinction has a practical consequence: **type a form field as the string
 the browser actually submits, and convert after validation.** A field typed
@@ -779,6 +781,69 @@ screen-reader user hears the error when focus lands on the field. The
 
 ---
 
+## Multi-value fields
+
+A checkbox group, a `<select multiple>` and a tag input send one key more than
+once: `tags=rust&tags=web`. Give the field a sequence type. Each value becomes
+one element:
+
+```rust,ignore
+#[derive(Deserialize, Serialize, Validate)]
+struct PostForm {
+    title: String,
+    #[serde(default)]          // no box checked → empty list
+    tags: Vec<String>,
+    #[serde(default)]
+    reviewer_ids: HashSet<i64>,
+    labels: Option<Vec<String>>, // absent → None
+}
+```
+
+`ChangesetForm<T>`, `NestedChangesetForm` and the multipart path all use these
+rules. So does `autumn_web::form::from_urlencoded`, for a handler that reads
+`Bytes`:
+
+| Body | Field | Result |
+|---|---|---|
+| `tags=a&tags=b` | `Vec<String>` | `["a", "b"]` |
+| `tags=a` | `Vec<String>` | `["a"]` |
+| (no `tags` key) | `#[serde(default)] Vec<String>` | `[]` |
+| (no `labels` key) | `Option<Vec<String>>` | `None` |
+| `q=a%20b&q=c+d` | `Vec<String>` | `["a b", "c d"]` |
+| `ids=1&ids=&ids=3` | `Vec<i64>` | `[1, 3]` — a blank element of a typed list is dropped |
+| `q=&q=x` | `Vec<String>` | `["", "x"]` — a blank string stays |
+| `ids=1&ids=x` | `Vec<i64>` | 400 |
+| `name=a&name=b` | `String` | **422** |
+
+**A repeated key on a single-value field is a 422.** The decoder does not
+select the first value or the last value. Two layers can select different
+values (a proxy log and the handler, for example). That causes
+parameter-pollution bugs. The message names the field, so a field that must be
+a `Vec` is easy to find. Single-value fields that arrive once decode as before.
+
+Notes:
+
+- Brackets are part of the key. `ids[]=1` does not fill `ids`. Use
+  `#[serde(alias = "ids[]")]` to accept both spellings. Do not send both in one
+  body.
+- `bool` also accepts `on`, the value a checkbox with no `value` attribute
+  sends.
+- A blank numeric or `bool` `Option` (`page=`) is `None`. A
+  `#[serde(default = "...")]` on that field does not apply to a blank value.
+- A fixed-size array (`[i64; 2]`) and a newtype around a `Vec` take one value.
+  Use a plain `Vec`.
+- `Changeset::field_values("tags")` returns every element as a string, to
+  re-render the checked boxes or the selected options. In a
+  [nested form](./nested-forms.md) row, `row.values("tags")` returns every
+  submitted value of that subfield. `row.value("tags")` returns only the last
+  one.
+- `field_from_urlencoded` reads one raw value for a preview. It is lenient and
+  returns the first value.
+- `Form<T>` still uses `serde_urlencoded`. It rejects a repeated key on a
+  struct field.
+
+---
+
 ## Multi-row and multi-step forms
 
 - **Repeated rows** — a `has_many` edited inline, with add/remove — are their own
@@ -796,23 +861,47 @@ screen-reader user hears the error when focus lands on the field. The
 per-file size caps — before your handler sees a byte. See
 [storage](./storage.md) for where the bytes then go.
 
-**`ChangesetForm` and file uploads do not compose.** It does decode
-`multipart/form-data` bodies when the `multipart` feature is on, but
-`decode_multipart` **skips file fields while consuming the stream** — so the
-upload is silently discarded, and a second `Multipart` extractor cannot recover
-it, because the body is already gone. A handler taking `ChangesetForm<T>` on a
-form that contains a file input validates the text fields correctly and loses
-the file with no error at all.
+**`ChangesetForm` keeps file parts**, so one form can take a file upload and
+its text fields together. On a `multipart/form-data` body (the
+`multipart` feature), the text fields decode into `T` as usual. Each file part
+goes to the form, not to `T`:
 
-So pick one per route:
+```rust,ignore
+#[post("/profile")]
+async fn update(mut form: ChangesetForm<ProfileForm>) -> impl IntoResponse {
+    if form.file("avatar").is_none() {
+        form.changeset.add_error("avatar", "Choose a picture");
+    }
+    let files = form.take_files(); // take them before `into_valid` consumes the form
+    match form.into_valid() {
+        Ok(profile) => { /* store `files`, save `profile` */ }
+        Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, render(&form)).into_response(),
+    }
+}
+```
 
-| The route needs | Use |
+| Method | Returns |
 |---|---|
-| validated text fields, re-rendered on failure | `ChangesetForm<T>` — and no file inputs on that form |
-| a file upload | `Multipart`, validating the text fields yourself |
+| `form.file("avatar")` | the first file part named `avatar` |
+| `form.files("photos")` | every file part named `photos` (`<input type="file" multiple>`) |
+| `form.take_files()` | all file parts, moved out of the form |
 
-If you need both, split them: take the upload on its own route or its own
-request, and keep the changeset form for the fields that have to round-trip.
+Each `FormFile` has `field()`, `file_name()`, `content_type()` (from the
+client), `sniffed_content_type()` (from the bytes, when a MIME policy is set)
+and `bytes()`.
+
+Rules:
+
+- The `security.upload` policy applies: the MIME allowlist (400), the per-file
+  cap (413), and the request cap. The per-file cap also applies to each text
+  part. A route that sets a smaller `DefaultBodyLimit` keeps it.
+- The form holds each file in memory. The per-file cap and the request cap
+  limit that memory. For a file larger than you want in memory, use
+  `Multipart` and stream it to storage on its own route.
+- An empty optional file input (no file chosen) is not a file. `file(..)`
+  returns `None`.
+- A browser cannot fill a file input again. When you re-render after an error,
+  the user must choose the file again.
 
 ---
 

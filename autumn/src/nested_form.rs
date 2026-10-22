@@ -217,9 +217,11 @@ pub trait NestedChild: serde::de::DeserializeOwned + validator::Validate + Send 
 /// it parsed or validated.
 #[derive(Debug, Clone)]
 pub struct NestedRow {
-    /// Raw submitted subfield values (`sku` → `"A-1"`), used to pre-fill
-    /// inputs when re-rendering after a failed submission.
-    values: HashMap<String, String>,
+    /// Raw submitted subfield values (`sku` → `["A-1"]`), used to pre-fill
+    /// inputs when re-rendering after a failed submission. A repeated subfield
+    /// (`items[0][tags]=a&items[0][tags]=b`) keeps every value in order
+    /// (issue #3394).
+    values: HashMap<String, Vec<String>>,
     /// Per-subfield validation (or parse) errors. A row that failed to parse
     /// records its error under the offending subfield's name (via
     /// `serde_path_to_error`), falling back to the empty-string (row-level) key
@@ -230,10 +232,23 @@ pub struct NestedRow {
 }
 
 impl NestedRow {
-    /// The raw submitted value for subfield `sub`, if present.
+    /// The raw submitted value for subfield `sub`, if present. For a repeated
+    /// subfield this is the last value; [`values`](Self::values) returns all
+    /// of them.
     #[must_use]
     pub fn value(&self, sub: &str) -> Option<&str> {
-        self.values.get(sub).map(String::as_str)
+        self.values
+            .get(sub)
+            .and_then(|v| v.last())
+            .map(String::as_str)
+    }
+
+    /// Every raw submitted value for subfield `sub`, in submission order, or an
+    /// empty slice. Use it to re-render a `Vec` subfield (a checkbox group or a
+    /// `<select multiple>`) after a failed submission (issue #3394).
+    #[must_use]
+    pub fn values(&self, sub: &str) -> &[String] {
+        self.values.get(sub).map_or(&[], Vec::as_slice)
     }
 
     /// Validation messages for subfield `sub`, or an empty slice.
@@ -405,7 +420,8 @@ impl<P, C: NestedChild + serde::Serialize> NestedChangeset<P, C> {
     /// submits a real, identifiable row for the handler to delete.
     ///
     /// Each row's raw `values` are produced by serializing the child with
-    /// [`serde_urlencoded::to_string`] and parsing the result back into the
+    /// [`serde_html_form::to_string`] (a `Vec` field becomes repeated keys) and
+    /// parsing the result back into the
     /// per-subfield map — the **same** string representation
     /// [`decode_nested_urlencoded`] populates from a real submission, so
     /// [`RowScope::value`] pre-fills a seeded row's inputs identically to a
@@ -430,15 +446,18 @@ impl<P, C: NestedChild + serde::Serialize> NestedChangeset<P, C> {
         let rows = children
             .iter()
             .map(|child| {
-                let mut values: HashMap<String, String> = HashMap::new();
+                let mut values: HashMap<String, Vec<String>> = HashMap::new();
                 // Serialize the child to the same `field=value` wire form the
                 // decoder reads, then parse it back so `RowScope::value` pre-fills
                 // seeded rows identically to a re-rendered submitted row. A
                 // serialization failure (never expected for a plain struct) simply
                 // yields an empty value map rather than panicking on the request path.
-                if let Ok(encoded) = serde_urlencoded::to_string(child) {
+                if let Ok(encoded) = serde_html_form::to_string(child) {
                     for (k, v) in url::form_urlencoded::parse(encoded.as_bytes()) {
-                        values.insert(k.into_owned(), v.into_owned());
+                        values
+                            .entry(k.into_owned())
+                            .or_default()
+                            .push(v.into_owned());
                     }
                 }
                 NestedRow {
@@ -482,9 +501,11 @@ impl<P, C: NestedChild + serde::Serialize> NestedChangeset<P, C> {
 /// errors.
 ///
 /// Both the parent and each non-destroyed child are decoded through the same
-/// blank-optional-dropping `serde_urlencoded` path
+/// blank-optional-dropping path
 /// [`ChangesetForm`](crate::form::ChangesetForm) uses, so string→typed
-/// coercion (`quantity=5` → `i32`) comes for free.
+/// coercion (`quantity=5` → `i32`) comes for free. A repeated key fills a
+/// `Vec<T>` field. On a single-value field it is an error (issue #3394): for
+/// the parent, the decode fails; for a row, the error is on that subfield.
 ///
 /// # Unstorable bytes
 ///
@@ -512,14 +533,17 @@ where
     C: NestedChild,
 {
     decode_nested_with_nul_message(pairs, crate::form::NUL_CHARACTER_FIELD_ERROR)
+        .map_err(|e| e.to_string())
 }
 
 /// Like [`decode_nested_urlencoded`], but the caller sets the message for a NUL
 /// byte.
+/// The error keeps its status, so the extractor answers 422 for a repeated
+/// parent field and 400 for the rest.
 fn decode_nested_with_nul_message<P, C>(
     pairs: &[(String, String)],
     nul_message: &str,
-) -> Result<NestedChangeset<P, C>, String>
+) -> Result<NestedChangeset<P, C>, crate::form::FormDecodeError>
 where
     P: serde::de::DeserializeOwned + validator::Validate,
     C: NestedChild,
@@ -584,8 +608,7 @@ where
     // Decode the parent through the shared blank-optional-dropping path.
     let parent_encoded = encode_pairs(&parent_pairs);
     let parent_data: P =
-        decode_urlencoded_dropping_blank_optional_fields::<P>(parent_encoded.as_bytes())
-            .map_err(|e| e.to_string())?;
+        decode_urlencoded_dropping_blank_optional_fields::<P>(parent_encoded.as_bytes())?;
     let mut parent = parent_data.into_changeset();
     for field in parent_nul_fields {
         parent.add_error(field, nul_message);
@@ -657,13 +680,13 @@ fn decode_child_row<C: NestedChild>(
     nul_fields: &[String],
     nul_message: &str,
 ) -> ChildRow<C> {
-    let mut values: HashMap<String, String> = HashMap::new();
+    let mut values: HashMap<String, Vec<String>> = HashMap::new();
     let mut destroyed = false;
     // Subfields decoded into `C`, excluding the `_destroy` marker (not a
     // field of `C`).
     let mut decode_pairs: Vec<(String, String)> = Vec::new();
     for (sub, val) in subfields {
-        values.insert(sub.clone(), val.clone());
+        values.entry(sub.clone()).or_default().push(val.clone());
         if sub == DESTROY_SUBFIELD {
             if is_truthy(val) {
                 destroyed = true;
@@ -826,7 +849,7 @@ fn parse_combined_child_key<'a>(key: &'a str, collection: &str) -> Option<(usize
 }
 
 /// Re-encode `pairs` as an `application/x-www-form-urlencoded` string so the
-/// shared `serde_urlencoded` decode path can re-parse them.
+/// shared form decode path can re-parse them.
 fn encode_pairs(pairs: &[(String, String)]) -> String {
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -893,9 +916,14 @@ fn missing_field_name(msg: &str) -> Option<String> {
 /// `None` via the primary blank-dropping decode, which succeeds for them and
 /// never reaches here.
 fn recover_child_error_field<C: serde::de::DeserializeOwned>(
-    primary: &serde_path_to_error::Error<serde_urlencoded::de::Error>,
+    primary: &crate::form::FormDecodeError,
     decode_pairs: &[(String, String)],
 ) -> String {
+    // 0. A repeated single-value subfield (issue #3394) names itself.
+    let Some(primary) = primary.invalid_error() else {
+        return primary.field().unwrap_or_default().to_owned();
+    };
+
     // 1. Primary decode path (present-but-malformed value at a real path).
     if let Some(field) = last_path_field(primary.path()) {
         return field;
@@ -911,8 +939,7 @@ fn recover_child_error_field<C: serde::de::DeserializeOwned>(
     //    for the rare root-level error with neither a path nor a missing-field
     //    message.
     let encoded = encode_pairs(decode_pairs);
-    let deserializer =
-        serde_urlencoded::Deserializer::new(url::form_urlencoded::parse(encoded.as_bytes()));
+    let deserializer = serde_html_form::Deserializer::from_bytes(encoded.as_bytes());
     if let Err(raw_err) = serde_path_to_error::deserialize::<_, C>(deserializer)
         && let Some(field) = last_path_field(raw_err.path())
     {
@@ -1303,7 +1330,7 @@ where
         }
 
         let changeset = decode_nested_with_nul_message::<P, C>(&pairs, &nul_message)
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e).into_response())?;
+            .map_err(|e| (e.status(), e.to_string()).into_response())?;
 
         Ok(Self {
             changeset,
@@ -1356,6 +1383,13 @@ impl RowScope<'_> {
     #[must_use]
     pub fn value(&self, sub: &str) -> Option<&str> {
         self.row.and_then(|r| r.value(sub))
+    }
+
+    /// Every raw submitted value for subfield `sub`, or an empty slice (always
+    /// empty for a blank row). See [`NestedRow::values`].
+    #[must_use]
+    pub fn values(&self, sub: &str) -> &[String] {
+        self.row.map_or(&[], |r| r.values(sub))
     }
 
     /// Validation messages for subfield `sub`, or an empty slice (always empty
@@ -1901,6 +1935,116 @@ mod tests {
 
     fn p(k: &str, v: &str) -> (String, String) {
         (k.to_owned(), v.to_owned())
+    }
+
+    // ── #3394: repeated keys on the nested path ───────────────────────
+
+    #[derive(serde::Deserialize, validator::Validate)]
+    struct TaggedOrder {
+        #[serde(default)]
+        tags: Vec<String>,
+    }
+
+    #[test]
+    fn repeated_parent_key_decodes_into_a_vec_field() {
+        let pairs = vec![
+            p("tags", "a"),
+            p("tags", "b"),
+            p("items[0][sku]", "A-1"),
+            p("items[0][quantity]", "2"),
+        ];
+        let cs = decode_nested_urlencoded::<TaggedOrder, LineItem>(&pairs).expect("parent decodes");
+        assert_eq!(cs.parent.data().tags, ["a", "b"]);
+        assert!(cs.is_valid());
+    }
+
+    #[test]
+    fn repeated_child_scalar_is_a_row_error_on_that_subfield() {
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", "A-1"),
+            p("items[0][sku]", "B-2"),
+            p("items[0][quantity]", "2"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        assert!(!cs.is_valid());
+        let errors = cs.rows()[0].errors_for("sku");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("`sku`"), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn repeated_parent_scalar_is_a_422_through_the_extractor() {
+        use tower::ServiceExt;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/t")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from("name=a&name=b"))
+            .unwrap();
+        let resp = axum::Router::new()
+            .route("/t", axum::routing::post(nested_ok))
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn repeated_parent_scalar_fails_the_decode() {
+        let pairs = vec![p("name", "a"), p("name", "b")];
+        let err = decode_nested_urlencoded::<Order, LineItem>(&pairs)
+            .err()
+            .expect("a repeated parent scalar must not decode");
+        assert!(err.contains("`name`"), "{err}");
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, validator::Validate)]
+    struct TaggedItem {
+        #[validate(length(min = 1, message = "sku required"))]
+        sku: String,
+        #[serde(default)]
+        tags: Vec<String>,
+    }
+
+    impl NestedChild for TaggedItem {
+        const COLLECTION: &'static str = "items";
+    }
+
+    #[test]
+    fn repeated_child_values_survive_a_validation_error_re_render() {
+        // `sku` fails validation; the re-render must keep both tags, not only
+        // the last one.
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", ""),
+            p("items[0][tags]", "a"),
+            p("items[0][tags]", "b"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, TaggedItem>(&pairs).expect("parent decodes");
+        assert!(!cs.is_valid());
+        let row = &cs.rows()[0];
+        assert!(!row.errors_for("sku").is_empty());
+        assert_eq!(row.values("tags"), ["a", "b"]);
+        assert_eq!(row.value("tags"), Some("b"));
+        assert_eq!(row.values("sku"), [""]);
+        assert!(row.values("missing").is_empty());
+    }
+
+    #[test]
+    fn seeded_child_vec_field_pre_fills_every_element() {
+        let cs = NestedChangeset::seeded(
+            Order {
+                name: "Existing order".to_owned(),
+            },
+            vec![TaggedItem {
+                sku: "A-1".to_owned(),
+                tags: vec!["a".to_owned(), "b".to_owned()],
+            }],
+        );
+        let row = &cs.rows()[0];
+        assert_eq!(row.value("sku"), Some("A-1"));
+        assert_eq!(row.values("tags"), ["a", "b"]);
     }
 
     // ── #2423: NUL bytes on the nested path ───────────────────────────

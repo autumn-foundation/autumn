@@ -4261,11 +4261,15 @@ fn render_routes_file(
     } else {
         String::new()
     };
-    let (flash_none_selected, flash_bulk_deleted) = if bulk_delete_enabled {
+    let (flash_none_selected, flash_bad_selection, flash_bulk_deleted) = if bulk_delete_enabled {
         (
             labels.lit(
                 &format!("{snake_name}.flash.none_selected"),
                 &format!("No {plural} selected"),
+            ),
+            labels.lit(
+                &format!("{snake_name}.flash.bad_selection"),
+                &format!("That is not a valid selection of {plural}"),
             ),
             labels.expr(
                 &format!("{snake_name}.flash.bulk_deleted"),
@@ -4275,7 +4279,7 @@ fn render_routes_file(
             ),
         )
     } else {
-        (String::new(), String::new())
+        (String::new(), String::new(), String::new())
     };
     let (flash_restored, flash_purged) = if trash_enabled {
         (
@@ -6060,9 +6064,9 @@ mod attachment_read_back_tests {{
 
     // ── issue #1312: bulk-select + delete-selected ─────────────────────────
     //
-    // The repeated-checkbox body parser. Emitted next to `csrf_input` /
-    // `submit_token_input` (the routes module's other private form helpers) and
-    // only when the bulk gate is on, so the `--live`/`--sharded` output is
+    // The bulk-select form struct (issue #3394 retired the hand-written
+    // `parse_bulk_ids`). Emitted next to `csrf_input` / `submit_token_input`
+    // and only when the bulk gate is on, so the `--live`/`--sharded` output is
     // byte-identical.
     let bulk_ids_parser = if bulk_delete_enabled {
         "\n/// Most rows one bulk submit may touch.\n\
@@ -6076,40 +6080,14 @@ mod attachment_read_back_tests {{
          /// no rows at all.\n\
          const MAX_BULK_IDS: usize = 5000;\n\
          \n\
-         /// Parse the bulk-select checkboxes out of a URL-encoded form body.\n\
+         /// The bulk-select checkboxes of the index list.\n\
          ///\n\
-         /// Accepts both the plain `ids=1&ids=2` spelling the generated checkboxes\n\
-         /// submit and the `ids[]=1&ids[]=2` spelling some clients send. A value\n\
-         /// that isn't an integer is dropped rather than rejected — a list-write\n\
-         /// endpoint never 400s on a hand-edited form — and repeats are collapsed\n\
-         /// so the same row is never queued for deletion twice.\n\
-         ///\n\
-         /// Dedup goes through a `HashSet` rather than a linear `Vec::contains`\n\
-         /// scan: this parses the raw body, not a page-sized selection, so a\n\
-         /// hand-crafted POST can carry as many distinct `ids` as the request body\n\
-         /// limit allows. A linear scan per value would make that Θ(n²) — a cheap\n\
-         /// request burning real CPU before the handler ever reaches the database.\n\
-         /// The `Vec` still carries insertion order; the set only answers \"seen?\".\n\
-         fn parse_bulk_ids(body: &Bytes) -> Vec<i64> {\n    \
-         let mut ids: Vec<i64> = Vec::new();\n    \
-         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();\n    \
-         for (key, value) in url::form_urlencoded::parse(body.as_ref()) {\n        \
-         if key == \"ids\" || key == \"ids[]\" {\n            \
-         if let Ok(id) = value.parse::<i64>() {\n                \
-         if seen.insert(id) {\n                    \
-         ids.push(id);\n                    \
-         // Stop one past the cap. The handler refuses anything longer, so\n                    \
-         // parsing the rest would burn CPU on a body already destined for\n                    \
-         // rejection — and collecting it would let the request size alone\n                    \
-         // decide how much memory this allocates.\n                    \
-         if ids.len() > MAX_BULK_IDS {\n                        \
-         break;\n                    \
-         }\n                \
-         }\n            \
-         }\n        \
-         }\n    \
-         }\n    \
-         ids\n\
+         /// The checkboxes submit `ids=1&ids=2`. Some clients send `ids[]=1`.\n\
+         /// The framework form decoder puts each repeated key into the `Vec`.\n\
+         #[derive(serde::Deserialize)]\n\
+         struct BulkSelection {\n    \
+         #[serde(default, alias = \"ids[]\")]\n    \
+         ids: Vec<i64>,\n\
          }\n"
     } else {
         ""
@@ -6155,10 +6133,10 @@ mod attachment_read_back_tests {{
         format!(
             "\n\n/// `POST /{plural}/bulk_delete` — delete every selected row in one submit.\n\
              ///\n\
-             /// Reads the index list's repeated `ids` checkboxes (see `parse_bulk_ids`,\n\
-             /// which also accepts the `ids[]` spelling). Malformed ids are dropped and an\n\
-             /// empty selection just redirects back with an informational flash — a\n\
-             /// list-write endpoint never 400s on bad params. The delete itself routes\n\
+             /// Reads the index list's repeated `ids` checkboxes into `BulkSelection`\n\
+             /// (the `ids[]` spelling works too). A malformed body and an empty\n\
+             /// selection each redirect back with a flash — a list-write endpoint\n\
+             /// never 400s on bad params. The delete itself routes\n\
              /// through the repository's `delete_many`, so soft-delete, model hooks, and\n\
              /// `dependent(...)` cascades all apply exactly as they do for the single-row\n\
              /// `destroy`; a `dependent(restrict)` violation aborts the whole batch with a\n\
@@ -6171,18 +6149,36 @@ mod attachment_read_back_tests {{
              mut db: {db_ty},\n    \
              body: Bytes,\n\
              ) -> AutumnResult<autumn_web::Redirect> {{\n    \
-             let ids = parse_bulk_ids(&body);\n    \
-             if ids.is_empty() {{\n        \
-             flash.info({flash_none_selected}).await;\n        \
-             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
-             }}\n    \
              // Refuse an oversized selection outright rather than truncating it: a\n    \
              // silently partial destructive batch is worse than a refused one. Like\n    \
-             // the empty case this redirects with a flash instead of 400ing.\n    \
-             if ids.len() > MAX_BULK_IDS {{\n        \
+             // the empty case this redirects with a flash instead of 400ing. The\n    \
+             // count runs before the decode and stops one past the cap, so a\n    \
+             // crafted body never allocates a body's worth of ids.\n    \
+             let submitted = url::form_urlencoded::parse(&body)\n        \
+             .filter(|(key, _)| key == \"ids\" || key == \"ids[]\")\n        \
+             .take(MAX_BULK_IDS + 1)\n        \
+             .count();\n    \
+             if submitted > MAX_BULK_IDS {{\n        \
              flash\n            \
              .error({flash_bulk_cap})\n            \
              .await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }}\n    \
+             // A body that does not decode (a non-integer id, a mixed `ids` and\n    \
+             // `ids[]` spelling) gets a flash, not a 400: a list-write endpoint\n    \
+             // never 400s on bad params.\n    \
+             let Ok(BulkSelection {{ mut ids }}) =\n        \
+             autumn_web::form::from_urlencoded::<BulkSelection>(&body)\n    \
+             else {{\n        \
+             flash.error({flash_bad_selection}).await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }};\n    \
+             // Collapse repeats so the same row is never queued twice. A\n    \
+             // `HashSet` keeps this O(n); the `Vec` keeps the submitted order.\n    \
+             let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();\n    \
+             ids.retain(|id| seen.insert(*id));\n    \
+             if ids.is_empty() {{\n        \
+             flash.info({flash_none_selected}).await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
              // Chunk the pre-flight the way the repository chunks its own id\n    \
@@ -13895,22 +13891,22 @@ async fn __PLURAL___write_path_crud() {
     const BULK_HANDLER: &str = r#"
 
     // Issue #1312: the index list's bulk form posts the checked rows here as
-    // repeated `ids` pairs. Malformed values are dropped and an empty selection
-    // is a no-op — a list-write endpoint never 400s on bad params.
+    // repeated `ids` pairs. They decode into a `Vec<i64>` (issue #3394). A
+    // malformed body and an empty selection are each a no-op — a list-write
+    // endpoint never 400s on bad params.
+    #[derive(serde::Deserialize)]
+    struct BulkSelection {
+        #[serde(default, alias = "ids[]")]
+        ids: Vec<i64>,
+    }
+
     #[post("/__PLURAL__/bulk_delete")]
     async fn bulk_delete(
         body: autumn_web::reexports::axum::body::Bytes,
     ) -> impl IntoResponse {
-        let mut ids: Vec<i64> = Vec::new();
-        for (key, value) in url::form_urlencoded::parse(body.as_ref()) {
-            if (key == "ids" || key == "ids[]")
-                && let Ok(id) = value.parse::<i64>()
-                && !ids.contains(&id)
-            {
-                ids.push(id);
-            }
+        if let Ok(BulkSelection { ids }) = autumn_web::form::from_urlencoded(&body) {
+            STORE.lock().unwrap().retain(|(i, _)| !ids.contains(i));
         }
-        STORE.lock().unwrap().retain(|(i, _)| !ids.contains(i));
         Redirect::to("/__PLURAL__")
     }"#;
     const BULK_STEPS: &str = r#"
@@ -22972,42 +22968,61 @@ exempt_paths = [
         );
     }
 
+    /// Issue #3394: the ids decode into a `Vec<i64>` field through the
+    /// framework form decoder. No generated parser remains.
     #[test]
-    fn bulk_ids_parser_accepts_bracket_form() {
+    fn bulk_selection_is_a_vec_field_that_accepts_bracket_form() {
         let routes = bulk_routes_default();
-        assert!(routes.contains("fn parse_bulk_ids("), "{routes}");
-        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
-            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
+        assert!(!routes.contains("parse_bulk_ids"), "{routes}");
+        let Some((_, rest)) = routes.split_once("struct BulkSelection") else {
+            panic!("routes must emit a BulkSelection form struct:\n{routes}");
         };
-        let parser = rest.split("\npub ").next().unwrap_or(rest);
-        assert!(parser.contains("url::form_urlencoded::parse"), "{parser}");
-        assert!(parser.contains("\"ids\""), "{parser}");
-        assert!(parser.contains("\"ids[]\""), "{parser}");
+        let selection = rest.split("\n}").next().unwrap_or(rest);
+        assert!(selection.contains("ids: Vec<i64>"), "{selection}");
+        assert!(selection.contains("alias = \"ids[]\""), "{selection}");
+        assert!(selection.contains("default"), "{selection}");
+        let bulk = handler_slice(&routes, "bulk_delete");
         assert!(
-            parser.contains("seen.insert("),
-            "the parser must dedupe selected ids: {parser}"
+            bulk.contains("autumn_web::form::from_urlencoded::<BulkSelection>(&body)"),
+            "{bulk}"
         );
     }
 
-    /// The parser reads the raw body, not a page-sized selection, so a crafted
-    /// POST can carry as many distinct ids as the body limit allows. Dedup must
-    /// stay O(1) per value — a `Vec::contains` scan would make it Θ(n²) and let
-    /// a small request burn real CPU before the handler reaches the database.
+    /// A crafted POST can carry as many distinct ids as the body limit
+    /// allows. Dedup must stay O(1) per value — a `Vec::contains` scan would
+    /// make it Θ(n²) and let a small request burn real CPU before the handler
+    /// reaches the database.
     #[test]
-    fn bulk_ids_parser_dedupes_in_linear_time() {
+    fn bulk_selection_dedupes_in_linear_time() {
         let routes = bulk_routes_default();
-        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
-            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
-        };
-        let parser = rest.split("\npub ").next().unwrap_or(rest);
+        let bulk = handler_slice(&routes, "bulk_delete");
         assert!(
-            parser.contains("HashSet"),
-            "dedup must go through a hash set, not a linear scan: {parser}"
+            bulk.contains("HashSet") && bulk.contains("seen.insert("),
+            "dedup must go through a hash set, not a linear scan: {bulk}"
         );
         assert!(
-            !parser.contains("ids.contains(&"),
-            "a per-value Vec::contains scan makes parsing quadratic: {parser}"
+            !bulk.contains("ids.contains(&"),
+            "a per-value Vec::contains scan makes dedup quadratic: {bulk}"
         );
+    }
+
+    /// A malformed or repeated-scalar body flashes and redirects. It never
+    /// 400s (see `bulk_delete_never_returns_bad_request`).
+    #[test]
+    fn bulk_delete_malformed_selection_flashes_and_redirects() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        let decode_at = bulk
+            .find("from_urlencoded::<BulkSelection>")
+            .unwrap_or_else(|| panic!("bulk delete must decode a BulkSelection:\n{bulk}"));
+        let after = &bulk[decode_at..];
+        let else_at = after
+            .find("else {")
+            .unwrap_or_else(|| panic!("a decode failure must take an else branch:\n{bulk}"));
+        let branch = &after[else_at..];
+        assert!(branch.contains("flash"), "{branch}");
+        assert!(branch.contains("Redirect::to(&paths::index())"), "{branch}");
+        assert!(bulk.contains("not a valid selection"), "{bulk}");
     }
 
     #[test]
