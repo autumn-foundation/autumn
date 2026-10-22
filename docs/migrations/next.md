@@ -214,9 +214,15 @@ store.reset_for_retry(key, record.owner, token).await?;
 Only code that implements `JobTrackingStore` must change. Add
 `get_with_token`. Return a `RetryToken` that changes on every write. Make
 `reset_for_retry` do nothing if the stored token is different. The built-in
-stores do this. Apps that use the built-in stores change nothing, but a
-Postgres app must run the new framework migration
-`add_version_to_job_tracking`.
+stores do this.
+
+Apps that use the built-in stores change no code. Postgres apps must run
+`autumn migrate` (migration `add_version_to_job_tracking`) **before** they
+deploy the new binary. The new binary reads the `version` column. SQLite adds
+the column by itself. A Redis record that has no counter reads as `0`.
+
+Do not run old and new binaries together for long. An old binary does not
+change the counter, so a retry can then overwrite a newer write.
 
 **Automation:** `manual` — update each custom `JobTrackingStore`.
 

@@ -123,7 +123,7 @@ async fn redis_backend_persists_tracked_job_and_expires_it() {
 #[cfg(feature = "redis")]
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn redis_retry_reset_is_a_no_op_after_a_write_under_a_frozen_clock() {
+async fn redis_retry_reset_is_a_no_op_after_a_later_write() {
     use autumn_web::job_tracking::{
         JobTrackingStore as _, RedisJobTrackingStore, TrackedJobOwner, TrackedJobStatus,
     };

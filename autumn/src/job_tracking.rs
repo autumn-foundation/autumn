@@ -129,8 +129,8 @@ pub struct TrackedJobRecord {
 ///
 /// It moves on every write to a record, even when the clock does not. Callers
 /// get one from [`JobTrackingStore::get_with_token`] and give it to
-/// [`JobTrackingStore::reset_for_retry`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`JobTrackingStore::reset_for_retry`]. Only a store makes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RetryToken(u64);
 
 impl RetryToken {
@@ -577,6 +577,18 @@ fn token_from_db(version: i64) -> RetryToken {
     RetryToken::new(u64::try_from(version).unwrap_or(0))
 }
 
+/// Decode a tracking row into its record and token.
+#[cfg(any(feature = "sqlite", feature = "db"))]
+fn decode_row(record: &str, version: i64) -> AutumnResult<(TrackedJobRecord, RetryToken)> {
+    serde_json::from_str::<TrackedJobRecord>(record)
+        .map(|record| (record, token_from_db(version)))
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "job tracking deserialize failed: {error}"
+            ))
+        })
+}
+
 /// A token as a `version` column value. Counters past `i64::MAX` match nothing.
 #[cfg(any(feature = "sqlite", feature = "db"))]
 fn token_to_db(token: RetryToken) -> i64 {
@@ -597,6 +609,10 @@ struct SqliteTrackingRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     version: i64,
 }
+
+/// How many times a Redis tracked-job update re-reads after losing its swap.
+#[cfg(feature = "redis")]
+const REDIS_CAS_RETRIES: usize = 5;
 
 /// How many times a tracked-job update re-reads after losing its swap.
 ///
@@ -959,17 +975,8 @@ impl JobTrackingStore for SqliteJobTrackingStore {
                 ))
             })?;
 
-            row.map(|row| {
-                let token = token_from_db(row.version);
-                serde_json::from_str::<TrackedJobRecord>(&row.record)
-                    .map(|record| (record, token))
-                    .map_err(|error| {
-                        AutumnError::internal_server_error_msg(format!(
-                            "job tracking deserialize failed: {error}"
-                        ))
-                    })
-            })
-            .transpose()
+            row.map(|row| decode_row(&row.record, row.version))
+                .transpose()
         })
     }
 }
@@ -1734,15 +1741,7 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
             Ok(guard
                 .get(key)
                 .filter(|entry| self.is_live(entry))
-                .map(|entry| TrackedJobRecord {
-                    status: entry.record.status,
-                    progress_pct: entry.record.progress_pct,
-                    progress_message: entry.record.progress_message.clone(),
-                    result: entry.record.result.clone(),
-                    error: entry.record.error.clone(),
-                    owner: entry.record.owner.clone(),
-                    updated_at: entry.record.updated_at,
-                }))
+                .map(|entry| entry.record.clone()))
         })
     }
 }
@@ -1841,26 +1840,39 @@ impl RedisJobTrackingStore {
             .transpose()
     }
 
-    /// Read-modify-write: a no-op if the key is unknown or expired.
-    async fn update(&self, key: &str, f: impl FnOnce(&mut TrackedJobRecord)) -> AutumnResult<()> {
-        let Some((mut record, version)) = self.read(key).await? else {
-            return Ok(());
-        };
-        f(&mut record);
-        record.updated_at = crate::time::ambient_now();
-        self.write(key, &record, version.saturating_add(1)).await
+    /// Read-modify-write under a compare-and-swap: a no-op if the key is
+    /// unknown or expired. A lost swap re-reads and reapplies, so two writers
+    /// never leave the same version on different content.
+    async fn update(&self, key: &str, f: impl Fn(&mut TrackedJobRecord)) -> AutumnResult<()> {
+        for _ in 0..REDIS_CAS_RETRIES {
+            let Some((mut record, version)) = self.read(key).await? else {
+                return Ok(());
+            };
+            f(&mut record);
+            record.updated_at = crate::time::ambient_now();
+            if self
+                .write_if_unchanged(key, RetryToken::new(version), &record)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(AutumnError::internal_server_error_msg(format!(
+            "job tracking update lost its compare-and-swap {REDIS_CAS_RETRIES} times"
+        )))
     }
 
     /// Atomically overwrite the record with `new_record`, but only if the
     /// stored write counter still equals `expected` — a compare-and-swap
     /// guard evaluated inside a single Lua script so the check-then-write
-    /// cannot race against a concurrent write landing in between.
+    /// cannot race against a concurrent write landing in between. Returns
+    /// whether the swap landed.
     async fn write_if_unchanged(
         &self,
         key: &str,
         expected: RetryToken,
         new_record: &TrackedJobRecord,
-    ) -> AutumnResult<()> {
+    ) -> AutumnResult<bool> {
         const SCRIPT: &str = r"
 local raw = redis.call('GET', KEYS[1])
 if not raw then
@@ -1874,7 +1886,7 @@ redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
 return 1
 ";
         let payload = Self::encode(new_record, expected.get().saturating_add(1))?;
-        redis::cmd("EVAL")
+        let landed = redis::cmd("EVAL")
             .arg(SCRIPT)
             .arg(1)
             .arg(self.key_for(key))
@@ -1885,10 +1897,10 @@ return 1
             .await
             .map_err(|error| {
                 AutumnError::internal_server_error_msg(format!(
-                    "job tracking redis reset failed: {error}"
+                    "job tracking redis compare-and-swap failed: {error}"
                 ))
             })?;
-        Ok(())
+        Ok(landed == 1)
     }
 }
 
@@ -1963,7 +1975,9 @@ impl JobTrackingStore for RedisJobTrackingStore {
                 owner,
                 updated_at: crate::time::ambient_now(),
             };
-            self.write_if_unchanged(key, expected, &record).await
+            self.write_if_unchanged(key, expected, &record)
+                .await
+                .map(|_| ())
         })
     }
 
@@ -2019,7 +2033,8 @@ const MAX_PG_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 ///
 /// Each record is a single JSONB blob in `autumn_job_tracking`, keyed by the
 /// token hash, with lazy expiry (reads filter on `expires_at`; writes refresh
-/// it). See the `create_job_tracking` framework migration.
+/// it). See the `create_job_tracking` and `add_version_to_job_tracking`
+/// framework migrations.
 ///
 /// The database clock (`NOW()`) sets and checks `expires_at`. Host clocks can
 /// differ, so the store never uses them for expiry (#2875).
@@ -2293,17 +2308,8 @@ impl JobTrackingStore for PgJobTrackingStore {
                 ))
             })?;
 
-            row.map(|row| {
-                let token = token_from_db(row.version);
-                serde_json::from_str::<TrackedJobRecord>(&row.record)
-                    .map(|record| (record, token))
-                    .map_err(|error| {
-                        AutumnError::internal_server_error_msg(format!(
-                            "job tracking deserialize failed: {error}"
-                        ))
-                    })
-            })
-            .transpose()
+            row.map(|row| decode_row(&row.record, row.version))
+                .transpose()
         })
     }
 }
@@ -2521,6 +2527,50 @@ mod tests {
 
         let record = store.get("k1").await.unwrap().expect("record");
         assert_eq!(record.status, TrackedJobStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn create_moves_the_token_so_an_old_token_cannot_reset() {
+        let store = store();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let (_, old) = store.get_with_token("k1").await.unwrap().expect("record");
+
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        store.mark_running("k1").await.unwrap();
+        store
+            .reset_for_retry("k1", TrackedJobOwner::Anonymous, old)
+            .await
+            .unwrap();
+
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn token_and_reset_ignore_a_missing_key() {
+        let store = store();
+        assert!(store.get_with_token("nope").await.unwrap().is_none());
+
+        store
+            .reset_for_retry("nope", TrackedJobOwner::Anonymous, RetryToken::new(0))
+            .await
+            .unwrap();
+        assert!(store.get("nope").await.unwrap().is_none());
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "db"))]
+    #[test]
+    fn db_tokens_round_trip_and_reject_out_of_range_values() {
+        assert_eq!(token_from_db(7), RetryToken::new(7));
+        assert_eq!(token_from_db(-1), RetryToken::new(0));
+        assert_eq!(token_to_db(RetryToken::new(7)), 7);
+        assert_eq!(token_to_db(RetryToken::new(u64::MAX)), -1);
     }
 
     #[tokio::test]

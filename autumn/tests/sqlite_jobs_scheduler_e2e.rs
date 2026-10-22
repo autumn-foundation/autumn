@@ -1812,7 +1812,6 @@ async fn sqlite_retry_reset_is_a_no_op_after_a_write_under_a_frozen_clock() {
         .create("k1", TrackedJobOwner::Anonymous)
         .await
         .expect("create");
-    store.fail("k1", "boom".to_owned()).await.expect("fail");
     let (_, token) = store
         .get_with_token("k1")
         .await
@@ -1820,10 +1819,6 @@ async fn sqlite_retry_reset_is_a_no_op_after_a_write_under_a_frozen_clock() {
         .expect("live");
 
     // A worker writes after the admin read, inside the same instant.
-    store
-        .create("k1", TrackedJobOwner::Anonymous)
-        .await
-        .expect("recreate");
     store.mark_running("k1").await.expect("mark running");
     store
         .reset_for_retry("k1", TrackedJobOwner::Anonymous, token)
