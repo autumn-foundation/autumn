@@ -301,9 +301,10 @@ async fn outbox_claim_profile() {
         .unwrap();
     assert!(claim_index_valid(&mut conn).is_empty());
     outbox::ensure_schema(&pool).await.unwrap();
-    // The build runs in a background task; wait for it.
-    for _ in 0..100 {
-        if !claim_index_valid(&mut conn).is_empty() {
+    // The build runs in a background task; wait until it is valid. A
+    // concurrent build is in the catalog with `indisvalid = false` first.
+    for _ in 0..300 {
+        if claim_index_valid(&mut conn) == [true] {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
