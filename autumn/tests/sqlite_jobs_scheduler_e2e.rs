@@ -2651,6 +2651,12 @@ async fn sqlite_owned_attempt_settles_the_tracked_status_after_the_ack() {
                     Err(autumn_web::AutumnError::internal_server_error_msg("boom"))
                 })
             }),
+            job_info("sqlite_owned_panic", 3, |_state, _payload| {
+                Box::pin(async move {
+                    OWNED_RUNS.fetch_add(1, Ordering::SeqCst);
+                    panic!("owned attempt panicked");
+                })
+            }),
         ],
         &state,
         &shutdown,
@@ -2666,16 +2672,79 @@ async fn sqlite_owned_attempt_settles_the_tracked_status_after_the_ack() {
         .await
         .expect("tracked enqueue");
 
-    eventually(400, "both records to settle", async || {
+    // A panic is terminal even with attempts left.
+    let panicked =
+        autumn_web::job_tracking::enqueue_tracked("sqlite_owned_panic", serde_json::json!({}))
+            .await
+            .expect("tracked enqueue");
+
+    eventually(400, "all records to settle", async || {
         let a = tracked_status(&pool, &ok.token).await.status;
         let b = tracked_status(&pool, &err.token).await.status;
-        matches!(a, TrackedJobStatus::Succeeded) && matches!(b, TrackedJobStatus::Failed)
+        let c = tracked_status(&pool, &panicked.token).await.status;
+        matches!(a, TrackedJobStatus::Succeeded)
+            && matches!(b, TrackedJobStatus::Failed)
+            && matches!(c, TrackedJobStatus::Failed)
     })
     .await;
     assert_eq!(
         tracked_status(&pool, &ok.token).await.result,
         Some(serde_json::json!({ "ok": true }))
     );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+/// A tracked job with no handler on this process dead-letters, and its
+/// record settles once the dead-letter ack applies.
+#[tokio::test]
+async fn sqlite_unknown_tracked_job_settles_failed_after_the_ack() {
+    use autumn_web::job_tracking::TrackedJobStatus;
+
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let handler: job::JobHandler = |_state, _payload| Box::pin(async move { Ok(()) });
+
+    // Web role: knows the job and runs no workers.
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let web_shutdown = tokio_util::sync::CancellationToken::new();
+    job::start_runtime(
+        vec![job_info("sqlite_unknown_job", 3, handler)],
+        &state,
+        &web_shutdown,
+        &fenced_job_config(),
+        false,
+    )
+    .expect("the enqueue-only sqlite runtime starts");
+    let handle =
+        autumn_web::job_tracking::enqueue_tracked("sqlite_unknown_job", serde_json::json!({}))
+            .await
+            .expect("tracked enqueue");
+    web_shutdown.cancel();
+    job::clear_global_job_client();
+
+    // Worker role: does not know the job.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    job::start_runtime(
+        vec![job_info("sqlite_other_job", 3, handler)],
+        &state,
+        &shutdown,
+        &fenced_job_config(),
+        true,
+    )
+    .expect("the worker sqlite runtime starts");
+
+    eventually(400, "the unknown job's record to settle", async || {
+        matches!(
+            tracked_status(&pool, &handle.token).await.status,
+            TrackedJobStatus::Failed
+        )
+    })
+    .await;
 
     shutdown.cancel();
     job::clear_global_job_client();
