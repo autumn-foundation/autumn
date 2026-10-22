@@ -3037,10 +3037,10 @@ fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
     tracing::info_span!("job.execute", "otel.kind" = "consumer", job.name = %name, job.attempt = attempt)
 }
 
-/// Run one job attempt and settle its tracked record at once.
+/// Run one job attempt. Settle its tracked record at once.
 ///
-/// For a queue with no claim to check, such as the in-process one. A claimed
-/// queue uses [`run_claimed_job_handler`] and settles after its ack.
+/// Use this for a queue with no claim, such as the in-process queue.
+/// A claimed queue uses [`run_claimed_job_handler`] and settles after its ack.
 async fn run_job_handler(
     name: &str,
     handler: JobHandler,
@@ -3052,16 +3052,16 @@ async fn run_job_handler(
 ) -> JobExecutionOutcome {
     let (outcome, pending) =
         run_claimed_job_handler(name, handler, state, payload, final_attempt, bounds, run).await;
-    pending.apply().await;
+    pending.apply(name).await;
     outcome
 }
 
 /// Run one job attempt, metered as one job run (issue #1720). All job
 /// backends run their handlers through here.
 ///
-/// The tracked record is not settled. The caller applies the returned
-/// [`PendingSettle`] only after the queue ack succeeds (issue #2583): a
-/// rejected ack means another attempt owns the job.
+/// This function does not settle the tracked record. The caller applies the
+/// returned [`PendingSettle`] after the queue ack succeeds (issue #2583).
+/// A rejected ack means another attempt owns the job.
 async fn run_claimed_job_handler(
     name: &str,
     handler: JobHandler,
@@ -10110,7 +10110,7 @@ async fn settle_failed_redis_job(
                         .record_failure(&dead.name, error.clone(), true);
                     crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
-                    pending.apply().await;
+                    pending.apply(&record.name).await;
                 }
                 Ok(false) => {
                     settle_redis_record(state, job_admin, record, false);
@@ -10164,7 +10164,7 @@ async fn dead_letter_panicked_redis_job(
                 .record_failure(&dead.name, error.clone(), true);
             crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
             job_admin.record_failure(&dead.id, error);
-            pending.apply().await;
+            pending.apply(&record.name).await;
         }
         Ok(false) => {
             settle_redis_record(state, job_admin, record, false);
@@ -10215,15 +10215,15 @@ async fn dead_letter_invalid_redis_job(
             .record_failure(&record.name, error.to_owned(), true);
         crate::alerts::notify_dead_lettered_job(state, &record.name, &record.id, error);
         job_admin.record_failure(&record.id, error.to_owned());
+        crate::job_tracking::settle_tracked_payload_as_failed(
+            state,
+            &record.payload,
+            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+        )
+        .await;
     } else if moved == Ok(false) {
         settle_redis_record(state, job_admin, record, false);
     }
-    crate::job_tracking::settle_tracked_payload_as_failed(
-        state,
-        &record.payload,
-        crate::job_tracking::GENERIC_FAILURE_MESSAGE,
-    )
-    .await;
 }
 
 #[cfg(feature = "redis")]
@@ -10242,13 +10242,16 @@ async fn process_redis_job_record(
     {
         state.job_registry.record_cancel(&record.name);
         job_admin.record_cancelled(&record.id);
-        let _ = ack_redis_success(connection, worker_config, &record).await;
-        crate::job_tracking::settle_tracked_payload_as_failed(
-            state,
-            &record.payload,
-            "This job was canceled.",
-        )
-        .await;
+        let acked = ack_redis_success(connection, worker_config, &record).await;
+        // A rejected ack means another attempt owns the job (issue #2583).
+        if matches!(acked, Ok(true)) {
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &record.payload,
+                "This job was canceled.",
+            )
+            .await;
+        }
         return;
     }
     state.job_registry.record_start(&record.name);
@@ -10349,7 +10352,7 @@ async fn process_redis_job_record(
                         settle_redis_record(state, job_admin, &record, true);
                         state.job_registry.record_success(&record.name);
                         job_admin.record_success(&record.id);
-                        pending.apply().await;
+                        pending.apply(&record.name).await;
                     }
                     Ok(false) => {
                         settle_redis_record(state, job_admin, &record, false);
@@ -12277,12 +12280,13 @@ async fn pg_execute_job(
             delay_ms,
         )
         .await;
-        record_pg_row_cancel_after_ack(ack, &row, state);
+        let applied = record_pg_row_cancel_after_ack(ack, &row, state);
         // `pg_nack_failure` reuses the ordinary retry-vs-dead-letter decision
         // even for a cancellation, so only settle the tracked record here
         // when this really was the terminal attempt; otherwise the job is
         // about to be retried and the retry will settle it later.
-        if is_final_attempt(&attempt, &max_attempts) {
+        // A rejected ack means another attempt owns the job (issue #2583).
+        if applied && is_final_attempt(&attempt, &max_attempts) {
             let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
             crate::job_tracking::settle_tracked_payload_as_failed(
                 state,
@@ -12316,13 +12320,22 @@ async fn pg_execute_job(
         let error = format!("unknown job '{}'", row.name);
         let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
         let lifecycle = PgLifecycleRecord::Failure { error: &error };
-        record_pg_row_lifecycle_ack_result(ack, &row, "unknown-type", lifecycle, state, job_admin);
-        crate::job_tracking::settle_tracked_payload_as_failed(
+        let applied = record_pg_row_lifecycle_ack_result(
+            ack,
+            &row,
+            "unknown-type",
+            lifecycle,
             state,
-            &payload,
-            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
-        )
-        .await;
+            job_admin,
+        );
+        if applied {
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &payload,
+                crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+            )
+            .await;
+        }
         return;
     };
 
@@ -12397,7 +12410,7 @@ async fn pg_settle_outcome(
                 job_admin,
             );
             if applied {
-                pending.apply().await;
+                pending.apply(&row.name).await;
             }
         }
         JobExecutionOutcome::Failed(error) => {
@@ -12433,7 +12446,7 @@ async fn pg_settle_outcome(
                 ack, row, "failure", lifecycle, state, job_admin,
             );
             if applied {
-                pending.apply().await;
+                pending.apply(&row.name).await;
             }
         }
         // Panics dead-letter immediately regardless of remaining attempts,
@@ -12445,7 +12458,7 @@ async fn pg_settle_outcome(
             let applied =
                 record_pg_row_lifecycle_ack_result(ack, row, "panic", lifecycle, state, job_admin);
             if applied {
-                pending.apply().await;
+                pending.apply(&row.name).await;
             }
         }
     }
@@ -19219,8 +19232,9 @@ mod tests {
 
     // ── Tracked-job choke-point behavior (#1373) ──────────────────────────────
     //
-    // run_job_handler is the single point all three backends run handlers
-    // through; these tests drive it via the real local backend + the free
+    // run_job_handler (local) and run_claimed_job_handler (sqlite, postgres,
+    // redis) share one handler path; these tests drive the local path via
+    // the real local backend + the free
     // enqueue_tracked function rather than calling it directly, so they also
     // exercise enqueue_tracked's envelope-wrapping and the local backend's
     // retry/dead-letter decisions end to end.

@@ -1061,10 +1061,16 @@ while a second worker claims the same job. The queue rejects the ack of the
 first attempt, so Autumn does not write its status. The second attempt
 settles the record.
 
-If the ack fails with an error, the record stays `running`. The job is then
-recovered and run again, and the next attempt settles it. If the worker stops
-between the ack and the status write, the record stays `running` until its
-TTL ends. The `local` backend has no claim, so it writes the status at once.
+If the ack fails with an error, the record stays `running`. Autumn recovers
+the job and runs it again. The next attempt settles the record. If the worker
+crashes after the ack and before the status write, the record stays
+`running` until its TTL ends. If a failed ack was for the last attempt, the
+queue dead-letters the job and the record ends `failed`, even when the handler
+succeeded. The `local` backend has no claim, so it writes
+the status at once.
+
+To see the durable queue state, use the admin dashboard
+([Observability](#observability)) or `JobAdminBackend`.
 
 ### Known limitation: stale progress writes on the Redis/Postgres stores
 

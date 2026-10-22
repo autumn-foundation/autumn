@@ -2472,7 +2472,7 @@ static STALE_GATE: AtomicBool = AtomicBool::new(false);
 static STALE_DONE: AtomicBool = AtomicBool::new(false);
 
 /// A claim-fenced config. The heartbeat period is a third of the visibility
-/// timeout, so a long timeout keeps it from noticing the lost claim in time.
+/// timeout. A long timeout stops the heartbeat from seeing the lost claim.
 fn fenced_job_config() -> JobConfig {
     let mut config = lease_job_config(1);
     config.sqlite.visibility_timeout_ms = 60_000;
@@ -2558,7 +2558,7 @@ async fn sqlite_stale_attempt_does_not_publish_a_terminal_tracked_status() {
         STALE_DONE.load(Ordering::SeqCst)
     })
     .await;
-    // Give a wrong settle time to show.
+    // Wait long enough for a wrong settle to appear.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let record = tracked_status(&pool, &handle.token).await;

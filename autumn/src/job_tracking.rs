@@ -417,10 +417,10 @@ impl JobContext {
 ///
 /// Only the claim owner may settle the record. The queue ack checks the
 /// claim, so a durable backend applies this after the ack succeeds. If the
-/// ack is rejected, drop it: another attempt owns the job.
-#[must_use = "apply it after the queue ack, or drop it when the ack fails"]
+/// ack is rejected, discard this value: another attempt owns the job.
+#[must_use = "apply it after the queue ack, or discard it when the ack fails"]
 pub(crate) enum PendingSettle {
-    /// Nothing to write: the job is untracked or a retry is pending.
+    /// Nothing to write: the job is untracked, a retry is pending, or the lease is lost.
     None,
     /// Write the success result.
     Success(JobContext),
@@ -429,8 +429,8 @@ pub(crate) enum PendingSettle {
 }
 
 impl PendingSettle {
-    /// Write the held terminal status, bounded by [`TRACKING_SETTLE_CAP`].
-    pub(crate) async fn apply(self) {
+    /// Write the held terminal status for `job`, bounded by [`TRACKING_SETTLE_CAP`].
+    pub(crate) async fn apply(self, job: &str) {
         let write = async {
             match &self {
                 Self::None => {}
@@ -443,7 +443,7 @@ impl PendingSettle {
             .is_err()
         {
             let cap_ms = TRACKING_SETTLE_CAP.as_millis();
-            tracing::warn!(cap_ms, "tracking settle timed out");
+            tracing::warn!(job, cap_ms, "tracking settle timed out");
         }
     }
 }
@@ -2835,9 +2835,9 @@ mod tests {
 
         // A rejected ack drops the held write.
         drop(PendingSettle::Success(ctx("dropped")));
-        PendingSettle::Success(ctx("applied")).apply().await;
-        PendingSettle::Failure(ctx("failed")).apply().await;
-        PendingSettle::None.apply().await;
+        PendingSettle::Success(ctx("applied")).apply("j").await;
+        PendingSettle::Failure(ctx("failed")).apply("j").await;
+        PendingSettle::None.apply("j").await;
 
         let status = async |key: &str| store.get(key).await.unwrap().expect("record").status;
         assert_eq!(status("dropped").await, TrackedJobStatus::Pending);

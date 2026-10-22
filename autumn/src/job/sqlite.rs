@@ -1267,10 +1267,11 @@ async fn execute_job(
             sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt),
         )
         .await;
-        record_pg_cancel_after_ack(ack, &row.name, &row.id, state);
+        let applied = record_pg_cancel_after_ack(ack, &row.name, &row.id, state);
         // The cancel reuses the ordinary retry-vs-dead-letter decision, so only
         // settle the tracked record when this really was the terminal attempt.
-        if is_final_attempt(&attempt, &max_attempts) {
+        // A rejected ack means another attempt owns the job (issue #2583).
+        if applied && is_final_attempt(&attempt, &max_attempts) {
             crate::job_tracking::settle_tracked_payload_as_failed(
                 state,
                 &payload,
@@ -1298,7 +1299,7 @@ async fn execute_job(
         // worker claim and discard the row until its attempts ran out.
         let error = format!("unknown job '{}'", row.name);
         let ack = ack_dead_letter(pool, now_ms(state), &row.id, worker_id, &error).await;
-        record_pg_lifecycle_ack_result(
+        let applied = record_pg_lifecycle_ack_result(
             ack,
             &row.name,
             &row.id,
@@ -1308,12 +1309,14 @@ async fn execute_job(
             state,
             job_admin,
         );
-        crate::job_tracking::settle_tracked_payload_as_failed(
-            state,
-            &payload,
-            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
-        )
-        .await;
+        if applied {
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &payload,
+                crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+            )
+            .await;
+        }
         return;
     };
 
@@ -1398,7 +1401,7 @@ async fn settle_outcome(
                 job_admin,
             );
             if applied {
-                pending.apply().await;
+                pending.apply(&row.name).await;
             }
         }
         JobExecutionOutcome::Failed(error) => {
@@ -1436,7 +1439,7 @@ async fn settle_outcome(
                 ack, &row.name, &row.id, attempt, "failure", lifecycle, state, job_admin,
             );
             if applied {
-                pending.apply().await;
+                pending.apply(&row.name).await;
             }
         }
         // A panic dead-letters at once whatever the remaining attempts, as on
@@ -1455,7 +1458,7 @@ async fn settle_outcome(
                 job_admin,
             );
             if applied {
-                pending.apply().await;
+                pending.apply(&row.name).await;
             }
         }
     }
