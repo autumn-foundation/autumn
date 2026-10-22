@@ -824,7 +824,23 @@ export class EdgeGateway {
     );
     const method = request.method.toUpperCase();
 
-    if (upgrade) return this.toOrigin(request, target, headers, "origin_only", null);
+    if (upgrade) {
+      if (typeof this.origin === "string" && !onWorkers()) {
+        // Only Workers' `fetch` forwards an upgrade handshake. Elsewhere
+        // `fetch` refuses `connection: upgrade`, so say what is missing
+        // instead of failing as a 502. A function origin can use the
+        // runtime's own upgrade API; `autumn edge serve` tunnels upgrades.
+        return {
+          response: plain(
+            501,
+            "this runtime cannot forward an upgrade (WebSocket) to a URL origin\n",
+          ),
+          lane: "origin_only",
+          reason: null,
+        };
+      }
+      return this.toOrigin(request, target, headers, "origin_only", null);
+    }
     if (method !== "GET" && method !== "HEAD") {
       return this.toOrigin(request, target, headers, "fallthrough", "method_not_edge_eligible");
     }
@@ -908,7 +924,7 @@ export class EdgeGateway {
     const out = new Headers(answer.headers);
     const named = (out.get("connection") || "").split(",").map((t) => t.trim().toLowerCase());
     for (const name of [...HOP_BY_HOP, ...named]) if (name && name !== "host") out.delete(name);
-    if (out.has("content-encoding") && !reencodesBodies()) {
+    if (out.has("content-encoding") && !onWorkers()) {
       // `fetch` decompressed the body but kept the origin's framing headers.
       // Workers re-encodes a body to match `content-encoding`; any other
       // runtime would send plain bytes labelled as compressed.
@@ -927,11 +943,11 @@ export class EdgeGateway {
   }
 }
 
-/// Whether this runtime re-encodes a returned body to match its
-/// `content-encoding` header. Cloudflare Workers does (its `fetch` decodes a
-/// compressed body as it is read, and its `Response` encodes it again); Node,
-/// Deno and Bun decode and do not re-encode.
-function reencodesBodies() {
+/// Whether this is Cloudflare Workers. Two things only Workers' Fetch API
+/// does: `fetch` forwards an upgrade (WebSocket) handshake, and a returned
+/// `Response` re-encodes its body to match `content-encoding` (its `fetch`
+/// decodes a compressed body as it is read). Node, Deno and Bun do neither.
+function onWorkers() {
   return globalThis.navigator?.userAgent === "Cloudflare-Workers";
 }
 

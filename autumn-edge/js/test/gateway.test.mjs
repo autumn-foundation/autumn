@@ -544,3 +544,26 @@ test("a compressed origin answer is not forwarded as plain bytes labelled gzip",
     server.close();
   }
 });
+
+test("an upgrade to a URL origin off Workers is a plain 501, never sent", async () => {
+  let reached = 0;
+  const server = await listen(() => {
+    reached += 1;
+  });
+  server.on("upgrade", () => {
+    reached += 1;
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const gateway = createEdgeGateway({ capsule: respond([served(200)]), origin: base });
+    const { response, lane } = await gateway.handle(
+      new Request("https://edge.test/ws", { headers: { connection: "Upgrade", upgrade: "websocket" } }),
+    );
+    assert.equal(lane, "origin_only");
+    assert.equal(response.status, 501);
+    assert.match(await response.text(), /cannot forward an upgrade/);
+    assert.equal(reached, 0);
+  } finally {
+    server.close();
+  }
+});

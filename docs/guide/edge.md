@@ -618,6 +618,10 @@ What the Fetch API makes different from the Rust gateway:
 - **Compression outside Workers.** `fetch` decompresses a compressed origin
   answer. Workers compresses it again; on Node, Deno and Bun the gateway sends
   it uncompressed, without `content-encoding` and `content-length`.
+- **WebSocket upgrades to a URL origin need Workers.** Only Workers' `fetch`
+  forwards an upgrade handshake. Elsewhere the gateway answers such a request
+  with `501`; use a function origin with the runtime's own upgrade API, or
+  `autumn edge serve`, which tunnels upgrades.
 - **Repeated request headers are joined.** `Headers` joins two `x-tag` lines
   into one `a, b` value before the capsule sees them. A header value with a
   non-ASCII character goes to the origin only.
