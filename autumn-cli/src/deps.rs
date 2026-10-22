@@ -138,22 +138,23 @@ pub fn policy_checks(policy: &str) -> Vec<String> {
     checks
 }
 
-/// Optional checks the policy declares that the scaffolded workflow's grep
-/// cannot see.
+/// Optional checks that doctor and the scaffolded workflow list differently.
 ///
-/// Doctor parses TOML; the workflow greps, because a shell cannot parse TOML.
-/// The two agree on every spelling a person writes by hand, but a basic key
-/// carrying an escape (`["ban\u0073"]`) decodes to `bans` for one and not the
-/// other. Rather than let that diverge silently, it is reported.
-pub fn checks_invisible_to_ci(policy: &str) -> Vec<String> {
+/// Doctor parses TOML. The workflow greps, because a shell cannot parse TOML.
+/// They agree on every hand-written policy. They differ in two cases:
+///
+/// - Only TOML sees the check: an escaped key (`["ban\u0073"]`).
+/// - Only the grep sees the check: header-like text inside a string.
+pub fn derivations_disagree(policy: &str) -> Vec<String> {
     let parsed = declared_sections(policy);
     OPTIONAL_CHECKS
         .iter()
         .filter(|section| {
-            parsed.iter().any(|key| key == *section)
-                && !policy
-                    .lines()
-                    .any(|line| line_declares(code_of(line), section))
+            let by_parse = parsed.iter().any(|key| key == *section);
+            let by_scan = policy
+                .lines()
+                .any(|line| line_declares(code_of(line), section));
+            by_parse != by_scan
         })
         .map(|section| (*section).to_owned())
         .collect()
@@ -192,21 +193,12 @@ fn line_declares(code: &str, section: &str) -> bool {
         .strip_prefix("[[")
         .or_else(|| code.strip_prefix('['))
         .map_or(code, ascii_trim_start);
-    // Quoted keys: ["bans"] and ['bans'].
-    let (body, quote) = match body.chars().next() {
-        Some(q @ ('"' | '\'')) => (&body[q.len_utf8()..], Some(q)),
-        _ => (body, None),
-    };
+    // Each quote is optional on its own, as in the workflow's grep.
+    let body = body.strip_prefix(['"', '\'']).unwrap_or(body);
     let Some(rest) = body.strip_prefix(section) else {
         return false;
     };
-    let rest = match quote {
-        Some(quote) => match rest.strip_prefix(quote) {
-            Some(rest) => rest,
-            None => return false,
-        },
-        None => rest,
-    };
+    let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
     matches!(ascii_trim_start(rest).chars().next(), Some(']' | '.' | '='))
 }
 
@@ -850,15 +842,15 @@ pub fn evaluate(root: &Path) -> Evaluation {
             checks,
         };
     }
-    // A section only one of the two derivations can see means the local check
-    // list and the CI check list differ, so no verdict here predicts that gate.
-    let invisible = checks_invisible_to_ci(&policy);
-    if !invisible.is_empty() {
+    // One derivation sees a section that the other does not. The local and CI
+    // check lists differ, so doctor gives no verdict.
+    let split = derivations_disagree(&policy);
+    if !split.is_empty() {
         return Evaluation::Unavailable {
             reason: format!(
-                "{POLICY_FILE} declares {} in a spelling the CI workflow's check-list derivation cannot detect; write it as [{}]",
-                invisible.join(", "),
-                invisible.join("], [")
+                "{POLICY_FILE} gives doctor and the CI workflow different check lists for {}. Write each as a plain [{}] header. Do not put header-like text in strings.",
+                split.join(", "),
+                split.join("], [")
             ),
             checks,
         };
@@ -879,7 +871,7 @@ pub fn evaluate(root: &Path) -> Evaluation {
     // pre-check only guards the default location, so an unreadable custom path
     // reports whatever the auditor says rather than a database that is missing.
     let custom_db = policy_db_path(&policy);
-    let mtime = newest_db_mtime(&custom_db.map_or_else(default_db_dir, PathBuf::from));
+    let mtime = newest_db_mtime(&resolve_db_dir(custom_db, &root));
     if mtime.is_none() && !policy_declares_db_path(&policy) {
         return Evaluation::DatabaseMissing { checks };
     }
@@ -930,6 +922,14 @@ pub fn evaluate(root: &Path) -> Evaluation {
         db_age_days: mtime.map(|mtime| age_days(mtime, SystemTime::now())),
         auditor,
     }
+}
+
+/// The advisory database directory to age.
+///
+/// cargo-deny runs in the policy root. A relative `db-path` is therefore
+/// relative to that root, not to the process directory.
+fn resolve_db_dir(custom: Option<String>, root: &Path) -> PathBuf {
+    custom.map_or_else(default_db_dir, |path| root.join(path))
 }
 
 /// True when the policy names its own advisory database location.
@@ -1395,7 +1395,7 @@ mod tests {
             policy_checks(escaped).contains(&"bans".to_owned()),
             "the TOML parse must decode the key"
         );
-        assert_eq!(checks_invisible_to_ci(escaped), vec!["bans".to_owned()]);
+        assert_eq!(derivations_disagree(escaped), vec!["bans".to_owned()]);
 
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::write(root.path().join(POLICY_FILE), escaped).expect("policy");
@@ -1406,6 +1406,71 @@ mod tests {
             }
             other => panic!("a divergent spelling must not read as evaluable: {other:?}"),
         }
+    }
+
+    #[test]
+    fn section_text_inside_a_string_is_reported_as_a_phantom() {
+        // Issue #2572: the workflow greps, so a header quoted in prose counts
+        // for CI. The TOML parse sees one string, so doctor never checks it.
+        let phantom = "[advisories]\nignore = [\n    { id = \"RUSTSEC-2020-0071\", reason = \"\"\"\nno fix; this is prose:\n[bans]\nreview-by 2026-12-01\"\"\" },\n]\n";
+        assert_eq!(policy_checks(phantom), vec!["advisories".to_owned()]);
+        assert_eq!(derivations_disagree(phantom), vec!["bans".to_owned()]);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(POLICY_FILE), phantom).expect("policy");
+        match evaluate(root.path()) {
+            Evaluation::Unavailable { reason, .. } => {
+                assert!(reason.contains("bans"), "{reason}");
+                assert!(reason.contains("strings"), "{reason}");
+            }
+            other => panic!("a phantom section must not read as evaluable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_header_quoted_in_any_string_is_a_phantom_for_every_optional_check() {
+        for section in OPTIONAL_CHECKS {
+            for quote in ["\"\"\"", "'''"] {
+                let policy = format!(
+                    "[advisories]\nignore = [{{ id = \"X\", reason = {quote}\n[{section}]\n{quote} }}]\n"
+                );
+                assert_eq!(derivations_disagree(&policy), vec![(*section).to_owned()]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_real_header_plus_quoted_text_is_not_a_split() {
+        let policy =
+            "[bans]\n[advisories]\nignore = [{ id = \"X\", reason = \"\"\"\n[bans]\n\"\"\" }]\n";
+        assert!(derivations_disagree(policy).is_empty());
+        assert!(derivations_disagree("[advisories]\n# [bans]\n").is_empty());
+    }
+
+    #[test]
+    fn unpaired_quotes_in_a_string_match_the_grep() {
+        // The grep makes each quote optional, so `["bans']` matches it.
+        let policy = "[advisories]\nnote = \"\"\"\n[\"bans']\n\"\"\"\n";
+        assert_eq!(derivations_disagree(policy), vec!["bans".to_owned()]);
+    }
+
+    #[test]
+    fn invalid_toml_falls_back_to_the_scan_and_agrees() {
+        assert!(derivations_disagree("[bans\n[sources]\n").is_empty());
+    }
+
+    #[test]
+    fn a_relative_db_path_is_resolved_against_the_policy_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let abs = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_db_dir(Some("advisory-dbs".to_owned()), root.path()),
+            root.path().join("advisory-dbs")
+        );
+        // An absolute path stays as written.
+        let abs_path = abs.path().to_string_lossy().into_owned();
+        assert_eq!(resolve_db_dir(Some(abs_path), root.path()), abs.path());
+        assert_eq!(resolve_db_dir(None, root.path()), default_db_dir());
     }
 
     #[test]
@@ -1421,8 +1486,8 @@ mod tests {
             "['bans']\n",
         ] {
             assert!(
-                checks_invisible_to_ci(policy).is_empty(),
-                "wrongly reported as invisible: {policy:?}"
+                derivations_disagree(policy).is_empty(),
+                "wrongly reported as a disagreement: {policy:?}"
             );
         }
     }

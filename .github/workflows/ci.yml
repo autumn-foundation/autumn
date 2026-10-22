@@ -2477,6 +2477,10 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- routes::tests:: \
             | tee "$RUNNER_TEMP/cli-routes-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-routes-cov.log"
+          # Issue #2572: same gap for `deps::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deps:: \
+            | tee "$RUNNER_TEMP/cli-deps-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deps-cov.log"
           # Issue #2374: same gap for `built_artifact::`. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- built_artifact:: \
             | tee "$RUNNER_TEMP/cli-built-artifact-cov.log"
