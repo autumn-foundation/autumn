@@ -97,6 +97,53 @@ pub(super) fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Forms",
+            "Field",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, checkbox_input_with, required_password_input,
+                    select_input_with, text_input_with,
+                };
+
+                // Field wrapper v2 (#3395): hint, required marker, typed
+                // attributes, and the error state.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("handle".to_string(), vec!["is taken".to_string()]);
+                let changeset = Changeset::from_errors(
+                    serde_json::json!({
+                        "email": "",
+                        "handle": "ada",
+                        "password": "",
+                        "plan": "pro",
+                        "terms": false,
+                    }),
+                    errors,
+                );
+
+                maud::html! {
+                    (text_input_with(&changeset, "email", "Email", &FieldOptions::new()
+                        .hint("We never share your address.")
+                        .required()
+                        .autocomplete("email")
+                        .inputmode("email")
+                        .placeholder("you@example.com")))
+                    (text_input_with(&changeset, "handle", "Handle", &FieldOptions::new()
+                        .hint("Letters and digits only.")
+                        .pattern("[a-z0-9]+")))
+                    (required_password_input(&changeset, "password", "Password"))
+                    // A disabled control does not submit its value.
+                    (select_input_with(
+                        &changeset,
+                        "plan",
+                        "Plan",
+                        &[("free", "Free"), ("pro", "Pro")],
+                        &FieldOptions::new().disabled().hint("Change your plan in billing."),
+                    ))
+                    (checkbox_input_with(&changeset, "terms", "I accept the terms", &FieldOptions::new().required()))
+                }
+            }
+        },
+        story! {
             "Display",
             "Property list",
             {

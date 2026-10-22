@@ -197,6 +197,8 @@ use crate::form::{
     Changeset, IntoChangeset, decode_urlencoded_dropping_blank_optional_fields,
     validation_errors_to_map,
 };
+#[cfg(feature = "maud")]
+use crate::form::{FieldKind, FieldOptions, FieldSpec, render_field};
 
 // ── NestedChild ────────────────────────────────────────────────────
 
@@ -1419,7 +1421,7 @@ impl RowScope<'_> {
     /// error block — but with the nested `name` and a per-row-unique `id`.
     #[must_use]
     pub fn text_input(&self, sub: &str, label: &str) -> maud::Markup {
-        self.text_like_input(sub, label, false)
+        self.text_input_with(sub, label, &FieldOptions::new())
     }
 
     /// Like [`RowScope::text_input`] but adds `required` + `aria-required="true"`
@@ -1445,11 +1447,86 @@ impl RowScope<'_> {
     /// neither the client nor the server treats the template row as a real child.
     #[must_use]
     pub fn required_text_input(&self, sub: &str, label: &str) -> maud::Markup {
-        self.text_like_input(sub, label, true)
+        self.text_input_with(sub, label, &FieldOptions::new().required())
     }
 
-    /// Shared body for the text-like inputs.
-    fn text_like_input(&self, sub: &str, label: &str, required: bool) -> maud::Markup {
+    /// [`RowScope::text_input`] with a hint and typed attributes. See
+    /// [`FieldOptions`]. A required option follows the template-row rule of
+    /// [`RowScope::required_text_input`].
+    #[must_use]
+    pub fn text_input_with(
+        &self,
+        sub: &str,
+        label: &str,
+        options: &FieldOptions<'_>,
+    ) -> maud::Markup {
+        self.row_field(FieldKind::Text, sub, label, options)
+    }
+
+    /// Render a labeled row-scoped `<input type="number">` for subfield `sub`.
+    ///
+    /// Mirrors [`crate::form::number_input`] (leaving the browser-default
+    /// `step`), with the nested `name` and a per-row-unique `id`.
+    #[must_use]
+    pub fn number_input(&self, sub: &str, label: &str) -> maud::Markup {
+        self.number_input_with(sub, label, &FieldOptions::new())
+    }
+
+    /// [`RowScope::number_input`] for a required subfield. See
+    /// [`RowScope::required_text_input`] for the template-row rule.
+    #[must_use]
+    pub fn required_number_input(&self, sub: &str, label: &str) -> maud::Markup {
+        self.number_input_with(sub, label, &FieldOptions::new().required())
+    }
+
+    /// [`RowScope::number_input`] with a hint and typed attributes. See
+    /// [`FieldOptions`].
+    #[must_use]
+    pub fn number_input_with(
+        &self,
+        sub: &str,
+        label: &str,
+        options: &FieldOptions<'_>,
+    ) -> maud::Markup {
+        self.row_field(FieldKind::Number, sub, label, options)
+    }
+
+    /// Render a labeled row-scoped `<textarea>` for subfield `sub`.
+    ///
+    /// Mirrors [`crate::form::textarea_input`]: the value is emitted as the
+    /// element body, with the nested `name` and a per-row-unique `id`.
+    #[must_use]
+    pub fn textarea_input(&self, sub: &str, label: &str) -> maud::Markup {
+        self.textarea_input_with(sub, label, &FieldOptions::new())
+    }
+
+    /// [`RowScope::textarea_input`] for a required subfield. See
+    /// [`RowScope::required_text_input`] for the template-row rule.
+    #[must_use]
+    pub fn required_textarea_input(&self, sub: &str, label: &str) -> maud::Markup {
+        self.textarea_input_with(sub, label, &FieldOptions::new().required())
+    }
+
+    /// [`RowScope::textarea_input`] with a hint and typed attributes. See
+    /// [`FieldOptions`].
+    #[must_use]
+    pub fn textarea_input_with(
+        &self,
+        sub: &str,
+        label: &str,
+        options: &FieldOptions<'_>,
+    ) -> maud::Markup {
+        self.row_field(FieldKind::Textarea, sub, label, options)
+    }
+
+    /// Shared body of the row-scoped field helpers.
+    fn row_field(
+        &self,
+        kind: FieldKind,
+        sub: &str,
+        label: &str,
+        options: &FieldOptions<'_>,
+    ) -> maud::Markup {
         // Emit the client-side `required`/`aria-required` constraint only for a
         // real/submitted row that is *not* marked for destruction. A blank
         // template row (`row: None`) must stay leaveable-empty so the browser
@@ -1461,108 +1538,22 @@ impl RowScope<'_> {
         // rows before validation, so re-emitting client-side `required` on an
         // empty destroyed field would let the browser's constraint validation
         // block the next submit before the server can honor `_destroy`.
-        let required = required && self.row.is_some() && !self.is_destroyed();
-        let errors = self.errors_for(sub);
-        let has_errors = !errors.is_empty();
-        let value = self.value(sub).unwrap_or_default();
+        let unmasked = self.row.is_some() && !self.is_destroyed();
+        let masked;
+        let options = if options.is_required() && !unmasked {
+            masked = options.clone().optional();
+            &masked
+        } else {
+            options
+        };
         let name = self.field_name(sub);
         let id = self.element_id(sub);
-        let error_id = format!("{id}-error");
-        let wrapper_id = format!("{id}-field");
-
-        maud::html! {
-            div id=(wrapper_id) class="autumn-field" {
-                label for=(id) class="autumn-field__label" { (label) }
-                input
-                    type="text"
-                    id=(id)
-                    name=(name)
-                    value=(value)
-                    required[required]
-                    aria-required=[required.then_some("true")]
-                    class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                    aria-invalid=(if has_errors { "true" } else { "false" })
-                    aria-describedby=(if has_errors { error_id.as_str() } else { "" });
-                @if has_errors {
-                    div id=(error_id) role="alert" class="autumn-field__errors" {
-                        @for error in errors {
-                            p class="autumn-field__error" { (error) }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Render a labeled row-scoped `<input type="number">` for subfield `sub`.
-    ///
-    /// Mirrors [`crate::form::number_input`] (leaving the browser-default
-    /// `step`), with the nested `name` and a per-row-unique `id`.
-    #[must_use]
-    pub fn number_input(&self, sub: &str, label: &str) -> maud::Markup {
-        let errors = self.errors_for(sub);
-        let has_errors = !errors.is_empty();
-        let value = self.value(sub).unwrap_or_default();
-        let name = self.field_name(sub);
-        let id = self.element_id(sub);
-        let error_id = format!("{id}-error");
-        let wrapper_id = format!("{id}-field");
-
-        maud::html! {
-            div id=(wrapper_id) class="autumn-field" {
-                label for=(id) class="autumn-field__label" { (label) }
-                input
-                    type="number"
-                    id=(id)
-                    name=(name)
-                    value=(value)
-                    class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                    aria-invalid=(if has_errors { "true" } else { "false" })
-                    aria-describedby=(if has_errors { error_id.as_str() } else { "" });
-                @if has_errors {
-                    div id=(error_id) role="alert" class="autumn-field__errors" {
-                        @for error in errors {
-                            p class="autumn-field__error" { (error) }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Render a labeled row-scoped `<textarea>` for subfield `sub`.
-    ///
-    /// Mirrors [`crate::form::textarea_input`]: the value is emitted as the
-    /// element body, with the nested `name` and a per-row-unique `id`.
-    #[must_use]
-    pub fn textarea_input(&self, sub: &str, label: &str) -> maud::Markup {
-        let errors = self.errors_for(sub);
-        let has_errors = !errors.is_empty();
-        let value = self.value(sub).unwrap_or_default();
-        let name = self.field_name(sub);
-        let id = self.element_id(sub);
-        let error_id = format!("{id}-error");
-        let wrapper_id = format!("{id}-field");
-
-        maud::html! {
-            div id=(wrapper_id) class="autumn-field" {
-                label for=(id) class="autumn-field__label" { (label) }
-                textarea
-                    id=(id)
-                    name=(name)
-                    class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                    aria-invalid=(if has_errors { "true" } else { "false" })
-                    aria-describedby=(if has_errors { error_id.as_str() } else { "" })
-                    { (value) }
-                @if has_errors {
-                    div id=(error_id) role="alert" class="autumn-field__errors" {
-                        @for error in errors {
-                            p class="autumn-field__error" { (error) }
-                        }
-                    }
-                }
-            }
-        }
+        let spec = FieldSpec {
+            name: Some(&name),
+            value: Some(self.value(sub).unwrap_or_default()),
+            ..FieldSpec::new(kind, &id, label)
+        };
+        render_field(&spec, self.errors_for(sub), options)
     }
 
     /// Render a row-scoped `<input type="hidden">` for subfield `sub`.

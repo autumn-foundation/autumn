@@ -169,6 +169,8 @@
     )
 )]
 
+#[cfg(feature = "maud")]
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -1747,50 +1749,11 @@ fn write_escaped(input: &str, out: &mut String) {
     out.push_str(&input[start..]);
 }
 
-/// A field value, label, or error message, escaped for direct
-/// interpolation into a `maud::html!` buffer.
-///
-/// Implements [`maud::Render`] itself — rather than pre-building an owned,
-/// escaped `String` and handing it to `maud::PreEscaped` — so the escaped
-/// bytes are written straight into `html!`'s own growing output buffer.
-/// Building a separate `String` first (an earlier version of this code
-/// did that, via a `Cow`-returning `fast_escape`) means a *second* copy
-/// for any value that actually needs escaping: once into the temporary
-/// `String`, then again when `PreEscaped` hands it off. This way there is
-/// only ever the one copy `maud::escape::escape_to_string` was already
-/// doing — a `Render` impl is documented as receiving "no further
-/// escaping" from `html!`, so this fully replaces it rather than skipping
-/// it.
-///
-/// Named `esc`, not `Escaped`/`escape`: `maud_macros` sizes a `html!`
-/// block's output buffer from the *source token length* of the macro
-/// invocation, not runtime content, so a longer call spelled out at every
-/// interpolation site measurably over-reserves that buffer's initial
-/// capacity even though it's never actually grown again. A short call
-/// keeps the estimate close to what the plain, unescaped `(value)` it
-/// replaces already cost.
-#[cfg(feature = "maud")]
-struct Esc<'a>(&'a str);
-
-#[cfg(feature = "maud")]
-impl maud::Render for Esc<'_> {
-    fn render_to(&self, w: &mut String) {
-        write_escaped(self.0, w);
-    }
-}
-
-#[cfg(feature = "maud")]
-const fn esc(s: &str) -> Esc<'_> {
-    Esc(s)
-}
-
 /// Pre-escape a field name the same way `maud::html!` would, for building
-/// an `id`/`name`-derived string (`format!("{field_html}-error")`) ahead
-/// of a `maud::html!` block rather than inside one.
+/// an `id`/`name`-derived string (`{field_html}-error`).
 ///
-/// Unlike [`esc`]/[`Esc`], this has to produce an owned-or-borrowed `str`
-/// rather than write into a buffer, since the result gets concatenated via
-/// `format!` before it's ever interpolated — so it keeps the `Cow`
+/// It produces an owned-or-borrowed `str`, because the caller adds a suffix
+/// before it writes the result — so it keeps the `Cow`
 /// interface and, when there's nothing to escape (the overwhelmingly
 /// common case for a field name), returns the input completely
 /// unallocated. Escaping first and concatenating after is equivalent to
@@ -1799,17 +1762,17 @@ const fn esc(s: &str) -> Esc<'_> {
 /// escaping — see `fast_escape_matches_naive_reference` for the
 /// byte-for-byte equivalence check against a naive reference.
 #[cfg(feature = "maud")]
-fn fast_escape(input: &str) -> std::borrow::Cow<'_, str> {
+fn fast_escape(input: &str) -> Cow<'_, str> {
     if !input
         .as_bytes()
         .iter()
         .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"'))
     {
-        return std::borrow::Cow::Borrowed(input);
+        return Cow::Borrowed(input);
     }
     let mut out = String::with_capacity(input.len());
     write_escaped(input, &mut out);
-    std::borrow::Cow::Owned(out)
+    Cow::Owned(out)
 }
 
 /// Build `"{base}{suffix}"` by direct, exactly-sized concatenation instead of
@@ -1829,6 +1792,635 @@ fn concat_suffix(base: &str, suffix: &str) -> String {
     s
 }
 
+// ── Field wrapper v2 (issue #3395) ──────────────────────────────────
+
+/// Options for the `*_with` field helpers and [`FormFor::field_options`].
+///
+/// Each option is typed. There is no setter for `id`, `name`, `class`,
+/// `type`, `value` or any `aria-*` attribute. The helper sets those, so the
+/// links between the label, hint, error and control stay correct. There is no
+/// label setter. The label is a positional argument of every helper.
+///
+/// - [`hint`](Self::hint) renders `<p id="{field}-hint">` between the label
+///   and the control (after the label for a checkbox). It adds `{field}-hint`
+///   to `aria-describedby`, before the error id.
+/// - [`required`](Self::required) adds `required`, `aria-required="true"`
+///   and a visual `*` marker. The marker has `aria-hidden="true"`, so a
+///   screen reader announces "required" one time only.
+/// - The typed attributes render only on controls that use them:
+///
+/// | Option | Controls |
+/// |---|---|
+/// | `placeholder`, `inputmode` | text, password, textarea, number |
+/// | `pattern` | text, password |
+/// | `min`, `max` | number, date, datetime |
+/// | `readonly` | all except checkbox, select, file |
+/// | `autocomplete` | all except checkbox, file |
+/// | `disabled` | all |
+///
+/// - [`data`](Self::data) and [`hx`](Self::hx) add `data-*` and `hx-*`
+///   attributes. The helper adds the prefix, so the name cannot be a reserved
+///   attribute. A name must be `[a-z0-9-]` (`hx` also accepts `:`). The setter
+///   drops a name that does not match, and a `data-autumn-*` name (Autumn uses
+///   these). An htmx helper drops an `hx-*` name that it sets. If you set one
+///   name two times, the last value applies.
+///
+/// The browser does not submit the value of a `disabled` control.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::form::{Changeset, FieldOptions, text_input_with};
+///
+/// #[derive(serde::Serialize)]
+/// struct Signup { email: String }
+///
+/// let changeset = Changeset::new(Signup { email: String::new() });
+/// let html = text_input_with(
+///     &changeset,
+///     "email",
+///     "Email",
+///     &FieldOptions::new()
+///         .hint("We never share it.")
+///         .required()
+///         .autocomplete("email")
+///         .data("test-id", "signup-email"),
+/// )
+/// .into_string();
+///
+/// assert!(html.contains(r#"aria-describedby="email-hint""#));
+/// assert!(html.contains(r#"<p id="email-hint" class="autumn-field__hint">"#));
+/// assert!(html.contains(r#"autocomplete="email""#));
+/// assert!(html.contains(r#"data-test-id="signup-email""#));
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldOptions<'a> {
+    hint: Option<Cow<'a, str>>,
+    required: bool,
+    disabled: bool,
+    readonly: bool,
+    placeholder: Option<Cow<'a, str>>,
+    autocomplete: Option<Cow<'a, str>>,
+    inputmode: Option<Cow<'a, str>>,
+    pattern: Option<Cow<'a, str>>,
+    min: Option<Cow<'a, str>>,
+    max: Option<Cow<'a, str>>,
+    /// `(prefix, name, value)`. The setters check `name`.
+    extra: Vec<(&'static str, Cow<'a, str>, Cow<'a, str>)>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> FieldOptions<'a> {
+    /// No hint, not required, no extra attributes.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            hint: None,
+            required: false,
+            disabled: false,
+            readonly: false,
+            placeholder: None,
+            autocomplete: None,
+            inputmode: None,
+            pattern: None,
+            min: None,
+            max: None,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Show `text` as a hint. Add the hint `id` to `aria-describedby`.
+    #[must_use]
+    pub fn hint(mut self, text: impl Into<Cow<'a, str>>) -> Self {
+        self.hint = Some(text.into());
+        self
+    }
+
+    /// Mark the field required: `required`, `aria-required="true"` and the
+    /// visual marker.
+    #[must_use]
+    pub const fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Add `disabled`. The browser does not submit the value.
+    #[must_use]
+    pub const fn disabled(mut self) -> Self {
+        self.disabled = true;
+        self
+    }
+
+    /// Add `readonly`.
+    #[must_use]
+    pub const fn readonly(mut self) -> Self {
+        self.readonly = true;
+        self
+    }
+
+    /// Set `placeholder`. Use [`hint`](Self::hint) for instructions. The
+    /// browser removes the placeholder when the user types.
+    #[must_use]
+    pub fn placeholder(mut self, text: impl Into<Cow<'a, str>>) -> Self {
+        self.placeholder = Some(text.into());
+        self
+    }
+
+    /// Set `autocomplete` (for example `"email"` or `"current-password"`).
+    #[must_use]
+    pub fn autocomplete(mut self, token: impl Into<Cow<'a, str>>) -> Self {
+        self.autocomplete = Some(token.into());
+        self
+    }
+
+    /// Set `inputmode` (for example `"numeric"`).
+    #[must_use]
+    pub fn inputmode(mut self, mode: impl Into<Cow<'a, str>>) -> Self {
+        self.inputmode = Some(mode.into());
+        self
+    }
+
+    /// Set `pattern`.
+    #[must_use]
+    pub fn pattern(mut self, regex: impl Into<Cow<'a, str>>) -> Self {
+        self.pattern = Some(regex.into());
+        self
+    }
+
+    /// Set `min`.
+    #[must_use]
+    pub fn min(mut self, min: impl Into<Cow<'a, str>>) -> Self {
+        self.min = Some(min.into());
+        self
+    }
+
+    /// Set `max`.
+    #[must_use]
+    pub fn max(mut self, max: impl Into<Cow<'a, str>>) -> Self {
+        self.max = Some(max.into());
+        self
+    }
+
+    /// Add `data-{name}="{value}"`. The setter drops `name` if it is not
+    /// `[a-z0-9-]+` or if it starts with `autumn-`.
+    #[must_use]
+    pub fn data(self, name: impl Into<Cow<'a, str>>, value: impl Into<Cow<'a, str>>) -> Self {
+        let name = name.into();
+        if name.starts_with("autumn-") || !is_valid_extra_name(&name, false) {
+            return self;
+        }
+        self.with_extra("data-", name, value.into())
+    }
+
+    /// Add `hx-{name}="{value}"`, for example `.hx("indicator", "#spin")`.
+    /// The setter drops `name` if it is not `[a-z0-9-:]+`.
+    #[must_use]
+    pub fn hx(self, name: impl Into<Cow<'a, str>>, value: impl Into<Cow<'a, str>>) -> Self {
+        let name = name.into();
+        if !is_valid_extra_name(&name, true) {
+            return self;
+        }
+        self.with_extra("hx-", name, value.into())
+    }
+
+    /// Whether [`required`](Self::required) is set.
+    pub(crate) const fn is_required(&self) -> bool {
+        self.required
+    }
+
+    /// Clear [`required`](Self::required).
+    pub(crate) const fn optional(mut self) -> Self {
+        self.required = false;
+        self
+    }
+
+    /// Store an extra attribute. A second value for one name replaces the
+    /// first, so the output has no duplicate attribute.
+    fn with_extra(mut self, prefix: &'static str, name: Cow<'a, str>, value: Cow<'a, str>) -> Self {
+        if let Some(slot) = self
+            .extra
+            .iter_mut()
+            .find(|(p, n, _)| *p == prefix && *n == name)
+        {
+            slot.2 = value;
+        } else {
+            self.extra.push((prefix, name, value));
+        }
+        self
+    }
+}
+
+/// `true` when `name` is a safe `data-*` / `hx-*` suffix. The alphabet has
+/// no space, `=`, `"` or `>`, so the name cannot end the attribute.
+#[cfg(feature = "maud")]
+fn is_valid_extra_name(name: &str, allow_colon: bool) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || (allow_colon && b == b':')
+        })
+}
+
+/// The `hx-*` names the htmx helpers set. A passthrough cannot replace them:
+/// a caller `hx-params` would send `_submit_token` with the validation POST
+/// (issue #1360).
+#[cfg(feature = "maud")]
+const HTMX_OWNED: &[&str] = &["post", "trigger", "target", "swap", "include", "params"];
+
+/// The element a field helper renders.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldKind {
+    Text,
+    Password,
+    Textarea,
+    Checkbox,
+    Number,
+    Date,
+    DateTime,
+    Select,
+    File,
+}
+
+#[cfg(feature = "maud")]
+impl FieldKind {
+    const fn input_type(self) -> Option<&'static str> {
+        match self {
+            Self::Text => Some("text"),
+            Self::Password => Some("password"),
+            Self::Checkbox => Some("checkbox"),
+            Self::Number => Some("number"),
+            Self::Date => Some("date"),
+            Self::DateTime => Some("datetime-local"),
+            Self::File => Some("file"),
+            Self::Textarea | Self::Select => None,
+        }
+    }
+
+    /// `placeholder` and `inputmode`.
+    const fn takes_text_entry(self) -> bool {
+        matches!(
+            self,
+            Self::Text | Self::Password | Self::Textarea | Self::Number
+        )
+    }
+
+    const fn takes_pattern(self) -> bool {
+        matches!(self, Self::Text | Self::Password)
+    }
+
+    const fn takes_range(self) -> bool {
+        matches!(self, Self::Number | Self::Date | Self::DateTime)
+    }
+
+    const fn takes_readonly(self) -> bool {
+        !matches!(self, Self::Checkbox | Self::Select | Self::File)
+    }
+
+    const fn takes_autocomplete(self) -> bool {
+        !matches!(self, Self::Checkbox | Self::File)
+    }
+}
+
+/// The `<option>` pairs of a select, borrowed or owned.
+#[cfg(feature = "maud")]
+#[derive(Clone, Copy)]
+pub(crate) enum SelectChoices<'a> {
+    None,
+    Borrowed(&'a [(&'a str, &'a str)]),
+    Owned(&'a [(String, String)]),
+}
+
+/// What [`render_field`] renders. The helpers fill it from the changeset.
+#[cfg(feature = "maud")]
+pub(crate) struct FieldSpec<'a> {
+    pub(crate) kind: FieldKind,
+    /// The `id`, and the base of the `-field`, `-hint` and `-error` ids.
+    pub(crate) field: &'a str,
+    /// The `name`, when it is not `field` (a nested row).
+    pub(crate) name: Option<&'a str>,
+    pub(crate) label: &'a str,
+    /// The `value` attribute, or the textarea body. `None` for password and
+    /// file (never pre-filled) and for select.
+    pub(crate) value: Option<&'a str>,
+    /// The current value a select marks `selected`.
+    pub(crate) current: &'a str,
+    pub(crate) checked: bool,
+    pub(crate) step: Option<&'a str>,
+    pub(crate) choices: SelectChoices<'a>,
+    /// `(validate_url, token_field)` for the htmx inline-validation input.
+    pub(crate) htmx: Option<(&'a str, &'a str)>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> FieldSpec<'a> {
+    pub(crate) const fn new(kind: FieldKind, field: &'a str, label: &'a str) -> Self {
+        Self {
+            kind,
+            field,
+            name: None,
+            label,
+            value: None,
+            current: "",
+            checked: false,
+            step: None,
+            choices: SelectChoices::None,
+            htmx: None,
+        }
+    }
+}
+
+/// Append ` {name}="{value}"` with the value escaped.
+#[cfg(feature = "maud")]
+fn push_attr(out: &mut String, name: &str, value: &str) {
+    out.push(' ');
+    out.push_str(name);
+    out.push_str("=\"");
+    write_escaped(value, out);
+    out.push('"');
+}
+
+/// The required marker. `aria-hidden` stops a second "required" from a
+/// screen reader: `aria-required` already gives the state.
+#[cfg(feature = "maud")]
+const REQUIRED_MARKER: &str = r#"<span class="autumn-field__required" aria-hidden="true">*</span>"#;
+
+/// Append the `<label>` (with the required marker when `required`).
+#[cfg(feature = "maud")]
+fn push_label(out: &mut String, field_html: &str, label: &str, required: bool) {
+    out.push_str(r#"<label for=""#);
+    out.push_str(field_html);
+    out.push_str(r#"" class="autumn-field__label">"#);
+    write_escaped(label, out);
+    if required {
+        out.push_str(REQUIRED_MARKER);
+    }
+    out.push_str("</label>");
+}
+
+/// Append the typed options and the `data-*`/`hx-*` passthrough. `reserved`
+/// lists the `hx-*` names the helper already set.
+#[cfg(feature = "maud")]
+fn push_option_attrs(
+    out: &mut String,
+    kind: FieldKind,
+    opts: &FieldOptions<'_>,
+    reserved: &[&str],
+) {
+    let typed = [
+        (
+            "placeholder",
+            opts.placeholder.as_deref(),
+            kind.takes_text_entry(),
+        ),
+        (
+            "autocomplete",
+            opts.autocomplete.as_deref(),
+            kind.takes_autocomplete(),
+        ),
+        (
+            "inputmode",
+            opts.inputmode.as_deref(),
+            kind.takes_text_entry(),
+        ),
+        ("pattern", opts.pattern.as_deref(), kind.takes_pattern()),
+        ("min", opts.min.as_deref(), kind.takes_range()),
+        ("max", opts.max.as_deref(), kind.takes_range()),
+    ];
+    for (name, value, accepted) in typed {
+        if accepted && let Some(value) = value {
+            push_attr(out, name, value);
+        }
+    }
+    if opts.disabled {
+        out.push_str(" disabled");
+    }
+    if opts.readonly && kind.takes_readonly() {
+        out.push_str(" readonly");
+    }
+    for (prefix, name, value) in &opts.extra {
+        if *prefix == "hx-" && reserved.contains(&name.as_ref()) {
+            continue;
+        }
+        out.push(' ');
+        out.push_str(prefix);
+        out.push_str(name);
+        out.push_str("=\"");
+        write_escaped(value, out);
+        out.push('"');
+    }
+}
+
+/// Append `<p id="{field}-hint">`.
+#[cfg(feature = "maud")]
+fn push_hint(out: &mut String, field_html: &str, hint: &str) {
+    out.push_str(r#"<p id=""#);
+    out.push_str(field_html);
+    out.push_str(r#"-hint" class="autumn-field__hint">"#);
+    write_escaped(hint, out);
+    out.push_str("</p>");
+}
+
+/// Append the `role="alert"` error block.
+#[cfg(feature = "maud")]
+fn push_errors(out: &mut String, field_html: &str, errors: &[String]) {
+    out.push_str(r#"<div id=""#);
+    out.push_str(field_html);
+    out.push_str(r#"-error" role="alert" class="autumn-field__errors">"#);
+    for error in errors {
+        out.push_str(r#"<p class="autumn-field__error">"#);
+        write_escaped(error, out);
+        out.push_str("</p>");
+    }
+    out.push_str("</div>");
+}
+
+/// The value of `aria-describedby`: the hint id, then the error id.
+/// `None` when the field has neither, so the attribute is not emitted.
+#[cfg(feature = "maud")]
+fn described_by(field_html: &str, has_hint: bool, has_errors: bool) -> Option<String> {
+    match (has_hint, has_errors) {
+        (false, false) => None,
+        (true, false) => Some(concat_suffix(field_html, "-hint")),
+        (false, true) => Some(concat_suffix(field_html, "-error")),
+        (true, true) => {
+            let mut ids =
+                String::with_capacity(field_html.len().saturating_mul(2).saturating_add(12));
+            ids.push_str(field_html);
+            ids.push_str("-hint ");
+            ids.push_str(field_html);
+            ids.push_str("-error");
+            Some(ids)
+        }
+    }
+}
+
+/// Render one field: wrapper, label, hint, control and errors.
+///
+/// Every changeset helper, every [`FieldControl`] arm of [`form_for`] and the
+/// nested-row helpers use this function, so all wrappers are the same. This
+/// function writes the markup directly, because maud needs static attribute
+/// names and the passthrough names are dynamic. Each value goes through
+/// [`write_escaped`], the same escape maud uses.
+#[cfg(feature = "maud")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear writer for the whole field; splitting it hides the attribute order"
+)]
+pub(crate) fn render_field(
+    spec: &FieldSpec<'_>,
+    errors: &[String],
+    opts: &FieldOptions<'_>,
+) -> maud::Markup {
+    let kind = spec.kind;
+    let has_errors = !errors.is_empty();
+    let hint = opts.hint.as_deref();
+    let field_html = fast_escape(spec.field);
+    let field_html = field_html.as_ref();
+    let describedby = described_by(field_html, hint.is_some(), has_errors);
+
+    let errors_len: usize = errors.iter().map(|e| e.len().saturating_add(40)).sum();
+    let mut out = String::with_capacity(
+        360usize
+            .saturating_add(field_html.len().saturating_mul(6))
+            .saturating_add(spec.label.len())
+            .saturating_add(spec.value.map_or(0, str::len))
+            .saturating_add(hint.map_or(0, str::len))
+            .saturating_add(errors_len),
+    );
+
+    out.push_str(r#"<div id=""#);
+    out.push_str(field_html);
+    out.push_str(r#"-field" class=""#);
+    out.push_str(if kind == FieldKind::Checkbox {
+        "autumn-field autumn-field--checkbox"
+    } else {
+        "autumn-field"
+    });
+    out.push('"');
+    if spec.htmx.is_some() {
+        out.push_str(r#" data-autumn-field-wrapper=""#);
+        out.push_str(field_html);
+        out.push('"');
+    }
+    out.push('>');
+
+    // A checkbox shows its box first, then the label. Other controls show
+    // the label and the hint first, so the user reads the hint before typing.
+    if kind != FieldKind::Checkbox {
+        push_label(&mut out, field_html, spec.label, opts.required);
+        if let Some(hint) = hint {
+            push_hint(&mut out, field_html, hint);
+        }
+    }
+
+    let tag = match kind {
+        FieldKind::Textarea => "textarea",
+        FieldKind::Select => "select",
+        _ => "input",
+    };
+    out.push('<');
+    out.push_str(tag);
+    if let Some(input_type) = kind.input_type() {
+        push_attr(&mut out, "type", input_type);
+    }
+    out.push_str(r#" id=""#);
+    out.push_str(field_html);
+    out.push('"');
+    if let Some(name) = spec.name {
+        push_attr(&mut out, "name", name);
+    } else {
+        out.push_str(r#" name=""#);
+        out.push_str(field_html);
+        out.push('"');
+    }
+    if kind == FieldKind::Checkbox {
+        out.push_str(r#" value="true""#);
+        if spec.checked {
+            out.push_str(" checked");
+        }
+    } else if kind.input_type().is_some()
+        && let Some(value) = spec.value
+    {
+        push_attr(&mut out, "value", value);
+    }
+    if let Some(step) = spec.step {
+        push_attr(&mut out, "step", step);
+    }
+    if opts.required {
+        out.push_str(r#" required aria-required="true""#);
+    }
+    out.push_str(if has_errors {
+        r#" class="autumn-field__input autumn-field__input--invalid" aria-invalid="true""#
+    } else {
+        r#" class="autumn-field__input" aria-invalid="false""#
+    });
+    if let Some(ids) = &describedby {
+        out.push_str(r#" aria-describedby=""#);
+        out.push_str(ids);
+        out.push('"');
+    }
+    let reserved: &[&str] = if let Some((validate_url, token_field)) = spec.htmx {
+        push_attr(&mut out, "hx-post", validate_url);
+        out.push_str(
+            r#" hx-trigger="change" hx-target="closest [data-autumn-field-wrapper]" hx-swap="outerHTML" hx-include="closest form" hx-params="not "#,
+        );
+        write_escaped(token_field, &mut out);
+        out.push('"');
+        HTMX_OWNED
+    } else {
+        &[]
+    };
+    push_option_attrs(&mut out, kind, opts, reserved);
+    out.push('>');
+
+    match kind {
+        FieldKind::Textarea => {
+            write_escaped(spec.value.unwrap_or_default(), &mut out);
+            out.push_str("</textarea>");
+        }
+        FieldKind::Select => {
+            let mut push_option = |value: &str, label: &str| {
+                out.push_str("<option");
+                push_attr(&mut out, "value", value);
+                if value == spec.current {
+                    out.push_str(" selected");
+                }
+                out.push('>');
+                write_escaped(label, &mut out);
+                out.push_str("</option>");
+            };
+            match spec.choices {
+                SelectChoices::None => {}
+                SelectChoices::Borrowed(choices) => {
+                    for (value, label) in choices {
+                        push_option(value, label);
+                    }
+                }
+                SelectChoices::Owned(choices) => {
+                    for (value, label) in choices {
+                        push_option(value, label);
+                    }
+                }
+            }
+            out.push_str("</select>");
+        }
+        _ => {}
+    }
+
+    if kind == FieldKind::Checkbox {
+        push_label(&mut out, field_html, spec.label, opts.required);
+        if let Some(hint) = hint {
+            push_hint(&mut out, field_html, hint);
+        }
+    }
+    if has_errors {
+        push_errors(&mut out, field_html, errors);
+    }
+    out.push_str("</div>");
+    maud::PreEscaped(out)
+}
+
 /// Render a labeled `<input type="text">` tied to a changeset field.
 ///
 /// - Sets `name` and `id` to `field`
@@ -1845,36 +2437,24 @@ pub fn text_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = changeset.field_value(field).unwrap_or_default();
-    let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
-    let wrapper_id = concat_suffix(&field_html, "-field");
-    let field_pe = maud::PreEscaped(field_html.as_ref());
-    let wrapper_pe = maud::PreEscaped(&wrapper_id);
-    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
+    text_input_with(changeset, field, label, &FieldOptions::new())
+}
 
-    maud::html! {
-        div id=(wrapper_pe) class="autumn-field" {
-            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
-            input
-                type="text"
-                id=(field_pe)
-                name=(field_pe)
-                value=(esc(&value))
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(aria_pe);
-            @if has_errors {
-                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (esc(error)) }
-                    }
-                }
-            }
-        }
-    }
+/// [`text_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn text_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset.field_value(field).unwrap_or_default();
+    let spec = FieldSpec {
+        value: Some(&value),
+        ..FieldSpec::new(FieldKind::Text, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Render a labeled `<input type="text">` with htmx inline-validation attributes.
@@ -1986,40 +2566,38 @@ pub fn text_input_htmx_with_token_field<T: Serialize>(
     validate_url: &str,
     token_field: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
-    let target = "closest [data-autumn-field-wrapper]";
-    let hx_params = format!("not {token_field}");
+    text_input_htmx_with(
+        changeset,
+        field,
+        label,
+        validate_url,
+        token_field,
+        &FieldOptions::new(),
+    )
+}
 
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" data-autumn-field-wrapper=(field) {
-            label for=(field) class="autumn-field__label" { (label) }
-            input
-                type="text"
-                id=(field)
-                name=(field)
-                value=(value)
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""))
-                hx-post=(validate_url)
-                hx-trigger="change"
-                hx-target=(target)
-                hx-swap="outerHTML"
-                hx-include="closest form"
-                hx-params=(hx_params);
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
+/// [`text_input_htmx_with_token_field`] with a hint and typed attributes.
+///
+/// See [`FieldOptions`]. The helper keeps its own `hx-post`, `hx-trigger`,
+/// `hx-target`, `hx-swap`, `hx-include` and `hx-params`, and drops a
+/// passthrough with one of these names.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn text_input_htmx_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    validate_url: &str,
+    token_field: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset.field_value(field).unwrap_or_default();
+    let spec = FieldSpec {
+        value: Some(&value),
+        htmx: Some((validate_url, token_field)),
+        ..FieldSpec::new(FieldKind::Text, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Like [`text_input_htmx`] but for a required field: adds `required` and
@@ -2074,42 +2652,14 @@ pub fn required_text_input_htmx_with_token_field<T: Serialize>(
     validate_url: &str,
     token_field: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
-    let target = "closest [data-autumn-field-wrapper]";
-    let hx_params = format!("not {token_field}");
-
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" data-autumn-field-wrapper=(field) {
-            label for=(field) class="autumn-field__label" { (label) }
-            input
-                type="text"
-                id=(field)
-                name=(field)
-                value=(value)
-                required
-                aria-required="true"
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""))
-                hx-post=(validate_url)
-                hx-trigger="change"
-                hx-target=(target)
-                hx-swap="outerHTML"
-                hx-include="closest form"
-                hx-params=(hx_params);
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
+    text_input_htmx_with(
+        changeset,
+        field,
+        label,
+        validate_url,
+        token_field,
+        &FieldOptions::new().required(),
+    )
 }
 
 /// Render a `<button type="submit">` with `label`.
@@ -2137,34 +2687,32 @@ pub fn password_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
-    let wrapper_id = concat_suffix(&field_html, "-field");
-    let field_pe = maud::PreEscaped(field_html.as_ref());
-    let wrapper_pe = maud::PreEscaped(&wrapper_id);
-    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
+    password_input_with(changeset, field, label, &FieldOptions::new())
+}
 
-    maud::html! {
-        div id=(wrapper_pe) class="autumn-field" {
-            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
-            input
-                type="password"
-                id=(field_pe)
-                name=(field_pe)
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(aria_pe);
-            @if has_errors {
-                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (esc(error)) }
-                    }
-                }
-            }
-        }
-    }
+/// [`password_input`] for a required field. See [`required_text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_password_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    password_input_with(changeset, field, label, &FieldOptions::new().required())
+}
+
+/// [`password_input`] with a hint and typed attributes. See [`FieldOptions`].
+/// The value is never rendered.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn password_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let spec = FieldSpec::new(FieldKind::Password, field, label);
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Render a labeled `<textarea>` tied to a changeset field.
@@ -2179,35 +2727,35 @@ pub fn textarea_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = changeset.field_value(field).unwrap_or_default();
-    let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
-    let wrapper_id = concat_suffix(&field_html, "-field");
-    let field_pe = maud::PreEscaped(field_html.as_ref());
-    let wrapper_pe = maud::PreEscaped(&wrapper_id);
-    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
+    textarea_input_with(changeset, field, label, &FieldOptions::new())
+}
 
-    maud::html! {
-        div id=(wrapper_pe) class="autumn-field" {
-            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
-            textarea
-                id=(field_pe)
-                name=(field_pe)
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(aria_pe)
-                { (esc(&value)) }
-            @if has_errors {
-                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (esc(error)) }
-                    }
-                }
-            }
-        }
-    }
+/// [`textarea_input`] for a required field. See [`required_text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_textarea_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    textarea_input_with(changeset, field, label, &FieldOptions::new().required())
+}
+
+/// [`textarea_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn textarea_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset.field_value(field).unwrap_or_default();
+    let spec = FieldSpec {
+        value: Some(&value),
+        ..FieldSpec::new(FieldKind::Textarea, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Extract one field's value from a URL-encoded form body, without
@@ -2372,7 +2920,14 @@ pub fn rich_text_area<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None, false, &RichTextLabels::new())
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        None,
+        &RichTextLabels::new(),
+        &FieldOptions::new(),
+    )
 }
 
 /// Like [`rich_text_area`] but with caller-supplied chrome labels, for
@@ -2385,7 +2940,48 @@ pub fn rich_text_area_with_labels<T: Serialize>(
     label: &str,
     labels: &RichTextLabels<'_>,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None, false, labels)
+    rich_text_area_inner(changeset, field, label, None, labels, &FieldOptions::new())
+}
+
+/// [`rich_text_area_with_labels`] with typed attributes. See
+/// [`FieldOptions`]. A [`FieldOptions::hint`] replaces the chrome hint text
+/// ([`RichTextLabels::hint`]) and keeps its `{field}-hint` id.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    labels: &RichTextLabels<'_>,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(changeset, field, label, None, labels, options)
+}
+
+/// [`rich_text_area_htmx_with_token_field_with_labels`] with typed
+/// attributes.
+///
+/// See [`rich_text_area_with`]. The helper keeps its own `hx-*`
+/// preview attributes and drops a passthrough with one of these names.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_htmx_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    token_field: &str,
+    labels: &RichTextLabels<'_>,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        Some((preview_url, token_field)),
+        labels,
+        options,
+    )
 }
 
 /// Render a [`rich_text_area`] with an htmx-driven live preview pane.
@@ -2486,8 +3082,8 @@ pub fn rich_text_area_htmx_with_token_field<T: Serialize>(
         field,
         label,
         Some((preview_url, token_field)),
-        false,
         &RichTextLabels::new(),
+        &FieldOptions::new(),
     )
 }
 
@@ -2509,8 +3105,8 @@ pub fn rich_text_area_htmx_with_token_field_with_labels<T: Serialize>(
         field,
         label,
         Some((preview_url, token_field)),
-        false,
         labels,
+        &FieldOptions::new(),
     )
 }
 
@@ -2534,7 +3130,14 @@ pub fn required_rich_text_area<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None, true, &RichTextLabels::new())
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        None,
+        &RichTextLabels::new(),
+        &FieldOptions::new().required(),
+    )
 }
 
 /// Like [`required_rich_text_area`] but with caller-supplied chrome labels;
@@ -2547,7 +3150,14 @@ pub fn required_rich_text_area_with_labels<T: Serialize>(
     label: &str,
     labels: &RichTextLabels<'_>,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None, true, labels)
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        None,
+        labels,
+        &FieldOptions::new().required(),
+    )
 }
 
 /// Render a **required** Markdown editor with an htmx-driven live preview.
@@ -2612,8 +3222,8 @@ pub fn required_rich_text_area_htmx_with_token_field<T: Serialize>(
         field,
         label,
         Some((preview_url, token_field)),
-        true,
         &RichTextLabels::new(),
+        &FieldOptions::new().required(),
     )
 }
 
@@ -2635,8 +3245,8 @@ pub fn required_rich_text_area_htmx_with_token_field_with_labels<T: Serialize>(
         field,
         label,
         Some((preview_url, token_field)),
-        true,
         labels,
+        &FieldOptions::new().required(),
     )
 }
 
@@ -2650,9 +3260,10 @@ fn rich_text_area_inner<T: Serialize>(
     field: &str,
     label: &str,
     preview: Option<(&str, &str)>,
-    required: bool,
     labels: &RichTextLabels<'_>,
+    options: &FieldOptions<'_>,
 ) -> maud::Markup {
+    let required = options.required;
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
@@ -2667,12 +3278,46 @@ fn rich_text_area_inner<T: Serialize>(
     } else {
         hint_id.clone()
     };
-    let preview_target = format!("#{preview_id}");
-    let hx_params = preview.map(|(_, token_field)| format!("not {token_field}"));
+    let hint = options.hint.as_deref().unwrap_or(labels.hint);
+
+    // The editor is written directly, so the `data-*`/`hx-*` passthrough
+    // (dynamic attribute names) can go on it.
+    let mut editor = String::with_capacity(320usize.saturating_add(value.len()));
+    editor.push_str("<textarea");
+    push_attr(&mut editor, "id", field);
+    push_attr(&mut editor, "name", field);
+    editor.push_str(r#" rows="12""#);
+    editor.push_str(if has_errors {
+        r#" class="autumn-field__input autumn-rich-text__editor autumn-field__input--invalid" aria-invalid="true""#
+    } else {
+        r#" class="autumn-field__input autumn-rich-text__editor" aria-invalid="false""#
+    });
+    push_attr(&mut editor, "aria-describedby", &described_by);
+    if required {
+        editor.push_str(r#" required aria-required="true""#);
+    }
+    let reserved: &[&str] = if let Some((url, token_field)) = preview {
+        push_attr(&mut editor, "hx-post", url);
+        editor.push_str(r##" hx-trigger="keyup changed delay:400ms, change" hx-target="#"##);
+        write_escaped(&preview_id, &mut editor);
+        editor.push_str(r#"" hx-swap="innerHTML" hx-include="closest form" hx-params="not "#);
+        write_escaped(token_field, &mut editor);
+        editor.push('"');
+        HTMX_OWNED
+    } else {
+        &[]
+    };
+    push_option_attrs(&mut editor, FieldKind::Textarea, options, reserved);
+    editor.push('>');
+    write_escaped(&value, &mut editor);
+    editor.push_str("</textarea>");
 
     maud::html! {
         div id=(wrapper_id) class="autumn-field autumn-rich-text" data-autumn-field-wrapper=(field) {
-            label for=(field) class="autumn-field__label" { (label) }
+            label for=(field) class="autumn-field__label" {
+                (label)
+                @if required { (maud::PreEscaped(REQUIRED_MARKER)) }
+            }
             div class="autumn-rich-text__toolbar" role="group" aria-label=(labels.toolbar_group) {
                 @for (control, syntax) in labels.controls {
                     span class="autumn-rich-text__toolbar-item" {
@@ -2681,23 +3326,8 @@ fn rich_text_area_inner<T: Serialize>(
                     }
                 }
             }
-            textarea
-                id=(field)
-                name=(field)
-                rows="12"
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-rich-text__editor autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input autumn-rich-text__editor") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(described_by)
-                required[required]
-                aria-required=[required.then_some("true")]
-                hx-post=[preview.map(|(url, _)| url)]
-                hx-trigger=[preview.map(|_| "keyup changed delay:400ms, change")]
-                hx-target=[preview.map(|_| preview_target.as_str())]
-                hx-swap=[preview.map(|_| "innerHTML")]
-                hx-include=[preview.map(|_| "closest form")]
-                hx-params=[hx_params.as_deref()]
-                { (value) }
-            p id=(hint_id) class="autumn-rich-text__hint" { (labels.hint) }
+            (maud::PreEscaped(editor))
+            p id=(hint_id) class="autumn-rich-text__hint" { (hint) }
             @if has_errors {
                 div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
@@ -2758,33 +3388,7 @@ pub fn required_text_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
-
-    maud::html! {
-        div id=(wrapper_id) {
-            label for=(field) { (label) }
-            input
-                type="text"
-                id=(field)
-                name=(field)
-                value=(value)
-                required
-                aria-required="true"
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" {
-                    @for error in errors {
-                        p { (error) }
-                    }
-                }
-            }
-        }
-    }
+    text_input_with(changeset, field, label, &FieldOptions::new().required())
 }
 
 /// Render a labeled `<input type="checkbox">` tied to a `bool` changeset field.
@@ -2826,37 +3430,35 @@ pub fn checkbox_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let checked = changeset.field_value(field).as_deref() == Some("true");
-    let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
-    let wrapper_id = concat_suffix(&field_html, "-field");
-    let field_pe = maud::PreEscaped(field_html.as_ref());
-    let wrapper_pe = maud::PreEscaped(&wrapper_id);
-    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
+    checkbox_input_with(changeset, field, label, &FieldOptions::new())
+}
 
-    maud::html! {
-        div id=(wrapper_pe) class="autumn-field" {
-            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
-            input
-                type="checkbox"
-                id=(field_pe)
-                name=(field_pe)
-                value="true"
-                checked[checked]
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(aria_pe);
-            @if has_errors {
-                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (esc(error)) }
-                    }
-                }
-            }
-        }
-    }
+/// [`checkbox_input`] for a box the user must check (for example "I accept
+/// the terms"). See [`required_text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_checkbox_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    checkbox_input_with(changeset, field, label, &FieldOptions::new().required())
+}
+
+/// [`checkbox_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn checkbox_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let spec = FieldSpec {
+        checked: changeset.field_value(field).as_deref() == Some("true"),
+        ..FieldSpec::new(FieldKind::Checkbox, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Render a labeled `<input type="number">` tied to a numeric changeset field
@@ -2875,37 +3477,26 @@ pub fn number_input<T: Serialize>(
     label: &str,
     step: Option<&str>,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = changeset.field_value(field).unwrap_or_default();
-    let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
-    let wrapper_id = concat_suffix(&field_html, "-field");
-    let field_pe = maud::PreEscaped(field_html.as_ref());
-    let wrapper_pe = maud::PreEscaped(&wrapper_id);
-    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
+    number_input_with(changeset, field, label, step, &FieldOptions::new())
+}
 
-    maud::html! {
-        div id=(wrapper_pe) class="autumn-field" {
-            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
-            input
-                type="number"
-                id=(field_pe)
-                name=(field_pe)
-                value=(esc(&value))
-                step=[step]
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(aria_pe);
-            @if has_errors {
-                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (esc(error)) }
-                    }
-                }
-            }
-        }
-    }
+/// [`number_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn number_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    step: Option<&str>,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset.field_value(field).unwrap_or_default();
+    let spec = FieldSpec {
+        value: Some(&value),
+        step,
+        ..FieldSpec::new(FieldKind::Number, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Render a labeled `<input type="number">` for a required numeric field.
@@ -2921,35 +3512,13 @@ pub fn required_number_input<T: Serialize>(
     label: &str,
     step: Option<&str>,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
-
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
-            input
-                type="number"
-                id=(field)
-                name=(field)
-                value=(value)
-                step=[step]
-                required
-                aria-required="true"
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
+    number_input_with(
+        changeset,
+        field,
+        label,
+        step,
+        &FieldOptions::new().required(),
+    )
 }
 
 /// Normalize a stored date/datetime string into `YYYY-MM-DD`, the shape the
@@ -3308,36 +3877,24 @@ pub fn date_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
-    let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
-    let wrapper_id = concat_suffix(&field_html, "-field");
-    let field_pe = maud::PreEscaped(field_html.as_ref());
-    let wrapper_pe = maud::PreEscaped(&wrapper_id);
-    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
+    date_input_with(changeset, field, label, &FieldOptions::new())
+}
 
-    maud::html! {
-        div id=(wrapper_pe) class="autumn-field" {
-            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
-            input
-                type="date"
-                id=(field_pe)
-                name=(field_pe)
-                value=(esc(&value))
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(aria_pe);
-            @if has_errors {
-                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (esc(error)) }
-                    }
-                }
-            }
-        }
-    }
+/// [`date_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn date_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
+    let spec = FieldSpec {
+        value: Some(&value),
+        ..FieldSpec::new(FieldKind::Date, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Render a labeled `<input type="date">` for a required field.
@@ -3352,34 +3909,7 @@ pub fn required_date_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
-
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
-            input
-                type="date"
-                id=(field)
-                name=(field)
-                value=(value)
-                required
-                aria-required="true"
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
+    date_input_with(changeset, field, label, &FieldOptions::new().required())
 }
 
 /// Render a labeled `<input type="datetime-local">` tied to a changeset
@@ -3425,33 +3955,25 @@ pub fn datetime_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
+    datetime_input_with(changeset, field, label, &FieldOptions::new())
+}
 
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
-            input
-                type="datetime-local"
-                id=(field)
-                name=(field)
-                value=(value)
-                step="any"
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
+/// [`datetime_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn datetime_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
+    let spec = FieldSpec {
+        value: Some(&value),
+        step: Some("any"),
+        ..FieldSpec::new(FieldKind::DateTime, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Render a labeled `<input type="datetime-local">` for a required field.
@@ -3466,35 +3988,7 @@ pub fn required_datetime_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
-
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
-            input
-                type="datetime-local"
-                id=(field)
-                name=(field)
-                value=(value)
-                step="any"
-                required
-                aria-required="true"
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
+    datetime_input_with(changeset, field, label, &FieldOptions::new().required())
 }
 
 /// Render a labeled `<select>` tied to a closed-set changeset field, with
@@ -3518,34 +4012,26 @@ pub fn select_input<T: Serialize>(
     label: &str,
     options: &[(&str, &str)],
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let current = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
+    select_input_with(changeset, field, label, options, &FieldOptions::new())
+}
 
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
-            select
-                id=(field)
-                name=(field)
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or("")) {
-                @for (option_value, option_label) in options {
-                    option value=(option_value) selected[*option_value == current] { (option_label) }
-                }
-            }
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
+/// [`select_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn select_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let current = changeset.field_value(field).unwrap_or_default();
+    let spec = FieldSpec {
+        current: &current,
+        choices: SelectChoices::Borrowed(choices),
+        ..FieldSpec::new(FieldKind::Select, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
 }
 
 /// Render a labeled `<select>` for a required closed-set field.
@@ -3563,36 +4049,13 @@ pub fn required_select_input<T: Serialize>(
     label: &str,
     options: &[(&str, &str)],
 ) -> maud::Markup {
-    let errors = changeset.errors_for(field);
-    let has_errors = !errors.is_empty();
-    let current = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
-
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
-            select
-                id=(field)
-                name=(field)
-                required
-                aria-required="true"
-                class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
-                aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or("")) {
-                @for (option_value, option_label) in options {
-                    option value=(option_value) selected[*option_value == current] { (option_label) }
-                }
-            }
-            @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
+    select_input_with(
+        changeset,
+        field,
+        label,
+        options,
+        &FieldOptions::new().required(),
+    )
 }
 
 /// Render an ARIA live region for htmx swap announcements.
@@ -3709,9 +4172,9 @@ pub struct FormField {
     pub label: String,
     /// Which HTML control renders this field.
     pub control: FieldControl,
-    /// Whether the rendered control should be marked required (`required`
-    /// attribute + `aria-required="true"`), where a required variant of the
-    /// control exists.
+    /// Mark the control `required` and `aria-required="true"`, with the
+    /// visual marker. A checkbox and a password ignore this flag. Use
+    /// [`FormFor::field_options`] with [`FieldOptions::required`] for them.
     pub required: bool,
     /// The serde-effective *serialized* key of this field on the changeset's
     /// data type, when it differs from [`FormField::name`] (e.g.
@@ -3903,6 +4366,7 @@ where
         excluded: Vec::new(),
         field_overrides: Vec::new(),
         label_overrides: Vec::new(),
+        field_options: Vec::new(),
         prepended: Vec::new(),
         appended: Vec::new(),
         submit_label: "Save".to_string(),
@@ -3922,6 +4386,7 @@ pub struct FormFor<'a, T: Serialize + FormModel> {
     excluded: Vec<String>,
     field_overrides: Vec<(String, FieldControl)>,
     label_overrides: Vec<(String, String)>,
+    field_options: Vec<(String, FieldOptions<'a>)>,
     prepended: Vec<maud::Markup>,
     appended: Vec<maud::Markup>,
     submit_label: String,
@@ -3929,7 +4394,7 @@ pub struct FormFor<'a, T: Serialize + FormModel> {
 }
 
 #[cfg(feature = "maud")]
-impl<T: Serialize + FormModel> FormFor<'_, T> {
+impl<'a, T: Serialize + FormModel> FormFor<'a, T> {
     /// Inject a hidden CSRF input carrying `token`.
     #[must_use]
     pub fn csrf(mut self, token: impl Into<String>) -> Self {
@@ -3964,6 +4429,20 @@ impl<T: Serialize + FormModel> FormFor<'_, T> {
     #[must_use]
     pub fn override_label(mut self, field: impl Into<String>, label: impl Into<String>) -> Self {
         self.label_overrides.push((field.into(), label.into()));
+        self
+    }
+
+    /// Set the hint, required state and typed attributes for `field`. See
+    /// [`FieldOptions`]. If you call this two times for one field, the last
+    /// call applies.
+    ///
+    /// The field is required when [`FormField::required`] or
+    /// [`FieldOptions::required`] is set. A checkbox and a password use only
+    /// [`FieldOptions::required`]: a required checkbox means "must be
+    /// checked", and a password is never pre-filled.
+    #[must_use]
+    pub fn field_options(mut self, field: impl Into<String>, options: FieldOptions<'a>) -> Self {
+        self.field_options.push((field.into(), options));
         self
     }
 
@@ -4015,11 +4494,13 @@ impl<T: Serialize + FormModel> FormFor<'_, T> {
             excluded,
             field_overrides,
             label_overrides,
+            field_options,
             prepended,
             appended,
             submit_label,
             force_multipart,
         } = self;
+        let no_options = FieldOptions::new();
 
         let fields = effective_form_fields::<T>(&excluded, &field_overrides, &label_overrides);
         let is_multipart = force_multipart
@@ -4032,7 +4513,15 @@ impl<T: Serialize + FormModel> FormFor<'_, T> {
                 (markup)
             }
             @for field in &fields {
-                (render_form_field(changeset, field))
+                (render_form_field(
+                    changeset,
+                    field,
+                    field_options
+                        .iter()
+                        .rev()
+                        .find(|(name, _)| *name == field.name)
+                        .map_or(&no_options, |(_, options)| options),
+                ))
             }
             @for markup in appended {
                 (markup)
@@ -4122,52 +4611,16 @@ impl<T: Serialize> Serialize for PrefillAlias<'_, T> {
     }
 }
 
-/// Wrap a primitive-rendered control (its own `<label>` + input) in the
-/// changeset field skeleton shared by every routed control: the stable
-/// `<div id="{field}-field" class="autumn-field">` htmx target and, when the
-/// field has errors, the `role="alert"` inline-error block keyed to
-/// `{field}-error`. This is the same wrapper/error markup the hand-written
-/// `*_input` helpers emit; only the inner control now comes from an
-/// `a11y` primitive.
-#[cfg(feature = "maud")]
-fn wrap_field_control(
-    field_name: &str,
-    control: impl maud::Render,
-    errors: &[String],
-) -> maud::Markup {
-    let error_id = (!errors.is_empty()).then(|| format!("{field_name}-error"));
-    let wrapper_id = format!("{field_name}-field");
-    maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            (control)
-            @if !errors.is_empty() {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
-                    @for error in errors {
-                        p class="autumn-field__error" { (error) }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The `class` a routed control carries, mirroring the `*_input` helpers:
-/// `autumn-field__input`, plus the `--invalid` modifier when the field errored.
-#[cfg(feature = "maud")]
-const fn field_control_class(has_errors: bool) -> &'static str {
-    if has_errors {
-        "autumn-field__input autumn-field__input--invalid"
-    } else {
-        "autumn-field__input"
-    }
-}
-
 /// Render a single [`FormField`], routing the pre-fill lookup through the
 /// field's serialized key ([`FormField::value_name`]) when it differs from
 /// the rendered input name — see [`PrefillAlias`]. Everything else (input
 /// `name`/`id`, error lookup) stays keyed by [`FormField::name`].
 #[cfg(feature = "maud")]
-fn render_form_field<T: Serialize>(changeset: &Changeset<T>, field: &FormField) -> maud::Markup {
+fn render_form_field<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &FormField,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
     if let Some(value_name) = field
         .value_name
         .as_deref()
@@ -4181,118 +4634,61 @@ fn render_form_field<T: Serialize>(changeset: &Changeset<T>, field: &FormField) 
             },
             changeset.errors().clone(),
         );
-        return render_form_control(&aliased, field);
+        return render_form_control(&aliased, field, options);
     }
-    render_form_control(changeset, field)
+    render_form_control(changeset, field, options)
 }
 
-/// Dispatch a single [`FormField`] to the matching typed-input helper.
+/// Dispatch a single [`FormField`] to the matching `*_with` helper. Every
+/// arm uses the same renderer, so the hint, marker and passthrough are the
+/// same on each [`FieldControl`].
 #[cfg(feature = "maud")]
-fn render_form_control<T: Serialize>(changeset: &Changeset<T>, field: &FormField) -> maud::Markup {
+fn render_form_control<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &FormField,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    // A non-null `bool` is not a "must be checked" box. A password is never
+    // pre-filled, so a required one blocks every edit form. These two controls
+    // use only `FieldOptions::required`.
+    let required_by_model = field.required
+        && !matches!(
+            field.control,
+            FieldControl::Checkbox | FieldControl::Password
+        );
+    let merged;
+    let options = if required_by_model && !options.required {
+        merged = options.clone().required();
+        &merged
+    } else {
+        options
+    };
+    let (name, label) = (field.name.as_str(), field.label.as_str());
     match &field.control {
-        FieldControl::Text => {
-            if field.required {
-                required_text_input(changeset, &field.name, &field.label)
-            } else {
-                text_input(changeset, &field.name, &field.label)
-            }
-        }
-        FieldControl::Textarea => {
-            let errors = changeset.errors_for(&field.name);
-            let has_errors = !errors.is_empty();
-            let value = changeset.field_value(&field.name).unwrap_or_default();
-            let mut control = crate::a11y::TextArea::new(field.name.as_str())
-                .label(field.label.as_str())
-                .label_class("autumn-field__label")
-                .value(value)
-                .class(field_control_class(has_errors))
-                .aria_invalid(has_errors);
-            if has_errors {
-                control = control.described_by(format!("{}-error", field.name));
-            }
-            wrap_field_control(&field.name, control, errors)
-        }
-        FieldControl::Password => password_input(changeset, &field.name, &field.label),
+        FieldControl::Text => text_input_with(changeset, name, label, options),
+        FieldControl::Textarea => textarea_input_with(changeset, name, label, options),
+        FieldControl::Password => password_input_with(changeset, name, label, options),
         FieldControl::Number { step } => {
-            if field.required {
-                required_number_input(changeset, &field.name, &field.label, step.as_deref())
-            } else {
-                number_input(changeset, &field.name, &field.label, step.as_deref())
-            }
+            number_input_with(changeset, name, label, step.as_deref(), options)
         }
-        FieldControl::Checkbox => {
-            let errors = changeset.errors_for(&field.name);
-            let has_errors = !errors.is_empty();
-            let checked = changeset.field_value(&field.name).as_deref() == Some("true");
-            let mut control = crate::a11y::Checkbox::new(field.name.as_str())
-                .label(field.label.as_str())
-                .label_class("autumn-field__label")
-                .value("true")
-                .checked(checked)
-                .class(field_control_class(has_errors))
-                .aria_invalid(has_errors);
-            if has_errors {
-                control = control.described_by(format!("{}-error", field.name));
-            }
-            wrap_field_control(&field.name, control, errors)
+        FieldControl::Checkbox => checkbox_input_with(changeset, name, label, options),
+        FieldControl::Date => date_input_with(changeset, name, label, options),
+        FieldControl::DateTime => datetime_input_with(changeset, name, label, options),
+        FieldControl::Select { options: choices } => {
+            let current = changeset.field_value(name).unwrap_or_default();
+            let spec = FieldSpec {
+                current: &current,
+                choices: SelectChoices::Owned(choices),
+                ..FieldSpec::new(FieldKind::Select, name, label)
+            };
+            render_field(&spec, changeset.errors_for(name), options)
         }
-        FieldControl::Date => {
-            if field.required {
-                required_date_input(changeset, &field.name, &field.label)
-            } else {
-                date_input(changeset, &field.name, &field.label)
-            }
-        }
-        FieldControl::DateTime => {
-            if field.required {
-                required_datetime_input(changeset, &field.name, &field.label)
-            } else {
-                datetime_input(changeset, &field.name, &field.label)
-            }
-        }
-        FieldControl::Select { options } => {
-            let errors = changeset.errors_for(&field.name);
-            let has_errors = !errors.is_empty();
-            let current = changeset.field_value(&field.name).unwrap_or_default();
-            let mut control = crate::a11y::Select::new(field.name.as_str())
-                .label(field.label.as_str())
-                .label_class("autumn-field__label")
-                .options(options.iter().map(|(value, label)| {
-                    crate::a11y::SelectOption::new(value.as_str(), label.as_str())
-                }))
-                .selected_value(current)
-                .class(field_control_class(has_errors))
-                .aria_invalid(has_errors);
-            if field.required {
-                control = control.required().aria_required();
-            }
-            if has_errors {
-                control = control.described_by(format!("{}-error", field.name));
-            }
-            wrap_field_control(&field.name, control, errors)
-        }
+        // The browser does not let markup fill a file input. The
+        // `FieldControl::File` variant, not this arm, makes the form
+        // multipart.
         FieldControl::File => {
-            // A file input can't be value-prefilled (browser security), so the
-            // typed [`crate::a11y::FileField`] primitive — which deliberately
-            // carries no `value` — is a natural fit; it also drops the
-            // competing derived `aria-label` in favour of the visible
-            // `<label for=…>`. Multipart encoding is unchanged: the
-            // `FieldControl::File` variant (not its rendering) still drives the
-            // `is_multipart` gate on the parent form.
-            let errors = changeset.errors_for(&field.name);
-            let has_errors = !errors.is_empty();
-            let mut control = crate::a11y::FileField::new(field.name.as_str())
-                .label(field.label.as_str())
-                .label_class("autumn-field__label")
-                .class(field_control_class(has_errors))
-                .aria_invalid(has_errors);
-            if field.required {
-                control = control.required().aria_required();
-            }
-            if has_errors {
-                control = control.described_by(format!("{}-error", field.name));
-            }
-            wrap_field_control(&field.name, control, errors)
+            let spec = FieldSpec::new(FieldKind::File, name, label);
+            render_field(&spec, changeset.errors_for(name), options)
         }
     }
 }

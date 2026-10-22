@@ -360,6 +360,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_radiogroup_unlabeled.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_radiooption_missing_label.rs");
+    // Field wrapper v2 (#3395): `FieldOptions` has no label setter, so a field
+    // with options and no label still does not build.
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/form_field_unlabeled.rs");
 }
 
 /// The `state_migration!` fixtures get their own `TestCases` for the same

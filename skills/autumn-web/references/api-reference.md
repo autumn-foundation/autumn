@@ -767,6 +767,21 @@ Free functions rendering changeset-aware, accessible inputs:
   `form.text_input(...)`).
 - **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
+- **(Unreleased, #3395)**: `FieldOptions` + a `*_with` variant of each helper
+  (`text_input_with`, `text_input_htmx_with(.., url, token_field, &opts)`,
+  `password_input_with`, `textarea_input_with`, `checkbox_input_with`,
+  `number_input_with`, `date_input_with`, `datetime_input_with`,
+  `select_input_with`, `rich_text_area_with`, `rich_text_area_htmx_with`,
+  `RowScope::{text,number,textarea}_input_with`). `FieldOptions::new()
+  .hint(..).required().placeholder(..).autocomplete(..).inputmode(..)
+  .pattern(..).min(..).max(..).disabled().readonly().data(name, v).hx(name, v)`.
+  The hint is `{field}-hint`, named in `aria-describedby` before the error.
+  No setter for `id`/`name`/`class`/`aria-*`; the label stays positional.
+  Every control has a `required_*` helper (`required_password_input`,
+  `required_textarea_input`, `required_checkbox_input` added); a required
+  label shows an `aria-hidden` `*` marker. `FormFor::field_options(field,
+  FieldOptions)` sets options per field (a checkbox and a password take
+  `required` only from options).
 - **(0.6.0)**: `form_for(&changeset,
   action, method) -> FormFor` whole-form builder. Renders the opening
   `<form>` (audited CSRF injection + hidden `_method` override, as
@@ -988,7 +1003,10 @@ Per-primitive setters (in addition to the shared set):
   &AvatarConfig)` with `AvatarSize::{Small,Medium,Large}` (image or
   colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
   &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
-  `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+  `error_summary(&Changeset) -> Option<Markup>` (each entry links to
+  `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
+  focus moves to it on a failed submit — one per page). All prelude
+  re-exported.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
   `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
