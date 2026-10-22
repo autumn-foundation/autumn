@@ -2532,7 +2532,7 @@ where
 }
 
 /// The routes [`router()`] serves under `prefix`, for
-/// [`AppBuilder::declare_plugin_routes`](crate::AppBuilder::declare_plugin_routes).
+/// [`AppBuilder::declare_plugin_routes`](crate::app::AppBuilder::declare_plugin_routes).
 ///
 /// A `nest`ed router is opaque to `autumn routes audit`, which fails closed on
 /// it. Declaring these alongside the nest makes the mount enumerable:
