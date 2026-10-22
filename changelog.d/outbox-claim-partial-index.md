@@ -6,7 +6,7 @@
   serves the `ORDER BY seq` of the claim: 126,813 buffers per three claims
   fall to 7,499 with 950,000 sent rows in retention, and the cost no longer
   grows with them. New installs get the index from the schema. On an
-  existing install, `outbox::ensure_schema` builds it with
+  existing install, `outbox::ensure_schema` builds it in a background task with
   `CREATE INDEX CONCURRENTLY` at boot, and only logs a warning when the role
   cannot create indexes. The index adds about 66 bytes of WAL to each
   enqueued message. [no-plugin]

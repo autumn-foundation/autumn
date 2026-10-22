@@ -172,7 +172,17 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
     crate::backend_select! {
         pg => {
             if tables_exist(&mut conn, &["autumn_outbox", "autumn_inbox"]).await? {
-                ensure_claim_index(&mut conn).await;
+                // Off the startup path: the build waits for every older
+                // transaction on the table, however long that takes.
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    match pool.get().await {
+                        Ok(mut conn) => ensure_claim_index(&mut conn).await,
+                        Err(error) => {
+                            tracing::warn!(%error, "no connection to build idx_autumn_outbox_claim");
+                        }
+                    }
+                });
                 return Ok(());
             }
             conn.batch_execute(&format!(
@@ -194,7 +204,8 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
 /// The claim reads pending rows in `seq` order. Without this index it walks
 /// the primary key past every sent row that the purge has not deleted yet.
 /// The build is `CONCURRENTLY`, so it blocks no writes, and the index covers
-/// only pending rows. A role that cannot create indexes keeps working, only
+/// only pending rows. [`ensure_schema`] runs it in a background task, because
+/// the build waits for older transactions on the table and must not delay boot. A role that cannot create indexes keeps working, only
 /// slower: the failure is a warning. After a failed build, drop the invalid
 /// `idx_autumn_outbox_claim` and restart.
 #[cfg(not(feature = "sqlite"))]
