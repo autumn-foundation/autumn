@@ -58,6 +58,17 @@ pub struct PluginJob {
     pub payload: PluginRow,
 }
 
+impl PluginJob {
+    /// Whether `installed_sha256` is the artifact that queued this job.
+    ///
+    /// A runner MUST call this before it runs the job. An empty digest never
+    /// matches.
+    #[must_use]
+    pub fn is_for_artifact(&self, installed_sha256: &str) -> bool {
+        !self.artifact_sha256.is_empty() && self.artifact_sha256 == installed_sha256
+    }
+}
+
 /// Somewhere a plugin's jobs are queued.
 pub trait JobSink: Send + Sync + 'static {
     /// Enqueue `job`, returning the id assigned to it.
@@ -291,5 +302,29 @@ impl JobSink for MemoryJobSink {
         queued.bytes = queued.bytes.saturating_add(incoming);
         queued.jobs.push(job);
         Ok(format!("j{}", queued.jobs.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(sha: &str) -> PluginJob {
+        PluginJob {
+            plugin: "shop".to_owned(),
+            artifact_sha256: sha.to_owned(),
+            job_type: "send".to_owned(),
+            tenant: None,
+            payload: PluginRow::default(),
+        }
+    }
+
+    #[test]
+    fn a_job_runs_only_under_the_artifact_that_queued_it() {
+        let queued = job("aaaa");
+        assert!(queued.is_for_artifact("aaaa"));
+        assert!(!queued.is_for_artifact("bbbb"), "an upgraded artifact");
+        assert!(!queued.is_for_artifact(""), "no installed digest");
+        assert!(!job("").is_for_artifact(""), "an unsealed job never runs");
     }
 }

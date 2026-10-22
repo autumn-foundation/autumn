@@ -811,18 +811,32 @@ where
         let _helper = HelperCall::enter();
         cache.try_get_value(key)
     };
-    let value = match read {
-        Ok(found) => found.and_then(|arc| {
-            if let Some(value) = arc.downcast_ref::<V>() {
-                return Some(value.clone());
-            }
-            arc.downcast_ref::<RawCacheBytes>()
-                .and_then(|raw| serde_json::from_slice::<V>(&raw.0).ok())
-        }),
+    let found = match read {
+        Ok(found) => found,
         Err(error) => {
             mark_failed_cache_op(FAILED_READ_NOTE);
             return Err(error);
         }
+    };
+    let value = match found {
+        None => None,
+        Some(arc) => match arc.downcast_ref::<V>() {
+            Some(value) => Some(value.clone()),
+            // Bytes the backend holds but this type cannot read are a fault,
+            // not an absent key.
+            None => match arc.downcast_ref::<RawCacheBytes>() {
+                Some(raw) => match serde_json::from_slice::<V>(&raw.0) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        mark_failed_cache_op(FAILED_READ_NOTE);
+                        return Err(CacheBackendError::new(format!(
+                            "the stored value cannot be decoded: {error}"
+                        )));
+                    }
+                },
+                None => None,
+            },
+        },
     };
     record_cache_get(key, value.as_ref());
     Ok(value)
@@ -2268,6 +2282,30 @@ mod tests {
         assert_eq!(err.reason(), "down");
         let err = try_get_cached::<i64>(&DownBackend, "k").expect_err("read failed");
         assert_eq!(err.reason(), "down");
+    }
+
+    /// Holds bytes that are not JSON.
+    struct CorruptBackend;
+
+    impl Cache for CorruptBackend {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+        fn invalidate(&self, _key: &str) {}
+        fn clear(&self) {}
+        fn try_get_value(
+            &self,
+            _key: &str,
+        ) -> Result<Option<Arc<dyn Any + Send + Sync>>, CacheBackendError> {
+            Ok(Some(Arc::new(RawCacheBytes(b"not json".to_vec()))))
+        }
+    }
+
+    #[test]
+    fn try_get_cached_reports_bytes_it_cannot_decode() {
+        let err = try_get_cached::<i64>(&CorruptBackend, "k").expect_err("corrupt bytes");
+        assert!(err.reason().contains("cannot be decoded"), "{err}");
     }
 
     #[test]
