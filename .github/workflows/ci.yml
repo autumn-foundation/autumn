@@ -2362,6 +2362,12 @@ jobs:
             --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: \
             | tee "$RUNNER_TEMP/isolation-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
+          # Issue #2555: the Postgres `TestDb::reset_table` runs only in this
+          # Docker test of the consolidated binary. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored test_db_reset_table:: \
+            | tee "$RUNNER_TEMP/test-db-reset-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/test-db-reset-cov.log"
           # Issue #3061: the Postgres side of the database idempotency store
           # runs only in these Docker tests, the `--lib` pg_tests and the
           # consolidated binary's idempotency suites. Both filters are checked
