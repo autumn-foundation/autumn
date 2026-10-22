@@ -1521,6 +1521,27 @@ mod tests {
 }
 
 #[test]
+fn decimal_family_predicates_cover_only_their_names() {
+    assert!(decimal_identity_predicate("Decimal").is_some());
+    assert!(decimal_identity_predicate("SqliteDecimal").is_some());
+    assert!(decimal_identity_predicate("Uuid").is_none());
+    assert!(decimal_identity_predicate("String").is_none());
+}
+
+#[test]
+fn sqlite_uuid_is_a_uuid_string_matched_by_text() {
+    assert_eq!(
+        scalar_json_schema("SqliteUuid"),
+        Some(("string", Some("uuid"), None))
+    );
+    let predicate = scalar_identity_predicate("SqliteUuid")
+        .expect("SqliteUuid has an identity predicate")
+        .to_string();
+    assert!(predicate.contains("autumn_web::db::sqlite_types::SqliteUuid"));
+    assert_eq!(scalar_json_schema("Decimal"), None);
+}
+
+#[test]
 fn primitive_json_type_matches_common() {
     assert_eq!(primitive_json_type("String"), Some("string"));
     assert_eq!(primitive_json_type("i64"), Some("integer"));

@@ -2579,48 +2579,6 @@ mod tests {
     }
 
     #[test]
-    fn scalar_impls_document_strings_with_a_format() {
-        use serde_json::json;
-        let cases = [
-            (
-                <uuid::Uuid as OpenApiSchema>::schema(),
-                json!({"type": "string", "format": "uuid"}),
-            ),
-            (
-                <chrono::DateTime<chrono::Utc> as OpenApiSchema>::schema(),
-                json!({"type": "string", "format": "date-time"}),
-            ),
-            (
-                <chrono::NaiveDate as OpenApiSchema>::schema(),
-                json!({"type": "string", "format": "date"}),
-            ),
-        ];
-        for (got, want) in cases {
-            assert_eq!(got, want);
-        }
-        let naive = <chrono::NaiveDateTime as OpenApiSchema>::schema();
-        assert_eq!(naive["type"], "string");
-        assert!(
-            naive.get("format").is_none(),
-            "naive has no offset: {naive}"
-        );
-    }
-
-    #[test]
-    fn decimal_schema_matches_its_serde_output() {
-        let wire = serde_json::to_value(rust_decimal::Decimal::new(12345, 2)).unwrap();
-        let schema = <rust_decimal::Decimal as OpenApiSchema>::schema();
-        if wire.is_string() {
-            assert_eq!(
-                schema,
-                serde_json::json!({"type": "string", "format": "decimal"})
-            );
-        } else {
-            assert_eq!(schema, serde_json::json!({"type": "number"}));
-        }
-    }
-
-    #[test]
     fn primitive_impls_cover_common_types() {
         assert_eq!(<String as OpenApiSchema>::schema_name(), "string");
         assert_eq!(<i32 as OpenApiSchema>::schema_name(), "integer");
@@ -2792,5 +2750,53 @@ mod tests {
             assign_display_keys(&reversed),
             "display-key assignment must not depend on input order"
         );
+    }
+}
+
+/// The scalar impls compile without the `openapi` feature, so their tests do too.
+#[cfg(test)]
+mod scalar_schema_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_impls_document_strings_with_a_format() {
+        use serde_json::json;
+        let cases = [
+            (
+                <uuid::Uuid as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "uuid"}),
+            ),
+            (
+                <chrono::DateTime<chrono::Utc> as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "date-time"}),
+            ),
+            (
+                <chrono::NaiveDate as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "date"}),
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, want);
+        }
+        let naive = <chrono::NaiveDateTime as OpenApiSchema>::schema();
+        assert_eq!(naive["type"], "string");
+        assert!(
+            naive.get("format").is_none(),
+            "naive has no offset: {naive}"
+        );
+    }
+
+    #[test]
+    fn decimal_schema_matches_its_serde_output() {
+        let wire = serde_json::to_value(rust_decimal::Decimal::new(12345, 2)).unwrap();
+        let schema = <rust_decimal::Decimal as OpenApiSchema>::schema();
+        if wire.is_string() {
+            assert_eq!(
+                schema,
+                serde_json::json!({"type": "string", "format": "decimal"})
+            );
+        } else {
+            assert_eq!(schema, serde_json::json!({"type": "number"}));
+        }
     }
 }
