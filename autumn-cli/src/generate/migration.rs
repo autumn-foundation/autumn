@@ -200,7 +200,13 @@ pub fn plan_migration_with_options(
             // Recover the table's prior indexes so the up path drops them first
             // (#1906). Postgres cascades the drop and needs none of this.
             let prior_indexes = if backend == autumn_web::config::DatabaseBackend::Sqlite {
-                super::prior_index::scan_prior_indexes(&project_root.join("migrations"), table)
+                let columns: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+                super::prior_index::scan_prior_indexes(
+                    &project_root.join("migrations"),
+                    table,
+                    &columns,
+                )
+                .map_err(GenerateError::Config)?
             } else {
                 Vec::new()
             };
@@ -951,7 +957,8 @@ pub struct Post {
             fs::create_dir_all(&earlier).unwrap();
             fs::write(
                 earlier.join("up.sql"),
-                "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT);\n\
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 author_id INTEGER, title TEXT);\n\
                  CREATE INDEX idx_posts_author_title ON posts (author_id, title);\n",
             )
             .unwrap();
@@ -986,6 +993,54 @@ pub struct Post {
                 .find("CREATE INDEX idx_posts_author_title ON posts (author_id, title);")
                 .unwrap_or_else(|| panic!("index not re-created: {down}"));
             assert!(add_col < recreate, "column must precede its index: {down}");
+        });
+    }
+
+    /// Issue #2579: a column behind an inline `UNIQUE` cannot be dropped on
+    /// `SQLite`. The generator says so now, not at apply time.
+    #[test]
+    fn remove_columns_migration_on_sqlite_rejects_an_inline_unique_column() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let earlier = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&earlier).unwrap();
+            fs::write(
+                earlier.join("up.sql"),
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, slug TEXT UNIQUE);\n",
+            )
+            .unwrap();
+
+            let err = plan_migration(
+                tmp.path(),
+                "RemoveSlugFromPosts",
+                &["slug:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("posts.slug"), "got: {err}");
+        });
+    }
+
+    /// Issue #2579: an earlier migration that does not replay stops the
+    /// generator with the file name, instead of a guess.
+    #[test]
+    fn remove_columns_migration_on_sqlite_names_a_migration_that_does_not_replay() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let earlier = tmp.path().join("migrations/20260101000000_broken");
+            fs::create_dir_all(&earlier).unwrap();
+            fs::write(earlier.join("up.sql"), "CREATE TABEL posts (id INTEGER);\n").unwrap();
+
+            let err = plan_migration(
+                tmp.path(),
+                "RemoveTitleFromPosts",
+                &["title:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("20260101000000_broken"), "got: {err}");
         });
     }
 

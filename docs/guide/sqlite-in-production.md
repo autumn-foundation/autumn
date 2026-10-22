@@ -876,22 +876,22 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
 - **Rollback drops indexes before columns.** On the SQLite rollback path the
   generator emits `DROP INDEX` before `DROP COLUMN`, since SQLite will not drop a
   column that an index still references.
-- **Pre-existing indexes are dropped too (#1906).** A `Remove…From…` migration
-  reads the project's earlier `migrations/*/up.sql` and emits a `DROP INDEX IF
-  EXISTS` for every index still live on the table that names the removed column.
-  Composite, partial, expression and hand-named indexes are all covered, as are
-  indexes carried through an `ALTER TABLE … RENAME TO`. `down.sql` re-creates
-  them after re-adding the column.
+- **Pre-existing indexes are dropped too (#1906, #2579).** A `Remove…From…`
+  migration replays the project's earlier `migrations/*/up.sql` into an
+  in-memory SQLite database. It then asks SQLite which indexes stop the
+  `DROP COLUMN`, and emits a `DROP INDEX IF EXISTS` for each one. It reads no
+  SQL text, so composite, partial, expression, quoted and renamed indexes
+  are all exact. `down.sql` re-creates them after it re-adds the column.
 
-  Three kinds stay invisible, and each still fails at apply time:
-  - an index created by hand against the database, outside `migrations/`;
-  - an index created in a migration's `down.sql` rather than its `up.sql`;
-  - the implicit index behind an inline `UNIQUE` or `PRIMARY KEY` column
-    constraint in a `CREATE TABLE`. SQLite refuses to drop such a column in any
-    case, and refuses to drop its `sqlite_autoindex_*` index too.
+  Two cases stay outside the replay:
+  - An index made by hand against the database, outside `migrations/`.
+    The drop fails when you apply the migration.
+  - A column behind an inline `UNIQUE` or `PRIMARY KEY`. SQLite cannot drop
+    it. `generate migration` stops with an error. Rebuild the table —
+    `autumn schema diff --write-migration` emits the rebuild.
 
-  For all three, rebuild the table — `autumn schema diff --write-migration`
-  emits the rebuild.
+  If an earlier migration does not replay, `generate migration` stops and
+  names the file.
 - **`autumn migrate check` applies SQLite rules (#1906).** The safety classifier
   reads the app's backend. It never recommends `CREATE INDEX CONCURRENTLY` (no
   such syntax), does not flag a plain `DROP INDEX` (a cheap catalog edit, and a
