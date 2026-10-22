@@ -2561,8 +2561,13 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::retention:: \
             | tee "$RUNNER_TEMP/cli-retention-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-retention-cov.log"
-          # Issue #2531: same gap for `generate::auth::` (the generated auth
-          # routes and their tests). Check the count.
+          # Issue #2531 (independently, also #2753/PR #3358: three
+          # near-identical Cargo-feature-injector functions were merged into
+          # one shared `ensure_autumn_web_feature` here): same gap for
+          # `generate::auth::` (the generated auth routes, and the
+          # Cargo-feature-injector unit tests, backed by unit tests on the
+          # `autumn` bin target that no other lane instruments). Check the
+          # count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::auth:: \
             | tee "$RUNNER_TEMP/cli-generate-auth-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-auth-cov.log"
