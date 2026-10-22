@@ -281,6 +281,12 @@ where
             status = ledger_err.http_status();
         }
 
+        // Issue #3394: a form body that does not decode is the client's fault.
+        // 422 for a repeated single-value field, 400 for the rest.
+        if let Some(form_err) = any_err.downcast_ref::<crate::form::FormDecodeError>() {
+            status = form_err.status();
+        }
+
         if matches!(
             any_err.downcast_ref::<crate::lock::LockError>(),
             Some(

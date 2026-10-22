@@ -438,6 +438,9 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 proptest = { version = "1.4", optional = true }
 serde_urlencoded = "0.7"
+# Form bodies (issue #3394): a fork of `serde_urlencoded` that puts a repeated
+# key into a `Vec<T>` field. Decode only.
+serde_html_form = { version = "0.4.1", default-features = false, features = ["de", "std"] }
 serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
 fd-lock = { version = "4", optional = true }

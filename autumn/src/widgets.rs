@@ -2262,9 +2262,10 @@ impl<'a> BulkActionsConfig<'a> {
 /// [`bulk_actions_form`]. Every checkbox shares the same `name`
 /// ([`BulkActionsConfig::field_name`], default `"ids"`), so a browser submits
 /// the checked rows as repeated `ids=<value>` pairs — no JavaScript, no
-/// per-row form. The server side reads them back with any repeated-key form
-/// parser (the scaffold's generated `parse_bulk_ids` accepts both `ids` and
-/// the `ids[]` spelling some clients emit).
+/// per-row form. The server side reads them into a `Vec` field with
+/// [`ChangesetForm`](crate::form::ChangesetForm) or
+/// [`from_urlencoded`](crate::form::from_urlencoded) (the scaffold's
+/// `BulkSelection { ids: Vec<i64> }` also accepts the `ids[]` spelling).
 ///
 /// `value` is anything [`Display`](std::fmt::Display) — typically the row's
 /// primary key. It is HTML-escaped by Maud, both in `value` and in the

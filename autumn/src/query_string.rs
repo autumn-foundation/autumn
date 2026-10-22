@@ -24,9 +24,12 @@
 //! bracketed dialect whose `items[0][sku]` shape matches the repeated-row
 //! encoding [`nested_form`](crate::nested_form) renders — generalized here to
 //! arbitrary objects, sequences and depths. Note this applies to the **query
-//! string only**: [`Form<T>`](crate::form) and
-//! [`NestedChangesetForm`](crate::nested_form::NestedChangesetForm) still decode
-//! request *bodies* through `serde_urlencoded` and its own nested-row parser.
+//! string only**. Request *bodies* use flat keys: [`Form<T>`](crate::extract::Form)
+//! decodes through `serde_urlencoded`, and
+//! [`ChangesetForm`](crate::form::ChangesetForm) and
+//! [`NestedChangesetForm`](crate::nested_form::NestedChangesetForm) decode
+//! through [`from_urlencoded`](crate::form::from_urlencoded) (repeated keys
+//! fill a `Vec`, brackets stay part of the key).
 //!
 //! ```text
 //! q=foo                       // scalar

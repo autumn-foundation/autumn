@@ -333,6 +333,28 @@ pub struct Multipart {
 
 #[cfg(feature = "multipart")]
 impl Multipart {
+    /// Like the [`FromRequest`] impl, but keep the body limit the route
+    /// already has. `ChangesetForm` uses this (issue #3394), so a route with a
+    /// tighter `DefaultBodyLimit` keeps it. The global layer applies
+    /// `max_request_size_bytes` to every route.
+    pub(crate) async fn from_request_with_route_limit<S>(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> crate::AutumnResult<Self>
+    where
+        S: Send + Sync,
+    {
+        let config = req
+            .extensions()
+            .get::<crate::security::config::UploadConfig>()
+            .cloned()
+            .unwrap_or_default();
+        let inner = axum::extract::Multipart::from_request(req, state)
+            .await
+            .map_err(|err| multipart_rejection_to_error(&err))?;
+        Ok(Self { inner, config })
+    }
+
     /// Read the next multipart field, validating MIME type when configured.
     ///
     /// # Errors
@@ -583,16 +605,15 @@ where
         mut req: axum::extract::Request,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let config = req
+        let max_request_size_bytes = req
             .extensions()
             .get::<crate::security::config::UploadConfig>()
-            .cloned()
-            .unwrap_or_default();
-        axum::extract::DefaultBodyLimit::max(config.max_request_size_bytes).apply(&mut req);
-        let inner = axum::extract::Multipart::from_request(req, state)
-            .await
-            .map_err(|err| multipart_rejection_to_error(&err))?;
-        Ok(Self { inner, config })
+            .map_or_else(
+                || crate::security::config::UploadConfig::default().max_request_size_bytes,
+                |config| config.max_request_size_bytes,
+            );
+        axum::extract::DefaultBodyLimit::max(max_request_size_bytes).apply(&mut req);
+        Self::from_request_with_route_limit(req, state).await
     }
 }
 
@@ -650,6 +671,12 @@ impl<'a> MultipartField<'a> {
             sniffed_content_type: None,
             is_empty_optional_input: false,
         }
+    }
+
+    /// `true` for an empty optional file input (no file chosen) on the
+    /// MIME-policy path. [`file_name`](Self::file_name) is `None` for it.
+    pub(crate) const fn is_empty_optional_input(&self) -> bool {
+        self.is_empty_optional_input
     }
 
     /// Field name from the multipart form.

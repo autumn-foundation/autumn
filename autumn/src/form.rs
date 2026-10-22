@@ -134,8 +134,15 @@
 //! # Multipart
 //!
 //! When the `multipart` feature is enabled, [`ChangesetForm`] also decodes
-//! `multipart/form-data` bodies.  File fields are skipped; only text fields
-//! are decoded.  File upload storage is out of scope here (see issue #494).
+//! `multipart/form-data` bodies. Text parts decode into `T`. File parts go to
+//! [`ChangesetForm::file`], [`ChangesetForm::files`] and
+//! [`ChangesetForm::take_files`], under the `security.upload` policy.
+//!
+//! # Repeated keys
+//!
+//! A repeated key (`tags=a&tags=b`) fills a `Vec<T>`, `HashSet<T>` or
+//! `Option<Vec<T>>` field. On a single-value field it is a 422. See
+//! [`from_urlencoded`] for the full rules.
 //!
 //! # Non-htmx fallback
 //!
@@ -334,12 +341,36 @@ impl<T: Serialize> Changeset<T> {
         let json = self.field_value_cache.get_or_init(|| {
             Box::new(serde_json::to_value(&self.data).unwrap_or(serde_json::Value::Null))
         });
-        match json.get(field)? {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            serde_json::Value::Bool(b) => Some(b.to_string()),
-            _ => None,
+        json_scalar_to_string(json.get(field)?)
+    }
+
+    /// Every value of `field` as strings, for multi-value controls (issue
+    /// #3394).
+    ///
+    /// A sequence field (`Vec<T>`, `HashSet<T>`) gives one string per scalar
+    /// element. A scalar field gives one string. A missing or `None` field
+    /// gives an empty list.
+    pub fn field_values(&self, field: &str) -> Vec<String> {
+        let json = self.field_value_cache.get_or_init(|| {
+            Box::new(serde_json::to_value(&self.data).unwrap_or(serde_json::Value::Null))
+        });
+        match json.get(field) {
+            Some(serde_json::Value::Array(items)) => {
+                items.iter().filter_map(json_scalar_to_string).collect()
+            }
+            Some(value) => json_scalar_to_string(value).into_iter().collect(),
+            None => Vec::new(),
         }
+    }
+}
+
+/// A string, number or bool as text. Any other JSON value is `None`.
+fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -522,10 +553,12 @@ impl<T: validator::Validate> IntoChangeset for T {
 /// Supports both `application/x-www-form-urlencoded` (always) and
 /// `multipart/form-data` (when the `multipart` feature is enabled).
 ///
-/// Unlike [`crate::validation::Valid`], this extractor **never** rejects with
-/// 422 — errors live in the [`Changeset`] and the handler decides how to
-/// respond.  Fails with 400 only when the body cannot be decoded into `T` at
-/// all.
+/// Unlike [`crate::validation::Valid`], this extractor does not reject a
+/// validation error — errors live in the [`Changeset`] and the handler decides
+/// how to respond. It rejects only a body it cannot decode into `T`: 415 for
+/// the wrong `Content-Type`, 400 for a value that does not parse, 422 for a
+/// single-value field sent more than once (see [`from_urlencoded`]), and on
+/// multipart the `security.upload` rejections (400, 413).
 ///
 /// # Unstorable bytes
 ///
@@ -538,6 +571,10 @@ impl<T: validator::Validate> IntoChangeset for T {
 /// for re-render is the author's text with the byte removed. The CSRF token is
 /// exempt (no template renders it); file parts of a multipart body are
 /// untouched.
+///
+/// # File parts
+///
+/// A multipart body keeps its file parts: see [`ChangesetForm::file`].
 ///
 /// # CSRF — no extra developer action in POST handlers
 ///
@@ -569,6 +606,14 @@ pub struct ChangesetForm<T> {
     pub changeset: Changeset<T>,
     pub(crate) csrf_token: Option<String>,
     pub(crate) csrf_field: String,
+    /// File parts of a multipart body, in body order. `None` when there are
+    /// none. A thin pointer, so `Result<T, Self>` in [`Self::into_valid`]
+    /// stays under clippy's `result_large_err` threshold.
+    #[allow(
+        clippy::box_collection,
+        reason = "a `Box<Vec>` is one pointer wide; a `Vec` or `Box<[T]>` pushes `into_valid`'s `Err` over `result_large_err`"
+    )]
+    pub(crate) files: Option<Box<Vec<FormFile>>>,
 }
 
 impl<T> ChangesetForm<T> {
@@ -589,6 +634,7 @@ impl<T> ChangesetForm<T> {
             changeset: Changeset::new(data),
             csrf_token: Some(csrf_token.to_owned()),
             csrf_field: "_csrf".to_owned(),
+            files: None,
         }
     }
 
@@ -604,6 +650,7 @@ impl<T> ChangesetForm<T> {
             changeset: Changeset::new(data),
             csrf_token: None,
             csrf_field: "_csrf".to_owned(),
+            files: None,
         }
     }
 
@@ -618,6 +665,7 @@ impl<T> ChangesetForm<T> {
             changeset,
             csrf_token: None,
             csrf_field: "_csrf".to_owned(),
+            files: None,
         }
     }
 
@@ -637,6 +685,40 @@ impl<T> ChangesetForm<T> {
     /// The CSRF token captured from the request, if the CSRF middleware is active.
     pub fn csrf_token(&self) -> Option<&str> {
         self.csrf_token.as_deref()
+    }
+
+    /// The first file part named `field`, from a `multipart/form-data` body.
+    ///
+    /// Returns `None` for a URL-encoded body, for an absent part, and for an
+    /// empty optional file input (no file chosen).
+    pub fn file(&self, field: &str) -> Option<&FormFile> {
+        self.all_files().iter().find(|file| file.field == field)
+    }
+
+    /// Every file part named `field`, in body order. Use this for
+    /// `<input type="file" multiple>`.
+    pub fn files<'a>(&'a self, field: &'a str) -> impl Iterator<Item = &'a FormFile> {
+        self.all_files()
+            .iter()
+            .filter(move |file| file.field == field)
+    }
+
+    /// Move every file part out of the form. Call it before
+    /// [`into_valid`](Self::into_valid), which consumes the form.
+    pub fn take_files(&mut self) -> Vec<FormFile> {
+        self.files.take().map(|files| *files).unwrap_or_default()
+    }
+
+    /// Attach file parts, as the extractor does for a multipart body. Use it
+    /// to build a form with files in a test.
+    #[must_use]
+    pub fn with_files(mut self, files: Vec<FormFile>) -> Self {
+        self.files = (!files.is_empty()).then(|| Box::new(files));
+        self
+    }
+
+    fn all_files(&self) -> &[FormFile] {
+        self.files.as_deref().map_or(&[], Vec::as_slice)
     }
 
     /// Consume and return only the inner [`Changeset`].
@@ -847,7 +929,7 @@ where
             .map_or_else(|| "_submit_token".to_owned(), |f| f.0.clone());
 
         let (req, nul_message) = nul_field_message(req, state).await;
-        let (data, nul_fields) = decode_form_body::<T, S>(req, state).await?;
+        let (data, nul_fields, files) = decode_form_body::<T, S>(req, state).await?;
 
         let mut changeset = data.into_changeset();
         for field in nul_fields {
@@ -871,15 +953,17 @@ where
             changeset,
             csrf_token,
             csrf_field,
+            files: (!files.is_empty()).then(|| Box::new(files)),
         })
     }
 }
 
 /// Decode a form body — URL-encoded always, multipart when that feature is on.
 ///
-/// Returns the decoded `T` alongside the names of the fields whose submitted
-/// value carried a NUL byte (#2423); those values are cleaned before `T` is
-/// built, so the caller only has to decide what to say about them.
+/// Returns the decoded `T`, the names of the fields whose submitted value
+/// carried a NUL byte (#2423), and the file parts of a multipart body. NUL
+/// values are cleaned before `T` is built, so the caller only has to decide
+/// what to say about them.
 // `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
 // 128 bytes — that is `axum::response::Response`'s own size, not something this
 // crate chose. Returning a ready-made rejection response IS the idiom here, and
@@ -890,7 +974,7 @@ where
 async fn decode_form_body<T, S>(
     req: Request,
     state: &S,
-) -> Result<(T, Vec<String>), axum::response::Response>
+) -> Result<(T, Vec<String>, Vec<FormFile>), axum::response::Response>
 where
     T: serde::de::DeserializeOwned + validator::Validate + Send,
     S: Send + Sync,
@@ -933,13 +1017,13 @@ where
     let mut pairs = parse_urlencoded_pairs(&bytes);
     let nul_fields = strip_nul_from_pairs(&mut pairs);
     let data = decode_pairs_dropping_blank_optional_fields::<T>(pairs)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
-    Ok((data, nul_fields))
+        .map_err(|e| (e.status(), e.to_string()).into_response())?;
+    Ok((data, nul_fields, Vec::new()))
 }
 
 /// Deserialize `T` from `application/x-www-form-urlencoded` bytes, tolerating
 /// blank values for non-string `Option<T>` fields (a number/date/uuid input
-/// the user left empty submits `field=`, which `serde_urlencoded` otherwise
+/// the user left empty submits `field=`, which the part parser otherwise
 /// rejects outright — an empty string is not a valid `i32`/`Uuid`/etc., so it
 /// never gets the chance to become "missing" and deserialize as `None`).
 ///
@@ -970,9 +1054,18 @@ where
 /// guarantee. And nothing new is reachable through this leniency: a client
 /// that wants a `#[serde(default)]` field to take its default value could
 /// already get that by omitting the key entirely.
+///
+/// # Repeated keys (issue #3394)
+///
+/// A repeated key fills a sequence field (`Vec<T>`, `HashSet<T>`,
+/// `Option<Vec<T>>`). On a single-value field it is a
+/// [`FormDecodeError::is_repeated_field`] error. That check runs before the
+/// blank drop, so `count=&count=5` never decodes as `5`. A blank element of a
+/// typed sequence (`ids=`) is dropped like a blank `Option`.
+/// `verification/form_decode.rs` models one step of this loop.
 pub(crate) fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
-) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
+) -> Result<T, FormDecodeError> {
     decode_pairs_dropping_blank_optional_fields(parse_urlencoded_pairs(bytes))
 }
 
@@ -992,24 +1085,232 @@ pub(crate) fn parse_urlencoded_pairs(bytes: &[u8]) -> Vec<(String, String)> {
 /// inspect and clean the pairs first.
 pub(crate) fn decode_pairs_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
     mut pairs: Vec<(String, String)>,
-) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
+) -> Result<T, FormDecodeError> {
     loop {
         let encoded = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .finish();
-        let deserializer =
-            serde_urlencoded::Deserializer::new(url::form_urlencoded::parse(encoded.as_bytes()));
+        let deserializer = serde_html_form::Deserializer::from_bytes(encoded.as_bytes());
         match serde_path_to_error::deserialize(deserializer) {
             Ok(data) => return Ok(data),
-            Err(err) => {
-                let field = err.path().to_string();
-                let Some(pos) = pairs.iter().position(|(k, v)| *k == field && v.is_empty()) else {
-                    return Err(err);
-                };
-                pairs.remove(pos);
-            }
+            Err(err) => match next_retry(&pairs, err.path()) {
+                Retry::DropPair(pos) => {
+                    pairs.remove(pos);
+                }
+                Retry::DropBlanksOf(field) => {
+                    pairs.retain(|(k, v)| !(*k == field && v.is_empty()));
+                }
+                Retry::Repeated(field) => return Err(FormDecodeError::repeated(field)),
+                Retry::Stop => return Err(FormDecodeError::invalid(err)),
+            },
         }
     }
+}
+
+/// What the retry loop does after a decode error at `path`.
+///
+/// Each retry removes all the blank pairs of one key, so the loop runs at most
+/// once for each field of `T`. It never runs once for each pair: a body of
+/// many blank `ids=` would then cost one full decode per pair.
+enum Retry {
+    /// Remove the pair at this index and decode again.
+    DropPair(usize),
+    /// Remove every blank pair with this key and decode again.
+    DropBlanksOf(String),
+    /// Stop: a single-value field got more than one value.
+    Repeated(String),
+    /// Stop with the decode error.
+    Stop,
+}
+
+/// Find the blank pairs that caused a decode error, if there are any.
+///
+/// - `field`: a single-value field. More than one pair with that key is a
+///   repeat. Else the blank pair with that key.
+/// - `field[n]`: element `n` of a sequence field. If the `n`-th pair with that
+///   key is blank, every blank pair of that key fails the same way, so all of
+///   them go.
+/// - Any other path: nothing to drop.
+fn next_retry(pairs: &[(String, String)], path: &serde_path_to_error::Path) -> Retry {
+    let mut segments = path.iter();
+    let Some(serde_path_to_error::Segment::Map { key: field }) = segments.next() else {
+        return Retry::Stop;
+    };
+    let mut same_key = pairs.iter().enumerate().filter(|(_, (k, _))| k == field);
+    match (segments.next(), segments.next()) {
+        (None, _) => {
+            if pairs.iter().filter(|(k, _)| k == field).nth(1).is_some() {
+                return Retry::Repeated(field.clone());
+            }
+            same_key
+                .find(|(_, (_, v))| v.is_empty())
+                .map_or(Retry::Stop, |(i, _)| Retry::DropPair(i))
+        }
+        (Some(serde_path_to_error::Segment::Seq { index }), None) => {
+            if same_key.nth(*index).is_some_and(|(_, (_, v))| v.is_empty()) {
+                Retry::DropBlanksOf(field.clone())
+            } else {
+                Retry::Stop
+            }
+        }
+        _ => Retry::Stop,
+    }
+}
+
+/// Decode an `application/x-www-form-urlencoded` body into `T` (issue #3394).
+///
+/// The same decoder [`ChangesetForm`] uses. Use it in a handler that reads
+/// the raw body as `Bytes`:
+///
+/// - A repeated key fills a `Vec<T>`, `HashSet<T>` or `Option<Vec<T>>` field.
+/// - A repeated key on a single-value field is an error with status 422.
+/// - A blank value for a typed `Option<T>` (`age=`) decodes as `None`. A blank
+///   element of a typed sequence (`ids=`) is dropped.
+/// - A value that does not parse is an error with status 400.
+///
+/// Brackets are part of the key: `ids[]=1` does not fill `ids`. Use
+/// `#[serde(alias = "ids[]")]` to accept both spellings.
+///
+/// Only `Vec`-like fields take repeats. A fixed-size array (`[i64; 2]`) and a
+/// newtype around a `Vec` take one value, so a repeat on them is a 422.
+///
+/// # Example
+///
+/// ```
+/// #[derive(serde::Deserialize)]
+/// struct Selection {
+///     #[serde(default)]
+///     ids: Vec<i64>,
+/// }
+///
+/// let selection: Selection = autumn_web::form::from_urlencoded(b"ids=1&ids=2").unwrap();
+/// assert_eq!(selection.ids, [1, 2]);
+/// ```
+///
+/// # Errors
+///
+/// Returns a [`FormDecodeError`] when the body does not decode into `T`.
+/// [`FormDecodeError::status`] tells a 400 from a 422.
+pub fn from_urlencoded<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, FormDecodeError> {
+    decode_urlencoded_dropping_blank_optional_fields(body)
+}
+
+/// The longest field name a [`FormDecodeError`] message repeats.
+const MAX_REPORTED_FIELD_CHARS: usize = 64;
+
+/// Why a form body did not decode into its target type (issue #3394).
+///
+/// - A **repeated field**: a single-value field got its key more than once
+///   (`name=a&name=b`). [`status`](Self::status) is 422. The decoder does not
+///   select one of the values.
+/// - An **invalid body**: a value does not parse, or a required field is
+///   missing. [`status`](Self::status) is 400.
+#[derive(Debug, Clone)]
+pub struct FormDecodeError {
+    field: Option<String>,
+    kind: FormDecodeErrorKind,
+}
+
+#[derive(Debug, Clone)]
+enum FormDecodeErrorKind {
+    Repeated,
+    Invalid(serde_path_to_error::Error<serde_html_form::de::Error>),
+}
+
+impl FormDecodeError {
+    const fn repeated(field: String) -> Self {
+        Self {
+            field: Some(field),
+            kind: FormDecodeErrorKind::Repeated,
+        }
+    }
+
+    fn invalid(err: serde_path_to_error::Error<serde_html_form::de::Error>) -> Self {
+        let field = err.path().iter().find_map(|segment| match segment {
+            serde_path_to_error::Segment::Map { key } => Some(key.clone()),
+            _ => None,
+        });
+        Self {
+            field,
+            kind: FormDecodeErrorKind::Invalid(err),
+        }
+    }
+
+    /// `true` when a single-value field got its key more than once.
+    #[must_use]
+    pub const fn is_repeated_field(&self) -> bool {
+        matches!(self.kind, FormDecodeErrorKind::Repeated)
+    }
+
+    /// The top-level form field that failed, when serde names one. A
+    /// missing-field error names no path, so it returns `None`.
+    #[must_use]
+    pub fn field(&self) -> Option<&str> {
+        self.field.as_deref()
+    }
+
+    /// 422 for a repeated field, 400 for every other failure.
+    #[must_use]
+    pub const fn status(&self) -> http::StatusCode {
+        match self.kind {
+            FormDecodeErrorKind::Repeated => http::StatusCode::UNPROCESSABLE_ENTITY,
+            FormDecodeErrorKind::Invalid(_) => http::StatusCode::BAD_REQUEST,
+        }
+    }
+
+    /// The `serde_path_to_error` error of an invalid body. `None` for a
+    /// repeated field.
+    pub(crate) const fn invalid_error(
+        &self,
+    ) -> Option<&serde_path_to_error::Error<serde_html_form::de::Error>> {
+        match &self.kind {
+            FormDecodeErrorKind::Invalid(err) => Some(err),
+            FormDecodeErrorKind::Repeated => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FormDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            FormDecodeErrorKind::Repeated => {
+                // The key comes from the request when `T` is a map, so bound it
+                // and remove control and bidi characters before it reaches a
+                // response or a log.
+                let field = self.field.as_deref().unwrap_or_default();
+                let mut shown: String = field
+                    .chars()
+                    .filter(|c| is_printable_key_char(*c))
+                    .take(MAX_REPORTED_FIELD_CHARS)
+                    .collect();
+                if field
+                    .chars()
+                    .filter(|c| is_printable_key_char(*c))
+                    .nth(MAX_REPORTED_FIELD_CHARS)
+                    .is_some()
+                {
+                    shown.push('…');
+                }
+                write!(
+                    f,
+                    "form field `{shown}` takes one value, but the form sent it more than once"
+                )
+            }
+            FormDecodeErrorKind::Invalid(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FormDecodeError {}
+
+/// `false` for control, bidi and zero-width characters. These can hide or
+/// reorder text in a log line.
+fn is_printable_key_char(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+        )
 }
 
 /// Fuzzing seam: run the `application/x-www-form-urlencoded` body decoder
@@ -1026,11 +1327,13 @@ pub fn __fuzz_decode_urlencoded(bytes: &[u8]) {
     >(bytes);
 }
 
-/// Decode `multipart/form-data` text fields and deserialize into `T`.
+/// Decode a `multipart/form-data` body: text parts into `T`, file parts into
+/// [`FormFile`]s.
 ///
-/// File-upload fields are skipped (file storage is out of scope here).
-/// The collected text pairs are re-encoded as URL-encoded so that
-/// `serde_urlencoded` handles the same type coercions axum's `Form` does.
+/// The parts come through [`crate::extract::Multipart`], so the
+/// `security.upload` policy applies: the MIME allowlist, the per-file cap and
+/// the request cap. Text parts decode with the same rules as a URL-encoded
+/// body. An empty optional file input (no file name, no bytes) is skipped.
 #[cfg(feature = "multipart")]
 // Same as `decode_form_body` above: the `Err` variant is an
 // `axum::response::Response`, which IS the rejection, and boxing it would cost
@@ -1039,78 +1342,169 @@ pub fn __fuzz_decode_urlencoded(bytes: &[u8]) {
 async fn decode_multipart<T, S>(
     req: Request,
     state: &S,
-) -> Result<(T, Vec<String>), axum::response::Response>
+) -> Result<(T, Vec<String>, Vec<FormFile>), axum::response::Response>
 where
     T: serde::de::DeserializeOwned,
     S: Send + Sync,
 {
-    let mut multipart = axum::extract::Multipart::from_request(req, state)
+    let mut multipart = crate::extract::Multipart::from_request_with_route_limit(req, state)
         .await
         .map_err(IntoResponse::into_response)?;
 
     let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut files: Vec<FormFile> = Vec::new();
 
-    loop {
-        let field = multipart
-            .next_field()
-            .await
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
-
-        let Some(field) = field else { break };
-
-        let name = match field.name() {
-            Some(n) => n.to_string(),
-            None => continue,
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(IntoResponse::into_response)?
+    {
+        let Some(name) = field.name().map(str::to_owned) else {
+            continue;
         };
-
-        // Skip file-upload fields; text-only decoding is in scope.
-        if field.file_name().is_some() {
+        // An empty optional file input (no file chosen) is not a file. On the
+        // MIME-policy path `file_name()` reports it as `None`, so test it first:
+        // it must not become a blank text value of `T`.
+        if field.is_empty_optional_input() {
             continue;
         }
-
-        let value = field
-            .text()
+        let file_name = field.file_name().map(str::to_owned);
+        let content_type = field.content_type().map(str::to_owned);
+        let sniffed_content_type = field.sniffed_content_type().map(str::to_owned);
+        let mut bytes = field
+            .bytes_limited()
             .await
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
-
-        pairs.push((name, value));
+            .map_err(IntoResponse::into_response)?;
+        if let Some(file_name) = file_name {
+            if file_name.is_empty() && bytes.is_empty() {
+                continue;
+            }
+            // The sniff buffer can hold more capacity than a small file needs.
+            // Many small parts would then keep far more memory than the body.
+            bytes.shrink_to_fit();
+            files.push(FormFile {
+                field: name,
+                file_name,
+                content_type,
+                sniffed_content_type,
+                bytes,
+            });
+        } else {
+            let value = String::from_utf8(bytes).map_err(|_| {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "a multipart text field is not valid UTF-8",
+                )
+                    .into_response()
+            })?;
+            pairs.push((name, value));
+        }
     }
 
     // #2423: the same NUL sweep the URL-encoded path runs, applied to the
-    // text fields only — file parts were skipped above and their bytes are
-    // never text to begin with.
+    // text fields only. File bytes are not text.
     let nul_fields = strip_nul_from_pairs(&mut pairs);
+    let data = decode_pairs_dropping_blank_optional_fields::<T>(pairs)
+        .map_err(|e| (e.status(), e.to_string()).into_response())?;
+    Ok((data, nul_fields, files))
+}
 
-    // Re-encode as URL-encoded so serde_urlencoded handles type coercions
-    // ("30" → u32, "true" → bool, etc.) consistently with the Form extractor.
-    let encoded = url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .finish();
+/// One file part of a `multipart/form-data` body (issue #3394).
+///
+/// [`ChangesetForm::file`], [`ChangesetForm::files`] and
+/// [`ChangesetForm::take_files`] return these. The bytes are in memory. The
+/// `security.upload` per-file cap and request cap limit their size.
+#[derive(Clone)]
+pub struct FormFile {
+    field: String,
+    file_name: String,
+    content_type: Option<String>,
+    sniffed_content_type: Option<String>,
+    bytes: Vec<u8>,
+}
 
-    match serde_urlencoded::from_str::<T>(&encoded) {
-        Ok(data) => Ok((data, nul_fields)),
-        Err(first_err) => {
-            // Same blank-optional-field accommodation as `decode_form_body`:
-            // a number/date/uuid field left empty submits an empty text
-            // value, which `serde_urlencoded` rejects for non-string
-            // `Option<T>` fields — retry with those fields dropped entirely
-            // so they deserialize as `None`.
-            let (blank, non_blank): (Vec<_>, Vec<_>) =
-                pairs.iter().partition(|(_, v)| v.is_empty());
-            if blank.is_empty() {
-                return Err(
-                    (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
-                );
-            }
-            let filtered = url::form_urlencoded::Serializer::new(String::new())
-                .extend_pairs(non_blank.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                .finish();
-            serde_urlencoded::from_str::<T>(&filtered)
-                .map(|data| (data, nul_fields))
-                .map_err(|_| {
-                    (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
-                })
+impl FormFile {
+    /// Make a file part, as the extractor does for a multipart body. Use it
+    /// with [`ChangesetForm::with_files`] to build a form in a test.
+    #[must_use]
+    pub fn new(
+        field: impl Into<String>,
+        file_name: impl Into<String>,
+        content_type: Option<String>,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            field: field.into(),
+            file_name: file_name.into(),
+            content_type,
+            sniffed_content_type: None,
+            bytes,
         }
+    }
+
+    /// The form field name (`name="avatar"`).
+    #[must_use]
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// The file name the client sent. The client can send any text: `../`, a
+    /// NUL, control characters. Do not use it as a storage path, and escape it
+    /// when you show it.
+    #[must_use]
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    /// The `Content-Type` the client sent. The client can set any value.
+    #[must_use]
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    /// The content type found from the bytes. Set only when a
+    /// `security.upload` MIME policy is on and the format is known.
+    #[must_use]
+    pub fn sniffed_content_type(&self) -> Option<&str> {
+        self.sniffed_content_type.as_deref()
+    }
+
+    /// The file contents.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The file contents, moved out.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// The size in bytes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// `true` for a zero-byte file.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// Shows the size, not the bytes: a file can be large, and its contents do not
+/// belong in a log.
+impl std::fmt::Debug for FormFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormFile")
+            .field("field", &self.field)
+            .field("file_name", &self.file_name)
+            .field("content_type", &self.content_type)
+            .field("sniffed_content_type", &self.sniffed_content_type)
+            .field("len", &self.bytes.len())
+            .finish()
     }
 }
 
@@ -1826,7 +2220,7 @@ pub fn textarea_input<T: Serialize>(
 /// posts **every** field on the page. Deserializing that into the form struct
 /// to read one value couples the fragment to the validity of every *other*
 /// field: on a freshly-opened "new" form, a required `i64` column arrives as
-/// `count=`, `serde_urlencoded` fails on the empty string, and the fragment
+/// `count=`, the decoder fails on the empty string, and the fragment
 /// renders nothing. The author would have to fill in every unrelated column
 /// before the preview started working (PR #2157 review).
 ///
@@ -1837,7 +2231,8 @@ pub fn textarea_input<T: Serialize>(
 /// they are for.
 ///
 /// Percent-escapes and `+`-as-space are decoded. The first occurrence of a
-/// repeated key wins, matching `serde_urlencoded`. A present-but-empty field
+/// repeated key wins. This helper is lenient on purpose: [`ChangesetForm`]
+/// rejects a repeated single-value key (422). A present-but-empty field
 /// returns `Some("")`, not `None`, so a cleared editor previews as empty
 /// rather than falling back to a stale value.
 ///
@@ -2401,10 +2796,9 @@ pub fn required_text_input<T: Serialize>(
 /// present" on the wire. **Do not** pair this with a hidden `<input
 /// type="hidden" value="false">` sibling sharing the same `name`: a checked
 /// box then submits the key *twice* (`field=false` from the hidden input,
-/// `field=true` from the checkbox), and `serde_urlencoded` (used by both
-/// axum's `Form` extractor and [`ChangesetForm`]) rejects duplicate keys
-/// with a "duplicate field" deserialize error instead of taking the last
-/// value — every checked submission would 400.
+/// `field=true` from the checkbox). A `bool` field takes one value, so axum's
+/// `Form` rejects that body (400) and [`ChangesetForm`] rejects it (422)
+/// instead of taking the last value — every checked submission would fail.
 ///
 /// Instead, mark the target `bool` field `#[serde(default)]` so a missing
 /// key decodes as `false`:
@@ -3392,9 +3786,9 @@ pub trait FormModel {
 /// # Checkboxes and `bool` fields
 ///
 /// A [`FieldControl::Checkbox`] field renders via [`checkbox_input`], which
-/// deliberately emits **no** hidden `false` fallback (`serde_urlencoded` — used
-/// by axum's `Form` and [`ChangesetForm`] — rejects duplicate keys, so a
-/// hidden sibling would 400 every *checked* submission). An unchecked box
+/// deliberately emits **no** hidden `false` fallback (a `bool` field takes one
+/// value, so axum's `Form` would 400 and [`ChangesetForm`] would 422 every
+/// *checked* submission). An unchecked box
 /// therefore submits no key at all, and the struct the form posts into must
 /// decode a missing key as `false` via `#[serde(default)]` on the `bool`
 /// field. The `#[model]`-generated `NewX` insert struct already does this for
@@ -3981,6 +4375,309 @@ mod tests {
         }
     }
 
+    // ── Repeated keys (issue #3394) ────────────────────────────────
+
+    mod repeated_keys {
+        use super::super::*;
+        use std::collections::HashSet;
+
+        #[derive(Debug, serde::Deserialize)]
+        struct Numbers {
+            #[serde(default)]
+            a: Vec<u32>,
+        }
+
+        #[test]
+        fn repeated_key_decodes_into_vec() {
+            let form: Numbers = from_urlencoded(b"a=1&a=2").unwrap();
+            assert_eq!(form.a, vec![1, 2]);
+        }
+
+        #[test]
+        fn no_key_decodes_into_empty_vec() {
+            let form: Numbers = from_urlencoded(b"").unwrap();
+            assert!(form.a.is_empty());
+        }
+
+        #[test]
+        fn single_key_decodes_into_one_element_vec() {
+            let form: Numbers = from_urlencoded(b"a=7").unwrap();
+            assert_eq!(form.a, vec![7]);
+        }
+
+        #[test]
+        fn repeated_key_decodes_into_hash_set() {
+            #[derive(serde::Deserialize)]
+            struct Tags {
+                #[serde(default)]
+                tag: HashSet<String>,
+            }
+            let form: Tags = from_urlencoded(b"tag=a&tag=b&tag=a").unwrap();
+            assert_eq!(form.tag, HashSet::from(["a".to_owned(), "b".to_owned()]));
+        }
+
+        #[test]
+        fn option_vec_is_none_when_absent_and_some_when_present() {
+            #[derive(serde::Deserialize)]
+            struct F {
+                ids: Option<Vec<i64>>,
+            }
+            let absent: F = from_urlencoded(b"").unwrap();
+            assert_eq!(absent.ids, None);
+            let one: F = from_urlencoded(b"ids=3").unwrap();
+            assert_eq!(one.ids, Some(vec![3]));
+            let two: F = from_urlencoded(b"ids=3&ids=4").unwrap();
+            assert_eq!(two.ids, Some(vec![3, 4]));
+        }
+
+        #[test]
+        fn percent_encoded_values_decode_into_vec() {
+            #[derive(serde::Deserialize)]
+            struct F {
+                #[serde(default)]
+                q: Vec<String>,
+            }
+            let form: F = from_urlencoded(b"q=a%20b&q=c+d&q=%26%3D&q=%C3%A9").unwrap();
+            assert_eq!(form.q, vec!["a b", "c d", "&=", "é"]);
+        }
+
+        #[test]
+        fn repeated_key_into_scalar_is_a_repeated_field_error() {
+            #[derive(Debug, serde::Deserialize)]
+            struct F {
+                #[allow(dead_code)]
+                name: String,
+            }
+            let err = from_urlencoded::<F>(b"name=a&name=b").unwrap_err();
+            assert!(err.is_repeated_field(), "{err}");
+            assert_eq!(err.field(), Some("name"));
+            assert_eq!(err.status(), http::StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(err.to_string().contains("`name`"), "{err}");
+        }
+
+        #[test]
+        fn repeated_blank_and_filled_scalar_is_still_repeated() {
+            // The blank-drop retry must not remove `count=` and accept `5`.
+            #[derive(Debug, serde::Deserialize)]
+            struct F {
+                #[allow(dead_code)]
+                count: Option<i32>,
+            }
+            let err = from_urlencoded::<F>(b"count=&count=5").unwrap_err();
+            assert!(err.is_repeated_field(), "{err}");
+        }
+
+        #[test]
+        fn malformed_element_is_a_400_not_a_repeat() {
+            let err = from_urlencoded::<Numbers>(b"a=1&a=x").unwrap_err();
+            assert!(!err.is_repeated_field(), "{err}");
+            assert_eq!(err.status(), http::StatusCode::BAD_REQUEST);
+            assert_eq!(err.field(), Some("a"));
+        }
+
+        #[test]
+        fn blank_element_of_a_typed_vec_is_dropped() {
+            let form: Numbers = from_urlencoded(b"a=&a=2&a=").unwrap();
+            assert_eq!(form.a, vec![2]);
+        }
+
+        #[test]
+        fn blank_element_of_a_string_vec_is_kept() {
+            #[derive(serde::Deserialize)]
+            struct F {
+                #[serde(default)]
+                q: Vec<String>,
+            }
+            let form: F = from_urlencoded(b"q=&q=x").unwrap();
+            assert_eq!(form.q, vec!["", "x"]);
+        }
+
+        #[test]
+        fn repeated_field_error_bounds_a_hostile_key() {
+            let key = format!("k{}\u{7}", "x".repeat(500));
+            let body = format!("{key}=1&{key}=2");
+            let err = from_urlencoded::<std::collections::HashMap<String, String>>(body.as_bytes())
+                .unwrap_err();
+            assert!(err.is_repeated_field(), "{err}");
+            let text = err.to_string();
+            assert!(text.len() < 300, "{text}");
+            assert!(!text.contains('\u{7}'), "{text}");
+        }
+
+        #[test]
+        fn single_value_fields_decode_as_before() {
+            #[derive(Debug, PartialEq, serde::Deserialize)]
+            struct F {
+                name: String,
+                age: Option<i32>,
+                note: Option<String>,
+                #[serde(default)]
+                active: bool,
+            }
+            let form: F = from_urlencoded(b"name=Ann&age=&note=&active=true").unwrap();
+            assert_eq!(
+                form,
+                F {
+                    name: "Ann".to_owned(),
+                    age: None,
+                    note: Some(String::new()),
+                    active: true,
+                }
+            );
+        }
+
+        #[test]
+        fn repeated_field_error_converts_to_a_422_autumn_error() {
+            #[derive(Debug, serde::Deserialize)]
+            struct F {
+                #[allow(dead_code)]
+                name: String,
+            }
+            let err: crate::AutumnError =
+                from_urlencoded::<F>(b"name=a&name=b").unwrap_err().into();
+            assert_eq!(err.status(), http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        #[test]
+        fn many_blank_elements_decode_in_one_retry() {
+            // Each retry drops every blank pair of one key. One retry per pair
+            // made this body cost one full decode per blank (quadratic).
+            let mut body = "ids=&".repeat(50_000);
+            body.push_str("ids=1");
+            let started = std::time::Instant::now();
+            let form: Numbers = from_urlencoded(body.replace("ids", "a").as_bytes()).unwrap();
+            assert_eq!(form.a, vec![1]);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn invalid_body_converts_to_a_400_autumn_error() {
+            let err: crate::AutumnError = from_urlencoded::<Numbers>(b"a=x").unwrap_err().into();
+            assert_eq!(err.status(), http::StatusCode::BAD_REQUEST);
+        }
+
+        #[test]
+        fn brackets_are_part_of_the_key_unless_aliased() {
+            #[derive(serde::Deserialize)]
+            struct Plain {
+                #[serde(default)]
+                ids: Vec<i64>,
+            }
+            #[derive(Debug, serde::Deserialize)]
+            struct Aliased {
+                #[serde(default, alias = "ids[]")]
+                ids: Vec<i64>,
+            }
+            let plain: Plain = from_urlencoded(b"ids[]=1").unwrap();
+            assert!(plain.ids.is_empty());
+            let aliased: Aliased = from_urlencoded(b"ids[]=1&ids[]=2").unwrap();
+            assert_eq!(aliased.ids, vec![1, 2]);
+            let mixed = from_urlencoded::<Aliased>(b"ids=1&ids[]=2").unwrap_err();
+            assert_eq!(mixed.status(), http::StatusCode::BAD_REQUEST);
+        }
+
+        #[test]
+        fn bool_accepts_on() {
+            #[derive(serde::Deserialize)]
+            struct F {
+                #[serde(default)]
+                active: bool,
+            }
+            let form: F = from_urlencoded(b"active=on").unwrap();
+            assert!(form.active);
+        }
+
+        #[test]
+        fn form_file_accessors_and_debug_hide_the_bytes() {
+            let file = FormFile::new(
+                "avatar",
+                "me.png",
+                Some("image/png".to_owned()),
+                b"secret".to_vec(),
+            );
+            assert_eq!(file.field(), "avatar");
+            assert_eq!(file.file_name(), "me.png");
+            assert_eq!(file.content_type(), Some("image/png"));
+            assert_eq!(file.sniffed_content_type(), None);
+            assert_eq!(file.len(), 6);
+            assert!(!file.is_empty());
+            let debug = format!("{file:?}");
+            assert!(debug.contains("len: 6"), "{debug}");
+            assert!(!debug.contains("secret"), "{debug}");
+            assert_eq!(file.into_bytes(), b"secret");
+        }
+
+        #[test]
+        fn with_files_attaches_files_to_a_form() {
+            #[derive(serde::Serialize)]
+            struct F {
+                name: String,
+            }
+            let mut form = ChangesetForm::without_csrf(F {
+                name: "x".to_owned(),
+            })
+            .with_files(vec![FormFile::new("a", "a.txt", None, Vec::new())]);
+            assert!(form.file("a").is_some_and(FormFile::is_empty));
+            assert_eq!(form.take_files().len(), 1);
+            assert!(form.file("a").is_none());
+        }
+
+        #[test]
+        fn field_values_lists_every_element_of_a_sequence_field() {
+            #[derive(serde::Serialize)]
+            struct F {
+                tags: Vec<String>,
+                ids: Vec<i64>,
+                name: String,
+            }
+            let cs = Changeset::new(F {
+                tags: vec!["a".to_owned(), "b".to_owned()],
+                ids: vec![1, 2],
+                name: "x".to_owned(),
+            });
+            assert_eq!(cs.field_values("tags"), vec!["a", "b"]);
+            assert_eq!(cs.field_values("ids"), vec!["1", "2"]);
+            assert_eq!(cs.field_values("name"), vec!["x"]);
+            assert!(cs.field_values("missing").is_empty());
+        }
+
+        #[test]
+        fn field_values_of_a_none_field_is_empty() {
+            #[derive(serde::Serialize)]
+            struct G {
+                tags: Option<Vec<String>>,
+            }
+            assert!(
+                Changeset::new(G { tags: None })
+                    .field_values("tags")
+                    .is_empty()
+            );
+        }
+
+        proptest::proptest! {
+            /// Encode a `Vec<String>` as repeated keys, then decode it.
+            #[test]
+            fn vec_of_strings_round_trips(
+                values in proptest::collection::vec(proptest::prelude::any::<String>(), 0..8)
+            ) {
+                #[derive(serde::Deserialize)]
+                struct F {
+                    #[serde(default)]
+                    v: Vec<String>,
+                }
+                let body = url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(values.iter().map(|value| ("v", value.as_str())))
+                    .finish();
+                let form: F = from_urlencoded(body.as_bytes()).unwrap();
+                proptest::prop_assert_eq!(form.v, values);
+            }
+        }
+    }
+
     // ── Changeset::new ─────────────────────────────────────────────
 
     #[test]
@@ -4331,6 +5028,7 @@ mod tests {
             changeset,
             csrf_token: None,
             csrf_field: "_csrf".into(),
+            files: None,
         };
         // Deref gives access to Changeset methods
         assert!(!form.is_valid());
@@ -4348,6 +5046,7 @@ mod tests {
             changeset: F { name: "ok".into() }.into_changeset(),
             csrf_token: None,
             csrf_field: "_csrf".into(),
+            files: None,
         };
         assert!(form.into_valid().is_ok());
     }
@@ -4363,6 +5062,7 @@ mod tests {
             changeset: F { name: "ab".into() }.into_changeset(),
             csrf_token: Some("tok123".into()),
             csrf_field: "_csrf".into(),
+            files: None,
         };
         let err_form = form.into_valid().unwrap_err();
         assert_eq!(err_form.csrf_token(), Some("tok123"));
@@ -4485,6 +5185,7 @@ mod tests {
             }),
             csrf_token: Some("tok".into()),
             csrf_field: "authenticity_token".into(),
+            files: None,
         };
         let html = form
             .form_tag("/x", "post", maud::html! { "" })
@@ -4709,7 +5410,7 @@ mod tests {
             field_from_urlencoded(b"body=&x=1", "body").as_deref(),
             Some("")
         );
-        // First occurrence wins, matching serde_urlencoded's own behaviour.
+        // First occurrence wins. This helper is lenient on purpose.
         assert_eq!(
             field_from_urlencoded(b"body=first&body=second", "body").as_deref(),
             Some("first")
@@ -4914,6 +5615,7 @@ mod tests {
             changeset: Changeset::new(F { body: "hi".into() }),
             csrf_token: None,
             csrf_field: "_csrf".to_owned(),
+            files: None,
         };
         let labels = RichTextLabels::new().hint("Se admite Markdown.");
         assert_eq!(
@@ -5199,6 +5901,7 @@ mod tests {
             changeset: Changeset::new(F { body: "hi".into() }),
             csrf_token: None,
             csrf_field: "_csrf".to_owned(),
+            files: None,
         };
         assert_eq!(
             form.rich_text_area("body", "Body").into_string(),
@@ -5784,8 +6487,8 @@ mod tests {
     fn checkbox_input_never_emits_a_hidden_fallback() {
         // A hidden "false" sibling sharing the checkbox's `name` would make a
         // *checked* submission send the key twice (`field=false&field=true`).
-        // serde_urlencoded rejects duplicate keys outright rather than taking
-        // the last value, so every checked submission would 400. Unchecked
+        // A `bool` field takes one value, so the form decoders reject the
+        // repeat rather than taking the last value. Unchecked
         // state must be recovered via `#[serde(default)]` on the target
         // field instead (see the function's doc comment) — never via a
         // hidden fallback input.
@@ -5811,8 +6514,8 @@ mod tests {
         // Regression test for the duplicate-key 400: decode the *exact*
         // query string a browser sends for a CHECKED box rendered by
         // checkbox_input (i.e. only the fields checkbox_input itself
-        // renders — no hidden sibling), through the same serde_urlencoded
-        // machinery axum's `Form` extractor and ChangesetForm use.
+        // renders — no hidden sibling), through both decoders: axum's `Form`
+        // (`serde_urlencoded`) and ChangesetForm's (`from_urlencoded`).
         #[derive(serde::Serialize)]
         struct F {
             active: bool,
@@ -5828,6 +6531,8 @@ mod tests {
 
         // A checked box submits `active=true` and nothing else.
         let decoded: Decoded = serde_urlencoded::from_str("active=true").unwrap();
+        assert!(decoded.active);
+        let decoded: Decoded = from_urlencoded(b"active=true").unwrap();
         assert!(decoded.active);
     }
 
@@ -7538,8 +8243,8 @@ mod tests {
         }
 
         /// A key submitted more than once contributes one message, not one per
-        /// occurrence. Repeating a key that *is* a field of `T` is a hard
-        /// `duplicate field` decode failure in `serde_urlencoded` (a 400 before
+        /// occurrence. Repeating a key that *is* a single-value field of `T` is a
+        /// hard repeated-field decode failure (a 422 before
         /// any of this runs), so the case that actually reaches the sweep is a
         /// repeated key `T` does not declare — which is also the shape that
         /// makes the dedupe load-bearing, since an unbounded body can repeat a
@@ -7701,7 +8406,344 @@ mod tests {
             assert_body(resp, "valid=false body_errors=1 body=beforeafter").await;
         }
 
+        // ── Repeated keys and file parts (issue #3394) ─────────────
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct TagsForm {
+            #[validate(length(min = 1))]
+            name: String,
+            #[serde(default)]
+            tags: Vec<String>,
+            #[serde(default)]
+            ids: Vec<i64>,
+        }
+
+        async fn tags_handler(form: ChangesetForm<TagsForm>) -> String {
+            format!(
+                "name={} tags={:?} ids={:?}",
+                form.data().name,
+                form.data().tags,
+                form.data().ids
+            )
+        }
+
+        #[tokio::test]
+        async fn urlencoded_repeated_keys_reach_vec_fields() {
+            let resp = Router::new()
+                .route("/test", post(tags_handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "name=Ann&tags=a&tags=b%20c&ids=1&ids=2",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, r#"name=Ann tags=["a", "b c"] ids=[1, 2]"#).await;
+        }
+
+        #[tokio::test]
+        async fn urlencoded_repeated_scalar_is_422_naming_the_field() {
+            let resp = Router::new()
+                .route("/test", post(tags_handler))
+                .oneshot(urlencoded_req("/test", "name=a&name=b"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(body_text(resp).await.contains("`name`"));
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_repeated_keys_reach_vec_fields() {
+            let resp = Router::new()
+                .route("/test", post(tags_handler))
+                .oneshot(multipart_req_multi(
+                    "/test",
+                    &[("name", "Ann"), ("tags", "a"), ("tags", "b"), ("ids", "9")],
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, r#"name=Ann tags=["a", "b"] ids=[9]"#).await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_file_field_reaches_the_form() {
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                let file = form.file("avatar").expect("file part must reach the form");
+                format!(
+                    "valid={} field={} name={} type={:?} bytes={:?}",
+                    form.is_valid(),
+                    file.field(),
+                    file.file_name(),
+                    file.content_type(),
+                    std::str::from_utf8(file.bytes()).unwrap()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_parts_req(
+                    "/test",
+                    &[
+                        Part::text("name", "Alice"),
+                        Part::file("avatar", "me.txt", "text/plain", b"hello"),
+                    ],
+                ))
+                .await
+                .unwrap();
+            assert_body(
+                resp,
+                r#"valid=true field=avatar name=me.txt type=Some("text/plain") bytes="hello""#,
+            )
+            .await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_files_under_one_name_all_reach_the_form() {
+            async fn handler(mut form: ChangesetForm<TestForm>) -> String {
+                let names: Vec<String> = form
+                    .files("photos")
+                    .map(|f| f.file_name().to_owned())
+                    .collect();
+                let taken = form.take_files();
+                format!(
+                    "{names:?} taken={} left={}",
+                    taken.len(),
+                    form.files("photos").count()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_parts_req(
+                    "/test",
+                    &[
+                        Part::text("name", "Alice"),
+                        Part::file("photos", "a.txt", "text/plain", b"a"),
+                        Part::file("photos", "b.txt", "text/plain", b"b"),
+                    ],
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, r#"["a.txt", "b.txt"] taken=2 left=0"#).await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_empty_optional_file_input_is_skipped() {
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                format!(
+                    "valid={} file={}",
+                    form.is_valid(),
+                    form.file("avatar").is_some()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_parts_req(
+                    "/test",
+                    &[
+                        Part::text("name", "Alice"),
+                        Part::file("avatar", "", "application/octet-stream", b""),
+                    ],
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true file=false").await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_file_obeys_the_upload_mime_allow_list() {
+            async fn handler(_form: ChangesetForm<TestForm>) -> &'static str {
+                "accepted"
+            }
+            let mut req = multipart_parts_req(
+                "/test",
+                &[
+                    Part::text("name", "Alice"),
+                    Part::file("avatar", "x.html", "image/png", b"<script>1</script>"),
+                ],
+            );
+            req.extensions_mut()
+                .insert(crate::security::config::UploadConfig {
+                    allowed_mime_types: vec!["image/png".to_owned()],
+                    ..Default::default()
+                });
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_file_obeys_the_upload_size_cap() {
+            async fn handler(_form: ChangesetForm<TestForm>) -> &'static str {
+                "accepted"
+            }
+            let mut req = multipart_parts_req(
+                "/test",
+                &[
+                    Part::text("name", "Alice"),
+                    Part::file("avatar", "big.txt", "text/plain", &[b'x'; 64]),
+                ],
+            );
+            req.extensions_mut()
+                .insert(crate::security::config::UploadConfig {
+                    max_file_size_bytes: 16,
+                    ..Default::default()
+                });
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_empty_optional_file_input_is_skipped_under_a_mime_policy() {
+            #[derive(serde::Deserialize, validator::Validate)]
+            #[serde(deny_unknown_fields)]
+            struct Strict {
+                name: String,
+            }
+            async fn handler(form: ChangesetForm<Strict>) -> String {
+                format!(
+                    "{} file={}",
+                    form.data().name,
+                    form.file("avatar").is_some()
+                )
+            }
+            let mut req = multipart_parts_req(
+                "/test",
+                &[
+                    Part::text("name", "Alice"),
+                    Part::file("avatar", "", "application/octet-stream", b""),
+                ],
+            );
+            req.extensions_mut()
+                .insert(crate::security::config::UploadConfig {
+                    allowed_mime_types: vec!["image/png".to_owned()],
+                    ..Default::default()
+                });
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_body(resp, "Alice file=false").await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_keeps_a_tighter_route_body_limit() {
+            async fn handler(_form: ChangesetForm<TestForm>) -> &'static str {
+                "accepted"
+            }
+            let req = multipart_parts_req(
+                "/test",
+                &[
+                    Part::text("name", "Alice"),
+                    Part::file("avatar", "big.txt", "text/plain", &[b'x'; 4096]),
+                ],
+            );
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .layer(axum::extract::DefaultBodyLimit::max(1024))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn urlencoded_form_has_no_files() {
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                format!("{}", form.files("avatar").count())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&avatar=x"))
+                .await
+                .unwrap();
+            assert_body(resp, "0").await;
+        }
+
         // ── Helpers ────────────────────────────────────────────────
+
+        /// One part of a hand-built multipart body.
+        #[cfg(feature = "multipart")]
+        struct Part<'a> {
+            name: &'a str,
+            file: Option<(&'a str, &'a str)>,
+            value: &'a [u8],
+        }
+
+        #[cfg(feature = "multipart")]
+        impl<'a> Part<'a> {
+            const fn text(name: &'a str, value: &'a str) -> Self {
+                Self {
+                    name,
+                    file: None,
+                    value: value.as_bytes(),
+                }
+            }
+
+            const fn file(
+                name: &'a str,
+                file_name: &'a str,
+                content_type: &'a str,
+                value: &'a [u8],
+            ) -> Self {
+                Self {
+                    name,
+                    file: Some((file_name, content_type)),
+                    value,
+                }
+            }
+        }
+
+        #[cfg(feature = "multipart")]
+        fn multipart_parts_req(uri: &str, parts: &[Part<'_>]) -> axum::http::Request<Body> {
+            let boundary = "----FormBoundary7MA4YWxkTrZu0gW";
+            let mut body: Vec<u8> = Vec::new();
+            for part in parts {
+                body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                match part.file {
+                    Some((file_name, content_type)) => body.extend_from_slice(
+                        format!(
+                            "Content-Disposition: form-data; name=\"{}\"; filename=\"{file_name}\"\r\n\
+                             Content-Type: {content_type}\r\n\r\n",
+                            part.name
+                        )
+                        .as_bytes(),
+                    ),
+                    None => body.extend_from_slice(
+                        format!(
+                            "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                            part.name
+                        )
+                        .as_bytes(),
+                    ),
+                }
+                body.extend_from_slice(part.value);
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap()
+        }
 
         fn urlencoded_req(uri: &str, body: &'static str) -> axum::http::Request<Body> {
             axum::http::Request::builder()
