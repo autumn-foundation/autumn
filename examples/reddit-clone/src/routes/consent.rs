@@ -43,6 +43,7 @@ pub const CONSENT_POLICY_VERSION: u32 = 1;
 pub const CATEGORIES: &[&str] = &["analytics"];
 
 /// Record consent to every category in [`CATEGORIES`].
+#[public]
 #[post("/consent/accept")]
 pub async fn accept(headers: HeaderMap) -> impl IntoResponse {
     let cookie = autumn_web::consent::accept_all_cookie(CATEGORIES, CONSENT_POLICY_VERSION);
@@ -50,6 +51,7 @@ pub async fn accept(headers: HeaderMap) -> impl IntoResponse {
 }
 
 /// Record an explicit rejection of every non-essential category.
+#[public]
 #[post("/consent/reject")]
 pub async fn reject(headers: HeaderMap) -> impl IntoResponse {
     let cookie = autumn_web::consent::reject_non_essential_cookie(CONSENT_POLICY_VERSION);
@@ -61,6 +63,7 @@ pub async fn reject(headers: HeaderMap) -> impl IntoResponse {
 /// Clearing the cookie returns the visitor to *undecided*, which is not the
 /// same as rejecting: the gate closes either way, but the banner comes back on
 /// the next page so the choice can be made again from scratch.
+#[public]
 #[post("/consent/withdraw")]
 pub async fn withdraw(flash: Flash, headers: HeaderMap) -> impl IntoResponse {
     let cookie = autumn_web::consent::expire_consent_cookie();
@@ -74,6 +77,7 @@ pub async fn withdraw(flash: Flash, headers: HeaderMap) -> impl IntoResponse {
 /// buttons, so "change your mind" and "decide the first time" are the same
 /// markup posting to the same routes. The injector detects the banner's marker
 /// and skips adding another copy on top.
+#[public]
 #[get(
     "/consent/manage",
     seo(

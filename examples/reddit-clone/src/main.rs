@@ -96,6 +96,15 @@ static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
+/// Mark generated routes as deliberately unauthenticated: the same claim
+/// `#[public]` makes on a hand-written handler.
+fn public_routes(mut routes: Vec<autumn_web::Route>) -> Vec<autumn_web::Route> {
+    for route in &mut routes {
+        route.api_doc.public = true;
+    }
+    routes
+}
+
 #[autumn_web::main]
 async fn main() {
     let webhook_store = Arc::new(InMemoryOutboundWebhookStore::new());
@@ -182,10 +191,6 @@ async fn main() {
             routes::live::subreddit_viewer_stream,
             routes::live::posts_stream,
             routes::live::subreddit_posts_stream,
-            repositories::subreddit_api_list,
-            repositories::subreddit_api_get,
-            repositories::post_api_list,
-            repositories::post_api_get,
             // Signed inbound webhook intake (see routes/webhooks.rs + autumn.toml).
             routes::webhooks::stripe_webhook,
             // Dev-only error routes for smoke-testing the dev error overlay.
@@ -194,6 +199,17 @@ async fn main() {
             routes::errors::trigger_panic,
             routes::errors::trigger_404,
         ])
+        // The read-only JSON API `#[repository(api = ...)]` generates. A
+        // generated handler cannot carry `#[public]`, and with no `policy =`
+        // it has no guard, so `autumn routes audit` would list it as
+        // unclassified. These four routes only read public posts and
+        // communities, so they are public on purpose.
+        .routes(public_routes(routes![
+            repositories::subreddit_api_list,
+            repositories::subreddit_api_get,
+            repositories::post_api_list,
+            repositories::post_api_get,
+        ]))
         // Threaded, polymorphic comments (#1367). This ONE mount serves every
         // `#[commentable]` model in the binary -- `Post` and `Subreddit` here --
         // because the framework router dispatches on the `{commentable_type}`
@@ -214,6 +230,9 @@ async fn main() {
                     }),
             ),
         )
+        // A nested router is opaque to `autumn routes audit`. This lists its two
+        // routes: reading a thread is public, and posting needs a session.
+        .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
         .mail_previews(routes::auth::mail_previews())
         .policy::<Post, _>(PostPolicy)
         .static_routes(static_routes![routes::about::about])

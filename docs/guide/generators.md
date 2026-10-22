@@ -1413,6 +1413,7 @@ autumn generate scaffold Post title:String comments:commentable
 
   ```rust
   .nest("/comments", autumn_web::commentable::router(Default::default()))
+  .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
   ```
 
   and render a thread with `autumn_web::widgets::comment_thread`. Adding a

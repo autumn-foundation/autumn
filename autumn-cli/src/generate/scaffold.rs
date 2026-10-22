@@ -873,7 +873,8 @@ fn plan_scaffold_with_options_impl(
                     "Added the shared `{table}` table. Every `#[commentable]` model \
                      attaches to it, so later models need no migration of their own. \
                      Mount the framework's comment routes once, e.g. \
-                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))`, \
+                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))\
+                     .declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))`, \
                      and render a thread with \
                      `autumn_web::widgets::comment_thread`.",
                     table = super::commentable::COMMENTS_TABLE,

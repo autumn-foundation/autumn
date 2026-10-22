@@ -16,6 +16,9 @@
 #      pass, which is precisely the change the gate exists to catch. Widening
 #      fails this script; narrowing and neutral changes are printed and pass.
 #
+#   3. Run scripts/check-posture-demo.sh: the golden diff that shows the gate
+#      blocking a widened copy of reddit-clone's manifest.
+#
 # Drift between the committed manifest and the freshly built one is reported,
 # not failed: unlike an app repository, this one *is* the framework, so the
 # framework-owned routes in every example's manifest move whenever the
@@ -63,10 +66,14 @@ cd "$root"
 #   invoice  - a `#[public]` page and a `#[public]` PDF
 #   todo-app - `#[public]` routes, and a bearer-token API that a layer guards
 #              (`AppBuilder::scoped_guarded`)
+#   reddit-clone - session-guarded `#[secured]` routes, the only example here
+#              with proven guards; a nested router declared with
+#              `declare_plugin_routes`; and generated repository routes
+#              marked public
 # The other examples stay out. Most mount admin or write routes with no guard.
 # `#[public]` on those routes would be false. Add an example only after you
 # classify each of its routes by hand.
-EXAMPLES=("hello" "flock" "invoice" "todo-app")
+EXAMPLES=("hello" "flock" "invoice" "todo-app" "reddit-clone")
 
 # The binary to audit. Only an example with more than one binary needs this.
 example_bin() {
@@ -279,3 +286,13 @@ done
 echo
 [ "$failed" = "0" ] || die "the security posture gate failed for at least one example"
 ok "security posture gate passed for: ${EXAMPLES[*]}"
+
+# The reddit-clone golden diff is derived from the baseline above, so it is
+# checked, and refreshed, in the same run.
+echo
+echo "── reddit-clone posture demo ───────────────────────────────"
+if [ "$UPDATE" = "1" ]; then
+  AUTUMN_CLI="$CLI" ./scripts/check-posture-demo.sh --update
+else
+  AUTUMN_CLI="$CLI" ./scripts/check-posture-demo.sh
+fi
