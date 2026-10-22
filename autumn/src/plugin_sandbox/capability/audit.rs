@@ -1106,7 +1106,7 @@ mod tests {
         let age = crate::time::ambient_instant().saturating_duration_since(shed);
         assert!(log.summary("other", age).truncated, "at the edge");
         assert!(
-            !log.summary("other", age - Duration::from_millis(1))
+            !log.summary("other", age.saturating_sub(Duration::from_millis(1)))
                 .truncated,
             "just outside"
         );
