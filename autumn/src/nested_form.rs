@@ -237,7 +237,10 @@ impl NestedRow {
     /// of them.
     #[must_use]
     pub fn value(&self, sub: &str) -> Option<&str> {
-        self.values.get(sub).and_then(|v| v.last()).map(String::as_str)
+        self.values
+            .get(sub)
+            .and_then(|v| v.last())
+            .map(String::as_str)
     }
 
     /// Every raw submitted value for subfield `sub`, in submission order, or an
@@ -451,7 +454,10 @@ impl<P, C: NestedChild + serde::Serialize> NestedChangeset<P, C> {
                 // yields an empty value map rather than panicking on the request path.
                 if let Ok(encoded) = serde_html_form::to_string(child) {
                     for (k, v) in url::form_urlencoded::parse(encoded.as_bytes()) {
-                        values.entry(k.into_owned()).or_default().push(v.into_owned());
+                        values
+                            .entry(k.into_owned())
+                            .or_default()
+                            .push(v.into_owned());
                     }
                 }
                 NestedRow {

@@ -2012,10 +2012,16 @@ mod tests {
         assert_eq!(health.details["owner"], "a");
         assert_eq!(health.details["held"][0]["range"], "0-9");
         assert_eq!(health.details["held"][0]["serving"], true);
-        assert!(!a.lose(3, token(1)), "the same epoch is not newer");
+        // The two ranges claim at the same time, so either one can get epoch 1.
+        let first = a.epoch_for(3).expect("0-9 is held");
+        let second = a.epoch_for(15).expect("10-19 is held");
+        let mut epochs = [first, second];
+        epochs.sort_by_key(|t| t.get());
+        assert_eq!(epochs, [token(1), token(2)]);
+        assert!(!a.lose(3, first), "the same epoch is not newer");
         assert!(a.lose(3, token(9)));
         assert_eq!(a.epoch_for(3), None);
-        assert_eq!(a.held(), vec![(range(10, 19), token(2))]);
+        assert_eq!(a.held(), vec![(range(10, 19), second)]);
         a.release_all().await;
         assert!(a.held().is_empty());
         // A store it cannot reach turns the indicator down.

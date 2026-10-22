@@ -861,7 +861,8 @@ Notes:
 per-file size caps — before your handler sees a byte. See
 [storage](./storage.md) for where the bytes then go.
 
-**`ChangesetForm` keeps file parts.** On a `multipart/form-data` body (the
+**`ChangesetForm` keeps file parts**, so one form can take a file upload and
+its text fields together. On a `multipart/form-data` body (the
 `multipart` feature), the text fields decode into `T` as usual. Each file part
 goes to the form, not to `T`:
 
