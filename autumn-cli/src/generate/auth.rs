@@ -11845,6 +11845,40 @@ mod tests {
     /// screen reader no accessible name. A label is bound by `for` plus a
     /// matching `id` in the same form, or by wrapping a checkbox. Every visible
     /// input needs an `id` or an `aria-label`. Ids are unique in a form.
+    /// Wayfinder audit: every form control the auth scaffold emits has an
+    /// accessible name. A sibling `<label>` with no `for=` names nothing, so
+    /// the login/signup/reset/reauth inputs were unlabeled to assistive tech
+    /// and clicking the visible label did not focus its field.
+    #[test]
+    fn auth_scaffold_has_no_unlabeled_form_controls() {
+        let tmp = project_with_main();
+        plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions {
+                providers: Vec::new(),
+            },
+            true, // totp
+            true, // passkeys
+            true, // magic_link
+        )
+        .expect("generate auth must scaffold")
+        .execute(Flags::default())
+        .unwrap();
+        let scan = crate::a11y::scan_project(&tmp.path().join("src")).unwrap();
+        let unlabeled: Vec<String> = scan
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "label")
+            .map(|f| format!("{}:{} <{}>", f.file, f.line, f.element))
+            .collect();
+        assert!(
+            unlabeled.is_empty(),
+            "auth scaffold has unlabeled controls: {unlabeled:#?}"
+        );
+    }
+
     #[test]
     fn generated_forms_bind_every_label_and_input() {
         let variants = [
