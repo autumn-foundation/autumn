@@ -22,6 +22,8 @@ narrative is `docs/guide/edge.md`, the design record is
 | Conformance | `tests/conformance.rs` | Runs one request corpus through the native lane, a real wasm artifact, the full origin app, and a gateway |
 | `EdgeGateway` | `tests/conformance.rs` | The capsule in front of the origin: a declined request goes to the origin unchanged |
 | `autumn edge serve` / `EdgeNode` | `tests/conformance.rs` | The edge node over real HTTP; Tier E measures TTFB |
+| The JS edge host | `tests/conformance.rs` | Tier J: `autumn-edge/js` runs the capsule to the reference host's outcome for every request |
+| `autumn edge bundle` | below | A Cloudflare Worker from this capsule; CI runs it in workerd |
 
 The module split is the whole trick:
 
@@ -134,6 +136,27 @@ autumn edge ttfb --divergence-only --edge http://127.0.0.1:8787 \
 On one machine there is no distance, so the edge is not faster. Run
 `autumn edge ttfb` without `--divergence-only` from a client far from the
 origin to measure the speed-up.
+
+## Running it in a Cloudflare Worker
+
+`autumn edge bundle` writes a Worker for this capsule. `wrangler dev` runs it
+locally in workerd, Cloudflare's runtime, in front of the same origin:
+
+```bash
+cargo run -p edge-greeting &                     # the origin, on :3000
+autumn edge bundle \
+  --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+  --origin http://127.0.0.1:3000 \
+  --response-header 'access-control-allow-origin: *'
+cd edge/cloudflare && npx wrangler dev --port 8788
+
+curl http://127.0.0.1:8788/greet/ada             # served by the capsule, in the Worker
+curl -X POST http://127.0.0.1:8788/feedback -d x # sent to the origin
+```
+
+`npx wrangler deploy` deploys the same directory. Bind a KV namespace as
+`AUTUMN_EDGE_KV` in `wrangler.toml` to give `/note/{key}` its store; without
+one, `/note/{key}` falls through to the origin.
 
 ## Running the conformance suite
 

@@ -22,6 +22,10 @@
 //! - **Tier D**: Tiers A to C over 10,000 generated requests (fixed seed).
 //!   This is the issue's success metric: zero divergence across >= 10k
 //!   requests.
+//! - **Tier J** (JS host vs wasm edge): the web-standard JS host
+//!   (`autumn-edge/js`, ADR-0024) runs the same artifact over the corpus and
+//!   the generated requests, synchronously and with replay-on-miss KV. Its
+//!   outcomes must equal the reference host's. Needs Node 18+.
 //!
 //! Every test is `#[ignore]`d because it needs the `wasm32-wasip1` target
 //! installed. CI runs them in the dedicated `edge-conformance` job:
@@ -253,11 +257,17 @@ fn origin_status_for_fallthrough(uri: &str) -> u16 {
 fn artifact() -> &'static Arc<EdgeArtifact> {
     static ARTIFACT: OnceLock<Arc<EdgeArtifact>> = OnceLock::new();
     ARTIFACT.get_or_init(|| {
-        let wasm = build_capsule();
         Arc::new(
-            EdgeArtifact::from_bytes(&wasm).expect("the built artifact is a valid wasm module"),
+            EdgeArtifact::from_bytes(capsule_bytes())
+                .expect("the built artifact is a valid wasm module"),
         )
     })
+}
+
+/// The built capsule's bytes, built once per test process.
+fn capsule_bytes() -> &'static [u8] {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    BYTES.get_or_init(build_capsule)
 }
 
 /// `cargo build --target wasm32-wasip1 --release --bin edge-capsule`.
@@ -1416,6 +1426,155 @@ async fn tier_d_a_generated_corpus_shows_zero_divergence_across_every_lane() {
     assert!(
         lanes.get("Edge").copied().unwrap_or_default() >= corpus.len() / 3,
         "too few requests reached the edge lane to prove byte-identity: {lanes:?}"
+    );
+}
+
+// ── Tier J: the JS host vs the reference host ────────────────────────
+
+/// Run `cases` through `autumn-edge/js/autumn-edge-host.mjs` under Node and
+/// return, per case, its synchronous and its replay-on-miss outcome.
+fn run_js_host(cases: &[Generated]) -> Vec<(EdgeOutcome, EdgeOutcome)> {
+    let node = std::env::var("NODE").unwrap_or_else(|_| "node".to_owned());
+    let dir = std::env::temp_dir().join(format!("edge-greeting-tier-j-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create a scratch directory");
+    let wasm = dir.join("edge-capsule.wasm");
+    std::fs::write(&wasm, capsule_bytes()).expect("write the capsule");
+
+    // `demo_kv` is an `InMemoryEdgeKv`; its keys are the two the example
+    // publishes. Every other key is a miss on both hosts.
+    let reference = edge_greeting::demo_kv();
+    let kv: serde_json::Map<String, serde_json::Value> = ["greeting", "release"]
+        .into_iter()
+        .map(|key| {
+            let value = reference.get(key).expect("demo_kv publishes this key");
+            (
+                key.to_owned(),
+                autumn_edge::wire::encode_body(&value).into(),
+            )
+        })
+        .collect();
+    let job = serde_json::json!({
+        "wasm": wasm,
+        "kv": kv,
+        "cases": cases.iter().map(|case| serde_json::json!({
+            "method": case.method,
+            "uri": case.uri,
+            "headers": case.headers,
+            "capabilities": case.capabilities,
+        })).collect::<Vec<_>>(),
+    });
+    let job_path = dir.join("job.json");
+    std::fs::write(&job_path, job.to_string()).expect("write the job");
+
+    let driver =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../autumn-edge/js/conformance-driver.mjs");
+    let output = Command::new(&node)
+        .arg(driver)
+        .arg(&job_path)
+        .output()
+        .unwrap_or_else(|err| panic!("Tier J needs Node 18+ (`{node}`): {err}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "the JS host driver failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let outcome = |frame: &serde_json::Value| {
+        serde_json::from_value::<GuestFrame>(frame.clone())
+            .expect("the driver prints guest frames")
+            .into_outcome()
+            .expect("the driver prints terminal frames")
+    };
+    let outcomes: Vec<_> = String::from_utf8(output.stdout)
+        .expect("the driver prints UTF-8")
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
+            (outcome(&value["sync"]), outcome(&value["replay"]))
+        })
+        .collect();
+    assert_eq!(outcomes.len(), cases.len(), "one outcome per case");
+    outcomes
+}
+
+/// Tier J: the web-standard JS host (ADR-0024) runs the same artifact to the
+/// same outcome as the reference host, for the hand-written corpus and the
+/// whole generated one — byte for byte, including the guest's own decline
+/// details. The one excused difference is the engine's wording of a trap.
+#[test]
+#[ignore = "requires wasm32-wasip1 target and Node (edge-conformance CI job)"]
+fn tier_j_the_js_host_reproduces_the_reference_host() {
+    let kv = edge_greeting::demo_kv();
+    let mut corpus: Vec<Generated> = CORPUS.iter().map(Generated::from).collect();
+    corpus.extend(generate(GENERATOR_SEED, GENERATED_REQUESTS));
+
+    let started = std::time::Instant::now();
+    let js = run_js_host(&corpus);
+    println!(
+        "\n  Tier J — JS host vs reference host, {} requests in {:.1?}\n",
+        corpus.len(),
+        started.elapsed()
+    );
+
+    let mut served = 0usize;
+    let mut failures = Vec::new();
+    for (case, (sync, replay)) in corpus.iter().zip(&js) {
+        let request = EdgeRequest {
+            method: case.method.to_owned(),
+            uri: case.uri.clone(),
+            headers: case.headers.clone(),
+            body: Vec::new(),
+            identity: None,
+        };
+        let reference = run_wasm(&request, case.capabilities, &kv);
+        for (path, outcome) in [("sync", sync), ("replay", replay)] {
+            let same = match (&reference, outcome) {
+                (
+                    EdgeOutcome::Fallthrough { reason, detail },
+                    EdgeOutcome::Fallthrough {
+                        reason: js_reason,
+                        detail: js_detail,
+                    },
+                ) if detail.starts_with("the capsule trapped") => {
+                    // The trap message is the engine's; the stderr excerpt
+                    // (the panic message) is the capsule's and must match.
+                    reason == js_reason
+                        && js_detail.starts_with("the capsule trapped")
+                        && detail.split_once("(stderr: ").map(|(_, tail)| tail)
+                            == js_detail.split_once("(stderr: ").map(|(_, tail)| tail)
+                }
+                _ => reference == *outcome,
+            };
+            if !same {
+                failures.push(format!(
+                    "[{}] {path}:\n  reference {reference:?}\n  js        {outcome:?}",
+                    case.name
+                ));
+            }
+        }
+        if reference.served().is_some() {
+            served += 1;
+        }
+    }
+    println!("    served at the edge                                   {served}");
+    println!(
+        "    declined                                             {}",
+        corpus.len() - served
+    );
+    assert!(
+        failures.is_empty(),
+        "{} JS host outcomes diverged from the reference host. First 20:\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        served >= corpus.len() / 3,
+        "too few requests reached the edge lane to prove anything: {served}"
     );
 }
 

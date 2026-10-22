@@ -376,8 +376,9 @@ repeats until stdin reaches EOF, so one process serves many requests.
   guessing.
 - **Anything the capsule writes after its terminal frame is ignored.**
 
-A host implementation you can read top to bottom lives in
-`autumn-edge/src/host.rs` — the same one the conformance suite runs.
+Two host implementations you can read top to bottom: `autumn-edge/src/host.rs`
+(Rust, wasmi) and `autumn-edge/js/autumn-edge-host.mjs` (JavaScript,
+web-standard). The conformance suite runs both and requires the same outcome.
 
 ## Security posture
 
@@ -484,18 +485,139 @@ case (see "What an edge handler may use"), so `autumn build` fails on it.
 
 ### Deploying
 
-What you deploy is the artifact plus this protocol. A CDN shim — a Worker, a
-Lambda, an nginx sidecar — loads the `.wasm`, speaks the NDJSON dialogue on
-stdio, answers `kv_get` from its own replica, and forwards any `fallthrough` to
-your origin unchanged.
+What you deploy is the artifact and a host for it. The host loads the
+`.wasm`, speaks the NDJSON dialogue on stdio, answers `kv_get` from its own
+replica, and forwards any `fallthrough` to your origin unchanged. Autumn ships
+two hosts you can deploy, and you write neither:
 
-**Autumn does not ship a vendor shim.** Vendor bindings are explicitly out of
-scope for this slice (see [ADR-0011](../adr/0011-edge-capsule-read-lane.md)): the
-deliverable is a portable artifact and a documented protocol, so no Autumn
-release is coupled to a CDN vendor's SDK cadence. `autumn-edge`'s reference host
-is the worked specification a shim implements against.
+| Host | Where it runs | How |
+| --- | --- | --- |
+| The JS edge host | a CDN: Cloudflare Workers, and any runtime with `WebAssembly` and the Fetch API | `autumn edge bundle` (below) |
+| The edge node | a server you run near your users | `autumn edge serve` (below) |
 
-Autumn ships one reference target that you can run: the edge node (below).
+Neither is a vendor binding (see
+[ADR-0024](../adr/0024-web-standard-js-edge-host.md)): the JS host uses only
+web-standard APIs, so no Autumn release waits on a CDN's SDK.
+
+### Cloudflare Workers: `autumn edge bundle`
+
+```sh
+autumn build
+autumn edge bundle --target cloudflare --origin https://origin.example.com
+cd edge/cloudflare && npx wrangler deploy
+```
+
+```text
+🍂 Edge bundle (cloudflare) in edge/cloudflare — capsule 312 KB
+  wrote edge-capsule.wasm
+  wrote autumn-edge-host.mjs
+  wrote worker.mjs
+  wrote .gitignore
+  wrote wrangler.toml (yours to edit; later bundles keep it)
+```
+
+| File | What it is | Rewritten by each bundle |
+| --- | --- | --- |
+| `edge-capsule.wasm` | the capsule `autumn build` made | yes |
+| `autumn-edge-host.mjs` | the JS edge host | yes |
+| `worker.mjs` | the Worker entry: passes `env` to the host | yes |
+| `wrangler.toml` | the Worker config: name, `AUTUMN_ORIGIN`, KV binding | **no** — written once, then yours |
+
+Commit `wrangler.toml`. The generated `.gitignore` keeps the other three out of
+git.
+
+Before it writes anything, the bundle checks the capsule's imports against what
+the host provides and names any import it cannot link. Flags:
+
+- `--origin URL`: the origin, written to `AUTUMN_ORIGIN` in a new
+  `wrangler.toml`. A kept `wrangler.toml` keeps its own value.
+- `--response-header 'NAME: VALUE'`: set a header on every edge response, for
+  example a CORS policy that is the same for every route. Repeat it.
+- `--probe-path PATH` / `--no-probe`: the Worker copies the origin's static
+  security headers (and a CSP without a nonce) from two `GET`s of this path,
+  once per isolate, as `autumn edge serve` does.
+- `--name NAME`: the Worker name for a new `wrangler.toml`. Defaults to
+  `<package>-edge`.
+- `--out DIR`: defaults to `edge/cloudflare`.
+
+**The `kv` capability is a KV namespace bound as `AUTUMN_EDGE_KV`.** Without
+the binding a `needs(kv)` route falls through to the origin.
+
+```sh
+npx wrangler kv namespace create AUTUMN_EDGE_KV   # put the id in wrangler.toml
+```
+
+The origin publishes into the namespace; the capsule only reads.
+
+### The JS edge host
+
+`autumn-edge-host.mjs` is one ES module with no dependencies. It is
+`autumn_edge::host` and `autumn_edge::gateway` written for `WebAssembly` and
+the Fetch API: the same WASI imports, the same dialogue, the same fixed clock
+and entropy, the same checks on a capsule's answer, the same forwarding rules.
+The edge-greeting suite's Tier J runs it and the reference host over the
+corpus and 10,000 generated requests and requires the same outcome for each.
+CI also runs the generated bundle in workerd, Cloudflare's runtime.
+
+Use it directly when the Worker does more than serve the capsule, for example
+a cron trigger or routes of its own. Pass a function as the origin, and your
+own routes become the fallthrough target:
+
+```js
+import capsule from "./edge-capsule.wasm";
+import { createEdgeGateway } from "./autumn-edge-host.mjs";
+
+let gateway = null;
+
+export default {
+  async fetch(request, env) {
+    gateway ??= createEdgeGateway({
+      capsule,
+      origin: (request) => myOwnRoutes(request, env), // or a URL string
+      kv: env.STATUS_KV,                               // a Workers KV binding
+      clientIp: (r) => r.headers.get("cf-connecting-ip"),
+    });
+    return gateway.fetch(request);
+  },
+  async scheduled(event, env, ctx) { /* … */ },
+};
+```
+
+| Option | Meaning |
+| --- | --- |
+| `capsule` | a `WebAssembly.Module` (a Workers `.wasm` import), bytes, or a promise of either |
+| `origin` | a base URL, or `(request) => Response` for an origin in the same Worker |
+| `kv` | `(key) => value`, a `Map`, or a Workers KV binding; gives `kv` |
+| `preload` | KV keys to read before the first run |
+| `identity` | `(request) => { user_id, roles } \| null`, after you verify the request; a throw goes to the origin |
+| `responseHeaders` | `[[name, value]]` set on every edge response |
+| `probeOrigin`, `probePath` | copy the origin's static security headers (URL origin only) |
+| `clientIp` | `(request) => ip` for `x-forwarded-for` |
+| `onLane` | `({ lane, reason, request, response }) => void`, for a log or a counter |
+
+`gateway.handle(request)` returns `{ response, lane, reason }`, where `lane` is
+`edge`, `fallthrough`, `origin_only` or `refused`. `gateway.fetch(request)`
+returns the response only.
+
+**KV reads are asynchronous; the capsule's are not.** The host answers
+`kv_get` from a per-request snapshot. When the capsule asks for a key the
+snapshot does not have, the host stops the instance, reads the key, and runs
+the request again. Because the host fixes the clock and the entropy, the run
+replays exactly. A request that reads N distinct keys costs N + 1 runs, and
+more than 32 keys falls through. `preload` reads known keys before the first
+run. A failed read is a miss.
+
+What the Fetch API makes different from the Rust gateway:
+
+- **No instruction budget.** JavaScript cannot meter a WebAssembly call. The
+  platform's CPU limit (on Workers, the per-request CPU time) stops a runaway
+  capsule.
+- **Memory is checked after instantiation.** A capsule whose memory is over the
+  256 MiB budget falls through, but the host cannot refuse each
+  `memory.grow`; the platform's memory limit applies.
+- **Repeated request headers are joined.** `Headers` joins two `x-tag` lines
+  into one `a, b` value before the capsule sees them. A header value with a
+  non-ASCII character goes to the origin only.
 
 ### The reference gateway
 
@@ -784,8 +906,9 @@ a middleware, a macro or a dependency is exactly what could break it.
 - **No compression, no i18n locale prefix, no sessions** in the edge lane. The
   origin's middleware stack does not run there — the capsule serves exactly what
   the handler produced.
-- **No vendor shim ships with Autumn.** Artifact, protocol, a reference
-  gateway and a reference edge node; see above.
+- **One bundle target: Cloudflare.** The JS host runs on Deno, Bun, Vercel
+  and Netlify edge functions too; `autumn edge bundle` writes the entry and
+  config for Workers only. Use the host directly elsewhere.
 - **CI simulates the distance.** Tier E proves the speed-up against a
   simulated origin round trip. For your deployment, run `autumn edge ttfb`
   from a distant client.
@@ -804,6 +927,8 @@ a middleware, a macro or a dependency is exactly what could break it.
   and its conformance suite
 - [ADR-0011](../adr/0011-edge-capsule-read-lane.md) — why a separate crate, and
   what was rejected
+- [ADR-0024](../adr/0024-web-standard-js-edge-host.md) — the JS edge host and
+  `autumn edge bundle`
 - [ADR-0004](../adr/0004-externalize-distributed-runtime-state.md) — the
   category-2 framing `EdgeKv` inherits
 - [Conditional GET](conditional-get.md) — and `#[static_get]`, for pages that
