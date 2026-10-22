@@ -345,7 +345,8 @@ needed; `diesel`, `diesel-async`, `serde`, and `tokio` are already in your
 Integration tests in `tests/` are separate crates that cannot import from
 `src/main.rs` (binary crates don't expose a library target). Define the schema
 and handler under test inline — or extract them into a `src/lib.rs` for larger
-apps:
+apps. `TestDb` is a Postgres container here. With the `sqlite` feature, it is a
+temp-file SQLite database instead. The API is the same.
 
 ```rust
 // tests/integration_test.rs

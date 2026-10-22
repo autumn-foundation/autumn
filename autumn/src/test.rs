@@ -271,7 +271,7 @@ use crate::state::AppState;
 // `AsyncPgConnection` by its short name now; the `TestClient` pool fields use the
 // `RuntimeConnection` alias, and the transactional establish path uses the fully
 // qualified path — so without `test-support` this import would be unused.
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 use diesel_async::AsyncPgConnection;
 // Used by the Postgres transactional establish path (the `.get_result()` on
 // `TransactionalDbInterceptor`), which is itself gated `not(feature = "sqlite")`;
@@ -4666,6 +4666,9 @@ impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
 
 /// Shared Postgres testcontainer for database integration tests.
 ///
+/// Under `--features sqlite` this type is a tempfile `SQLite` database instead
+/// (issue #2555); the API is the same.
+///
 /// Rather than spinning up a new container per test (slow!), `TestDb`
 /// provides a shared container that all tests in a binary can reuse.
 /// This mirrors Spring Boot's `@Testcontainers` with `@Container` +
@@ -4696,14 +4699,14 @@ impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
 ///     client.get("/data").send().await.assert_ok();
 /// }
 /// ```
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 pub struct TestDb {
     _container: testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
     pool: Pool<AsyncPgConnection>,
     url: String,
 }
 
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 impl TestDb {
     /// Start a new Postgres testcontainer and create a connection pool.
     ///
@@ -4791,6 +4794,189 @@ impl TestDb {
             .await
             .unwrap_or_else(|e| panic!("SQL execution failed: {e}\nSQL: {sql}"));
     }
+
+    /// Empty `table` and restart its id sequence (`TRUNCATE … RESTART IDENTITY`).
+    ///
+    /// `table` must match `[A-Za-z0-9_]+`. Schema-qualified names are not allowed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a plain identifier, or if the SQL fails.
+    pub async fn reset_table(&self, table: &str) {
+        assert_plain_identifier(table);
+        self.execute_sql(&format!("TRUNCATE \"{table}\" RESTART IDENTITY"))
+            .await;
+    }
+}
+
+/// Throwaway `SQLite` database for integration tests (issue #2555).
+///
+/// This is the `--features sqlite` counterpart of the Postgres `TestDb`. It has
+/// the same API and needs no Docker. Each instance owns a tempfile database.
+/// [`TestDb::shared`] reuses one per test binary.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::test::{TestApp, TestDb};
+///
+/// #[tokio::test]
+/// async fn db_test() {
+///     let db = TestDb::shared().await;
+///     db.execute_sql("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)").await;
+///     let client = TestApp::new().routes(routes![h]).with_db(db.pool()).build();
+///     client.get("/t").send().await.assert_ok();
+/// }
+/// ```
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+pub struct TestDb {
+    pool: Pool<crate::db::RuntimeConnection>,
+    url: String,
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+impl TestDb {
+    /// Create a new tempfile database and a connection pool for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool cannot be built.
+    pub async fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "autumn-testdb-{}-{}.db",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A file from a crashed run can share this name (the process id is
+        // reused). Remove it so the database starts empty.
+        remove_sqlite_files(&path);
+        let url = format!("sqlite://{}", path.display());
+        let config = crate::config::DatabaseConfig {
+            primary_url: Some(url.clone()),
+            ..Default::default()
+        };
+        let pool = crate::db::create_pool(&config)
+            .expect("failed to build SQLite test pool")
+            .expect("SQLite test URL did not yield a pool");
+        // Create the file now so a failure shows up here, not in a later test.
+        drop(
+            pool.get()
+                .await
+                .expect("failed to open SQLite test database"),
+        );
+        Self { pool, url, path }
+    }
+
+    /// Get a shared `TestDb`, created on first use.
+    ///
+    /// The database is created once per test binary. Rust never drops a
+    /// static, so its file stays in the temp directory. Use [`TestDb::new`] when
+    /// the file must be removed.
+    pub async fn shared() -> &'static Self {
+        use std::sync::OnceLock;
+        use tokio::sync::OnceCell;
+
+        static CELL: OnceLock<OnceCell<TestDb>> = OnceLock::new();
+        let once = CELL.get_or_init(OnceCell::new);
+        once.get_or_init(Self::new).await
+    }
+
+    /// Get the database connection pool.
+    #[must_use]
+    pub fn pool(&self) -> Pool<crate::db::RuntimeConnection> {
+        self.pool.clone()
+    }
+
+    /// Get the `sqlite://` connection URL.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Execute raw SQL against the test database.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the SQL fails.
+    pub async fn execute_sql(&self, sql: &str) {
+        use diesel_async::SimpleAsyncConnection as _;
+        let mut conn = self.pool.get().await.expect("failed to get connection");
+        conn.batch_execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("SQL execution failed: {e}\nSQL: {sql}"));
+    }
+
+    /// Empty `table` and restart its id counter.
+    ///
+    /// `SQLite` has no `TRUNCATE`. This deletes every row, then clears the
+    /// `AUTOINCREMENT` counter in `sqlite_sequence`. `table` must match
+    /// `[A-Za-z0-9_]+`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a plain identifier, or if the SQL fails.
+    pub async fn reset_table(&self, table: &str) {
+        use diesel_async::RunQueryDsl as _;
+        use diesel_async::SimpleAsyncConnection as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct Found {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        assert_plain_identifier(table);
+        // One connection for all steps, so no other writer slips in between.
+        let mut conn = self.pool.get().await.expect("failed to get connection");
+        conn.batch_execute(&format!("DELETE FROM \"{table}\""))
+            .await
+            .unwrap_or_else(|e| panic!("failed to empty {table}: {e}"));
+        // `sqlite_sequence` exists only after the first AUTOINCREMENT table.
+        let found = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'sqlite_sequence'",
+        )
+        .get_result::<Found>(&mut *conn)
+        .await
+        .expect("failed to probe sqlite_sequence");
+        if found.n > 0 {
+            conn.batch_execute(&format!(
+                "DELETE FROM sqlite_sequence WHERE name = '{table}'"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("failed to reset the id counter of {table}: {e}"));
+        }
+    }
+}
+
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        self.pool.close();
+        remove_sqlite_files(&self.path);
+    }
+}
+
+/// Remove a `SQLite` database file and its `-wal` and `-shm` files.
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+fn remove_sqlite_files(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(name);
+    }
+}
+
+/// Reject anything but `[A-Za-z0-9_]+`: table names go into SQL text.
+#[cfg(all(feature = "db", feature = "test-support"))]
+fn assert_plain_identifier(name: &str) {
+    assert!(
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "table name must be a plain identifier: {name:?}"
+    );
 }
 
 /// Deterministically claims and runs up to `max_rows` ready durable repository
@@ -4897,6 +5083,27 @@ pub async fn drain_ready_repository_commit_hooks(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    fn plain_identifiers_are_accepted() {
+        super::assert_plain_identifier("posts");
+        super::assert_plain_identifier("Post_2");
+    }
+
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    #[should_panic(expected = "plain identifier")]
+    fn an_empty_identifier_is_rejected() {
+        super::assert_plain_identifier("");
+    }
+
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    #[should_panic(expected = "plain identifier")]
+    fn sql_in_an_identifier_is_rejected() {
+        super::assert_plain_identifier("t; DROP TABLE x");
+    }
+
     use super::*;
 
     fn cleanup_probe_job(

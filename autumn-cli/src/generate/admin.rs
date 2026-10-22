@@ -473,7 +473,7 @@ fn model_has_uuid_id(model_source: &str, pascal_name: &str) -> bool {
                 .path
                 .segments
                 .last()
-                .is_some_and(|seg| seg.ident == "Uuid")
+                .is_some_and(|seg| seg.ident == "Uuid" || seg.ident == "SqliteUuid")
         })
     })
 }
@@ -1554,6 +1554,22 @@ mod tests {
     /// Create a minimal project root: Cargo.toml + src/models/<snake>.rs.
     fn project_with_model(snake: &str) -> TempDir {
         project_with_model_source(snake, "// stub\n")
+    }
+
+    #[test]
+    fn sqlite_uuid_id_counts_as_a_uuid_id() {
+        for ty in [
+            "uuid::Uuid",
+            "Uuid",
+            "autumn_web::db::sqlite_types::SqliteUuid",
+        ] {
+            let src = format!("pub struct Post {{ #[id] pub id: {ty}, pub title: String }}");
+            assert!(model_has_uuid_id(&src, "Post"), "{ty}");
+        }
+        assert!(!model_has_uuid_id(
+            "pub struct Post { #[id] pub id: i64 }",
+            "Post"
+        ));
     }
 
     #[test]

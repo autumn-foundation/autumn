@@ -533,6 +533,8 @@ nix = { version = "0.31.2", features = ["resource", "time"] }
 # cannot lift a forbid (E0453). The crate installs its `#[global_allocator]` on
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
+# The SQLite UUID default shared with the generator (tests/sqlite_uuid_primary_key.rs).
+autumn-schema-core = { path = "../autumn-schema-core" }
 # Criterion benches (issue #3068, `benches/admission.rs`). No plots: only the
 # statistics and the `cargo bench` harness.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
@@ -1196,6 +1198,20 @@ path = "tests/sqlite_searchable_repository.rs"
 [[test]]
 name = "sqlite_immediate_transaction"
 path = "tests/sqlite_immediate_transaction.rs"
+
+# `TestDb` on the SQLite backend (issue #2555): a throwaway tempfile database with
+# the Postgres harness API, so a scaffolded SQLite app can run its smoke test.
+# Run: `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_test_db`.
+[[test]]
+name = "sqlite_test_db"
+path = "tests/sqlite_test_db.rs"
+
+# UUID primary keys on SQLite (issue #2555): the generator's `randomblob` default
+# builds canonical v4 ids through a `#[model]` + `#[repository]`.
+# Run: `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_uuid_primary_key`.
+[[test]]
+name = "sqlite_uuid_primary_key"
+path = "tests/sqlite_uuid_primary_key.rs"
 
 # SQLite `statement_timeout` fail-closed boot guard (issue #1996, item 4). SQLite
 # cannot enforce a per-statement wall-clock timeout through the async connection

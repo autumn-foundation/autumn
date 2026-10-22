@@ -183,8 +183,9 @@ published support contract**. Available **today**:
 - **Backend-aware app dependencies (#1924)** — a SQLite app's `Cargo.toml` gets
   diesel on its `sqlite` feature with the bundled `libsqlite3-sys`, no `pq-sys`,
   and `autumn-web`'s `sqlite` feature, so the generated code actually compiles.
+- **UUID primary keys (#2555)** — `--id uuid` makes a `TEXT` key. The database
+  sets its value. See [UUID primary keys](#uuid-primary-keys-on-sqlite).
 - **Generate-time rejections**, each naming its tracking issue:
-  - `--id uuid` primary keys — #2555.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
   - `DROP INDEX` emitted before `DROP COLUMN` on the forward **and** rollback
@@ -220,11 +221,10 @@ published support contract**. Available **today**:
   [backup, restore, scrub, retention](#backup-restore-scrub-retention) and
   [deploy: the data file is persistent state](#deploy-the-data-file-is-persistent-state).
 
-**Not in this slice — scaffold smoke tests on SQLite.** A scaffolded app still
-carries the **Postgres-shaped** (`#[ignore]`d) smoke test: it uses the
-Postgres-only `TestDb` testcontainer and `TRUNCATE … RESTART IDENTITY`. The
-runtime landed without a SQLite-native scaffold smoke harness; that is tracked
-in #2555.
+**Scaffold smoke tests (#2555).** A scaffolded SQLite app has a SQLite-native
+smoke test. Under the `sqlite` feature, `autumn_web::test::TestDb` is a temp-file
+SQLite database, so the test needs no Docker and runs in a plain `cargo test`.
+See [Testing with `TestDb`](#testing-with-testdb-on-sqlite).
 
 One support-matrix row is still **Planned**: durable jobs and `#[scheduled]`
 tasks (#1907). #1909 added backup/restore and `autumn deploy` data-file
@@ -761,18 +761,33 @@ Rust equality. A row inserted by hand or migrated from elsewhere may not be:
 unhyphenated, uppercase), and such a row loads correctly but will not match a
 `find_by_…` for the same UUID. Write canonical text.
 
-**Smoke test.** A scaffolded SQLite app's `tests/<model>.rs` still uses
-`autumn_web::test::TestDb`, a Postgres-only testcontainer, so `cargo test` on a
-generated SQLite app does not compile yet — `autumn generate scaffold` warns
-about this on a SQLite app. The app itself is unaffected: `cargo run`, `cargo
-build` and `autumn migrate` all work. A SQLite-native smoke harness
-is tracked in #2555.
+**Smoke test.** A scaffolded SQLite app's `tests/<model>.rs` uses the SQLite
+`TestDb` (see [Testing with `TestDb`](#testing-with-testdb-on-sqlite)). It is not
+`#[ignore]`d, and each test gets its own database.
 
-Additional generator shapes are refused on SQLite:
+<a id="uuid-primary-keys-on-sqlite"></a>
 
-- **`--id uuid` primary keys** are rejected at generate time — the SQLite primary
-  key is `INTEGER PRIMARY KEY AUTOINCREMENT`, and a UUID primary key has no
-  working conversion yet. Tracked in #2555.
+#### UUID primary keys on SQLite
+
+`autumn generate model Post --id uuid` works on a SQLite app. SQLite has no
+`uuid` type and no `gen_random_uuid()`, so the generator writes:
+
+```sql
+id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4))) || '-' || ...)
+```
+
+The default makes a random version-4 UUID in lowercase text. The database makes
+the id, as on Postgres. `NOT NULL` is required: SQLite lets a
+`TEXT PRIMARY KEY` hold `NULL` unless the column forbids it. The model field is
+`pub id: SqliteUuid`, and the schema type is `Text`.
+
+A table that you wrote by hand as `TEXT PRIMARY KEY` has no such default. The
+schema tools expect the default for a `SqliteUuid` key, so `autumn schema diff`
+reports it as drift on that table. Add the default in a migration to clear it.
+
+On both backends, a UUID key cannot be used with `#[repository]`,
+`--searchable`, `generate scaffold` or `comments:commentable`. These need an
+`i64` key.
 > **`generate auth` / `generate mailer` now generate on SQLite (#1927 / #1908).**
 > Historically refused at generate time, both now scaffold SQLite-dialect
 > migrations on a SQLite app (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
@@ -826,13 +841,29 @@ Additional generator shapes are refused on SQLite:
 > (`unicode61` tokenization, `bm25` ranking) on SQLite. See
 > [Full-text search](./full-text-search.md#6-sqlite-fts5).
 
-> **Scaffold smoke tests are still Postgres-shaped.** The generated-scaffold smoke
-> test (including the duplicate-`unique` rejection) uses
-> `autumn_web::test::TestDb`, a **Postgres-only** testcontainer, and
-> `TRUNCATE … RESTART IDENTITY`, and runs only under `cargo test -- --ignored`
-> (it is `#[ignore]`d). There is no SQLite `TestDb` yet, so a scaffolded SQLite
-> app still carries the Postgres-shaped smoke test rather than a SQLite-native
-> one. A backend-aware scaffold smoke harness is tracked in #2555.
+> **Scaffold smoke tests run on SQLite (#2555).** The generated-scaffold smoke
+> test (including the duplicate-`unique` rejection) uses the SQLite `TestDb`
+> and `db.reset_table(...)`. It is not `#[ignore]`d, and each test gets its own
+> database.
+
+<a id="testing-with-testdb-on-sqlite"></a>
+
+### Testing with `TestDb` on SQLite
+
+Under `--features sqlite`, `autumn_web::test::TestDb` is a temp-file SQLite
+database. Its API is the same as the Postgres `TestDb`:
+
+| Call | Effect |
+| --- | --- |
+| `TestDb::new().await` | A new database. Its file is removed on drop. |
+| `TestDb::shared().await` | One database for the test binary. Its file is not removed. |
+| `db.pool()` | The connection pool. Pass it to `TestApp::with_db`. |
+| `db.execute_sql(sql).await` | Run SQL. A statement list is allowed. |
+| `db.reset_table("t").await` | Delete all rows and restart the id counter. |
+
+Use `TestDb::new()` for parallel tests that use the same table names. Each call
+makes a new database. SQLite has no `TRUNCATE`. `reset_table` runs `DELETE`, then
+clears the row in `sqlite_sequence`.
 
 ### Migration mechanics on SQLite
 
@@ -939,7 +970,7 @@ never as a runtime surprise on some unlucky code path days later.
   Postgres-only job/scheduler backend, a multi-replica lock) fails at boot with
   an actionable diagnostic.
 - A **generator** that would emit output which compiles on Postgres but breaks
-  on SQLite (for example an `--id uuid` primary key) is rejected at **generate
+  on SQLite (for example `--sharded`) is rejected at **generate
   time**, with the reason stated — never silent output that fails later.
 
 So the operational rule is simple: if a SQLite app boots, every feature it is

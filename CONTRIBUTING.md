@@ -100,7 +100,8 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 |------|------|----------------|
 | `generated_project_compiles_runs_and_serves` | `e2e.rs` | `autumn new` → `cargo build` + HTTP responses |
 | `generated_scaffold_cargo_checks` | `generate.rs` | `generate scaffold` → `cargo check --tests` |
-| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) → `cargo check`. Not `--all-targets`: the scaffold smoke test is Postgres-only until #2555 (#1924) |
+| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) plus an `--id uuid` model → `cargo check` (#1924, #2555) |
+| `generated_sqlite_scaffold_smoke_tests_pass` | `generate.rs` | SQLite-configured HTML and `--api` scaffolds → `cargo test --tests`. The generated smoke tests run on the SQLite `TestDb` (#2555) |
 | `generated_scaffold_config_cargo_checks` | `generate.rs` | config-driven scaffold → `cargo check --tests` |
 | `generated_scaffold_serves_posts_index_and_json_api` | `generate.rs` | scaffold + Postgres migrations + live HTTP |
 | `generated_constrained_scaffold_enforces_validation_end_to_end` | `generate.rs` | scaffold DSL `{…}` constraints + Postgres + live HTTP: rendered HTML5 attributes, 422 + inline errors, nothing stored (#1388) |

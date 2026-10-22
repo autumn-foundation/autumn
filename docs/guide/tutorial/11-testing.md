@@ -58,7 +58,8 @@ Integration test files in `tests/` are compiled as their own crate and linked
 against your package's public API. Because the todo-app is a binary (no
 `src/lib.rs`), the test file cannot import your handler functions directly.
 Instead, define the schema and handlers inline — the same approach Autumn uses
-for its own `test_db_integration.rs`.
+for its own `test_db_integration.rs`. `TestDb` is a Postgres container in this
+tutorial. With the `sqlite` feature, it is a temp-file SQLite database instead.
 
 ```rust
 //! Integration tests for the todo-app.
