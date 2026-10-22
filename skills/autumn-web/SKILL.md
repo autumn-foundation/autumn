@@ -824,6 +824,8 @@ segment, so a third commentable model needs no route:
 
 ```rust
 .nest("/comments", autumn_web::commentable::router(Default::default()))
+// A nest is opaque to `autumn routes audit`; declare its two routes, or the audit fails:
+.declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
 // GET/POST /comments/{commentable_type}/{parent_id}
 ```
 
