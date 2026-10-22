@@ -479,7 +479,7 @@ struct Priced {
     discount: Option<rust_decimal::Decimal>,
 }
 
-/// The JSON Schema `type` of what serde really writes for a `Decimal`.
+/// The JSON Schema type of the value serde writes for a `Decimal`.
 fn decimal_wire_type() -> &'static str {
     let wire = serde_json::to_value(rust_decimal::Decimal::new(12345, 2)).unwrap();
     if wire.is_string() { "string" } else { "number" }

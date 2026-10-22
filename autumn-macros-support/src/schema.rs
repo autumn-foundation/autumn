@@ -851,8 +851,8 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         return unconstrained_json_tokens(ty);
     }
 
-    // `Decimal`'s wire type depends on the serde features the build unified, so
-    // the schema is read from serde at run time, not fixed here.
+    // The wire type of `Decimal` depends on the serde features of the build.
+    // Read it at run time.
     if let Some(identity_predicate) = decimal_identity_predicate(&name) {
         return emit_identity_guarded(
             ty,
@@ -956,8 +956,8 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 /// Deliberately narrow: only types whose serde output is unambiguous.
 /// `Decimal` is not in this table: its wire type depends on the serde features
 /// in the build, so [`decimal_identity_predicate`] reads it at run time.
-/// `BigDecimal` is left out on purpose, as an opaque placeholder beats a
-/// confidently wrong scalar.
+/// `BigDecimal` is not in this table. Its wire type is not certain, and a wrong
+/// scalar is worse than an opaque placeholder.
 ///
 /// The **naive** chrono types deliberately carry NO `format`. `OpenAPI`'s
 /// `date-time` and `time` are RFC 3339 productions that *require* a UTC offset,
@@ -1088,9 +1088,9 @@ fn unconstrained_json_tokens(ty: &syn::Type) -> TokenStream {
 /// Runtime predicate for `Decimal` and its `SQLite` wrapper, or `None` for any
 /// other name.
 ///
-/// The wrapper's path is matched as text because `autumn_web::db::sqlite_types`
-/// exists only under the `sqlite` feature; a `use` of it would not compile
-/// without. A unit test in `autumn` pins the literal to the real `type_name`.
+/// The wrapper path is matched as text. The type exists only with the `sqlite`
+/// feature, so this crate cannot name it. A unit test in `autumn` checks that
+/// the text equals the real `type_name`.
 fn decimal_identity_predicate(name: &str) -> Option<TokenStream> {
     match name {
         "Decimal" => Some(quote! {
@@ -1172,7 +1172,7 @@ fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
         "NaiveDateTime" => quote! { #chrono::NaiveDateTime },
         "NaiveTime" => quote! { #chrono::NaiveTime },
         "Uuid" => quote! { ::autumn_web::reexports::uuid::Uuid },
-        // Text match: the type exists only under the `sqlite` feature.
+        // Match as text. The type exists only with the `sqlite` feature.
         "SqliteUuid" => {
             return Some(quote! { __identity == "autumn_web::db::sqlite_types::SqliteUuid" });
         }

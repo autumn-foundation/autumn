@@ -556,7 +556,7 @@ impl_scalar_schema!(
     "date",
     serde_json::json!({ "type": "string", "format": "date" })
 );
-// No `format`: a naive value has no UTC offset, so `date-time` would be false.
+// No `format`. A naive value has no UTC offset, so `date-time` is wrong.
 impl_scalar_schema!(
     chrono::NaiveDateTime,
     "naive-date-time",
@@ -567,12 +567,12 @@ impl_scalar_schema!(
 );
 impl_scalar_schema!(rust_decimal::Decimal, "decimal", decimal_scalar_schema());
 
-/// The schema of a [`rust_decimal::Decimal`], as serde really writes it.
+/// The schema of a [`rust_decimal::Decimal`], as serde writes it.
 ///
-/// `rust_decimal` writes a JSON string by default, but a number under its
-/// `serde-float` or `serde-arbitrary-precision` features. Cargo unifies
-/// features across the build, so the answer is read from serde at run time
-/// instead of being fixed here. The schema cannot disagree with the wire.
+/// By default, `rust_decimal` writes a JSON string. With the `serde-float` or
+/// `serde-arbitrary-precision` feature, it writes a number. Cargo merges the
+/// features of all crates in a build, so this function reads the type from
+/// serde at run time. The schema always matches the wire.
 #[must_use]
 pub fn decimal_scalar_schema() -> serde_json::Value {
     match serde_json::to_value(rust_decimal::Decimal::new(12345, 2)) {
