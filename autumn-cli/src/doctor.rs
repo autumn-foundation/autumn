@@ -266,7 +266,7 @@ pub fn check_dependencies_impl(eval: &crate::deps::Evaluation) -> CheckResult {
         Evaluation::AuditorMissing { checks } => (
             CheckStatus::Pass,
             format!(
-                "not evaluated — cargo-deny is not installed (`cargo install --locked cargo-deny`); {}",
+                "not evaluated. cargo-deny is not installed (`cargo install --locked cargo-deny`). Doctor cannot check that deny.toml is valid, so CI can still reject it; {}",
                 dependency_checks_phrase(checks)
             ),
             None,
@@ -9480,6 +9480,13 @@ pub fn run(opts: DoctorOptions) {
     type Task = Box<dyn FnOnce() -> CheckResult + Send>;
 
     let cli_version = env!("CARGO_PKG_VERSION");
+
+    // The dependency audit runs in its own process group, so Ctrl+C does not
+    // reach it. Stop it here, or it keeps Cargo's package-cache lock.
+    let _ = ctrlc::set_handler(|| {
+        crate::deps::stop_all();
+        std::process::exit(130);
+    });
 
     if !opts.json {
         println!("\u{1F342} autumn doctor\n");
@@ -22839,6 +22846,20 @@ redirect_uri = "http://localhost/callback"
                 detail.contains("cargo install"),
                 "the detail must say how to enable it: {detail}"
             );
+        }
+
+        #[test]
+        fn a_missing_auditor_says_the_policy_is_not_validated_either() {
+            // Only cargo-deny knows its config schema. `yanked = "bogus"` is
+            // valid TOML, so doctor passes it, and CI rejects it (issue #2575).
+            let result = check_dependencies_impl(&Evaluation::AuditorMissing {
+                checks: vec!["advisories".to_owned()],
+            });
+            assert_eq!(result.status, CheckStatus::Pass);
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("not installed"), "{detail}");
+            assert!(detail.contains("valid"), "{detail}");
+            assert!(detail.contains("CI can still reject"), "{detail}");
         }
 
         #[test]

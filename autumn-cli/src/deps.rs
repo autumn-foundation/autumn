@@ -7,6 +7,10 @@
 //! issue #1600. Two differences remain and are reported, not hidden: CI pins
 //! its auditor version, and CI fetches the advisory database before it audits.
 //! See `docs/guide/supply-chain.md`, "Part 3b — the dev loop".
+//!
+//! One limit follows from that. Only `cargo deny` knows its config schema. A
+//! `deny.toml` that is valid TOML but breaks the schema (`yanked = "bogus"`)
+//! is accepted here when `cargo deny` is absent, and CI rejects it (issue #2575).
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -765,18 +769,55 @@ pub fn name_some(ids: &[&str], limit: usize) -> String {
 /// Doctor reports a verdict or reports that it got none. It never hangs.
 pub const DOCTOR_BUDGET: Duration = Duration::from_secs(30);
 
+/// A running evaluation: the verdict channel and the means to stop it.
+pub struct Running {
+    /// Delivers the verdict. Closed without one if the audit was stopped.
+    pub receiver: mpsc::Receiver<Evaluation>,
+    /// Ends the auditor process. Call it when you give up on the verdict.
+    pub stop: StopHandle,
+}
+
 /// Run the evaluation on its own thread.
 ///
-/// The caller decides how long to wait. A caller that gives up leaves the
-/// thread to finish and drop its result.
-pub fn spawn_evaluation(root: &Path) -> mpsc::Receiver<Evaluation> {
+/// The caller decides how long to wait. A caller that gives up must call
+/// [`StopHandle::stop`], or the auditor keeps running.
+pub fn spawn_evaluation(root: &Path) -> Running {
+    spawn(root, None)
+}
+
+/// Run the evaluation on its own thread, and stop it after `deadline`.
+///
+/// A watchdog thread enforces the deadline. It does not depend on the caller
+/// polling, so it holds while the caller is busy (for example in a rebuild).
+pub fn spawn_evaluation_with_deadline(root: &Path, deadline: Duration) -> Running {
+    spawn(root, Some(deadline))
+}
+
+fn spawn(root: &Path, deadline: Option<Duration>) -> Running {
     let (sender, receiver) = mpsc::channel();
     let root = root.to_path_buf();
+    let stop = StopHandle::default();
+    ACTIVE.register(&stop);
+    let finished = deadline.map(|deadline| watchdog(stop.clone(), deadline));
+    let worker_stop = stop.clone();
     std::thread::spawn(move || {
         // A closed receiver means the caller moved on. Nothing to report.
-        let _ = sender.send(evaluate(&root));
+        let _ = sender.send(evaluate_with(&root, &worker_stop));
+        // Dropping this ends the watchdog without a stop.
+        drop(finished);
     });
-    receiver
+    Running { receiver, stop }
+}
+
+/// Stop `stop` after `deadline`, unless the returned sender is dropped first.
+fn watchdog(stop: StopHandle, deadline: Duration) -> mpsc::Sender<()> {
+    let (finished, wait) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if wait.recv_timeout(deadline) == Err(mpsc::RecvTimeoutError::Timeout) {
+            stop.stop();
+        }
+    });
+    finished
 }
 
 /// Wait up to `budget` for a spawned evaluation. `None` means it did not
@@ -791,11 +832,175 @@ pub fn await_evaluation(
 /// Evaluate the policy, giving up after `budget`.
 ///
 /// A budget that expires is reported as no verdict, never as a clean tree.
+/// The auditor process is stopped at that point, not before.
 pub fn evaluate_within(root: &Path, budget: Duration) -> Evaluation {
-    let receiver = spawn_evaluation(root);
-    await_evaluation(&receiver, budget).unwrap_or_else(|| Evaluation::Unavailable {
-        reason: format!("the audit did not finish within {}s", budget.as_secs()),
-        checks: Vec::new(),
+    await_or_stop(&spawn_evaluation(root), budget)
+}
+
+/// Wait up to `budget` for `running`. On expiry, stop it and report no verdict.
+fn await_or_stop(running: &Running, budget: Duration) -> Evaluation {
+    await_evaluation(&running.receiver, budget).unwrap_or_else(|| {
+        running.stop.stop();
+        Evaluation::Unavailable {
+            reason: format!("the audit did not finish within {}s", budget.as_secs()),
+            checks: Vec::new(),
+        }
+    })
+}
+
+/// The audits that may still be running.
+static ACTIVE: Registry = Registry(std::sync::Mutex::new(Vec::new()));
+
+/// Stop every audit this process started.
+///
+/// A process that dies on Ctrl+C runs no destructors, and each auditor leads
+/// its own process group, so the terminal does not reach it. The interrupt
+/// handler calls this first.
+pub fn stop_all() {
+    ACTIVE.stop_all();
+}
+
+/// A list of audits to stop together.
+struct Registry(std::sync::Mutex<Vec<StopHandle>>);
+
+impl Registry {
+    fn register(&self, stop: &StopHandle) {
+        let mut handles = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.push(stop.clone());
+    }
+
+    fn stop_all(&self) {
+        let handles = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stop in handles.iter() {
+            stop.stop();
+        }
+    }
+}
+
+/// State shared by an audit thread and the caller that may stop it.
+#[derive(Default)]
+struct Slot {
+    child: Option<std::process::Child>,
+    stopped: bool,
+}
+
+/// Ends an audit's auditor process.
+///
+/// Call it after the deadline, or when the caller ends. On the normal path the
+/// verdict arrives and the process has already exited. Killing a live `cargo metadata` is safe for
+/// Cargo's package-cache lock: the OS releases the lock when its holder dies.
+#[derive(Clone, Default)]
+pub struct StopHandle(std::sync::Arc<std::sync::Mutex<Slot>>);
+
+impl StopHandle {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Kill the auditor and its children. Safe to call at any time, and more
+    /// than once. A call before the process starts prevents it from running.
+    pub fn stop(&self) {
+        let mut slot = self.slot();
+        slot.stopped = true;
+        if let Some(child) = slot.child.as_mut() {
+            kill_tree(child);
+        }
+    }
+
+    /// True after [`stop`](Self::stop).
+    #[cfg(test)]
+    pub fn is_stopped(&self) -> bool {
+        self.slot().stopped
+    }
+}
+
+/// Kill a child and every process it started.
+///
+/// The auditor runs `cargo metadata` as its own child. Killing only the
+/// auditor leaves that process holding the package-cache lock. On Unix the
+/// child leads its own process group (see `run_stoppable`). On Windows the
+/// sweep walks the process tree.
+fn kill_tree(child: &mut std::process::Child) {
+    crate::process::force_kill_group(child.id());
+    let _ = child.kill();
+}
+
+/// How long to wait for output after the auditor exits. A descendant that
+/// outlives it can hold the pipe open.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How often a running auditor is checked for exit.
+const POLL: Duration = Duration::from_millis(10);
+
+/// Run `command` to completion, unless `stop` ends it first.
+///
+/// A stopped run returns an `Interrupted` error.
+fn run_stoppable(
+    command: &mut Command,
+    stop: &StopHandle,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Own process group, so `stop` reaches the auditor's children too.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+    let mut child = command.spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = sender.send(bytes);
+        });
+        receiver
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+
+    {
+        let mut slot = stop.slot();
+        if slot.stopped {
+            kill_tree(&mut child);
+        }
+        slot.child = Some(child);
+    }
+    let status = loop {
+        let mut slot = stop.slot();
+        let waited = slot.child.as_mut().map(std::process::Child::try_wait);
+        match waited {
+            Some(Ok(Some(status))) => {
+                slot.child = None;
+                if slot.stopped {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                break status;
+            }
+            Some(Ok(None)) => {}
+            Some(Err(error)) => return Err(error),
+            None => return Err(std::io::ErrorKind::Interrupted.into()),
+        }
+        drop(slot);
+        std::thread::sleep(POLL);
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.recv_timeout(DRAIN_GRACE).unwrap_or_default(),
+        stderr: stderr.recv_timeout(DRAIN_GRACE).unwrap_or_default(),
     })
 }
 
@@ -836,7 +1041,12 @@ fn is_workspace_root(dir: &Path) -> bool {
 ///
 /// Always offline: the advisory database is never fetched here, so this cannot
 /// depend on the network. `cargo deny fetch db` refreshes it.
+#[cfg(test)]
 pub fn evaluate(root: &Path) -> Evaluation {
+    evaluate_with(root, &StopHandle::default())
+}
+
+fn evaluate_with(root: &Path, stop: &StopHandle) -> Evaluation {
     let Some(root) = find_policy_root(root) else {
         return Evaluation::NoPolicy;
     };
@@ -904,8 +1114,7 @@ pub fn evaluate(root: &Path) -> Evaluation {
         .args(&checks)
         .current_dir(&root);
     no_toolchain_installs(&mut command);
-    let output = command.output();
-    let output = match output {
+    let output = match run_stoppable(&mut command, stop) {
         Ok(output) => output,
         Err(error) => {
             return Evaluation::Unavailable {
@@ -1504,6 +1713,154 @@ mod tests {
                 derivations_disagree(policy).is_empty(),
                 "wrongly reported as a disagreement: {policy:?}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    mod stoppable {
+        use super::*;
+
+        fn alive(pid: i32) -> bool {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+        }
+
+        fn sh(script: &str) -> Command {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            command
+        }
+
+        #[test]
+        fn a_finished_audit_returns_its_output_and_is_not_killed() {
+            let stop = StopHandle::default();
+            let output = run_stoppable(&mut sh("echo out; echo err >&2"), &stop).expect("run");
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+            assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+            assert!(!stop.is_stopped(), "the normal path never stops");
+        }
+
+        #[test]
+        fn stopping_kills_the_auditor_and_its_children() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pid_file = dir.path().join("grandchild.pid");
+            let tmp_file = dir.path().join("grandchild.tmp");
+            // Write, then rename: the reader never sees a partial pid.
+            let script = format!(
+                "sleep 60 & echo $! > {tmp}; mv {tmp} {pid}; wait",
+                tmp = tmp_file.display(),
+                pid = pid_file.display()
+            );
+            let stop = StopHandle::default();
+            let stopper = stop.clone();
+            let runner = std::thread::spawn(move || run_stoppable(&mut sh(&script), &stopper));
+            let mut grandchild = None;
+            for _ in 0..500 {
+                if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                    grandchild = text.trim().parse::<i32>().ok();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let Some(grandchild) = grandchild else {
+                stop.stop();
+                panic!("the auditor never started its child");
+            };
+            // Kill the child on any failure below.
+            let _cleanup = Cleanup(grandchild);
+            assert!(alive(grandchild));
+            stop.stop();
+            let result = runner.join().expect("join");
+            assert_eq!(
+                result.expect_err("stopped").kind(),
+                std::io::ErrorKind::Interrupted
+            );
+            // Reaping is up to init; allow it a moment.
+            for _ in 0..1000 {
+                if !alive(grandchild) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the auditor's child outlived the stop");
+        }
+
+        /// Kills a leftover process when a test fails early.
+        struct Cleanup(i32);
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(self.0),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+
+        #[test]
+        fn stop_all_stops_every_registered_audit() {
+            let registry = Registry(std::sync::Mutex::new(Vec::new()));
+            let (first, second) = (StopHandle::default(), StopHandle::default());
+            registry.register(&first);
+            registry.register(&second);
+            registry.stop_all();
+            assert!(first.is_stopped() && second.is_stopped());
+        }
+
+        #[test]
+        fn the_watchdog_stops_an_audit_that_outlives_its_deadline() {
+            let stop = StopHandle::default();
+            let _finished = watchdog(stop.clone(), Duration::from_millis(20));
+            for _ in 0..500 {
+                if stop.is_stopped() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the deadline did not stop the audit");
+        }
+
+        #[test]
+        fn the_watchdog_leaves_a_finished_audit_alone() {
+            let stop = StopHandle::default();
+            drop(watchdog(stop.clone(), Duration::from_millis(50)));
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!stop.is_stopped());
+        }
+
+        #[test]
+        fn a_stop_twice_is_harmless() {
+            let stop = StopHandle::default();
+            stop.stop();
+            stop.stop();
+            assert!(stop.is_stopped());
+        }
+
+        #[test]
+        fn output_larger_than_a_pipe_buffer_is_drained() {
+            let stop = StopHandle::default();
+            let output = run_stoppable(&mut sh("head -c 300000 /dev/zero"), &stop).expect("run");
+            assert_eq!(output.stdout.len(), 300_000);
+        }
+
+        #[test]
+        fn a_budget_that_expires_stops_the_audit() {
+            let (_sender, receiver) = mpsc::channel();
+            let stop = StopHandle::default();
+            let running = Running {
+                receiver,
+                stop: stop.clone(),
+            };
+            let eval = await_or_stop(&running, Duration::from_millis(10));
+            assert!(matches!(eval, Evaluation::Unavailable { .. }));
+            assert!(stop.is_stopped(), "expiry must stop the auditor");
+        }
+
+        #[test]
+        fn a_stop_before_the_start_prevents_the_run() {
+            let stop = StopHandle::default();
+            stop.stop();
+            let error = run_stoppable(&mut sh("sleep 60"), &stop).expect_err("stopped");
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         }
     }
 

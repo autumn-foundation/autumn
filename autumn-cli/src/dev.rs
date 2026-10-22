@@ -706,7 +706,10 @@ impl DevReloadState {
 /// beside the build makes its `cargo metadata` contend with Cargo's
 /// package-cache lock and slow the build itself — and the watch loop then polls
 /// for the result without blocking. A verdict that has not arrived by this
-/// deadline is dropped and the dev loop says nothing.
+/// deadline is dropped, its auditor process is killed, and the dev loop says
+/// nothing. A watchdog thread enforces the deadline, so it holds while the
+/// loop is busy in a rebuild. The process is not killed before the deadline,
+/// except when the dev session ends.
 const DEPENDENCY_AUDIT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Startup lines for an evaluation that may not have finished in time.
@@ -720,14 +723,17 @@ fn dependency_startup_lines(eval: Option<&crate::deps::Evaluation>) -> Vec<Strin
 /// or not a verdict has arrived, so the watch loop never stalls on the auditor.
 struct DependencyAudit {
     receiver: mpsc::Receiver<crate::deps::Evaluation>,
+    stop: crate::deps::StopHandle,
     deadline: std::time::Instant,
     done: bool,
 }
 
 impl DependencyAudit {
     fn start(root: &Path) -> Self {
+        let running = crate::deps::spawn_evaluation_with_deadline(root, DEPENDENCY_AUDIT_DEADLINE);
         Self {
-            receiver: crate::deps::spawn_evaluation(root),
+            receiver: running.receiver,
+            stop: running.stop,
             deadline: std::time::Instant::now() + DEPENDENCY_AUDIT_DEADLINE,
             done: false,
         }
@@ -749,8 +755,21 @@ impl DependencyAudit {
             // Still running. Give up once the deadline passes so a wedged
             // auditor cannot keep this poll alive for the whole session.
             Err(mpsc::TryRecvError::Empty) => {
-                self.done = std::time::Instant::now() >= self.deadline;
+                if std::time::Instant::now() >= self.deadline {
+                    self.done = true;
+                    // Do not leave the auditor to contend with the next build.
+                    self.stop.stop();
+                }
             }
+        }
+    }
+}
+
+impl Drop for DependencyAudit {
+    /// Ending the dev session ends an audit still in flight.
+    fn drop(&mut self) {
+        if !self.done {
+            self.stop.stop();
         }
     }
 }
@@ -5078,30 +5097,56 @@ watch_dirs = ["views", "locales"]
     #[test]
     fn a_dependency_audit_that_never_answers_stops_being_polled() {
         let (sender, receiver) = mpsc::channel();
+        let stop = crate::deps::StopHandle::default();
         let mut audit = DependencyAudit {
             receiver,
+            stop: stop.clone(),
             deadline: std::time::Instant::now(),
             done: false,
         };
         audit.report();
         assert!(audit.done, "an expired deadline must end the polling");
+        assert!(
+            stop.is_stopped(),
+            "an expired deadline must kill the auditor"
+        );
         drop(sender);
     }
 
     #[test]
     fn a_dependency_audit_reports_its_verdict_once() {
         let (sender, receiver) = mpsc::channel();
+        let stop = crate::deps::StopHandle::default();
         let mut audit = DependencyAudit {
             receiver,
+            stop: stop.clone(),
             deadline: std::time::Instant::now() + Duration::from_secs(60),
             done: false,
         };
         audit.report();
         assert!(!audit.done, "a pending audit stays pending");
+        assert!(!stop.is_stopped(), "a pending audit is not killed early");
         sender
             .send(crate::deps::Evaluation::NoPolicy)
             .expect("send");
         audit.report();
         assert!(audit.done, "a delivered verdict ends the polling");
+        assert!(!stop.is_stopped(), "a delivered verdict is never killed");
+        drop(audit);
+        assert!(!stop.is_stopped(), "a finished audit is not killed on drop");
+    }
+
+    #[test]
+    fn dropping_an_unfinished_audit_stops_it() {
+        let (_sender, receiver) = mpsc::channel();
+        let stop = crate::deps::StopHandle::default();
+        let audit = DependencyAudit {
+            receiver,
+            stop: stop.clone(),
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+            done: false,
+        };
+        drop(audit);
+        assert!(stop.is_stopped());
     }
 }

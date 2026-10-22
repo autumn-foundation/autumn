@@ -540,8 +540,8 @@ job uses. Nothing here is a second implementation, and there is no second
 waiver format: a waiver is an `[advisories] ignore` entry, read by doctor, dev
 and CI alike.
 
-Two differences remain, and doctor reports both on its own line so you can
-judge them:
+Three differences remain. Doctor reports the first two on its own line so you
+can judge them:
 
 - **The auditor version.** The generated workflow pins `cargo-deny@0.20.2`; a
   local run uses whatever `cargo deny` is on your PATH. Doctor names the
@@ -552,6 +552,16 @@ judge them:
   (see *Offline and air-gapped* below) and names its data age. An advisory
   published since your last fetch is red in CI and silent locally — run
   `cargo deny fetch db` to close the gap.
+
+A third difference has no line, because doctor cannot see it. Only cargo-deny
+knows the `deny.toml` schema. Doctor checks that the file is valid TOML. If
+cargo-deny is not installed, doctor does not check the schema: `yanked =
+"bogus"` is valid TOML, so doctor passes and CI rejects it. Without cargo-deny,
+the doctor line says `not evaluated` and that doctor cannot check `deny.toml`. Install cargo-deny to close the gap.
+
+When a doctor or dev audit reaches its deadline (30 seconds), Autumn kills the
+`cargo-deny` process and the processes it started, so they cannot hold Cargo's
+package-cache lock. A finished audit is never killed.
 
 Uncommenting a section widens both sides at once. The generated workflow
 derives its check list from the file:
