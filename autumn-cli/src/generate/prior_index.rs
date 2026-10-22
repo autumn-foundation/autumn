@@ -89,35 +89,37 @@ pub fn scan_prior_indexes(
             present.push(column);
         }
     }
-    for column in &present {
-        let others: Vec<&str> = present
-            .iter()
-            .copied()
-            .filter(|c| !c.eq_ignore_ascii_case(column))
-            .collect();
+    for (pos, column) in present.iter().enumerate() {
         let drop_one =
             |c: &str| format!("ALTER TABLE {} DROP COLUMN {};\n", quote(table), quote(c));
-        // A column can depend on another one removed in the same migration
-        // (a generated column), so try the others first, in both orders.
-        let forward: String = others.iter().map(|c| drop_one(c)).collect();
-        let backward: String = others.iter().rev().map(|c| drop_one(c)).collect();
+        // The migration drops the columns in this order, so earlier ones are gone
+        // when this one goes (a generated column may depend on a later one).
+        let script: String = present[..=pos].iter().map(|c| drop_one(c)).collect();
         let all: Vec<usize> = (0..found.len()).collect();
         // Control: with every index gone, the drop must work.
-        let control = [String::new(), forward, backward]
-            .into_iter()
-            .map(|prefix| format!("{prefix}{}", drop_one(column)))
-            .find(|script| probe(&mut conn, &found, &all, script).is_ok());
-        let Some(script) = control else {
-            let reason = probe(&mut conn, &found, &all, &drop_one(column)).unwrap_err();
+        if let Err(reason) = probe(&mut conn, &found, &all, &script) {
             return Err(format!(
                 "SQLite cannot drop `{table}.{column}` even without its indexes: {reason}. \
                  If a UNIQUE or PRIMARY KEY constraint holds it, rebuild the table. \
                  If a view or trigger uses it, change that first"
             ));
-        };
+        }
+        // Attribute the block to an index by dropping the column alone. A
+        // generated column can need the migration's order, so when the column
+        // does not drop alone, use the ordered script and skip steps that an
+        // earlier index already blocks.
+        let alone = drop_one(column);
+        let alone_ok = probe(&mut conn, &found, &all, &alone).is_ok();
+        let before: String = present[..pos].iter().map(|c| drop_one(c)).collect();
         for i in 0..found.len() {
             let others: Vec<usize> = (0..found.len()).filter(|j| *j != i).collect();
-            if probe(&mut conn, &found, &others, &script).is_err() {
+            let blocks = if alone_ok {
+                probe(&mut conn, &found, &others, &alone).is_err()
+            } else {
+                probe(&mut conn, &found, &others, &script).is_err()
+                    && probe(&mut conn, &found, &others, &before).is_ok()
+            };
+            if blocks {
                 found[i].blocks.push(column.to_ascii_lowercase());
             }
         }
@@ -710,14 +712,27 @@ mod tests {
     }
 
     #[test]
-    fn a_generated_column_removed_with_its_source_is_not_an_error() {
+    fn a_generated_column_is_checked_in_the_requested_drop_order() {
         let t = tree(&with_posts(
             "CREATE INDEX i ON posts (title);\n\
              ALTER TABLE posts ADD COLUMN slug TEXT GENERATED ALWAYS AS (lower(title)) VIRTUAL;",
         ));
-        for order in [["title", "slug"], ["slug", "title"]] {
-            let found = scan_prior_indexes(t.path(), "posts", &order).unwrap();
-            assert_eq!(found.len(), 1, "got {found:?}");
-        }
+        let found = scan_prior_indexes(t.path(), "posts", &["slug", "title"]).unwrap();
+        assert_eq!(found.len(), 1, "got {found:?}");
+        // Dropping the source first is what the migration would do, and it fails.
+        let err = scan_prior_indexes(t.path(), "posts", &["title", "slug"]).unwrap_err();
+        assert!(err.contains("posts.title"), "{err}");
+    }
+
+    #[test]
+    fn a_chain_of_generated_columns_drops_in_the_requested_order() {
+        let t = tree(&[(
+            "2026_01_01_000000_a",
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, a TEXT, \
+             b TEXT GENERATED ALWAYS AS (a) VIRTUAL, c TEXT GENERATED ALWAYS AS (b) VIRTUAL);\n\
+             CREATE INDEX i ON posts (a);",
+        )]);
+        let found = scan_prior_indexes(t.path(), "posts", &["c", "b", "a"]).unwrap();
+        assert_eq!(found.len(), 1, "got {found:?}");
     }
 }
