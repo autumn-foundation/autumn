@@ -1069,6 +1069,11 @@ queue dead-letters the job and the record ends `failed`, even when the handler
 succeeded. The `local` backend has no claim, so it writes
 the status at once.
 
+The queue row can be retried as soon as the ack lands. An operator retry in
+the short time before the status write can reset the record first. The late
+write then overwrites that reset. This needs a compare-and-swap token on the
+tracking write, which Autumn does not have yet.
+
 To see the durable queue state, use the admin dashboard
 ([Observability](#observability)) or `JobAdminBackend`.
 
