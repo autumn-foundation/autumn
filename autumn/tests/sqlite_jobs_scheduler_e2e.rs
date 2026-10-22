@@ -2492,13 +2492,11 @@ async fn tracked_status(
         .expect("the tracked record is live")
 }
 
-/// A stale attempt must not publish a terminal status the queue rejects.
+/// Run a tracked job whose claim moves to another worker before it ends.
 ///
-/// The first attempt fails after another worker took its claim. The queue
-/// rejects that ack, so the record must stay `running`, and the new owner's
-/// result must still be able to settle it.
-#[tokio::test]
-async fn sqlite_stale_attempt_does_not_publish_a_terminal_tracked_status() {
+/// The queue rejects the ack of that stale attempt, so the record must stay
+/// `running`. The new owner's result must still be able to settle it.
+async fn assert_stale_attempt_is_not_published(name: &'static str, handler: job::JobHandler) {
     use autumn_web::job_tracking::TrackedJobStatus;
 
     let _guard = job::global_job_runtime_test_lock().lock().await;
@@ -2514,18 +2512,7 @@ async fn sqlite_stale_attempt_does_not_publish_a_terminal_tracked_status() {
     let shutdown = tokio_util::sync::CancellationToken::new();
 
     job::start_runtime(
-        vec![job_info("sqlite_stale_tracked", 1, |_state, _payload| {
-            Box::pin(async move {
-                STALE_RUNS.fetch_add(1, Ordering::SeqCst);
-                while !STALE_GATE.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                STALE_DONE.store(true, Ordering::SeqCst);
-                Err(autumn_web::AutumnError::internal_server_error_msg(
-                    "stale attempt failed",
-                ))
-            })
-        })],
+        vec![job_info(name, 1, handler)],
         &state,
         &shutdown,
         &fenced_job_config(),
@@ -2533,10 +2520,9 @@ async fn sqlite_stale_attempt_does_not_publish_a_terminal_tracked_status() {
     )
     .expect("the durable sqlite job runtime starts");
 
-    let handle =
-        autumn_web::job_tracking::enqueue_tracked("sqlite_stale_tracked", serde_json::json!({}))
-            .await
-            .expect("tracked enqueue");
+    let handle = autumn_web::job_tracking::enqueue_tracked(name, serde_json::json!({}))
+        .await
+        .expect("tracked enqueue");
     eventually(400, "the first attempt to start", async || {
         STALE_RUNS.load(Ordering::SeqCst) == 1
     })
@@ -2586,6 +2572,50 @@ async fn sqlite_stale_attempt_does_not_publish_a_terminal_tracked_status() {
 
     shutdown.cancel();
     job::clear_global_job_client();
+}
+
+/// Hold the attempt until the test moves its claim, then let it end.
+async fn stale_gate() {
+    STALE_RUNS.fetch_add(1, Ordering::SeqCst);
+    while !STALE_GATE.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    STALE_DONE.store(true, Ordering::SeqCst);
+}
+
+#[tokio::test]
+async fn sqlite_stale_failed_attempt_does_not_publish_a_terminal_tracked_status() {
+    assert_stale_attempt_is_not_published("sqlite_stale_err", |_state, _payload| {
+        Box::pin(async move {
+            stale_gate().await;
+            Err(autumn_web::AutumnError::internal_server_error_msg(
+                "stale attempt failed",
+            ))
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_stale_successful_attempt_does_not_publish_a_terminal_tracked_status() {
+    assert_stale_attempt_is_not_published("sqlite_stale_ok", |_state, _payload| {
+        Box::pin(async move {
+            stale_gate().await;
+            Ok(())
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_stale_panicked_attempt_does_not_publish_a_terminal_tracked_status() {
+    assert_stale_attempt_is_not_published("sqlite_stale_panic", |_state, _payload| {
+        Box::pin(async move {
+            stale_gate().await;
+            panic!("stale attempt panicked");
+        })
+    })
+    .await;
 }
 
 static OWNED_RUNS: AtomicUsize = AtomicUsize::new(0);
