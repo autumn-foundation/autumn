@@ -851,6 +851,16 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         return unconstrained_json_tokens(ty);
     }
 
+    // `Decimal`'s wire type depends on the serde features the build unified, so
+    // the schema is read from serde at run time, not fixed here.
+    if let Some(identity_predicate) = decimal_identity_predicate(&name) {
+        return emit_identity_guarded(
+            ty,
+            &identity_predicate,
+            &quote! { ::autumn_web::openapi::decimal_scalar_schema() },
+        );
+    }
+
     if let Some((json_type, format, description)) = scalar_json_schema(&name) {
         let format_insert = format.map(|f| {
             quote! { __scalar.insert("format".to_owned(), #f.into()); }
@@ -944,10 +954,10 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 /// non-primitive type that nevertheless serializes as a single scalar.
 ///
 /// Deliberately narrow: only types whose serde output is unambiguous.
-/// Numeric-adjacent wrappers (`Decimal`, `BigDecimal`) are left out on purpose —
-/// whether they serialize as a JSON number or a string depends on which serde
-/// feature the app enabled, and an opaque placeholder beats a confidently wrong
-/// scalar.
+/// `Decimal` is not in this table: its wire type depends on the serde features
+/// in the build, so [`decimal_identity_predicate`] reads it at run time.
+/// `BigDecimal` is left out on purpose, as an opaque placeholder beats a
+/// confidently wrong scalar.
 ///
 /// The **naive** chrono types deliberately carry NO `format`. `OpenAPI`'s
 /// `date-time` and `time` are RFC 3339 productions that *require* a UTC offset,
@@ -1075,6 +1085,24 @@ fn unconstrained_json_tokens(ty: &syn::Type) -> TokenStream {
     )
 }
 
+/// Runtime predicate for `Decimal` and its `SQLite` wrapper, or `None` for any
+/// other name.
+///
+/// The wrapper's path is matched as text because `autumn_web::db::sqlite_types`
+/// exists only under the `sqlite` feature; a `use` of it would not compile
+/// without. A unit test in `autumn` pins the literal to the real `type_name`.
+fn decimal_identity_predicate(name: &str) -> Option<TokenStream> {
+    match name {
+        "Decimal" => Some(quote! {
+            __identity == ::core::any::type_name::<::autumn_web::reexports::rust_decimal::Decimal>()
+        }),
+        "SqliteDecimal" => Some(quote! {
+            __identity == "autumn_web::db::sqlite_types::SqliteDecimal"
+        }),
+        _ => None,
+    }
+}
+
 fn scalar_json_schema(
     name: &str,
 ) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
@@ -1092,7 +1120,7 @@ fn scalar_json_schema(
             None,
             Some("ISO 8601 time with no UTC offset, e.g. 18:00:00"),
         ),
-        "Uuid" => ("string", Some("uuid"), None),
+        "Uuid" | "SqliteUuid" => ("string", Some("uuid"), None),
         // #1771: both confidential wrappers serialize as a string — `Sealed` as
         // the base64 envelope, `BlindIndex` as its hex token. Without an entry
         // here the emitter publishes an unresolved `$ref` backfilled as an
@@ -1144,6 +1172,10 @@ fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
         "NaiveDateTime" => quote! { #chrono::NaiveDateTime },
         "NaiveTime" => quote! { #chrono::NaiveTime },
         "Uuid" => quote! { ::autumn_web::reexports::uuid::Uuid },
+        // Text match: the type exists only under the `sqlite` feature.
+        "SqliteUuid" => {
+            return Some(quote! { __identity == "autumn_web::db::sqlite_types::SqliteUuid" });
+        }
         "Sealed" => quote! { ::autumn_web::confidential::Sealed },
         "BlindIndex" => quote! { ::autumn_web::confidential::BlindIndex },
         _ => return None,
