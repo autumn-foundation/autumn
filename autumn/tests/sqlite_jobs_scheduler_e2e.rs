@@ -1793,6 +1793,58 @@ async fn sqlite_tracking_store_swaps_on_a_version_not_a_timestamp() {
     );
 }
 
+/// A retry reset holding a stale token is a no-op, even on a frozen clock
+/// (issue #2581).
+#[tokio::test]
+async fn sqlite_retry_reset_is_a_no_op_after_a_write_under_a_frozen_clock() {
+    use autumn_web::job_tracking::{
+        JobTrackingStore as _, SqliteJobTrackingStore, TrackedJobOwner, TrackedJobStatus,
+    };
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let clock = std::sync::Arc::new(autumn_web::time::FixedClock::at(
+        chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid instant"),
+    ));
+    let store = SqliteJobTrackingStore::new(pool, 3_600).with_clock(clock);
+
+    store
+        .create("k1", TrackedJobOwner::Anonymous)
+        .await
+        .expect("create");
+    store.fail("k1", "boom".to_owned()).await.expect("fail");
+    let (_, token) = store
+        .get_with_token("k1")
+        .await
+        .expect("get")
+        .expect("live");
+
+    // A worker writes after the admin read, inside the same instant.
+    store
+        .create("k1", TrackedJobOwner::Anonymous)
+        .await
+        .expect("recreate");
+    store.mark_running("k1").await.expect("mark running");
+    store
+        .reset_for_retry("k1", TrackedJobOwner::Anonymous, token)
+        .await
+        .expect("reset");
+    let record = store.get("k1").await.expect("get").expect("live");
+    assert_eq!(record.status, TrackedJobStatus::Running);
+
+    let (_, fresh) = store
+        .get_with_token("k1")
+        .await
+        .expect("get")
+        .expect("live");
+    store
+        .reset_for_retry("k1", TrackedJobOwner::Anonymous, fresh)
+        .await
+        .expect("reset");
+    let record = store.get("k1").await.expect("get").expect("live");
+    assert_eq!(record.status, TrackedJobStatus::Pending);
+}
+
 /// (24) A settled tracked record is final: a stale attempt of the same job
 /// cannot flip the authoritative attempt's result.
 ///

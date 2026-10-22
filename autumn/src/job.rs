@@ -52,8 +52,8 @@ use serde_json::Value;
 use crate::{AppState, AutumnError, AutumnResult};
 
 pub use crate::job_tracking::{
-    JobContext, JobTrackingStore, JobTrackingStoreEntry, TrackedJobHandle, TrackedJobOwner,
-    TrackedJobRecord, TrackedJobStatus, enqueue_tracked, enqueue_tracked_for,
+    JobContext, JobTrackingStore, JobTrackingStoreEntry, RetryToken, TrackedJobHandle,
+    TrackedJobOwner, TrackedJobRecord, TrackedJobStatus, enqueue_tracked, enqueue_tracked_for,
 };
 
 /// The asynchronous function signature for a background job.
@@ -22014,7 +22014,9 @@ mod tests {
             let mut conn = pool.get().await.unwrap();
             let tracking_sql =
                 include_str!("../migrations/20260702000000_create_job_tracking/up.sql");
-            for stmt in tracking_sql.split(';') {
+            let version_sql =
+                include_str!("../migrations/20261022120000_add_version_to_job_tracking/up.sql");
+            for stmt in tracking_sql.split(';').chain(version_sql.split(';')) {
                 let stmt = stmt.trim();
                 if !stmt.is_empty() {
                     diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
@@ -27895,9 +27897,28 @@ mod lease_tests {
             &'a self,
             _key: &'a str,
             _owner: crate::job_tracking::TrackedJobOwner,
-            _expected_updated_at: chrono::DateTime<chrono::Utc>,
+            _expected: crate::job_tracking::RetryToken,
         ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn get_with_token<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = AutumnResult<
+                            Option<(
+                                crate::job_tracking::TrackedJobRecord,
+                                crate::job_tracking::RetryToken,
+                            )>,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
         }
     }
 
@@ -27915,7 +27936,11 @@ mod lease_tests {
         store.fail("k", "e".to_owned()).await.unwrap();
         assert!(store.get("k").await.unwrap().is_none());
         store
-            .reset_for_retry("k", TrackedJobOwner::Anonymous, chrono::Utc::now())
+            .reset_for_retry(
+                "k",
+                TrackedJobOwner::Anonymous,
+                crate::job_tracking::RetryToken::new(0),
+            )
             .await
             .unwrap();
     }
