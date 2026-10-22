@@ -495,7 +495,6 @@ mod pg_clock_skew {
             .create("frozen", TrackedJobOwner::Anonymous)
             .await
             .expect("create");
-        store.fail("frozen", "boom".to_owned()).await.expect("fail");
         let (_, token) = store
             .get_with_token("frozen")
             .await
