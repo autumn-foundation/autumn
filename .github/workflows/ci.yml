@@ -2577,6 +2577,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- db_scrub_sqlite:: \
             | tee "$RUNNER_TEMP/cli-scrub-sqlite-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scrub-sqlite-cov.log"
+          # PR #3407: same gap for `generate::tests::` (the Echo linked-copies
+          # drift guard comparing tauri's and tauri_mobile's placeholder icon
+          # assets, plus the module's other unit tests). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::tests:: \
+            | tee "$RUNNER_TEMP/cli-generate-tests-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-tests-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
