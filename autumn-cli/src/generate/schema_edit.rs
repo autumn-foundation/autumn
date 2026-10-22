@@ -1714,7 +1714,8 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
 /// re-creates each one that named a removed column, after the columns are back:
 /// an index cannot reference a column that does not exist yet. Without it a
 /// `migrate down` would leave the table missing indexes it had before. Ignored
-/// on Postgres, whose output stays byte-for-byte identical.
+/// on Postgres, whose output stays byte-for-byte identical. A prior index with
+/// the same name as a regenerated index replaces it and keeps its own `UNIQUE`.
 pub fn remove_columns_down_sql_for(
     backend: DatabaseBackend,
     table: &str,
@@ -1728,8 +1729,8 @@ pub fn remove_columns_down_sql_for(
     // repeats one must not be re-created twice: SQLite fails the whole rollback
     // with "index <name> already exists".
     let mut own_indexes: Vec<String> = Vec::new();
-    // A scanned index on a removed column keeps its own definition (it may be
-    // UNIQUE), so it replaces a regenerated index of the same name.
+    // A prior index on a removed column keeps its own definition (it can be
+    // UNIQUE). It replaces a regenerated index of the same name.
     let scanned: Vec<String> = if backend == DatabaseBackend::Sqlite {
         prior_indexes
             .iter()
@@ -6651,6 +6652,93 @@ mod tests {
         let add = down.find("ADD COLUMN author_id").expect("column re-added");
         assert!(
             add < down.find("CREATE UNIQUE INDEX").unwrap(),
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_prior_index_name_match_ignores_case_and_quotes() {
+        let indexes = prior(
+            "CREATE UNIQUE INDEX \"IDX_posts_author_id\" ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(down.contains("CREATE UNIQUE INDEX"), "got:\n{down}");
+        assert!(
+            !down.contains("CREATE INDEX idx_posts_author_id"),
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_keeps_both_indexes_when_names_differ() {
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_author ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(
+            down.contains("CREATE INDEX idx_posts_author_id ON"),
+            "got:\n{down}"
+        );
+        assert!(
+            down.contains("CREATE UNIQUE INDEX idx_posts_author ON"),
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_prior_index_replaces_a_unique_field_index() {
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_slug_unique ON posts (slug) WHERE slug IS NOT NULL;",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["slug:Option<String>:unique"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert_eq!(
+            down.matches("idx_posts_slug_unique ON").count(),
+            1,
+            "got:\n{down}"
+        );
+        assert!(down.contains("WHERE slug IS NOT NULL"), "got:\n{down}");
+    }
+
+    #[test]
+    fn postgres_rollback_still_regenerates_the_plain_index() {
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_author_id ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Postgres,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(
+            down.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
             "got:\n{down}"
         );
     }
