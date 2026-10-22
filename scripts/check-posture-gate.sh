@@ -16,8 +16,8 @@
 #      pass, which is precisely the change the gate exists to catch. Widening
 #      fails this script; narrowing and neutral changes are printed and pass.
 #
-#   3. Run scripts/check-posture-demo.sh: the golden diff that shows the gate
-#      blocking a widened copy of reddit-clone's manifest.
+# With --update, it also refreshes scripts/check-posture-demo.sh's goldens,
+# which are derived from reddit-clone's baseline.
 #
 # Drift between the committed manifest and the freshly built one is reported,
 # not failed: unlike an app repository, this one *is* the framework, so the
@@ -287,12 +287,11 @@ echo
 [ "$failed" = "0" ] || die "the security posture gate failed for at least one example"
 ok "security posture gate passed for: ${EXAMPLES[*]}"
 
-# The reddit-clone golden diff is derived from the baseline above, so it is
-# checked, and refreshed, in the same run.
-echo
-echo "── reddit-clone posture demo ───────────────────────────────"
+# The reddit-clone golden diff is derived from the baseline above, so a
+# refreshed baseline refreshes it too. The check itself is its own step in the
+# `publish-gate` workflow.
 if [ "$UPDATE" = "1" ]; then
+  echo
+  echo "── reddit-clone posture demo ───────────────────────────────"
   AUTUMN_CLI="$CLI" ./scripts/check-posture-demo.sh --update
-else
-  AUTUMN_CLI="$CLI" ./scripts/check-posture-demo.sh
 fi

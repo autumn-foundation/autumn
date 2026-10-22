@@ -17,7 +17,8 @@
 #
 # Nothing here builds reddit-clone: the input is the committed manifest, which
 # `check-posture-gate.sh` keeps current. That script's `--update` calls this
-# one's, so refreshing the baseline refreshes the goldens with it.
+# one's, so refreshing the baseline refreshes the goldens with it. The
+# `publish-gate` workflow runs this check as its own step.
 #
 # Usage:
 #

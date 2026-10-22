@@ -9687,6 +9687,15 @@ fn posture_gate_job_harvests_pull_request_acknowledgments() {
 }
 
 #[test]
+fn posture_gate_job_checks_the_reddit_clone_demo() {
+    let job = posture_gate_job(&workspace_root());
+    assert!(
+        job.contains("run: ./scripts/check-posture-demo.sh"),
+        "the golden diff in docs/guide/posture-gate.md is only real while CI checks it: {job}"
+    );
+}
+
+#[test]
 fn posture_gate_job_takes_a_dispatch_acknowledgment_through_env() {
     let root = workspace_root();
     let workflow = std::fs::read_to_string(root.join(".github/workflows/publish-gate.yml"))
@@ -9724,6 +9733,9 @@ fn posture_gate_script_documents_the_acknowledgment_scope() {
     );
 }
 
+/// The examples `scripts/check-posture-gate.sh` gates, in its `EXAMPLES` order.
+const POSTURE_EXAMPLES: [&str; 5] = ["hello", "flock", "invoice", "todo-app", "reddit-clone"];
+
 /// Run the posture script with a stub `cargo` and a stub `autumn`.
 /// Return the log of stub calls and the script output.
 #[cfg(unix)]
@@ -9739,7 +9751,7 @@ fn run_posture_script_with_stubs(envs: &[(&str, &str)]) -> (String, String) {
         repo.join("scripts/check-posture-gate.sh"),
     )
     .expect("copy script");
-    for example in ["hello", "flock", "invoice", "todo-app"] {
+    for example in POSTURE_EXAMPLES {
         let dir = repo.join("examples").join(example);
         std::fs::create_dir_all(&dir).expect("mkdir example");
         std::fs::write(dir.join("security-posture.json"), "{}").expect("baseline");
@@ -9801,6 +9813,25 @@ exit 0
     (std::fs::read_to_string(&log).unwrap_or_default(), stdout)
 }
 
+/// The stub harness builds one baseline per example. A list that lags the
+/// script fails it with "no committed baseline" instead of testing anything.
+#[test]
+fn posture_examples_match_the_script() {
+    let script = std::fs::read_to_string(workspace_root().join("scripts/check-posture-gate.sh"))
+        .expect("read check-posture-gate.sh");
+    let line = script
+        .lines()
+        .find(|l| l.starts_with("EXAMPLES=("))
+        .expect("the script declares EXAMPLES=(...)");
+    let listed: Vec<&str> = line
+        .trim_start_matches("EXAMPLES=(")
+        .trim_end_matches(')')
+        .split_whitespace()
+        .map(|w| w.trim_matches('"'))
+        .collect();
+    assert_eq!(listed, POSTURE_EXAMPLES);
+}
+
 #[cfg(unix)]
 #[test]
 fn posture_script_passes_the_ack_dir_to_the_diff_and_logs_it() {
@@ -9809,7 +9840,11 @@ fn posture_script_passes_the_ack_dir_to_the_diff_and_logs_it() {
         .lines()
         .filter(|l| l.starts_with("routes posture diff"))
         .collect();
-    assert_eq!(diffs.len(), 4, "one diff per example: {calls}");
+    assert_eq!(
+        diffs.len(),
+        POSTURE_EXAMPLES.len(),
+        "one diff per example: {calls}"
+    );
     assert!(
         diffs.iter().all(|l| l.contains("--ack-dir /acks")),
         "every diff must carry --ack-dir: {diffs:?}"

@@ -140,6 +140,10 @@ jobs:
           AUTUMN_POSTURE_ACK: ${{ inputs.posture_ack }}
           AUTUMN_POSTURE_ACK_DIR: ${{ github.event_name == 'pull_request' && format('{0}/acks', runner.temp) || '' }}
         run: ./scripts/check-posture-gate.sh
+      # The golden diff in docs/guide/posture-gate.md: the gate must block a
+      # widened copy of reddit-clone's manifest, and print the same report.
+      - name: Check the reddit-clone posture demo
+        run: ./scripts/check-posture-demo.sh
 
   # ---------------------------------------------------------------------------
   # 0b. Benchmark harness structure gate
