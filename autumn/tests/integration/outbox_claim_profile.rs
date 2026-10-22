@@ -19,6 +19,11 @@
 //! ```
 
 #![cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::items_after_statements,
+    clippy::struct_field_names
+)]
 
 use std::sync::{Arc, Mutex};
 
