@@ -365,6 +365,11 @@ Run it locally. CI derives its check list from the sections `deny.toml`
 declares, so the exact command depends on your policy — `autumn doctor` does
 that derivation for you and reports the same verdict:
 
+In a workspace, `autumn doctor` and `autumn dev` read the outermost
+`deny.toml`, up to the `.git` folder. This is the file CI reads. A `deny.toml`
+in a member crate is ignored. A nested workspace (its own `[workspace]` table)
+keeps its own policy.
+
 ```bash
 cargo install --locked cargo-deny   # once
 autumn doctor                       # derives the checks, as CI does

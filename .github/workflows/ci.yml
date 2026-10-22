@@ -2503,6 +2503,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: routes_audit:: \
             | tee "$RUNNER_TEMP/cli-posture-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-posture-cov.log"
+          # Issue #2570: same gap for `deps::` (the policy search). Check the
+          # count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deps:: \
+            | tee "$RUNNER_TEMP/cli-deps-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deps-cov.log"
           # Issue #3232: same gap for `autumn fleet` (its clap shape and the
           # Postgres-build stub) and the `db::replica` config loader it shares.
           # Check the count.
