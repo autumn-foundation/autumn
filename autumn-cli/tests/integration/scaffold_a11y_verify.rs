@@ -2,6 +2,10 @@
 //! generator writes, for the standard `form_for` path and the
 //! `--live-validation` raw-markup path.
 
+// DSL tokens like `"handle:slug{from:name}"` are literal scaffold inputs, not
+// format strings.
+#![allow(clippy::literal_string_with_formatting_args)]
+
 use std::path::Path;
 use std::process::Command;
 
