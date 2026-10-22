@@ -414,6 +414,54 @@ mod redis_backend {
         serde_json::from_value(record["status"].clone()).ok()
     }
 
+    /// A job with no handler dead-letters and settles `failed`.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_unknown_tracked_job_settles_failed_after_the_ack() {
+        let _guard = job::global_job_runtime_test_lock().lock().await;
+        job::clear_global_job_client();
+        let (_container, url) = start_redis().await;
+        let state = AppState::for_test().with_profile("dev");
+
+        // Web role: knows the job and runs no workers.
+        let web_shutdown = tokio_util::sync::CancellationToken::new();
+        job::start_runtime(
+            vec![ok_job("settle_ack_unknown")],
+            &state,
+            &web_shutdown,
+            &config(&url),
+            false,
+        )
+        .expect("enqueue-only runtime starts");
+        let handle = job::enqueue_tracked("settle_ack_unknown", serde_json::json!({}))
+            .await
+            .expect("tracked enqueue");
+        web_shutdown.cancel();
+        job::clear_global_job_client();
+
+        // Worker role: does not know the job.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        job::start_runtime(
+            vec![ok_job("settle_ack_other")],
+            &state,
+            &shutdown,
+            &config(&url),
+            true,
+        )
+        .expect("worker runtime starts");
+
+        assert!(
+            wait_for(Duration::from_secs(30), || async {
+                status(&url, &handle.token).await == Some(TrackedJobStatus::Failed)
+            })
+            .await,
+            "the unknown job's record settles failed"
+        );
+
+        shutdown.cancel();
+        job::clear_global_job_client();
+    }
+
     /// Owned attempts settle: success, final failure, panic.
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
