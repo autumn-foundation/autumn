@@ -6452,8 +6452,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("2026_01_01_000000_a");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("up.sql"), create).unwrap();
-        crate::generate::prior_index::scan_prior_indexes(tmp.path(), table)
+        std::fs::write(
+            dir.join("up.sql"),
+            format!(
+                "CREATE TABLE {table} (id INTEGER PRIMARY KEY, author_id INTEGER, \
+                 title TEXT, body TEXT, slug TEXT);\n{create}"
+            ),
+        )
+        .unwrap();
+        crate::generate::prior_index::scan_prior_indexes(
+            tmp.path(),
+            table,
+            &["author_id", "title", "body", "slug"],
+        )
+        .unwrap()
     }
 
     #[test]

@@ -4166,11 +4166,13 @@ ON, and the migration connection leaves it OFF, so the statement applies.
 `DROP COLUMN` also fails on SQLite when the column is a primary key, is `UNIQUE`,
 is named by any index (including a partial index's `WHERE`), or appears in a
 `CHECK`, generated column, view or trigger. `autumn generate migration
-Remove…From…` handles the index case: it reads the project's earlier
-`migrations/*/up.sql`, emits `DROP INDEX IF EXISTS` for every live index that
-names the removed column — composite, partial, expression and hand-named
-included — before the `DROP COLUMN`, and re-creates them in `down.sql`. An index
-created outside `migrations/` stays invisible; drop it in the same migration.
+Remove…From…` handles the index case. It replays the project's earlier
+`migrations/*/up.sql` in an in-memory SQLite database and tests which indexes
+block the `DROP COLUMN`. It emits `DROP INDEX IF EXISTS` for each one before the
+drop, and re-creates them in `down.sql`. It stops with an error for a
+`UNIQUE` or `PRIMARY KEY` column, for a column that a CHECK, view or trigger uses,
+and for an earlier migration that does not replay. An index created outside
+`migrations/` stays invisible; drop it in the same migration.
 
 Postgres classification and generated Postgres DDL are unchanged.
 
