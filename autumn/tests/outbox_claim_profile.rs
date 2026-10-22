@@ -273,6 +273,37 @@ async fn outbox_claim_profile() {
         let (calls, buffers) = profile(&mut conn, &format!("history={history}"));
         summary.push((history, calls, buffers));
     }
+    // Existing install: tables made before the claim index existed get it from
+    // `ensure_schema`, without a table lock (CONCURRENTLY) and without DDL when
+    // it is already there.
+    #[derive(QueryableByName)]
+    struct Valid {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        valid: bool,
+    }
+    let claim_index_valid = |conn: &mut PgConnection| {
+        diesel::sql_query(
+            "SELECT i.indisvalid AS valid FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'idx_autumn_outbox_claim'",
+        )
+        .load::<Valid>(conn)
+        .unwrap()
+        .into_iter()
+        .map(|v| v.valid)
+        .collect::<Vec<_>>()
+    };
+    conn.batch_execute("DROP INDEX idx_autumn_outbox_claim")
+        .unwrap();
+    assert!(claim_index_valid(&mut conn).is_empty());
+    outbox::ensure_schema(&pool).await.unwrap();
+    assert_eq!(
+        claim_index_valid(&mut conn),
+        [true],
+        "ensure_schema adds the index"
+    );
+    outbox::ensure_schema(&pool).await.unwrap();
+    assert_eq!(claim_index_valid(&mut conn), [true], "and is idempotent");
+
     println!("\n=== summary (workload: 50 writes + drain(300)) ===");
     for (history, calls, buffers) in summary {
         println!("history={history:<8} statements={calls:<5} buffers={buffers}");

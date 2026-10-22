@@ -106,6 +106,9 @@ CREATE TABLE IF NOT EXISTS autumn_outbox (
 CREATE INDEX IF NOT EXISTS idx_autumn_outbox_pending
     ON autumn_outbox (aggregate, seq)
     WHERE dispatched_at IS NULL AND dead_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_autumn_outbox_claim
+    ON autumn_outbox (seq)
+    WHERE dispatched_at IS NULL AND dead_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_autumn_outbox_dispatched
     ON autumn_outbox (dispatched_at)
     WHERE dispatched_at IS NOT NULL;
@@ -169,6 +172,7 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
     crate::backend_select! {
         pg => {
             if tables_exist(&mut conn, &["autumn_outbox", "autumn_inbox"]).await? {
+                ensure_claim_index(&mut conn).await;
                 return Ok(());
             }
             conn.batch_execute(&format!(
@@ -184,6 +188,33 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
         },
     }
 }
+
+/// Add the claim index to tables made before it existed (Postgres).
+///
+/// The claim reads pending rows in `seq` order. Without this index it walks
+/// the primary key past every sent row that the purge has not deleted yet.
+/// The build is `CONCURRENTLY`, so it blocks no writes, and the index covers
+/// only pending rows. A role that cannot create indexes keeps working, only
+/// slower: the failure is a warning. After a failed build, drop the invalid
+/// `idx_autumn_outbox_claim` and restart.
+#[cfg(not(feature = "sqlite"))]
+async fn ensure_claim_index(conn: &mut RuntimeConnection) {
+    match tables_exist(conn, &["idx_autumn_outbox_claim"]).await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(error) = conn.batch_execute(CLAIM_INDEX_SQL).await {
+                tracing::warn!(%error, "could not create idx_autumn_outbox_claim; the outbox claim stays slow on a large backlog of sent rows");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not probe idx_autumn_outbox_claim");
+        }
+    }
+}
+
+#[cfg(not(feature = "sqlite"))]
+const CLAIM_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_autumn_outbox_claim \
+     ON autumn_outbox (seq) WHERE dispatched_at IS NULL AND dead_at IS NULL";
 
 /// `true` when every table in `tables` exists (Postgres).
 #[cfg(not(feature = "sqlite"))]
