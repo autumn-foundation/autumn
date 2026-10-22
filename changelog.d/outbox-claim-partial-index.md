@@ -9,4 +9,4 @@
   existing install, `outbox::ensure_schema` builds it with
   `CREATE INDEX CONCURRENTLY` at boot, and only logs a warning when the role
   cannot create indexes. The index adds about 66 bytes of WAL to each
-  enqueued message.
+  enqueued message. [no-plugin]
