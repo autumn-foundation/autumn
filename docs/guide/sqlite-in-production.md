@@ -878,20 +878,21 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
   column that an index still references.
 - **Pre-existing indexes are dropped too (#1906, #2579).** A `Remove…From…`
   migration replays the project's earlier `migrations/*/up.sql` into an
-  in-memory SQLite database. It then asks SQLite which indexes stop the
+  in-memory SQLite database. It then tests which indexes block the
   `DROP COLUMN`, and emits a `DROP INDEX IF EXISTS` for each one. It reads no
   SQL text, so composite, partial, expression, quoted and renamed indexes
-  are all exact. `down.sql` re-creates them after it re-adds the column.
+  are all handled. `down.sql` re-creates them after it re-adds the column.
 
   Two cases stay outside the replay:
-  - An index made by hand against the database, outside `migrations/`.
-    The drop fails when you apply the migration.
+  - SQLite does not know an index made by hand outside `migrations/`.
+    The drop then fails when you apply the migration.
   - A column behind an inline `UNIQUE` or `PRIMARY KEY`. SQLite cannot drop
-    it. `generate migration` stops with an error. Rebuild the table —
+    it, and so cannot a column that a view or trigger uses. `generate migration`
+    stops with an error. For a constraint, rebuild the table —
     `autumn schema diff --write-migration` emits the rebuild.
 
-  If an earlier migration does not replay, `generate migration` stops and
-  names the file.
+  Each earlier migration must replay, for any table. If one does not,
+  `generate migration` stops and names the file.
 - **`autumn migrate check` applies SQLite rules (#1906).** The safety classifier
   reads the app's backend. It never recommends `CREATE INDEX CONCURRENTLY` (no
   such syntax), does not flag a plain `DROP INDEX` (a cheap catalog edit, and a

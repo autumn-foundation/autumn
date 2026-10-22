@@ -12,6 +12,7 @@
 //! - An index made by hand, outside `migrations/`, is not seen.
 //! - An index behind an inline `UNIQUE` or `PRIMARY KEY` cannot be dropped.
 //!   The scan returns an error for it.
+//! - Every earlier migration must replay, not only those for the target table.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -35,7 +36,7 @@ impl PriorIndex {
     /// Whether this index blocks the drop of `column`.
     #[must_use]
     pub fn covers(&self, column: &str) -> bool {
-        let needle = column.to_lowercase();
+        let needle = column.to_ascii_lowercase();
         self.blocks.contains(&needle)
     }
 }
@@ -76,29 +77,48 @@ pub fn scan_prior_indexes(
     let mut found: Vec<PriorIndex> = indexes
         .into_iter()
         .map(|row| PriorIndex {
-            name: render_name(&row.name),
+            name: render_name(&mut conn, &row.name),
             create_sql: terminated(&row.sql),
             blocks: Vec::new(),
         })
         .collect();
 
+    let mut present: Vec<&str> = Vec::new();
     for column in columns {
-        if !has_column(&mut conn, table, column)? {
-            continue;
+        if has_column(&mut conn, table, column)? {
+            present.push(column);
         }
-        let drop_column = format!("ALTER TABLE {} DROP COLUMN {}", quote(table), quote(column));
-        // Control: with every index gone, the drop must work.
+    }
+    for column in &present {
+        let others: Vec<&str> = present
+            .iter()
+            .copied()
+            .filter(|c| !c.eq_ignore_ascii_case(column))
+            .collect();
+        let drop_one =
+            |c: &str| format!("ALTER TABLE {} DROP COLUMN {};\n", quote(table), quote(c));
+        // A column can depend on another one removed in the same migration
+        // (a generated column), so try the others first, in both orders.
+        let forward: String = others.iter().map(|c| drop_one(c)).collect();
+        let backward: String = others.iter().rev().map(|c| drop_one(c)).collect();
         let all: Vec<usize> = (0..found.len()).collect();
-        if let Err(e) = probe(&mut conn, &found, &all, &drop_column) {
+        // Control: with every index gone, the drop must work.
+        let control = [String::new(), forward, backward]
+            .into_iter()
+            .map(|prefix| format!("{prefix}{}", drop_one(column)))
+            .find(|script| probe(&mut conn, &found, &all, script).is_ok());
+        let Some(script) = control else {
+            let reason = probe(&mut conn, &found, &all, &drop_one(column)).unwrap_err();
             return Err(format!(
-                "SQLite cannot drop `{table}.{column}` even without its indexes: {e}. \
-                 Rebuild the table by hand"
+                "SQLite cannot drop `{table}.{column}` even without its indexes: {reason}. \
+                 If a UNIQUE or PRIMARY KEY constraint holds it, rebuild the table. \
+                 If a view or trigger uses it, change that first"
             ));
-        }
+        };
         for i in 0..found.len() {
             let others: Vec<usize> = (0..found.len()).filter(|j| *j != i).collect();
-            if probe(&mut conn, &found, &others, &drop_column).is_err() {
-                found[i].blocks.push(column.to_lowercase());
+            if probe(&mut conn, &found, &others, &script).is_err() {
+                found[i].blocks.push(column.to_ascii_lowercase());
             }
         }
     }
@@ -168,7 +188,6 @@ fn probe(
         let _ = writeln!(script, "DROP INDEX {};", indexes[*i].name);
     }
     script.push_str(statement);
-    script.push(';');
     let result = conn.batch_execute(&script).map_err(|e| e.to_string());
     conn.batch_execute("ROLLBACK TO autumn_probe; RELEASE autumn_probe")
         .map_err(|e| e.to_string())?;
@@ -180,14 +199,19 @@ fn quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// `name` as written in SQL: bare when it is a plain identifier.
-fn render_name(name: &str) -> String {
+/// `name` as written in SQL: bare when `SQLite` takes it as an alias, so a
+/// reserved word such as `order` is quoted.
+fn render_name(conn: &mut SqliteConnection, name: &str) -> String {
     let plain = name
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if plain { name.to_owned() } else { quote(name) }
+    if plain && conn.batch_execute(&format!("SELECT 1 AS {name}")).is_ok() {
+        name.to_owned()
+    } else {
+        quote(name)
+    }
 }
 
 fn terminated(sql: &str) -> String {
@@ -222,17 +246,15 @@ mod tests {
         scan_prior_indexes(t.path(), "posts", columns).expect("scan")
     }
 
-    fn with_posts(index_sql: &str) -> Vec<(&'static str, String)> {
+    fn with_posts(index_sql: &str) -> Vec<(&'static str, &str)> {
         vec![
-            ("2026_01_01_000000_a", POSTS.to_owned()),
-            ("2026_01_02_000000_b", index_sql.to_owned()),
+            ("2026_01_01_000000_a", POSTS),
+            ("2026_01_02_000000_b", index_sql),
         ]
     }
 
     fn scan_after(index_sql: &str, columns: &[&str]) -> Vec<PriorIndex> {
-        let owned = with_posts(index_sql);
-        let refs: Vec<(&str, &str)> = owned.iter().map(|(a, b)| (*a, b.as_str())).collect();
-        scan(&refs, columns)
+        scan(&with_posts(index_sql), columns)
     }
 
     #[test]
@@ -550,7 +572,7 @@ mod tests {
         )]);
         let err = scan_prior_indexes(t.path(), "posts", &["slug"]).unwrap_err();
         assert!(err.contains("posts.slug"), "{err}");
-        assert!(err.contains("Rebuild the table"), "{err}");
+        assert!(err.contains("rebuild the table"), "{err}");
     }
 
     #[test]
@@ -569,18 +591,11 @@ mod tests {
 
     #[test]
     fn probing_changes_nothing() {
-        let t = tree(&with_posts_refs("CREATE INDEX i ON posts (title);"));
+        let t = tree(&with_posts("CREATE INDEX i ON posts (title);"));
         let a = scan_prior_indexes(t.path(), "posts", &["title", "body"]).unwrap();
         let b = scan_prior_indexes(t.path(), "posts", &["title", "body"]).unwrap();
         assert_eq!(a, b);
         assert_eq!(a.len(), 1);
-    }
-
-    fn with_posts_refs(index_sql: &str) -> Vec<(&'static str, &str)> {
-        vec![
-            ("2026_01_01_000000_a", POSTS),
-            ("2026_01_02_000000_b", index_sql),
-        ]
     }
 
     #[test]
@@ -592,7 +607,7 @@ mod tests {
 
     #[test]
     fn dropping_the_found_indexes_lets_sqlite_drop_the_column() {
-        let t = tree(&with_posts_refs(
+        let t = tree(&with_posts(
             "CREATE INDEX a ON posts (author_id, title);\n\
              CREATE INDEX b ON posts (lower(title)) WHERE status = 'x';\n\
              CREATE INDEX keep ON posts (body);",
@@ -611,6 +626,98 @@ mod tests {
             .unwrap();
         for i in &found {
             conn.batch_execute(&i.create_sql).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn a_table_level_unique_is_an_error_and_no_autoindex_is_listed() {
+        let t = tree(&[(
+            "2026_01_01_000000_a",
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b));\n\
+             CREATE INDEX i ON posts (b);",
+        )]);
+        assert!(table_indexes_of(t.path()).iter().all(|n| n == "i"));
+        let err = scan_prior_indexes(t.path(), "posts", &["a"]).unwrap_err();
+        assert!(err.contains("posts.a"), "{err}");
+    }
+
+    fn table_indexes_of(dir: &Path) -> Vec<String> {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        replay(&mut conn, dir).unwrap();
+        table_indexes(&mut conn, "posts")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect()
+    }
+
+    #[test]
+    fn a_column_used_by_a_view_is_an_error() {
+        let t = tree(&with_posts(
+            "CREATE INDEX i ON posts (body);\n\
+             CREATE VIEW v AS SELECT title FROM posts;",
+        ));
+        let err = scan_prior_indexes(t.path(), "posts", &["title"]).unwrap_err();
+        assert!(err.contains("posts.title"), "{err}");
+    }
+
+    #[test]
+    fn a_generated_column_that_uses_the_column_is_an_error() {
+        let t = tree(&with_posts(
+            "CREATE INDEX i ON posts (body);\n\
+             ALTER TABLE posts ADD COLUMN t2 TEXT GENERATED ALWAYS AS (title || 'x') VIRTUAL;",
+        ));
+        let err = scan_prior_indexes(t.path(), "posts", &["title"]).unwrap_err();
+        assert!(err.contains("posts.title"), "{err}");
+    }
+
+    #[test]
+    fn create_sql_keeps_desc_and_expressions() {
+        let found = scan_after(
+            "CREATE INDEX i ON posts (lower(title), body DESC);",
+            &["title"],
+        );
+        assert_eq!(
+            found[0].create_sql,
+            "CREATE INDEX i ON posts (lower(title), body DESC);"
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_column_matches_by_ascii_case_like_sqlite() {
+        let t = tree(&[(
+            "2026_01_01_000000_a",
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, \"Éa\" TEXT);\n\
+             CREATE INDEX i ON posts (\"Éa\");",
+        )]);
+        assert_eq!(
+            scan_prior_indexes(t.path(), "posts", &["Éa"])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            scan_prior_indexes(t.path(), "posts", &["éa"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_index_named_like_a_keyword_is_quoted() {
+        let found = scan_after("CREATE INDEX \"order\" ON posts (title);", &["title"]);
+        assert_eq!(found[0].name, "\"order\"");
+    }
+
+    #[test]
+    fn a_generated_column_removed_with_its_source_is_not_an_error() {
+        let t = tree(&with_posts(
+            "CREATE INDEX i ON posts (title);\n\
+             ALTER TABLE posts ADD COLUMN slug TEXT GENERATED ALWAYS AS (lower(title)) VIRTUAL;",
+        ));
+        for order in [["title", "slug"], ["slug", "title"]] {
+            let found = scan_prior_indexes(t.path(), "posts", &order).unwrap();
+            assert_eq!(found.len(), 1, "got {found:?}");
         }
     }
 }
