@@ -1579,3 +1579,11 @@ path = "tests/tls_client_auth_metrics.rs"
 [[bench]]
 name = "query_decode"
 harness = false
+
+# Ledger harness for the outbox relay's claim statement. Own binary and
+# `#[ignore]`d: seeds up to 1M rows, so the consolidated Docker sweep must not
+# reach it.
+[[test]]
+name = "outbox_claim_profile"
+path = "tests/outbox_claim_profile.rs"
+required-features = ["db", "test-support"]
