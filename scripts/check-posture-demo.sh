@@ -69,6 +69,8 @@ if [ -z "${AUTUMN_CLI:-}" ]; then
   AUTUMN_CLI="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}/debug/autumn"
 fi
 [ -x "$AUTUMN_CLI" ] || die "the autumn CLI is not at $AUTUMN_CLI"
+# Absolute, because the diffs below run from inside $work.
+AUTUMN_CLI="$(cd "$(dirname "$AUTUMN_CLI")" && pwd)/$(basename "$AUTUMN_CLI")"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
