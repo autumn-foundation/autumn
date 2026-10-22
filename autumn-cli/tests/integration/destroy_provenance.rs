@@ -537,3 +537,129 @@ fn destroy_proceeds_when_the_moved_bundle_was_moved_with_it() {
             .contains("Post")
     );
 }
+
+// A revert the generator skips because of file state is not a changed input.
+
+fn plain_scaffold(name: &str, extra: &[&str]) -> (tempfile::TempDir, PathBuf, Vec<String>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", name]);
+    let project = tmp.path().join(name);
+    let mut args = vec!["scaffold", "Post", "title:String"];
+    args.extend_from_slice(extra);
+    let mut generate = vec!["generate"];
+    generate.extend_from_slice(&args);
+    run_autumn_ok(&project, &generate);
+    let destroy: Vec<String> = std::iter::once("destroy")
+        .chain(args)
+        .map(str::to_owned)
+        .collect();
+    (tmp, project, destroy)
+}
+
+fn run_owned(project: &Path, args: &[String]) -> std::process::Output {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_autumn(project, &refs)
+}
+
+#[test]
+fn destroy_of_a_plain_scaffold_still_succeeds() {
+    let (_tmp, project, destroy) = plain_scaffold("prov-plain", &[]);
+
+    let out = run_owned(&project, &destroy);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!project.join("src/models/post.rs").exists());
+}
+
+#[test]
+fn destroy_of_a_live_validation_scaffold_still_succeeds() {
+    // The submit-token exemption is appended once. At destroy time it exists,
+    // so the plan has no revert for it. That is a skip, not a changed input.
+    let (_tmp, project, destroy) = plain_scaffold("prov-live-validation", &["--live-validation"]);
+
+    let out = run_owned(&project, &destroy);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!project.join("src/models/post.rs").exists());
+}
+
+#[test]
+fn a_refusal_lists_each_edit_on_its_own_line_and_names_force() {
+    let (_tmp, project) = i18n_scaffold_in("prov-i18n-text", "translations");
+    drop_i18n_dir_setting(&project);
+
+    let out = run_verb(&project, "destroy", &[]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("pass --force"), "{stderr}");
+    assert!(
+        !stderr.contains("  below"),
+        "no runs of spaces in prose: {stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l == "  translations/en.ftl: I18nFtlKeys(Post, post)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_dry_run_says_a_real_run_would_refuse() {
+    let (_tmp, project) = i18n_scaffold_in("prov-i18n-dry-text", "translations");
+    drop_i18n_dir_setting(&project);
+
+    let out = run_verb(&project, "destroy", &["--dry-run"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("A real run refuses without --force"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("translations/en.ftl: I18nFtlKeys(Post, post)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_forced_dry_run_does_not_report_a_refusal() {
+    let (_tmp, project) = i18n_scaffold_in("prov-i18n-dry-force", "translations");
+    drop_i18n_dir_setting(&project);
+
+    let out = run_verb(&project, "destroy", &["--dry-run", "--force"]);
+
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("A real run refuses without --force"));
+}
+
+#[test]
+fn a_finished_destroy_forgets_its_run() {
+    let (_tmp, project) = i18n_scaffold("prov-i18n-forget");
+    fs::write(
+        project.join(MANIFEST),
+        format!(
+            "{}\n[files.\"keep.rs\"]\ndigest = \"1\"\ninvocation = \"other\"\n",
+            fs::read_to_string(project.join(MANIFEST)).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let out = run_verb(&project, "destroy", &[]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manifest = fs::read_to_string(project.join(MANIFEST)).unwrap();
+    assert!(!manifest.contains("runs"), "{manifest}");
+    assert!(manifest.contains("keep.rs"), "{manifest}");
+}

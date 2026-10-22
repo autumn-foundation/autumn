@@ -248,15 +248,14 @@ impl Revert {
         }
     }
 
-    /// The edits this revert undoes, as `destroy` compares them with the
-    /// record `generate` made (issue #2560).
+    /// The anchors of the edits this revert undoes (issue #2560).
     ///
-    /// Names the target and the parameters that choose the edit. Leaves out
-    /// text that comes from a template, such as `expected_block`: that moves
-    /// with the CLI version, and the check must not. A list parameter gives one
-    /// anchor for each item, because `destroy` plans a superset of the entries
-    /// that `generate` wrote. The `match` has no wildcard, so a new variant
-    /// does not compile until it is described.
+    /// An anchor holds the target path and the values that choose the edit. It
+    /// holds no template text (for example `expected_block`), because template
+    /// text changes with the CLI version. A list value gives one anchor for each
+    /// item, because `destroy` can plan more entries than `generate` wrote. The
+    /// `match` has no wildcard. A new variant does not compile until it has an
+    /// anchor.
     #[must_use]
     pub(super) fn anchors(&self, root: &Path) -> Vec<provenance::RevertAnchor> {
         let rel =
@@ -1021,8 +1020,8 @@ impl Plan {
             let scope = self.sole_resource.then_some(scope);
             recorded.record(&self.project_root, &path, digest, &self.invocation, scope);
         }
-        // Only a claimed plan: an unclaimed one may share its invocation with
-        // other plans in the process, and their edits would count against it.
+        // Only a claimed plan records anchors. An unclaimed plan can share its
+        // invocation with other plans, and their edits must not count against it.
         if self.sole_resource {
             recorded.record_reverts(&self.invocation, self.revert_anchors());
         }
@@ -1041,6 +1040,8 @@ impl Plan {
             .reverts
             .iter()
             .flat_map(|r| r.anchors(&self.project_root))
+            // A target outside the project can never be checked.
+            .filter(provenance::RevertAnchor::is_project_relative)
             .collect();
         anchors.sort();
         anchors.dedup();
@@ -1152,7 +1153,7 @@ impl Plan {
             }
             if !plan.dropped_reverts.is_empty() {
                 println!(
-                    "  A real run would refuse (without --force) — it would leave these edits behind:"
+                    "  A real run refuses without --force. It would leave these edits behind:"
                 );
                 for anchor in &plan.dropped_reverts {
                     println!("    {anchor}");
@@ -1188,7 +1189,7 @@ impl Plan {
             prune_empty_ancestors(dir, &self.project_root);
         }
 
-        self.forget_provenance(&removed);
+        self.forget_provenance(&removed, result.is_ok());
         result?;
 
         // Nested sub-module declarations (e.g. `src/mailers/mod.rs`'s
@@ -1282,13 +1283,23 @@ impl Plan {
     ///
     /// Best effort, like [`Self::record_provenance`]: the files are already
     /// gone, and failing here would report a destroy that in fact succeeded.
-    fn forget_provenance(&self, removed: &Removed) {
-        if removed.files.is_empty() && removed.dirs.is_empty() && removed.stale.is_empty() {
+    fn forget_provenance(&self, removed: &Removed, finished: bool) {
+        // A finished destroy has reverted the run's edits, or the user chose
+        // `--force`. Only a claimed plan owns its run (issue #2560).
+        let forget_run = finished && self.sole_resource;
+        if removed.files.is_empty()
+            && removed.dirs.is_empty()
+            && removed.stale.is_empty()
+            && !forget_run
+        {
             return;
         }
         let mut recorded = provenance::Provenance::load(&self.project_root);
         if recorded.is_empty() {
             return;
+        }
+        if forget_run {
+            recorded.forget_run(&self.invocation);
         }
         for path in removed.files.iter().chain(&removed.stale) {
             recorded.forget(&self.project_root, path);
@@ -1375,9 +1386,9 @@ impl Plan {
         } else {
             sweep::Sweep::default()
         };
-        // Shared-file edits `generate` made that this plan no longer reverts
-        // (issue #2560). Only for a claimed plan (see `Plan::claim_sole_resource`),
-        // and not under `--force`.
+        // Edits that `generate` made and this plan does not revert (issue
+        // #2560). Only a claimed plan checks them (see
+        // `Plan::claim_sole_resource`). `--force` skips the check.
         let dropped_reverts = if force || !self.sole_resource {
             Vec::new()
         } else {
@@ -1602,7 +1613,7 @@ struct RevertPlan {
     /// (its reverts emptied it down to nothing).
     modifies: Vec<(PathBuf, Option<String>)>,
     diverged: Vec<PathBuf>,
-    /// Recorded reverts this plan no longer holds (issue #2560).
+    /// Recorded reverts that this plan does not contain (issue #2560).
     dropped_reverts: Vec<provenance::RevertAnchor>,
     warnings: Vec<String>,
     /// Files the orphan sweep removes, with their recorded digests (issue
@@ -3775,6 +3786,347 @@ mod tests {
 
         assert_eq!(short.len(), 2);
         assert!(short.iter().all(|anchor| long.contains(anchor)));
+    }
+
+    #[test]
+    fn a_revert_the_plan_skips_is_not_a_drop() {
+        // The generator skips a revert when its append is already done. That
+        // is file state, not a changed input (issue #2560).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+        let mut destroy = Plan::new(tmp.path());
+        destroy.create(target.clone(), "// v1 template\n");
+        destroy.push_revert(Revert::PwaMainRsInjection {
+            path: tmp.path().join("src/main.rs"),
+        });
+
+        sole(destroy).revert(Flags::default()).unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn an_unclaimed_destroy_does_not_check_recorded_reverts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+        let mut destroy = Plan::new(tmp.path());
+        destroy.create(target.clone(), "// v1 template\n");
+        destroy.push_revert(i18n_revert(tmp.path(), "translations"));
+
+        destroy.revert(Flags::default()).unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_finished_destroy_forgets_the_recorded_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+        let stray = tmp.path().join("stray.rs");
+        fs::write(&stray, "x").unwrap();
+        let manifest = tmp.path().join(provenance::MANIFEST_PATH);
+        let mut recorded = provenance::Provenance::load(tmp.path());
+        recorded.record(
+            tmp.path(),
+            &stray,
+            provenance::text_digest("x"),
+            "other",
+            None,
+        );
+        recorded.save(tmp.path()).unwrap();
+
+        destroy_plan(&tmp, &target, "// v1 template\n", "i18n")
+            .revert(Flags::default())
+            .unwrap();
+
+        let text = fs::read_to_string(manifest).unwrap();
+        assert!(!text.contains("I18nFtlKeys"), "{text}");
+        assert!(text.contains("stray.rs"), "{text}");
+    }
+
+    #[test]
+    fn a_target_outside_the_project_is_never_recorded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("src/models/post.rs");
+        let mut generated = Plan::new(tmp.path());
+        generated.create(target, "// v1 template\n");
+        generated.push_revert(Revert::PwaMainRsInjection {
+            path: PathBuf::from("/elsewhere/main.rs"),
+        });
+
+        assert!(generated.revert_anchors().is_empty());
+    }
+
+    #[test]
+    fn an_owner_dir_changes_the_anchor_and_none_is_stable() {
+        let root = Path::new("/p");
+        let feature = |dir: Option<&str>| Revert::CargoAutumnWebFeature {
+            path: root.join("Cargo.toml"),
+            feature: "maud".to_owned(),
+            owner_dir: dir.map(|d| root.join(d)),
+        };
+
+        assert_eq!(feature(None).anchors(root), feature(None).anchors(root));
+        assert_ne!(
+            feature(None).anchors(root),
+            feature(Some("src/routes")).anchors(root)
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table row for each Revert variant; splitting it hides a missing row"
+    )]
+    fn every_revert_kind_anchors_by_its_values_and_not_by_template_text() {
+        let root = Path::new("/p");
+        let path = |p: &str| root.join(p);
+        let s = |v: &str| v.to_owned();
+        let kinds: Vec<(&str, Revert, Revert)> = vec![
+            (
+                "ModDecl",
+                Revert::ModDecl {
+                    path: path("a"),
+                    name: s("x"),
+                },
+                Revert::ModDecl {
+                    path: path("a"),
+                    name: s("y"),
+                },
+            ),
+            (
+                "RoutesEntries",
+                Revert::RoutesEntries {
+                    path: path("a"),
+                    entries: vec![s("x")],
+                },
+                Revert::RoutesEntries {
+                    path: path("a"),
+                    entries: vec![s("y")],
+                },
+            ),
+            (
+                "SchemaTable",
+                Revert::SchemaTable {
+                    path: path("a"),
+                    table: s("x"),
+                    expected_block: s("1"),
+                },
+                Revert::SchemaTable {
+                    path: path("a"),
+                    table: s("y"),
+                    expected_block: s("1"),
+                },
+            ),
+            (
+                "CargoDeps",
+                Revert::CargoDeps {
+                    path: path("a"),
+                    names: vec![s("x")],
+                    owner_dir: path("o"),
+                },
+                Revert::CargoDeps {
+                    path: path("a"),
+                    names: vec![s("y")],
+                    owner_dir: path("o"),
+                },
+            ),
+            (
+                "CargoAutumnWebFeature",
+                Revert::CargoAutumnWebFeature {
+                    path: path("a"),
+                    feature: s("x"),
+                    owner_dir: None,
+                },
+                Revert::CargoAutumnWebFeature {
+                    path: path("a"),
+                    feature: s("y"),
+                    owner_dir: None,
+                },
+            ),
+            (
+                "CargoAutumnWebDevFeature",
+                Revert::CargoAutumnWebDevFeature {
+                    path: path("a"),
+                    feature: s("x"),
+                    owner_dir: None,
+                },
+                Revert::CargoAutumnWebDevFeature {
+                    path: path("a"),
+                    feature: s("y"),
+                    owner_dir: None,
+                },
+            ),
+            (
+                "JobEntry",
+                Revert::JobEntry {
+                    path: path("a"),
+                    entry: s("x"),
+                },
+                Revert::JobEntry {
+                    path: path("a"),
+                    entry: s("y"),
+                },
+            ),
+            (
+                "JobsRegistration",
+                Revert::JobsRegistration {
+                    path: path("a"),
+                    owner_dir: path("x"),
+                },
+                Revert::JobsRegistration {
+                    path: path("a"),
+                    owner_dir: path("y"),
+                },
+            ),
+            (
+                "PolicyRegistration",
+                Revert::PolicyRegistration {
+                    path: path("a"),
+                    pascal: s("X"),
+                    snake: s("x"),
+                },
+                Revert::PolicyRegistration {
+                    path: path("a"),
+                    pascal: s("Y"),
+                    snake: s("x"),
+                },
+            ),
+            (
+                "MailPreview",
+                Revert::MailPreview {
+                    path: path("a"),
+                    mailer_type: s("x"),
+                },
+                Revert::MailPreview {
+                    path: path("a"),
+                    mailer_type: s("y"),
+                },
+            ),
+            (
+                "InboundMailHandler",
+                Revert::InboundMailHandler {
+                    path: path("a"),
+                    handler_module_path: s("x"),
+                },
+                Revert::InboundMailHandler {
+                    path: path("a"),
+                    handler_module_path: s("y"),
+                },
+            ),
+            (
+                "SystemTestCargoPatch",
+                Revert::SystemTestCargoPatch {
+                    path: path("a"),
+                    snake_name: s("x"),
+                },
+                Revert::SystemTestCargoPatch {
+                    path: path("a"),
+                    snake_name: s("y"),
+                },
+            ),
+            (
+                "PwaMainRsInjection",
+                Revert::PwaMainRsInjection { path: path("a") },
+                Revert::PwaMainRsInjection { path: path("b") },
+            ),
+            (
+                "AuthOAuthProviderStubs",
+                Revert::AuthOAuthProviderStubs {
+                    path: path("a"),
+                    providers: vec![s("x")],
+                },
+                Revert::AuthOAuthProviderStubs {
+                    path: path("a"),
+                    providers: vec![s("y")],
+                },
+            ),
+            (
+                "AuthWebauthnStub",
+                Revert::AuthWebauthnStub { path: path("a") },
+                Revert::AuthWebauthnStub { path: path("b") },
+            ),
+            (
+                "WebhookEndpointStub",
+                Revert::WebhookEndpointStub {
+                    path: path("a"),
+                    name: s("x"),
+                    route_path: s("/r"),
+                },
+                Revert::WebhookEndpointStub {
+                    path: path("a"),
+                    name: s("x"),
+                    route_path: s("/q"),
+                },
+            ),
+            (
+                "SubmitTokenValidateExempt",
+                Revert::SubmitTokenValidateExempt {
+                    path: path("a"),
+                    plural: s("x"),
+                    segment: s("validate"),
+                },
+                Revert::SubmitTokenValidateExempt {
+                    path: path("a"),
+                    plural: s("x"),
+                    segment: s("preview"),
+                },
+            ),
+            (
+                "RememberMiddleware",
+                Revert::RememberMiddleware { path: path("a") },
+                Revert::RememberMiddleware { path: path("b") },
+            ),
+            (
+                "SeedBinLinks",
+                Revert::SeedBinLinks {
+                    path: path("a"),
+                    owner_dir: path("x"),
+                },
+                Revert::SeedBinLinks {
+                    path: path("a"),
+                    owner_dir: path("y"),
+                },
+            ),
+            (
+                "NestedChildSection",
+                Revert::NestedChildSection {
+                    path: path("a"),
+                    child_plural: s("x"),
+                },
+                Revert::NestedChildSection {
+                    path: path("a"),
+                    child_plural: s("y"),
+                },
+            ),
+            (
+                "I18nFtlKeys",
+                Revert::I18nFtlKeys {
+                    path: path("a"),
+                    pascal: s("X"),
+                    snake: s("x"),
+                },
+                Revert::I18nFtlKeys {
+                    path: path("b"),
+                    pascal: s("X"),
+                    snake: s("x"),
+                },
+            ),
+        ];
+
+        for (kind, one, other) in kinds {
+            let anchors = one.anchors(root);
+            assert!(!anchors.is_empty(), "{kind}");
+            assert!(
+                anchors.iter().all(|a| a.kind() == kind),
+                "{kind}: {anchors:?}"
+            );
+            assert_ne!(
+                anchors,
+                other.anchors(root),
+                "{kind} ignores a value that names the edit"
+            );
+        }
     }
 
     #[test]

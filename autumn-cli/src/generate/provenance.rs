@@ -144,17 +144,36 @@ where
     })
 }
 
-/// One shared-file edit a run made, as the revert that undoes it describes it
-/// (issue #2560).
+/// The stored description of one shared-file edit that a run made (issue
+/// #2560).
 ///
-/// `destroy` compares these with the reverts its own plan builds. The text
-/// carries no template content, so a template change does not move it.
+/// `destroy` compares anchors with the reverts of its own plan. An anchor holds
+/// no template text, so a template change does not alter it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RevertAnchor {
     /// Project-relative, forward-slashed path of the edited file.
     pub path: String,
-    /// The revert kind and the parameters that name the edit.
+    /// The revert kind and the values that name the edit, as `Kind(values)`.
     pub revert: String,
+}
+
+impl RevertAnchor {
+    /// The revert kind: the text before the first `(`.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        self.revert.split('(').next().unwrap_or(&self.revert)
+    }
+
+    /// Whether the path names a file inside the project.
+    ///
+    /// The path comes from the manifest. Only plain components qualify: an
+    /// absolute path or a `..` is not a target.
+    #[must_use]
+    pub fn is_project_relative(&self) -> bool {
+        Path::new(&self.path)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+    }
 }
 
 impl std::fmt::Display for RevertAnchor {
@@ -169,13 +188,13 @@ struct ManifestFile {
     /// Project-relative path → what was written there, and by what.
     #[serde(default)]
     files: BTreeMap<String, Entry>,
-    /// Run id ([`run_id`]) → the shared-file edits that run made.
+    /// Maps a run id ([`run_id`]) to the shared-file edits of that run.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     runs: BTreeMap<String, Vec<RevertAnchor>>,
 }
 
-/// The id of the run an invocation names. The invocation holds control
-/// characters, so it is hashed into a plain TOML key.
+/// The run id of an invocation. The invocation has control characters, so the
+/// id is its hash. A hash is a valid TOML key.
 fn run_id(invocation: &str) -> String {
     digest(invocation.as_bytes())
 }
@@ -419,11 +438,10 @@ impl Provenance {
         }
     }
 
-    /// Record the shared-file edits `invocation` made, beside any earlier
-    /// record of it.
+    /// Record the shared-file edits `invocation` made.
     ///
-    /// Added, not replaced: an earlier run made its edits too, and they are
-    /// still in the files. This also keeps two plans of one invocation apart.
+    /// Add to the earlier record, do not replace it. An earlier run made its
+    /// edits, and they stay in the files.
     pub fn record_reverts(&mut self, invocation: &str, anchors: Vec<RevertAnchor>) {
         if anchors.is_empty() {
             return;
@@ -434,15 +452,19 @@ impl Provenance {
         run.dedup();
     }
 
-    /// The reverts `invocation` recorded that `planned` no longer holds, and
-    /// whose target file still exists (issue #2560).
+    /// The recorded edits that a destroy with `planned` would leave behind
+    /// (issue #2560).
     ///
-    /// Such an edit would stay in the file after a destroy. A target that is
-    /// gone has nothing left to strand, which is also what an earlier `destroy`
-    /// of a sibling resource leaves. A revert in `planned` that was not
-    /// recorded is fine: it only cleans more.
+    /// An anchor counts when all three hold:
     ///
-    /// Empty when nothing was recorded: a manifest from before this check keeps
+    /// - its target file still exists;
+    /// - `planned` has no equal anchor;
+    /// - `planned` has an anchor of the same kind. The revert moved, so an
+    ///   input changed. A kind that is missing from `planned` is a skip that
+    ///   depends on file state, such as an append that was already done.
+    ///
+    /// A revert in `planned` that was not recorded is fine: it only cleans
+    /// more. Empty when nothing was recorded. A manifest from an older CLI keeps
     /// the old behaviour.
     #[must_use]
     pub fn dropped_reverts(
@@ -456,14 +478,16 @@ impl Provenance {
             .into_iter()
             .flatten()
             .filter(|anchor| !planned.contains(anchor))
-            .filter(|anchor| {
-                // The path is manifest data. One that leaves the project names
-                // nothing to strand.
-                let p = Path::new(&anchor.path);
-                p.components().all(|c| matches!(c, Component::Normal(_))) && root.join(p).exists()
-            })
+            .filter(|anchor| planned.iter().any(|p| p.kind() == anchor.kind()))
+            .filter(|anchor| anchor.is_project_relative() && root.join(&anchor.path).exists())
             .cloned()
             .collect()
+    }
+
+    /// Forget the run of `invocation`: its edits were reverted, or the user
+    /// chose `--force`.
+    pub fn forget_run(&mut self, invocation: &str) {
+        self.runs.remove(&run_id(invocation));
     }
 
     /// Drop the entry for `path`, if any.
@@ -1053,7 +1077,93 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("i18n")).unwrap();
         std::fs::write(dir.path().join("i18n/en.ftl"), "").unwrap();
 
-        assert_eq!(p.dropped_reverts(dir.path(), OWNER, &[]), vec![a]);
+        let moved = anchor("elsewhere", "I18nFtlKeys(Post)");
+        assert_eq!(p.dropped_reverts(dir.path(), OWNER, &[moved]), vec![a]);
+    }
+
+    #[test]
+    fn a_revert_that_vanished_is_a_skip_not_a_drop() {
+        let dir = tmp();
+        let p = recorded_run(
+            dir.path(),
+            vec![anchor(
+                "autumn.toml",
+                "SubmitTokenValidateExempt(posts, validate)",
+            )],
+        );
+        std::fs::write(dir.path().join("autumn.toml"), "").unwrap();
+
+        // The plan holds no revert of that kind: the append was a no-op.
+        assert!(
+            p.dropped_reverts(dir.path(), OWNER, &[anchor("src/main.rs", "ModDecl(post)")])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_revert_that_moved_within_its_kind_is_a_drop() {
+        let dir = tmp();
+        let old = anchor("i18n/en.ftl", "I18nFtlKeys(Post)");
+        let p = recorded_run(dir.path(), vec![old.clone()]);
+        std::fs::create_dir_all(dir.path().join("i18n")).unwrap();
+        std::fs::write(dir.path().join("i18n/en.ftl"), "").unwrap();
+
+        assert_eq!(
+            p.dropped_reverts(
+                dir.path(),
+                OWNER,
+                &[anchor("translations/en.ftl", "I18nFtlKeys(Post)")]
+            ),
+            vec![old]
+        );
+    }
+
+    #[test]
+    fn a_recorded_path_that_leaves_the_project_is_ignored() {
+        let dir = tmp();
+        let outside = tmp();
+        std::fs::write(outside.path().join("x"), "").unwrap();
+        let absolute = outside.path().join("x").to_string_lossy().into_owned();
+        let parent = format!(
+            "../{}/x",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        for path in [absolute, parent] {
+            let p = recorded_run(dir.path(), vec![anchor(&path, "A(x)")]);
+            let planned = [anchor("elsewhere", "A(y)")];
+            assert!(
+                p.dropped_reverts(dir.path(), OWNER, &planned).is_empty(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_kind_is_the_text_before_the_first_paren() {
+        assert_eq!(anchor("a", "ModDecl(post)").kind(), "ModDecl");
+        assert_eq!(
+            anchor("a", "PwaMainRsInjection").kind(),
+            "PwaMainRsInjection"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_run_leaves_another_invocations_run() {
+        let dir = tmp();
+        let mut p = recorded_run(dir.path(), vec![anchor("a", "A(x)")]);
+        p.record(
+            dir.path(),
+            &dir.path().join("b.rs"),
+            "2".to_owned(),
+            "other",
+            None,
+        );
+        p.record_reverts("other", vec![anchor("b", "B(y)")]);
+        p.forget_run(OWNER);
+        p.save(dir.path()).unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_PATH)).unwrap();
+        assert!(text.contains("B(y)") && !text.contains("A(x)"), "{text}");
     }
 
     #[test]
@@ -1094,7 +1204,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("i18n")).unwrap();
         std::fs::write(dir.path().join("i18n/en.ftl"), "").unwrap();
 
-        assert!(p.dropped_reverts(dir.path(), "other", &[]).is_empty());
+        let moved = [anchor("elsewhere", "I18nFtlKeys(Post)")];
+        assert!(p.dropped_reverts(dir.path(), "other", &moved).is_empty());
     }
 
     #[test]
@@ -1141,13 +1252,13 @@ mod tests {
     #[test]
     fn a_later_record_adds_to_the_earlier_one() {
         let dir = tmp();
-        let mut p = recorded_run(dir.path(), vec![anchor("old", "Old")]);
+        let mut p = recorded_run(dir.path(), vec![anchor("old", "Old(a)")]);
         std::fs::write(dir.path().join("old"), "").unwrap();
-        p.record_reverts(OWNER, vec![anchor("new", "New")]);
+        p.record_reverts(OWNER, vec![anchor("new", "Old(b)")]);
 
         assert_eq!(
-            p.dropped_reverts(dir.path(), OWNER, &[anchor("new", "New")]),
-            vec![anchor("old", "Old")],
+            p.dropped_reverts(dir.path(), OWNER, &[anchor("new", "Old(b)")]),
+            vec![anchor("old", "Old(a)")],
             "the first run's edit is still in its file"
         );
     }

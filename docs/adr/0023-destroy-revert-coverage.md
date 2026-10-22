@@ -1,9 +1,16 @@
-# ADR 0023: `destroy` Checks That Every Recorded Revert Is Still Planned
+# ADR 0023: `destroy` Checks That Recorded Edits Are Still Reverted
 
 - Status: Accepted
 - Date: 2026-10-22
 - Deciders: Autumn maintainers
 - Tags: generators, destroy, provenance
+
+## Terms
+
+- **Edit**: a change that `generate` makes to a shared file.
+- **Revert**: the planned action that undoes an edit.
+- **Anchor**: the stored description of an edit. It has a path and a revert
+  text.
 
 ## Context
 
@@ -17,100 +24,89 @@ A generator can read other project config. The scaffold reads `[i18n]`. If
 `I18nFtlKeys` revert now targets the new bundle path, so the old bundle keeps
 its keys. This is a partial destroy (issue #2560).
 
-Each fix so far added one more input to the identity. Four sub-shapes are
-known:
+Each earlier fix added one more input to the identity. The issue lists four
+sub-shapes:
 
 | Sub-shape | Direction | Example |
 | --- | --- | --- |
-| Input the arguments cannot see | too narrow | `[i18n]` locale and dir |
+| Input the arguments do not show | too narrow | `[i18n]` locale and dir |
 | Argument with no effect on the plan | too wide | `--import` on `--live` |
 | Identity depends on uncommitted state | unstable | `.env`, environment |
 | Argument order | too wide | `--api --soft-delete` |
 
 ## Options
 
-Brainstorm:
-
-1. Fingerprint all of `autumn.toml`. Closes the class. Any port edit drops
-   every baseline.
-2. Fingerprint the sections generators read. A list that goes stale in
-   silence.
-3. Each generator declares its inputs. Precise. A missed generator is silent.
-4. Check the consequence: a revert that no longer reaches an edit that
-   `generate` made.
-5. Replace the identity with the parsed options. Every new option field
-   drops every old baseline.
-
-Reverse brainstorm (how does option 4 fail?):
-
-- A revert that does nothing is normal after an earlier `destroy` removed the
-  shared entry (`destroy model` then `destroy admin`). A "matched nothing"
-  test cannot tell this from "never matched". → Do not test matches. Compare
-  what the plan targets with what `generate` targeted.
-- Reverts depend on disk state (a locale bundle that a translator added). →
-  Allow extra reverts. Block only a lost one.
-- A recorded target file is gone (the user moved `i18n/`). → Nothing is left
-  to strand. Allow it.
-- A template change alters a revert parameter. → The old edit still sits in
-  the shared file. Refuse. `--force` overrides.
-- An old manifest has no record. → Fall back to the identity. No new refusal.
-
-Six hats:
-
-- White (facts): reverts are typed data. `Revert` has 21 variants.
-- Red (feel): users distrust a destroy that stops half way.
-- Black (risk): a false refusal costs `--force`. A false accept costs lost
-  data. Prefer the refusal.
-- Yellow (gain): no list of inputs. No generator work. A newer CLI can add
-  reverts without dropping old baselines.
-- Green (new idea): record the revert targets, not the inputs.
-- Blue (process): keep the identity. It still blocks another command from
-  claiming a file. Add one check beside it.
+1. Fingerprint all of `autumn.toml`. Any edit to it makes every baseline
+   invalid.
+2. Fingerprint the sections that generators read. The list can become wrong
+   with no warning.
+3. Each generator declares its inputs. A missing declaration gives no error.
+4. Check the result: `destroy` must not leave a recorded edit behind.
+5. Replace the identity with the parsed options. Every new option field makes
+   every old baseline invalid.
 
 ## Decision
 
-`generate` records the revert **anchors** of the run in
-`.autumn/generated.toml` (`[[runs.<id>.reverts]]`). An anchor is the project
-path and a stable description of the revert. It leaves out text that comes
-from templates, such as `expected_block`.
+Option 4. The identity stays. It still stops one command from claiming the
+output of another.
 
-A revert with a list parameter gives one anchor for each item. `destroy` plans
-more route entries than `generate` wrote, and that must not count as a change.
+`generate` stores the anchors of the run in `.autumn/generated.toml`, under
+`[[runs.<id>]]`. An anchor holds the target path and the values that name the
+edit. It holds no template text, such as `expected_block`, because template
+text changes with the CLI version. A list value gives one anchor for each item,
+because `destroy` plans more route entries than `generate` wrote.
 
-`destroy` refuses when a recorded anchor meets both conditions:
+`destroy` refuses when an anchor meets all three conditions:
 
 1. Its target file still exists.
-2. The current plan has no equal anchor.
+2. The new plan has no equal anchor.
+3. The new plan has an anchor of the same revert kind.
 
-`--force` overrides. The refusal names each anchor. Only a plan that claims to
-be the sole resource of its process records or checks anchors (see ADR 0021).
-The CLI dispatcher always claims. Two plans in one test process share one
-invocation, and their edits must not count against each other.
+Condition 3 separates a **moved** revert from a **vanished** one. A moved
+revert means an input changed (`[i18n] dir`). A vanished revert means the
+generator skipped it because of file state. Example: the append of a
+submit-token exemption is a no-op when the exemption exists. A skip is normal
+and is not a refusal.
 
-`Revert::anchor` is an exhaustive `match`. A new variant does not compile
-until it is described. No list can go stale in silence.
+`--force` overrides. A dry run reports the refusal and exits with success.
+Only a plan that claims to be the sole resource of its process records or
+checks anchors (see `0021-destroy-orphan-sweep.md`). The CLI always claims. Two
+plans in one test process share one invocation, and their edits must not count
+against each other. After a `destroy` finishes, the run is forgotten.
 
-### Rule: identity uses only state that travels with the repository
+`Revert::anchors` is an exhaustive `match`. A new variant does not compile
+until it has an anchor.
 
-Neither the identity nor the anchors may read uncommitted state. The anchors
-come from the plan, and the plan comes from committed files. The `.env` and
-environment input stays in the backend part of the identity. It is lost
-tolerance, never an unsafe delete.
+### Rule: use only state that travels with the repository
+
+Neither the identity nor the anchors read uncommitted state. The plan reads
+files on disk, and extra reverts are allowed, so a file that exists only on one
+machine can add a revert but cannot remove one. The `.env` input stays in the
+backend part of the identity. A changed `.env` can only cause a refusal. It
+cannot cause an unsafe delete.
 
 ## Consequences
 
-- The `[i18n]` case is closed. So is every later input of that shape, with no
-  change to the identity.
+- The `[i18n]` case is fixed. Any later input of the same kind is also covered,
+  if the edit has a `Revert`.
+- **Limit:** an edit with no `Revert` variant is not covered. Examples: the
+  `Dockerfile` copy lines and the `[i18n]` table in `autumn.toml` from the
+  scaffold, the `autumn.toml` blocks from `auth`, and all edits from
+  `introspect`. `destroy` never reverts them. A new `plan.modify` without a
+  `Revert` gives no warning.
+- **Limit:** an anchor holds no template text. A setting that changes only the
+  content of an edit, not its path or name, is not seen.
 - `destroy model` then `destroy admin` still works. Anchors compare plans, not
   file content.
-- A translator who adds a locale bundle does not block `destroy`.
-- Too-wide identities (`--import`, argument order) are not fixed. They lose
-  tolerance only. They are out of scope, and a later change can relax the
-  identity now that the anchor check covers the safety job.
-- A manifest from an older CLI has no anchors. It keeps the old behaviour
-  until the next `generate` of that resource.
-- A later `generate` with the same invocation adds its anchors to the record.
-  It does not replace them. An earlier run made its edits, and they stay in the
-  files. After a setting change and a new `generate`, the edits at the old
-  path still need `--force` or a manual check. The record goes when the last
-  file of the run goes.
+- A translator who adds a locale bundle does not block `destroy`. The plan
+  reverts more, not less.
+- A moved target file does not block `destroy`. If the old file is gone, there
+  is no edit to leave.
+- Identities that are too wide (`--import`, argument order) only cause extra
+  refusals. This ADR does not change them.
+- A manifest from an older CLI has no anchors. It keeps the old behaviour until
+  the next `generate` of that resource.
+- A later `generate` with the same invocation adds its anchors to the run. After
+  a setting change and a new `generate`, the edits at the old path still need
+  `--force` or a manual check. The run goes when `destroy` finishes or when its
+  last file goes.

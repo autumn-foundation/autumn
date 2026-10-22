@@ -45,6 +45,7 @@ pub mod teams;
 pub mod webhook;
 pub mod wizard;
 
+use provenance::RevertAnchor;
 use std::path::{Path, PathBuf};
 
 /// Errors that can occur during code generation.
@@ -103,18 +104,21 @@ pub enum GenerateError {
     )]
     Diverged(Vec<PathBuf>),
 
-    /// `autumn destroy` would leave a shared-file edit behind: `generate`
-    /// recorded a revert for a file that still exists, and the plan built now
-    /// no longer reverts it (issue #2560). A project config the arguments do
-    /// not show, such as `[i18n]`, changed since.
+    /// `autumn destroy` would leave a shared-file edit behind (issue #2560).
+    /// `generate` recorded a revert for a file that still exists. The new plan
+    /// holds a revert of the same kind with different values. A project setting
+    /// that the arguments do not show (for example `[i18n]`) has changed.
     #[error(
-        "refusing to destroy — it would leave edits behind. `generate` edited the file(s)          below, and a project setting has changed since, so this destroy no longer reverts          them. Undo the setting change and run destroy again, or check the files by hand          and pass --force:\n{}",
+        "refusing to destroy — it would leave edits behind. `generate` made the edit(s) \
+         below. A project setting has changed since, so this destroy does not revert \
+         them. Undo the setting change and run destroy again, or check the files by \
+         hand and pass --force:\n{}",
         format_anchors(.0)
     )]
-    RevertsDropped(Vec<crate::generate::provenance::RevertAnchor>),
+    RevertsDropped(Vec<RevertAnchor>),
 }
 
-fn format_anchors(anchors: &[crate::generate::provenance::RevertAnchor]) -> String {
+fn format_anchors(anchors: &[RevertAnchor]) -> String {
     anchors
         .iter()
         .map(|a| format!("  {a}"))
