@@ -791,12 +791,14 @@ where
 
 /// [`get_cached`], with a backend failure kept apart from a miss.
 ///
-/// A value that cannot be decoded is a miss, as in [`get_cached`]. A failed
+/// Unlike [`get_cached`], stored bytes that cannot be decoded are an error,
+/// not a miss. The key stays unreadable until a writer replaces it. A failed
 /// read marks a failure capsule incomplete, so replay does not run it.
 ///
 /// # Errors
 ///
-/// [`CacheBackendError`] when the backend could not answer.
+/// [`CacheBackendError`] when the backend could not answer, or the stored
+/// bytes cannot be decoded.
 pub fn try_get_cached<V>(cache: &dyn Cache, key: &str) -> Result<Option<V>, CacheBackendError>
 where
     V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
@@ -818,25 +820,25 @@ where
             return Err(error);
         }
     };
-    let value = match found {
-        None => None,
-        Some(arc) => match arc.downcast_ref::<V>() {
-            Some(value) => Some(value.clone()),
-            // Bytes the backend holds but this type cannot read are a fault,
-            // not an absent key.
-            None => match arc.downcast_ref::<RawCacheBytes>() {
-                Some(raw) => match serde_json::from_slice::<V>(&raw.0) {
-                    Ok(value) => Some(value),
-                    Err(error) => {
-                        mark_failed_cache_op(FAILED_READ_NOTE);
-                        return Err(CacheBackendError::new(format!(
-                            "the stored value cannot be decoded: {error}"
-                        )));
-                    }
-                },
-                None => None,
-            },
-        },
+    let Some(arc) = found else {
+        record_cache_get::<V>(key, None);
+        return Ok(None);
+    };
+    if let Some(value) = arc.downcast_ref::<V>() {
+        let value = Some(value.clone());
+        record_cache_get(key, value.as_ref());
+        return Ok(value);
+    }
+    // Bytes the backend holds but this type cannot read are a fault, not an
+    // absent key. The text is fixed: a guest can read it.
+    let value = if let Some(raw) = arc.downcast_ref::<RawCacheBytes>() {
+        let Ok(value) = serde_json::from_slice::<V>(&raw.0) else {
+            mark_failed_cache_op(FAILED_READ_NOTE);
+            return Err(CacheBackendError::new("the stored value cannot be decoded"));
+        };
+        Some(value)
+    } else {
+        None
     };
     record_cache_get(key, value.as_ref());
     Ok(value)
@@ -2306,6 +2308,20 @@ mod tests {
     fn try_get_cached_reports_bytes_it_cannot_decode() {
         let err = try_get_cached::<i64>(&CorruptBackend, "k").expect_err("corrupt bytes");
         assert!(err.reason().contains("cannot be decoded"), "{err}");
+    }
+
+    /// A decode fault marks the capsule, as a backend fault does.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_decode_fault_marks_the_capsule_incomplete() {
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                assert!(try_get_cached::<i64>(&CorruptBackend, "k").is_err());
+            },
+        ));
+        assert!(scope.is_truncated());
     }
 
     #[test]
