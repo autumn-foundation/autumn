@@ -294,6 +294,8 @@ mod offline_sync_store;
 mod openapi;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
+mod outbox_claim_profile;
 #[cfg(feature = "db")]
 mod outbox_pg;
 mod pagination;

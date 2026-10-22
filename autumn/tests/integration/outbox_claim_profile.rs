@@ -9,13 +9,13 @@
 //! 50,000-row pending backlog (see `docs/perf/outbox-claim/fixture.sql`). The
 //! history size is swept over three tiers so the plan shape is shown scaling.
 //!
-//! Own binary, `#[ignore]`d, outside the consolidated Docker sweep: it seeds
-//! up to 1M rows. Run with Docker, or point `OUTBOX_PROFILE_DATABASE_URL` at a
-//! Postgres with `shared_preload_libraries = pg_stat_statements`:
+//! `#[ignore]`d and skipped by name in ci.yml's Docker sweep: it seeds up to 1M
+//! rows. Run with Docker, or point `OUTBOX_PROFILE_DATABASE_URL` at a Postgres
+//! with `shared_preload_libraries = pg_stat_statements`:
 //!
 //! ```text
-//! cargo test -p autumn-web --features test-support --test outbox_claim_profile \
-//!   -- --ignored --nocapture --test-threads=1
+//! cargo test -p autumn-web --features test-support --test integration_tests \
+//!   outbox_claim_profile -- --ignored --nocapture --test-threads=1
 //! ```
 
 #![cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
@@ -32,7 +32,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 
-const FIXTURE: &str = include_str!("../../docs/perf/outbox-claim/fixture.sql");
+const FIXTURE: &str = include_str!("../../../docs/perf/outbox-claim/fixture.sql");
 const TIERS: [i64; 3] = [100_000, 300_000, 950_000];
 const TOPICS: [&str; 4] = [
     "order.placed",
