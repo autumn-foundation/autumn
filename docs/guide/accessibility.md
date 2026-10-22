@@ -67,17 +67,29 @@ html! {
 }
 ```
 
-### `required_text_input`
+### `required_text_input` and the other `required_*` helpers
 
 Like `text_input` but adds both the HTML `required` attribute and
 `aria-required="true"` so assistive technology announces the field as
-mandatory.
+mandatory. The label also shows a `*` marker with `aria-hidden="true"`, so a
+screen reader does not say "required" two times. Each control has a
+`required_*` helper, for example `required_password_input`,
+`required_textarea_input` and `required_checkbox_input`.
 
 ```rust
 html! {
     (required_text_input(&changeset, "email", "Email address"))
 }
 ```
+
+### Hints and attributes: the `*_with` helpers
+
+Each helper has a `*_with` variant that takes `&FieldOptions`. A hint renders
+between the label and the control with `id="{field}-hint"`, and
+`aria-describedby` names it before the error. `FieldOptions` has no setter for
+`id`, `name` or `aria-*`, so the links between the label, hint, error and
+control stay correct. See the
+[forms guide](./forms.md#hints-attributes-and-required-state-fieldoptions).
 
 ### `textarea_input`
 

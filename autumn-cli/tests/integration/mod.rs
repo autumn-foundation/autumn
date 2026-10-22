@@ -34,6 +34,7 @@ mod replay;
 mod replica_restore;
 mod repo_hygiene;
 mod resilience_hygiene;
+mod scaffold_a11y_verify;
 mod scaffold_belongs_to;
 mod scaffold_bulk_delete;
 mod scaffold_commentable;

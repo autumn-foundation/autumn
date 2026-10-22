@@ -117,17 +117,71 @@ The free functions in `autumn_web::form` cover the rest of the control types:
 `password_input`, `textarea_input`, `checkbox_input`, `number_input`,
 `date_input`, `datetime_input`, and `select_input`.
 
-A `required_*` variant — one that adds the HTML5 constraint attributes for you —
-exists for **some but not all** of them:
+Each control has a `required_*` variant. It adds `required`,
+`aria-required="true"` and a visual `*` marker in the label. The marker has
+`aria-hidden="true"`, so a screen reader says "required" one time only. Tell
+sighted users what `*` means, for example with "* required" above the form.
+`required_*` writes only the client-side signal. The model rule
+`#[validate(presence)]` rejects a blank submission.
 
-| Has a `required_*` variant | Does not |
+### Hints, attributes and required state: `FieldOptions`
+
+Each helper also has a `*_with` variant that takes `&FieldOptions`. The label
+stays a positional argument, so a field with no label does not compile.
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, text_input_with};
+
+text_input_with(&changeset, "email", "Email", &FieldOptions::new()
+    .hint("We never share your address.")
+    .required()
+    .autocomplete("email")
+    .placeholder("you@example.com")
+    .data("test-id", "signup-email")
+    .hx("indicator", "#spinner"))
+```
+
+- `hint` renders `<p id="email-hint" class="autumn-field__hint">` between the
+  label and the control (after the label for a checkbox). `aria-describedby`
+  names the hint first, then the error.
+- The typed attributes (`placeholder`, `autocomplete`, `inputmode`, `pattern`,
+  `min`, `max`, `disabled`, `readonly`) render only on controls that use them.
+- `data` and `hx` add `data-*` and `hx-*` attributes. There is no setter for
+  `id`, `name`, `class` or `aria-*`: the helper owns them. The htmx helpers also
+  keep their own `hx-post`, `hx-params` and the other `hx-*` names they set.
+  If you set one name two times, the last value applies.
+- The browser does not submit the value of a `disabled` control.
+
+| Helper | With options |
 |---|---|
-| `text_input`, `number_input`, `date_input`, `datetime_input`, `select_input`, `rich_text_area` | `password_input`, `textarea_input`, `checkbox_input` |
+| `text_input` | `text_input_with` |
+| `text_input_htmx_with_token_field` | `text_input_htmx_with` |
+| `password_input` | `password_input_with` |
+| `textarea_input` | `textarea_input_with` |
+| `checkbox_input` | `checkbox_input_with` |
+| `number_input` | `number_input_with` |
+| `date_input` | `date_input_with` |
+| `datetime_input` | `datetime_input_with` |
+| `select_input` | `select_input_with` |
+| `rich_text_area_with_labels` | `rich_text_area_with` |
+| `rich_text_area_htmx_with_token_field_with_labels` | `rich_text_area_htmx_with` |
 
-For the three without one, set the attribute yourself in the markup. Server-side
-validation is unaffected either way: `required_*` only writes the client-side
-hint, and `#[validate(presence)]` on the model is what actually rejects a blank
-submission.
+The `*_with` htmx helpers take the submit-token field name. Pass
+`"_submit_token"` for the default. A nested-form `RowScope` has
+`text_input_with`, `number_input_with` and `textarea_input_with`.
+
+The Autumn stylesheet marks a field invalid with `:user-invalid`, so the
+browser's own check shows only after the user changes the field or submits.
+Server errors use the `autumn-field__input--invalid` class.
+
+### The error summary
+
+`autumn_web::widgets::error_summary(&changeset)` lists every error at the top of
+the form. Each entry links to `#field`, the `id` of the control. The summary has
+`tabindex="-1"` and `autofocus`, so focus moves to it when a submit fails, with
+no JavaScript. A form-level error (key `__all__`) has no link. Put one summary
+on a page, with no other `autofocus` element. Do not return it from an
+inline-validation response: it takes focus while the user types.
 
 ### Rendering a whole form in one call
 
@@ -135,14 +189,20 @@ A `#[model]` implements `FormModel`, so `form_for` can derive one control per
 editable column:
 
 ```rust,ignore
-use autumn_web::form::form_for;
+use autumn_web::form::{FieldOptions, form_for};
 
 form_for(&changeset, "/posts", "post")
     .csrf(csrf.token())
     .exclude("author_id")
     .override_label("body", "Post text")
+    .field_options("title", FieldOptions::new().hint("Keep it short."))
     .render()
 ```
+
+Use `.field_options(field, FieldOptions)` to give one field a hint, attributes
+or the required state. A checkbox and a password become required only from
+`FieldOptions`: a non-null `bool` column does not mean "must be checked", and
+the browser never fills a password field again on an edit form.
 
 This is what the scaffold generator emits. Reach for the individual helpers when
 the form's layout matters; reach for `form_for` when it does not.

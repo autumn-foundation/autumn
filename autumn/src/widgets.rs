@@ -4922,9 +4922,23 @@ pub fn alert_with(
     body: maud::Markup,
     config: &AlertConfig<'_>,
 ) -> maud::Markup {
+    alert_root(variant, &body, config, None)
+}
+
+/// Shared body of [`alert_with`] and [`error_summary`]. `focus_id` gives the
+/// root an `id`, `tabindex="-1"` and `autofocus`, so the browser (and htmx
+/// after a swap) moves focus to it.
+#[cfg(feature = "maud")]
+fn alert_root(
+    variant: AlertVariant,
+    body: &maud::Markup,
+    config: &AlertConfig<'_>,
+    focus_id: Option<&str>,
+) -> maud::Markup {
     let root = merge_class(&format!("alert alert-{}", variant.as_str()), config.class);
     maud::html! {
-        div class=(root) role=(variant.role()) {
+        div id=[focus_id] class=(root) role=(variant.role())
+            tabindex=[focus_id.map(|_| "-1")] autofocus[focus_id.is_some()] {
             @if config.icon {
                 span class="alert__icon" { (variant.icon()) }
             }
@@ -4949,11 +4963,28 @@ pub fn alert_with(
     }
 }
 
+/// The `id` of the [`error_summary`] root.
+#[cfg(feature = "maud")]
+pub const ERROR_SUMMARY_ID: &str = "error-summary";
+
 /// Render an [`AlertVariant::Error`] alert summarizing every field error in a
 /// [`Changeset`](crate::form::Changeset), or `None` when the changeset is valid.
 ///
 /// The messages are listed in a `<ul>` in a stable (sorted) order — directly
 /// usable at the top of a re-rendered form. Each message is HTML-escaped.
+///
+/// Each entry links to `#{field}`, the `id` the form helpers give the
+/// control, so a click moves to the field. A form-level error has no field
+/// and no link: its key, or the part after the last `.`, starts with `__`
+/// (for example `__all__` or `address.__all__`).
+///
+/// The summary renders only when the changeset has errors. Its root has
+/// `id="error-summary"`, `tabindex="-1"` and `autofocus`: the browser moves
+/// focus to it when the page loads, and htmx does the same after a swap. A
+/// screen reader then reads the summary first. Put one summary on a page,
+/// and no other `autofocus` element: the browser uses only the first one. Do
+/// not return it from an inline-validation response, because it takes focus
+/// while the user types.
 ///
 /// # Example
 ///
@@ -4971,9 +5002,10 @@ pub fn alert_with(
 /// let invalid = Changeset::from_errors((), errs);
 /// let out = error_summary(&invalid).unwrap().into_string();
 /// assert!(out.contains(r#"class="alert alert-error""#));
-/// assert!(out.contains("<ul"));
-/// assert!(out.contains("is invalid"));
+/// assert!(out.contains(r##"<a href="#email">is invalid</a>"##));
 /// assert!(out.contains("must be &lt;set&gt;")); // caller text escaped
+/// assert!(out.contains(r#"tabindex="-1""#));
+/// assert!(out.contains(" autofocus"));
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
@@ -4981,28 +5013,67 @@ pub fn error_summary<T>(changeset: &crate::form::Changeset<T>) -> Option<maud::M
     if changeset.is_valid() {
         return None;
     }
-    // Stable order: sort by (field, message) so the summary is deterministic.
-    let mut messages: Vec<&str> = Vec::new();
+    // Stable order: sort by field so the summary is deterministic.
     let mut fields: Vec<&String> = changeset.all_errors().keys().collect();
     fields.sort();
-    for field in fields {
-        for msg in &changeset.all_errors()[field] {
-            messages.push(msg.as_str());
-        }
-    }
     let body = maud::html! {
         ul class="alert__errors" {
-            @for msg in &messages {
-                li { (msg) }
+            @for field in fields {
+                @let href = field_fragment(field);
+                @for msg in &changeset.all_errors()[field] {
+                    @if let Some(href) = &href {
+                        li { a href=(href) { (msg) } }
+                    } @else {
+                        li { (msg) }
+                    }
+                }
             }
         }
     };
-    Some(alert_with(
+    Some(alert_root(
         AlertVariant::Error,
-        body,
+        &body,
         &AlertConfig::new()
             .title("Please fix the following errors")
             .icon(true),
+        Some(ERROR_SUMMARY_ID),
+    ))
+}
+
+/// The bytes a URL fragment cannot hold (RFC 3986 `fragment`), plus `%`.
+#[cfg(feature = "maud")]
+const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b';')
+    .remove(b'=')
+    .remove(b':')
+    .remove(b'@')
+    .remove(b'/')
+    .remove(b'?');
+
+/// `#{field}`, percent-encoded for a URL fragment, or `None` for a
+/// form-level key.
+#[cfg(feature = "maud")]
+fn field_fragment(field: &str) -> Option<String> {
+    let last = field.rsplit('.').next().unwrap_or(field);
+    if field.is_empty() || last.starts_with("__") {
+        return None;
+    }
+    Some(format!(
+        "#{}",
+        percent_encoding::utf8_percent_encode(field, FRAGMENT)
     ))
 }
 

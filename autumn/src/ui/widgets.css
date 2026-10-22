@@ -157,6 +157,54 @@
     margin: 0;
 }
 
+/* Field wrapper v2 — issue #3395. The hint is between the label and the
+   control. The marker has aria-hidden="true": aria-required gives the state
+   to a screen reader. */
+.autumn-field__hint {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.autumn-field__required {
+    color: var(--danger);
+    margin-left: 0.25rem;
+}
+
+/* A checkbox shows the box, then the label, on one line. */
+.autumn-field--checkbox {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.autumn-field--checkbox .autumn-field__input {
+    width: auto;
+}
+
+.autumn-field__input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.autumn-field--checkbox .autumn-field__hint,
+.autumn-field--checkbox .autumn-field__errors {
+    flex-basis: 100%;
+}
+
+/* Client-side state: :user-invalid matches only after the user changes the
+   field or submits the form. Plain :invalid matches an empty required field
+   when the page loads. Server errors use the --invalid class above. */
+.autumn-field__input:user-invalid {
+    border-color: var(--danger);
+}
+
+.autumn-field__input:user-invalid:focus {
+    border-color: var(--danger);
+    box-shadow: 0 0 0 3px var(--danger-light);
+}
+
 /* Currently stored file shown above an attachment column's file input, and the
    type/size annotation beside a rendered attachment link — issue #1236. A file
    input can't be repopulated, so this line is the only signal that the record
