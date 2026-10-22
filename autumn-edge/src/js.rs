@@ -105,8 +105,12 @@ mod tests {
     }
 
     /// The keys of the object `wasiImports` returns, in source order.
-    fn js_wasi_imports() -> Vec<String> {
-        let body = HOST
+    ///
+    /// Line endings are normalized first: a Windows checkout with
+    /// `core.autocrlf` embeds the file with `\r\n`.
+    fn js_wasi_imports(source: &str) -> Vec<String> {
+        let source = source.replace("\r\n", "\n");
+        let body = source
             .split_once("function wasiImports(")
             .and_then(|(_, rest)| rest.split_once("\n  return {\n"))
             .and_then(|(_, rest)| rest.split_once("\n  };\n"))
@@ -128,14 +132,17 @@ mod tests {
 
     #[test]
     fn the_js_host_provides_exactly_the_listed_imports() {
-        let mut provided = js_wasi_imports();
         let mut listed: Vec<String> = super::HOST_WASI_IMPORTS
             .iter()
             .map(|name| (*name).to_owned())
             .collect();
-        provided.sort();
         listed.sort();
-        assert_eq!(provided, listed);
+        // The checked-out source, and the same source with CRLF endings.
+        for source in [HOST.to_owned(), HOST.replace('\n', "\r\n")] {
+            let mut provided = js_wasi_imports(&source);
+            provided.sort();
+            assert_eq!(provided, listed);
+        }
     }
 
     #[test]
