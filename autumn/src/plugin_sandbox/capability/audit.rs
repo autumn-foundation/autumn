@@ -134,6 +134,9 @@ struct LogState {
     folded: BTreeMap<(String, u64), (Instant, u64)>,
     /// The time the hour buckets count from. Set by the first fold.
     origin: Option<Instant>,
+    /// The newest time of a drop count the full `folded` ledger shed. Its
+    /// owner is unknown, so a summary can only say that counts were lost.
+    shed: Option<Instant>,
 }
 
 /// The gap between two instants, whichever is later.
@@ -242,6 +245,7 @@ impl PluginActivityLog {
             .filter(|(_, (at, _))| in_window(*at))
             .fold(0_u64, |sum, (_, (_, count))| sum.saturating_add(*count));
         summary.dropped = summary.dropped.saturating_add(folded);
+        summary.truncated = state.shed.is_some_and(in_window);
         drop(state);
         summary
     }
@@ -321,12 +325,15 @@ impl LogState {
             folded.1 = folded.1.saturating_add(count);
         }
         // Bounded like the other ledgers. Past this the oldest hour goes, which
-        // takes thousands of plugin-hours of overflow to reach.
+        // takes thousands of plugin-hours of overflow to reach. Keep the newest
+        // shed time. A summary then says its counts are incomplete.
         while self.folded.len() > MAX_LOG_EVENTS {
             let Some(oldest) = self.folded.keys().min_by_key(|(_, hour)| *hour).cloned() else {
                 break;
             };
-            self.folded.remove(&oldest);
+            if let Some((at, _)) = self.folded.remove(&oldest) {
+                self.shed = Some(self.shed.map_or(at, |seen| seen.max(at)));
+            }
         }
     }
 }
@@ -367,6 +374,10 @@ pub struct ActivitySummary {
     /// means every count above is a **floor**, and an operator must not have to
     /// infer that from a suspiciously round number.
     pub dropped: u64,
+    /// True if the log shed drop counts in this window.
+    ///
+    /// The shed counts belong to any plugin. Then every number here is a floor.
+    pub truncated: bool,
 }
 
 impl ActivitySummary {
@@ -459,9 +470,14 @@ impl ActivitySummary {
             plugin = self.plugin,
             secs = self.window.as_secs()
         );
-        if self.is_empty() && self.dropped == 0 {
+        if self.is_empty() && self.dropped == 0 && !self.truncated {
             out.push_str("  no capability calls\n");
             return;
+        }
+        if self.truncated {
+            out.push_str(
+                "  \u{26A0} the log shed older drop counts. Every number here is a floor\n",
+            );
         }
         if self.dropped > 0 {
             let _ = writeln!(
@@ -1027,5 +1043,84 @@ mod tests {
             "{}",
             recent.dropped
         );
+    }
+
+    #[test]
+    fn a_summary_says_so_when_the_log_lost_drop_counts() {
+        let log = PluginActivityLog::new();
+        let hour = Duration::from_secs(3600);
+        // This many plugins overflow the dropped ledger. Then the folded
+        // ledger overflows and sheds a count.
+        for n in 0..(MAX_LOG_EVENTS * 2 + 10) {
+            log.ingest_dropped(&format!("p{n}"), 1);
+        }
+        assert!(
+            log.summary("p0", hour).truncated,
+            "counts were lost, and the summary must say so"
+        );
+        assert!(
+            !PluginActivityLog::new().summary("p0", hour).truncated,
+            "a log that lost nothing is not truncated"
+        );
+    }
+
+    #[test]
+    fn a_truncation_leaves_the_window_with_its_time() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+        for n in 0..(MAX_LOG_EVENTS * 2 + 10) {
+            log.ingest_dropped(&format!("p{n}"), 1);
+        }
+        clock.advance(10 * hour);
+        assert!(!log.summary("p0", hour).truncated, "the loss is old");
+        assert!(log.summary("p0", 11 * hour).truncated);
+    }
+
+    #[test]
+    fn truncation_is_exact_at_the_window_edge_and_reaches_every_plugin() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+        for n in 0..(MAX_LOG_EVENTS * 2 + 10) {
+            log.ingest_dropped(&format!("p{n}"), 1);
+        }
+        let shed = log.lock().shed.expect("a count was shed");
+        clock.advance(hour);
+        let age = crate::time::ambient_instant().saturating_duration_since(shed);
+        assert!(log.summary("other", age).truncated, "at the edge");
+        assert!(
+            !log.summary("other", age.saturating_sub(Duration::from_millis(1)))
+                .truncated,
+            "just outside"
+        );
+    }
+
+    #[test]
+    fn a_truncated_summary_is_not_reported_as_empty() {
+        let summary = ActivitySummary {
+            plugin: "shop".to_owned(),
+            truncated: true,
+            ..ActivitySummary::default()
+        };
+        let text = summary.to_string();
+        assert!(text.contains("shed older drop counts"), "{text}");
+        assert!(!text.contains("no capability calls"), "{text}");
     }
 }
