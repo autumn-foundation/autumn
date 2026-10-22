@@ -2212,6 +2212,17 @@ quietly do nothing. It also keeps one command from claiming another's files:
 `autumn new --starter` writes through the same machinery, and no generator
 owns what it wrote.
 
+`generate` also records each edit it makes to a shared file (`Cargo.toml`,
+`src/main.rs`, `i18n/en.ftl`), under `[[runs.<id>]]`. `destroy` refuses when a
+recorded edit sits in a file that still exists and the new plan no longer
+reverts it. This happens when a project setting that the arguments do not show
+(for example `[i18n] dir`) changed after `generate`. Without the check, `destroy`
+would delete the owned files and leave the edit behind. The message names each
+edit. Undo the setting change and run `destroy` again, or check the files by
+hand and pass `--force`. A plan that reverts more than `generate` edited is
+fine, and so is an edit whose file is gone. A manifest from an older CLI has no
+record, so it keeps the old behaviour.
+
 Commit `.autumn/generated.toml`. It is the baseline a later checkout compares
 against. Without it, `destroy` can only compare against the current templates —
 so a CLI upgrade that changed a template makes every untouched file that

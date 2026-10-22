@@ -248,6 +248,92 @@ impl Revert {
         }
     }
 
+    /// The edits this revert undoes, as `destroy` compares them with the
+    /// record `generate` made (issue #2560).
+    ///
+    /// Names the target and the parameters that choose the edit. Leaves out
+    /// text that comes from a template, such as `expected_block`: that moves
+    /// with the CLI version, and the check must not. A list parameter gives one
+    /// anchor for each item, because `destroy` plans a superset of the entries
+    /// that `generate` wrote. The `match` has no wildcard, so a new variant
+    /// does not compile until it is described.
+    #[must_use]
+    pub(super) fn anchors(&self, root: &Path) -> Vec<provenance::RevertAnchor> {
+        let rel =
+            |p: &Path| provenance::key(root, p).unwrap_or_else(|| p.to_string_lossy().into_owned());
+        let owner = |dir: Option<&Path>| dir.map_or_else(String::new, rel);
+        let each = |kind: &str, items: &[String], tail: String| -> Vec<String> {
+            items
+                .iter()
+                .map(|item| format!("{kind}({item}{tail})"))
+                .collect()
+        };
+        let reverts: Vec<String> = match self {
+            Self::ModDecl { name, .. } => vec![format!("ModDecl({name})")],
+            Self::RoutesEntries { entries, .. } => each("RoutesEntries", entries, String::new()),
+            Self::SchemaTable { table, .. } => vec![format!("SchemaTable({table})")],
+            Self::CargoDeps {
+                names, owner_dir, ..
+            } => each("CargoDeps", names, format!("; {}", rel(owner_dir))),
+            Self::CargoAutumnWebFeature {
+                feature, owner_dir, ..
+            } => vec![format!(
+                "CargoAutumnWebFeature({feature}; {})",
+                owner(owner_dir.as_deref())
+            )],
+            Self::CargoAutumnWebDevFeature {
+                feature, owner_dir, ..
+            } => vec![format!(
+                "CargoAutumnWebDevFeature({feature}; {})",
+                owner(owner_dir.as_deref())
+            )],
+            Self::JobEntry { entry, .. } => vec![format!("JobEntry({entry})")],
+            Self::JobsRegistration { owner_dir, .. } => {
+                vec![format!("JobsRegistration({})", rel(owner_dir))]
+            }
+            Self::PolicyRegistration { pascal, snake, .. } => {
+                vec![format!("PolicyRegistration({pascal}, {snake})")]
+            }
+            Self::MailPreview { mailer_type, .. } => vec![format!("MailPreview({mailer_type})")],
+            Self::InboundMailHandler {
+                handler_module_path,
+                ..
+            } => vec![format!("InboundMailHandler({handler_module_path})")],
+            Self::SystemTestCargoPatch { snake_name, .. } => {
+                vec![format!("SystemTestCargoPatch({snake_name})")]
+            }
+            Self::PwaMainRsInjection { .. } => vec!["PwaMainRsInjection".to_owned()],
+            Self::AuthOAuthProviderStubs { providers, .. } => {
+                each("AuthOAuthProviderStubs", providers, String::new())
+            }
+            Self::AuthWebauthnStub { .. } => vec!["AuthWebauthnStub".to_owned()],
+            Self::WebhookEndpointStub {
+                name, route_path, ..
+            } => vec![format!("WebhookEndpointStub({name}, {route_path})")],
+            Self::SubmitTokenValidateExempt {
+                plural, segment, ..
+            } => vec![format!("SubmitTokenValidateExempt({plural}, {segment})")],
+            Self::RememberMiddleware { .. } => vec!["RememberMiddleware".to_owned()],
+            Self::SeedBinLinks { owner_dir, .. } => {
+                vec![format!("SeedBinLinks({})", rel(owner_dir))]
+            }
+            Self::NestedChildSection { child_plural, .. } => {
+                vec![format!("NestedChildSection({child_plural})")]
+            }
+            Self::I18nFtlKeys { pascal, snake, .. } => {
+                vec![format!("I18nFtlKeys({pascal}, {snake})")]
+            }
+        };
+        let path = rel(self.path());
+        reverts
+            .into_iter()
+            .map(|revert| provenance::RevertAnchor {
+                path: path.clone(),
+                revert,
+            })
+            .collect()
+    }
+
     /// The directory whose continued occupancy (by any file other than
     /// this same destroy's own deletions) means this revert must NOT be
     /// applied yet — a sibling resource of the same generator may still
@@ -935,6 +1021,11 @@ impl Plan {
             let scope = self.sole_resource.then_some(scope);
             recorded.record(&self.project_root, &path, digest, &self.invocation, scope);
         }
+        // Only a claimed plan: an unclaimed one may share its invocation with
+        // other plans in the process, and their edits would count against it.
+        if self.sole_resource {
+            recorded.record_reverts(&self.invocation, self.revert_anchors());
+        }
         if let Err(e) = recorded.save(&self.project_root) {
             eprintln!(
                 "Warning: could not record generated-file provenance in {}: {e}. \
@@ -942,6 +1033,18 @@ impl Plan {
                 provenance::MANIFEST_PATH
             );
         }
+    }
+
+    /// The anchors of this plan's reverts (issue #2560).
+    fn revert_anchors(&self) -> Vec<provenance::RevertAnchor> {
+        let mut anchors: Vec<_> = self
+            .reverts
+            .iter()
+            .flat_map(|r| r.anchors(&self.project_root))
+            .collect();
+        anchors.sort();
+        anchors.dedup();
+        anchors
     }
 
     /// Print every advisory warning to stderr. Called only on a path that
@@ -1047,6 +1150,14 @@ impl Plan {
                     );
                 }
             }
+            if !plan.dropped_reverts.is_empty() {
+                println!(
+                    "  A real run would refuse (without --force) — it would leave these edits behind:"
+                );
+                for anchor in &plan.dropped_reverts {
+                    println!("    {anchor}");
+                }
+            }
             for warning in &plan.warnings {
                 eprintln!("Warning: {warning}");
             }
@@ -1055,6 +1166,9 @@ impl Plan {
 
         if !plan.diverged.is_empty() && !flags.force {
             return Err(GenerateError::Diverged(plan.diverged));
+        }
+        if !plan.dropped_reverts.is_empty() {
+            return Err(GenerateError::RevertsDropped(plan.dropped_reverts));
         }
 
         for warning in &plan.warnings {
@@ -1261,6 +1375,14 @@ impl Plan {
         } else {
             sweep::Sweep::default()
         };
+        // Shared-file edits `generate` made that this plan no longer reverts
+        // (issue #2560). Only for a claimed plan (see `Plan::claim_sole_resource`),
+        // and not under `--force`.
+        let dropped_reverts = if force || !self.sole_resource {
+            Vec::new()
+        } else {
+            recorded.dropped_reverts(&self.project_root, &self.invocation, &self.revert_anchors())
+        };
         let mut files_to_remove = sweep.remove.clone();
         let mut diverged = Vec::new();
         let mut warnings = sweep.warnings;
@@ -1447,6 +1569,7 @@ impl Plan {
             migrations_to_remove,
             modifies,
             diverged,
+            dropped_reverts,
             warnings,
             swept: sweep.digests,
             stale: sweep.forget,
@@ -1479,6 +1602,8 @@ struct RevertPlan {
     /// (its reverts emptied it down to nothing).
     modifies: Vec<(PathBuf, Option<String>)>,
     diverged: Vec<PathBuf>,
+    /// Recorded reverts this plan no longer holds (issue #2560).
+    dropped_reverts: Vec<provenance::RevertAnchor>,
     warnings: Vec<String>,
     /// Files the orphan sweep removes, with their recorded digests (issue
     /// #2557). Also in `files_to_remove`.
@@ -3435,6 +3560,221 @@ mod tests {
         destroy.revert(Flags::default()).unwrap();
 
         assert!(!target.exists());
+    }
+
+    fn i18n_revert(root: &Path, dir: &str) -> Revert {
+        Revert::I18nFtlKeys {
+            path: root.join(dir).join("en.ftl"),
+            pascal: "Post".to_owned(),
+            snake: "post".to_owned(),
+        }
+    }
+
+    /// A project with one generated file and one shared bundle, generated by a
+    /// plan that reverts `i18n/en.ftl`.
+    fn generated_with_bundle(tmp: &tempfile::TempDir) -> PathBuf {
+        let target = tmp.path().join("src/models/post.rs");
+        fs::create_dir_all(tmp.path().join("i18n")).unwrap();
+        fs::write(
+            tmp.path().join("i18n/en.ftl"),
+            "# Post\npost.title = Post\n",
+        )
+        .unwrap();
+        let mut generated = Plan::new(tmp.path());
+        generated.create(target.clone(), "// v1 template\n");
+        generated.push_revert(i18n_revert(tmp.path(), "i18n"));
+        sole(generated).execute(Flags::default()).unwrap();
+        target
+    }
+
+    fn destroy_plan(tmp: &tempfile::TempDir, target: &Path, template: &str, dir: &str) -> Plan {
+        let mut destroy = Plan::new(tmp.path());
+        destroy.create(target.to_path_buf(), template);
+        destroy.push_revert(i18n_revert(tmp.path(), dir));
+        sole(destroy)
+    }
+
+    #[test]
+    fn a_revert_that_moved_off_a_live_target_refuses_the_destroy() {
+        // The files match the current render, so the digest is not even
+        // consulted. The shared edit would still be left behind (issue #2560).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+
+        let err = destroy_plan(&tmp, &target, "// v1 template\n", "translations")
+            .revert(Flags::default())
+            .unwrap_err();
+
+        assert!(
+            matches!(err, GenerateError::RevertsDropped(ref r) if r.len() == 1),
+            "{err}"
+        );
+        assert!(err.to_string().contains("i18n/en.ftl"), "{err}");
+        assert!(target.exists(), "nothing is removed");
+    }
+
+    #[test]
+    fn a_moved_revert_is_refused_after_a_template_change_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+
+        let err = destroy_plan(&tmp, &target, "// v2 template\n", "translations")
+            .revert(Flags::default())
+            .unwrap_err();
+
+        assert!(matches!(err, GenerateError::RevertsDropped(_)));
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn force_overrides_a_moved_revert() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+
+        destroy_plan(&tmp, &target, "// v2 template\n", "translations")
+            .revert(Flags {
+                force: true,
+                ..Flags::default()
+            })
+            .unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_dry_run_reports_a_moved_revert_and_touches_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+
+        destroy_plan(&tmp, &target, "// v1 template\n", "translations")
+            .revert(Flags {
+                dry_run: true,
+                ..Flags::default()
+            })
+            .unwrap();
+
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn the_same_reverts_keep_the_baseline_across_a_template_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+
+        destroy_plan(&tmp, &target, "// v2 template\n", "i18n")
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_revert_planned_in_addition_is_not_a_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+        let mut destroy = destroy_plan(&tmp, &target, "// v2 template\n", "i18n");
+        destroy.push_revert(i18n_revert(tmp.path(), "i18n-extra"));
+
+        destroy.revert(Flags::default()).unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_recorded_revert_whose_target_is_gone_does_not_block() {
+        // `destroy model` then `destroy admin`: the shared entry is already out.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+        fs::remove_file(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        destroy_plan(&tmp, &target, "// v2 template\n", "translations")
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_manifest_without_recorded_reverts_keeps_the_old_behaviour() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+        let manifest = tmp.path().join(provenance::MANIFEST_PATH);
+        let text = fs::read_to_string(&manifest).unwrap();
+        let (files, _) = text.split_once("[[runs").expect("a run was recorded");
+        fs::write(&manifest, files).unwrap();
+
+        destroy_plan(&tmp, &target, "// v2 template\n", "translations")
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn an_unclaimed_plan_neither_records_nor_checks_reverts() {
+        // Two plans of one process share an invocation, so one plan's edits
+        // must not count against the other.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("src/models/post.rs");
+        fs::create_dir_all(tmp.path().join("i18n")).unwrap();
+        fs::write(tmp.path().join("i18n/en.ftl"), "").unwrap();
+        let mut generated = Plan::new(tmp.path());
+        generated.create(target.clone(), "// v1 template\n");
+        generated.push_revert(i18n_revert(tmp.path(), "i18n"));
+        generated.execute(Flags::default()).unwrap();
+        let text = fs::read_to_string(tmp.path().join(provenance::MANIFEST_PATH)).unwrap();
+        assert!(!text.contains("runs"), "{text}");
+
+        let mut destroy = Plan::new(tmp.path());
+        destroy.create(target.clone(), "// v1 template\n");
+        destroy.revert(Flags::default()).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_destroy_prunes_the_recorded_run_with_its_last_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = generated_with_bundle(&tmp);
+
+        destroy_plan(&tmp, &target, "// v1 template\n", "i18n")
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join(provenance::MANIFEST_PATH).exists());
+    }
+
+    #[test]
+    fn a_revert_anchor_ignores_template_text_and_the_project_location() {
+        let here = tempfile::TempDir::new().unwrap();
+        let there = tempfile::TempDir::new().unwrap();
+        let schema = |root: &Path, block: &str| Revert::SchemaTable {
+            path: root.join("src/schema.rs"),
+            table: "posts".to_owned(),
+            expected_block: block.to_owned(),
+        };
+
+        assert_eq!(
+            schema(here.path(), "v1 columns").anchors(here.path()),
+            schema(there.path(), "v2 columns").anchors(there.path()),
+        );
+        assert_ne!(
+            i18n_revert(here.path(), "i18n").anchors(here.path()),
+            i18n_revert(here.path(), "translations").anchors(here.path()),
+        );
+    }
+
+    #[test]
+    fn a_list_revert_anchors_each_item_so_a_longer_list_is_a_superset() {
+        let root = Path::new("/p");
+        let routes = |entries: &[&str]| Revert::RoutesEntries {
+            path: root.join("src/main.rs"),
+            entries: entries.iter().map(|e| (*e).to_owned()).collect(),
+        };
+        let short = routes(&["a", "b"]).anchors(root);
+        let long = routes(&["a", "b", "c"]).anchors(root);
+
+        assert_eq!(short.len(), 2);
+        assert!(short.iter().all(|anchor| long.contains(anchor)));
     }
 
     #[test]

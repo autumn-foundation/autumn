@@ -102,6 +102,24 @@ pub enum GenerateError {
         format_collisions(.0)
     )]
     Diverged(Vec<PathBuf>),
+
+    /// `autumn destroy` would leave a shared-file edit behind: `generate`
+    /// recorded a revert for a file that still exists, and the plan built now
+    /// no longer reverts it (issue #2560). A project config the arguments do
+    /// not show, such as `[i18n]`, changed since.
+    #[error(
+        "refusing to destroy — it would leave edits behind. `generate` edited the file(s)          below, and a project setting has changed since, so this destroy no longer reverts          them. Undo the setting change and run destroy again, or check the files by hand          and pass --force:\n{}",
+        format_anchors(.0)
+    )]
+    RevertsDropped(Vec<crate::generate::provenance::RevertAnchor>),
+}
+
+fn format_anchors(anchors: &[crate::generate::provenance::RevertAnchor]) -> String {
+    anchors
+        .iter()
+        .map(|a| format!("  {a}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// ⚡ Bolt optimization: Formats collision paths directly into a pre-allocated

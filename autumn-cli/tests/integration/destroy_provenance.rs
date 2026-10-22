@@ -363,3 +363,177 @@ fn destroy_never_sweeps_a_forged_entry_for_a_project_file() {
 
     assert!(project.join("Cargo.toml").exists());
 }
+
+// Issue #2560: a config input the arguments cannot see must not turn a destroy
+// into a partial one.
+
+const SCAFFOLD: [&str; 4] = ["scaffold", "Post", "title:String", "--i18n"];
+
+fn with(verb: &str, extra: &[&str]) -> Vec<String> {
+    std::iter::once(verb)
+        .chain(SCAFFOLD)
+        .chain(extra.iter().copied())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn run_verb(project: &Path, verb: &str, extra: &[&str]) -> std::process::Output {
+    let args = with(verb, extra);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_autumn(project, &refs)
+}
+
+/// `autumn new` + `generate scaffold Post --i18n`, with the bundle in `dir`.
+fn i18n_scaffold_in(name: &str, dir: &str) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", name]);
+    let project = tmp.path().join(name);
+    if dir != "i18n" {
+        let toml = project.join("autumn.toml");
+        let body = fs::read_to_string(&toml).unwrap();
+        fs::write(toml, format!("{body}\n[i18n]\ndir = \"{dir}\"\n")).unwrap();
+    }
+    let out = run_verb(&project, "generate", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        fs::read_to_string(project.join(dir).join("en.ftl"))
+            .unwrap()
+            .contains("Post"),
+        "the scaffold wrote its keys to {dir}/en.ftl"
+    );
+    (tmp, project)
+}
+
+fn i18n_scaffold(name: &str) -> (tempfile::TempDir, PathBuf) {
+    i18n_scaffold_in(name, "i18n")
+}
+
+/// Points `[i18n] dir` back at the default, the way a config edit would.
+fn drop_i18n_dir_setting(project: &Path) {
+    let path = project.join("autumn.toml");
+    let body = fs::read_to_string(&path).unwrap();
+    let kept: Vec<&str> = body.lines().filter(|l| !l.starts_with("dir = ")).collect();
+    fs::write(path, kept.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn destroy_refuses_when_the_i18n_dir_moved_since_generate() {
+    let (_tmp, project) = i18n_scaffold_in("prov-i18n-dir", "translations");
+    drop_i18n_dir_setting(&project);
+
+    let output = run_verb(&project, "destroy", &[]);
+
+    assert!(!output.status.success(), "a partial destroy must not run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refusing to destroy"), "{stderr}");
+    assert!(
+        stderr.contains("translations/en.ftl"),
+        "names the stranded edit: {stderr}"
+    );
+    assert!(
+        project.join("src/models/post.rs").exists(),
+        "nothing removed"
+    );
+    assert!(
+        fs::read_to_string(project.join("translations/en.ftl"))
+            .unwrap()
+            .contains("Post"),
+        "the translations survive"
+    );
+}
+
+#[test]
+fn force_destroys_despite_a_moved_i18n_dir() {
+    let (_tmp, project) = i18n_scaffold_in("prov-i18n-force", "translations");
+    drop_i18n_dir_setting(&project);
+
+    let out = run_verb(&project, "destroy", &["--force"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!project.join("src/models/post.rs").exists());
+}
+
+#[test]
+fn a_dry_run_names_the_moved_i18n_dir_and_removes_nothing() {
+    let (_tmp, project) = i18n_scaffold_in("prov-i18n-dry", "translations");
+    drop_i18n_dir_setting(&project);
+
+    let out = run_verb(&project, "destroy", &["--dry-run"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("translations/en.ftl"));
+    assert!(project.join("src/models/post.rs").exists());
+}
+
+#[test]
+fn destroy_still_works_when_the_i18n_config_is_unchanged() {
+    let (_tmp, project) = i18n_scaffold("prov-i18n-same");
+
+    let output = run_verb(&project, "destroy", &[]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!project.join("src/models/post.rs").exists());
+    assert!(
+        !fs::read_to_string(project.join("i18n/en.ftl"))
+            .unwrap()
+            .contains("Post")
+    );
+}
+
+#[test]
+fn destroy_tolerates_a_locale_bundle_added_after_generate() {
+    // A translator copies the default bundle. The plan reverts more than
+    // generate did, never less, so the destroy proceeds and cleans both.
+    let (_tmp, project) = i18n_scaffold("prov-i18n-fr");
+    fs::copy(project.join("i18n/en.ftl"), project.join("i18n/fr.ftl")).unwrap();
+
+    let output = run_verb(&project, "destroy", &[]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fs::read_to_string(project.join("i18n/fr.ftl"))
+            .unwrap()
+            .contains("Post")
+    );
+}
+
+#[test]
+fn destroy_proceeds_when_the_moved_bundle_was_moved_with_it() {
+    // The old target is gone, so the revert it recorded has nothing to leave.
+    let (_tmp, project) = i18n_scaffold_in("prov-i18n-moved", "translations");
+    fs::rename(project.join("translations"), project.join("i18n")).unwrap();
+    drop_i18n_dir_setting(&project);
+
+    let output = run_verb(&project, "destroy", &[]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fs::read_to_string(project.join("i18n/en.ftl"))
+            .unwrap()
+            .contains("Post")
+    );
+}
