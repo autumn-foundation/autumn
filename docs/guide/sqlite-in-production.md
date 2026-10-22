@@ -887,7 +887,7 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
   - SQLite does not know an index made by hand outside `migrations/`.
     The drop then fails when you apply the migration.
   - A column behind an inline `UNIQUE` or `PRIMARY KEY`. SQLite cannot drop
-    it, and so cannot a column that a view or trigger uses. `generate migration`
+    it, and so cannot a column that a CHECK, view or trigger uses. `generate migration`
     stops with an error. For a constraint, rebuild the table —
     `autumn schema diff --write-migration` emits the rebuild.
 

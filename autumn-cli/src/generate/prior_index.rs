@@ -101,7 +101,7 @@ pub fn scan_prior_indexes(
             return Err(format!(
                 "SQLite cannot drop `{table}.{column}` even without its indexes: {reason}. \
                  If a UNIQUE or PRIMARY KEY constraint holds it, rebuild the table. \
-                 If a view or trigger uses it, change that first"
+                 If a CHECK, view or trigger uses it, change that first"
             ));
         }
         // Attribute the block to an index by dropping the column alone. A

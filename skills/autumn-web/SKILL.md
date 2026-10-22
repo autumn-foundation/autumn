@@ -4170,7 +4170,7 @@ Remove…From…` handles the index case. It replays the project's earlier
 `migrations/*/up.sql` in an in-memory SQLite database and tests which indexes
 block the `DROP COLUMN`. It emits `DROP INDEX IF EXISTS` for each one before the
 drop, and re-creates them in `down.sql`. It stops with an error for a
-`UNIQUE` or `PRIMARY KEY` column, for a column that a view or trigger uses,
+`UNIQUE` or `PRIMARY KEY` column, for a column that a CHECK, view or trigger uses,
 and for an earlier migration that does not replay. An index created outside
 `migrations/` stays invisible; drop it in the same migration.
 
