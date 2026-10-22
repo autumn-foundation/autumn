@@ -1728,6 +1728,17 @@ pub fn remove_columns_down_sql_for(
     // repeats one must not be re-created twice: SQLite fails the whole rollback
     // with "index <name> already exists".
     let mut own_indexes: Vec<String> = Vec::new();
+    // A scanned index on a removed column keeps its own definition (it may be
+    // UNIQUE), so it replaces a regenerated index of the same name.
+    let scanned: Vec<String> = if backend == DatabaseBackend::Sqlite {
+        prior_indexes
+            .iter()
+            .filter(|i| fields.iter().any(|f| i.covers(&f.name)))
+            .map(|i| index_name_key(&i.name))
+            .collect()
+    } else {
+        Vec::new()
+    };
     for f in fields.iter().rev() {
         // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a DEFAULT
         // (#1614 AC #4). The rollback re-adds the dropped column with the same `ADD
@@ -1765,20 +1776,22 @@ pub fn remove_columns_down_sql_for(
         // `references` field that is also `unique` must not get the plain
         // auto-index restored too.
         if f.kind.is_reference() && !f.unique {
-            let _ = writeln!(
-                out,
-                "CREATE INDEX idx_{table}_{} ON {table} ({});",
-                f.name, f.name
-            );
-            own_indexes.push(index_name_key(&format!("idx_{table}_{}", f.name)));
+            let key = index_name_key(&format!("idx_{table}_{}", f.name));
+            if !scanned.contains(&key) {
+                let _ = writeln!(
+                    out,
+                    "CREATE INDEX idx_{table}_{} ON {table} ({});",
+                    f.name, f.name
+                );
+                own_indexes.push(key);
+            }
         }
         if f.unique {
-            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
-            own_indexes.push(index_name_key(&unique_index_name(
-                table,
-                &f.name,
-                &collision_fields,
-            )));
+            let key = index_name_key(&unique_index_name(table, &f.name, &collision_fields));
+            if !scanned.contains(&key) {
+                out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
+                own_indexes.push(key);
+            }
         }
     }
     // Re-create the prior indexes the up path dropped, after every column is
@@ -6607,6 +6620,37 @@ mod tests {
             down.matches("idx_posts_author_id ON posts (author_id);")
                 .count(),
             1,
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_keeps_a_prior_unique_index_on_a_conventional_name() {
+        // The scanned UNIQUE index wins over the regenerated plain one (#2580).
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_author_id ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(
+            down.contains("CREATE UNIQUE INDEX idx_posts_author_id ON posts (author_id);"),
+            "got:\n{down}"
+        );
+        assert_eq!(
+            down.matches("idx_posts_author_id ON").count(),
+            1,
+            "got:\n{down}"
+        );
+        let add = down.find("ADD COLUMN author_id").expect("column re-added");
+        assert!(
+            add < down.find("CREATE UNIQUE INDEX").unwrap(),
             "got:\n{down}"
         );
     }

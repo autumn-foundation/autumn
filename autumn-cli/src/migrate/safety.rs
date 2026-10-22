@@ -310,9 +310,19 @@ fn alter_table_subcommands(normalized: &str) -> Vec<&str> {
 
     let mut result = Vec::new();
     let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
     let mut start = 0;
     for (i, c) in subcommands.char_indices() {
+        // Inside a quoted literal or identifier, only the closing quote counts.
+        // A doubled quote (`''`) closes and reopens, so it needs no special case.
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
         match c {
+            '\'' | '"' => quote = Some(c),
             '(' => depth += 1,
             ')' => depth -= 1,
             ',' if depth == 0 => {
@@ -354,8 +364,9 @@ fn is_known_alter_subcommand(backend: DatabaseBackend, subcommand: &str) -> bool
 
 /// Rewrite `SQLite`'s optional-`COLUMN` `ALTER TABLE` spellings into the
 /// canonical ones, so `ADD title TEXT` classifies exactly as
-/// `ADD COLUMN title TEXT`. `ADD CONSTRAINT` and `DROP CONSTRAINT` are left
-/// alone: they are Postgres-only, and the grammar rule must still reject them.
+/// `ADD COLUMN title TEXT`, and `RENAME a TO b` as `RENAME COLUMN a TO b`.
+/// `ADD CONSTRAINT` and `DROP CONSTRAINT` are left alone: they are
+/// Postgres-only, and the grammar rule must still reject them.
 fn canonical_sqlite_alter(normalized: &str) -> String {
     if !normalized.starts_with("alter table ") {
         return normalized.to_owned();
@@ -369,6 +380,13 @@ fn canonical_sqlite_alter(normalized: &str) -> String {
     let rewritten: Vec<String> = subcommands
         .iter()
         .map(|sub| {
+            if let Some(rest) = sub.strip_prefix("rename ")
+                && !rest.starts_with("column ")
+                && !rest.starts_with("to ")
+                && rest.contains(" to ")
+            {
+                return format!("rename column {rest}");
+            }
             for verb in ["add", "drop"] {
                 let prefix = format!("{verb} ");
                 if let Some(rest) = sub.strip_prefix(&prefix)
@@ -2969,6 +2987,56 @@ mod tests {
                 .any(|f| f.risk == RiskLevel::Unsupported),
             "got {:?}",
             sqlite_ops(sql)
+        );
+    }
+
+    #[test]
+    fn sqlite_bare_rename_is_a_rename_column() {
+        // SQLite accepts `RENAME old TO new` without `COLUMN` (#2580).
+        let f = sqlite_finding(
+            "ALTER TABLE posts RENAME title TO headline;",
+            "RENAME COLUMN",
+        )
+        .expect("a bare column rename must be flagged");
+        assert_eq!(f.risk, RiskLevel::Irreversible);
+    }
+
+    #[test]
+    fn sqlite_bare_rename_is_not_a_rename_table() {
+        let ops = sqlite_ops("ALTER TABLE posts RENAME title TO headline;");
+        assert!(
+            !ops.iter().any(|o| o.starts_with("RENAME TABLE")),
+            "{ops:?}"
+        );
+        // `RENAME TO` still renames the table.
+        assert!(sqlite_finding("ALTER TABLE posts RENAME TO articles;", "RENAME TABLE").is_some());
+    }
+
+    #[test]
+    fn alter_table_subcommands_ignores_a_comma_in_a_string_literal() {
+        let subs = alter_table_subcommands("alter table posts add column l text default 'a,b'");
+        assert_eq!(subs, ["add column l text default 'a,b'"]);
+        let subs = alter_table_subcommands("alter table posts add column l text default 'it''s,x'");
+        assert_eq!(subs.len(), 1, "{subs:?}");
+        let subs = alter_table_subcommands("alter table posts drop column \"a,b\"");
+        assert_eq!(subs.len(), 1, "{subs:?}");
+    }
+
+    #[test]
+    fn sqlite_comma_in_a_default_literal_is_not_multi_action() {
+        let sql = "ALTER TABLE posts ADD COLUMN label TEXT DEFAULT 'a,b';";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, sql).is_empty(),
+            "{:?}",
+            sqlite_ops(sql)
+        );
+        // A real second action still trips the rule.
+        assert!(
+            sqlite_finding(
+                "ALTER TABLE posts ADD COLUMN a TEXT DEFAULT 'x,y', ADD COLUMN b TEXT;",
+                "Multi-action ALTER TABLE (unsupported on SQLite)",
+            )
+            .is_some()
         );
     }
 
