@@ -521,7 +521,7 @@ cd edge/cloudflare && npx wrangler deploy
 | `edge-capsule.wasm` | the capsule `autumn build` made | yes |
 | `autumn-edge-host.mjs` | the JS edge host | yes |
 | `worker.mjs` | the Worker entry: passes `env` to the host | yes |
-| `wrangler.toml` | the Worker config: name, `AUTUMN_ORIGIN`, KV binding | **no** — written once, then yours |
+| `wrangler.toml` | the Worker config: name, `ORIGIN_URL`, KV binding | **no** — written once, then yours |
 
 Commit `wrangler.toml`. The generated `.gitignore` keeps the other three out of
 git.
@@ -529,7 +529,7 @@ git.
 Before it writes anything, the bundle checks the capsule's imports against what
 the host provides and names any import it cannot link. Flags:
 
-- `--origin URL`: the origin, written to `AUTUMN_ORIGIN` in a new
+- `--origin URL`: the origin, written to `ORIGIN_URL` in a new
   `wrangler.toml`. A kept `wrangler.toml` keeps its own value.
 - `--response-header 'NAME: VALUE'`: set a header on every edge response, for
   example a CORS policy that is the same for every route. Repeat it.
@@ -540,11 +540,11 @@ the host provides and names any import it cannot link. Flags:
   `<package>-edge`.
 - `--out DIR`: defaults to `edge/cloudflare`.
 
-**The `kv` capability is a KV namespace bound as `AUTUMN_EDGE_KV`.** Without
+**The `kv` capability is a KV namespace bound as `EDGE_KV`.** Without
 the binding a `needs(kv)` route falls through to the origin.
 
 ```sh
-npx wrangler kv namespace create AUTUMN_EDGE_KV   # put the id in wrangler.toml
+npx wrangler kv namespace create EDGE_KV   # put the id in wrangler.toml
 ```
 
 The origin publishes into the namespace; the capsule only reads.
@@ -591,7 +591,7 @@ export default {
 | `preload` | KV keys to read before the first run |
 | `identity` | `(request) => { user_id, roles } \| null`, after you verify the request; a throw goes to the origin |
 | `responseHeaders` | `[[name, value]]` set on every edge response |
-| `probeOrigin`, `probePath` | copy the origin's static security headers (URL origin only) |
+| `probeOrigin`, `probePath`, `probeTimeoutMs` | copy the origin's static security headers (URL origin only). Each probe `GET` may take 5 s by default; after a failed probe, edge responses go out without them for 30 s, then the gateway probes again |
 | `clientIp` | `(request) => ip` for `x-forwarded-for` |
 | `onLane` | `({ lane, reason, request, response }) => void`, for a log or a counter |
 
@@ -615,6 +615,9 @@ What the Fetch API makes different from the Rust gateway:
 - **Memory is checked after instantiation.** A capsule whose memory is over the
   256 MiB budget falls through, but the host cannot refuse each
   `memory.grow`; the platform's memory limit applies.
+- **Compression outside Workers.** `fetch` decompresses a compressed origin
+  answer. Workers compresses it again; on Node, Deno and Bun the gateway sends
+  it uncompressed, without `content-encoding` and `content-length`.
 - **Repeated request headers are joined.** `Headers` joins two `x-tag` lines
   into one `a, b` value before the capsule sees them. A header value with a
   non-ASCII character goes to the origin only.

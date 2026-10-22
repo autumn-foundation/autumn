@@ -6,11 +6,13 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test } from "node:test";
+import { gzipSync } from "node:zlib";
 
 import {
   Capsule,
   checkResponseHeader,
   createEdgeGateway,
+  decodeBase64,
   intoResponse,
   isSafePath,
 } from "../autumn-edge-host.mjs";
@@ -474,4 +476,71 @@ test("onLane sees every answer, and a throwing hook changes nothing", async () =
   const response = await gateway.fetch(new Request("https://edge.test/x"));
   assert.equal(response.status, 200);
   assert.deepEqual(lanes, ["edge"]);
+});
+
+// ── review regressions ───────────────────────────────────────────────
+
+test("a multi-MB base64 body decodes; malformed base64 is still refused", () => {
+  assert.equal(decodeBase64("AAAA".repeat(1_250_000)).length, 3_750_000);
+  assert.deepEqual([...decodeBase64("aGk=")], [104, 105]);
+  for (const bad of ["aGk", "a Gk=", "aG=k", "aGk==", "====", "aGk*"]) {
+    assert.throws(() => decodeBase64(bad), bad);
+  }
+});
+
+test("a multi-MB capsule body is served, not refused as malformed", async () => {
+  const body = "x".repeat(3_000_000);
+  const gateway = createEdgeGateway({
+    capsule: respond([served(200, [], body)]),
+    origin: () => assert.fail("the origin is not asked"),
+  });
+  const { response, lane } = await gateway.handle(new Request("https://edge.test/big"));
+  assert.equal(lane, "edge");
+  assert.equal((await response.text()).length, body.length);
+});
+
+test("a stalled origin probe times out and does not stall the edge lane", async () => {
+  let probes = 0;
+  const server = await listen((request) => {
+    probes += 1; // never answers
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const gateway = createEdgeGateway({
+      capsule: respond([served(200, [], "edge")]),
+      origin: base,
+      probeOrigin: true,
+      probeTimeoutMs: 100,
+    });
+    const started = Date.now();
+    const first = await gateway.fetch(new Request("https://edge.test/a"));
+    assert.equal(await first.text(), "edge");
+    assert.ok(Date.now() - started < 2000, "bounded by the probe timeout");
+    // Inside the retry window the next request does not probe again.
+    const again = Date.now();
+    await gateway.fetch(new Request("https://edge.test/b"));
+    assert.ok(Date.now() - again < 100);
+    assert.equal(probes, 1);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("a compressed origin answer is not forwarded as plain bytes labelled gzip", async () => {
+  const server = await listen((request, response) => {
+    const body = gzipSync("origin answer");
+    response.writeHead(200, { "content-encoding": "gzip", "content-length": body.length });
+    response.end(body);
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const gateway = createEdgeGateway({ capsule: respond([declined("unknown_route")]), origin: base });
+    const response = await gateway.fetch(new Request("https://edge.test/x"));
+    assert.equal(await response.text(), "origin answer");
+    assert.equal(response.headers.get("content-encoding"), null);
+    assert.equal(response.headers.get("content-length"), null);
+  } finally {
+    server.close();
+  }
 });

@@ -52,9 +52,9 @@ const WORKER_FILE: &str = "worker.mjs";
 /// The Cloudflare config, written once.
 const WRANGLER_FILE: &str = "wrangler.toml";
 /// The KV binding name the generated entry reads.
-pub const KV_BINDING: &str = "AUTUMN_EDGE_KV";
+pub const KV_BINDING: &str = "EDGE_KV";
 /// The `[vars]` entry naming the origin.
-pub const ORIGIN_VAR: &str = "AUTUMN_ORIGIN";
+pub const ORIGIN_VAR: &str = "ORIGIN_URL";
 /// The `compatibility_date` a new `wrangler.toml` gets. A fixed, past date:
 /// a date newer than the deploying `wrangler` is refused, and the bundle only
 /// uses `fetch`, `Request`/`Response` and `WebAssembly`, which every date has.
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(config["name"].as_str(), Some("my-app-edge"));
         assert_eq!(config["main"].as_str(), Some("worker.mjs"));
         assert_eq!(
-            config["vars"]["AUTUMN_ORIGIN"].as_str(),
+            config["vars"]["ORIGIN_URL"].as_str(),
             Some("https://origin.example.com")
         );
         let ignore = std::fs::read_to_string(out.join(".gitignore")).unwrap();

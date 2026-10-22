@@ -83,6 +83,12 @@ const STDERR_EXCERPT = 512;
 /// Distinct KV keys one request may read before it falls through.
 export const MAX_KV_ROUNDS = 32;
 
+/// How long one origin header probe `GET` may take, and how long the gateway
+/// serves edge responses without probed headers after a failed probe before
+/// it probes again. A stalled origin must not stall the edge lane.
+export const PROBE_TIMEOUT_MS = 5000;
+export const PROBE_RETRY_MS = 30000;
+
 const ERRNO = Object.freeze({ SUCCESS: 0, BADF: 8, INVAL: 28, NOSPC: 51, SPIPE: 70 });
 const FDSTAT_SIZE = 24;
 const RANDOM_SEED = 0x9e3779b97f4a7c15n;
@@ -102,12 +108,24 @@ export function encodeBase64(bytes) {
   return btoa(binary);
 }
 
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+/// Standard base64 with padding, no whitespace. A loop, not a regex: a
+/// repeated-group pattern overflows V8's regex stack on a multi-MB body.
+function isStrictBase64(text) {
+  if (text.length % 4 !== 0) return false;
+  const padding = text.endsWith("==") ? 2 : text.endsWith("=") ? 1 : 0;
+  for (let i = 0; i < text.length - padding; i++) {
+    const c = text.charCodeAt(i);
+    const alphabet =
+      (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 47;
+    if (!alphabet) return false;
+  }
+  return true;
+}
 
 /// Strict standard base64, as the Rust side decodes it: padding required,
 /// no whitespace. Throws on anything else.
 export function decodeBase64(text) {
-  if (!BASE64.test(text)) {
+  if (!isStrictBase64(text)) {
     throw new Error("invalid base64");
   }
   const binary = atob(text);
@@ -731,6 +749,7 @@ function plain(status, text) {
 ///   probeOrigin      copy the origin's static security headers (and a
 ///                    nonce-free CSP) from two `GET probePath`s, once
 ///   probePath        defaults to `/`
+///   probeTimeoutMs   per probe `GET`; defaults to `PROBE_TIMEOUT_MS`
 ///   clientIp         `(request) => string | null` for `x-forwarded-for`
 ///                    (on Workers: `r => r.headers.get("cf-connecting-ip")`)
 ///   onLane           `({ lane, reason, request, response }) => void`
@@ -748,6 +767,7 @@ export class EdgeGateway {
     responseHeaders = [],
     probeOrigin = false,
     probePath = "/",
+    probeTimeoutMs = PROBE_TIMEOUT_MS,
     clientIp = null,
     onLane = null,
   }) {
@@ -765,6 +785,8 @@ export class EdgeGateway {
     this.responseHeaders = responseHeaders.map(([n, v]) => [String(n).toLowerCase(), String(v)]);
     this.probe = probeOrigin && typeof origin === "string" ? null : Promise.resolve([]);
     this.probePath = probePath;
+    this.probeTimeoutMs = probeTimeoutMs;
+    this.probeRetryAt = 0;
     this.clientIp = clientIp;
     this.onLane = onLane;
   }
@@ -846,14 +868,21 @@ export class EdgeGateway {
   /// Probed headers first, then `responseHeaders`, which replace a probed
   /// header of the same name.
   async staticHeaders() {
-    if (!this.probe) {
-      this.probe = probeStaticHeaders(this.origin, this.probePath).catch((err) => {
-        this.probe = null; // try again on the next request
-        console.warn(`[autumn-edge] origin header probe failed: ${messageOf(err)}`);
-        return [];
-      });
+    let probed = [];
+    if (this.probe) {
+      probed = await this.probe;
+    } else if (Date.now() >= this.probeRetryAt) {
+      this.probe = probeStaticHeaders(this.origin, this.probePath, this.probeTimeoutMs).catch(
+        (err) => {
+          // Serve without probed headers for a while, then probe again.
+          this.probe = null;
+          this.probeRetryAt = Date.now() + PROBE_RETRY_MS;
+          console.warn(`[autumn-edge] origin header probe failed: ${messageOf(err)}`);
+          return [];
+        },
+      );
+      probed = await this.probe;
     }
-    const probed = await this.probe;
     const explicit = new Set(this.responseHeaders.map(([name]) => name));
     return [...probed.filter(([name]) => !explicit.has(name)), ...this.responseHeaders];
   }
@@ -879,6 +908,13 @@ export class EdgeGateway {
     const out = new Headers(answer.headers);
     const named = (out.get("connection") || "").split(",").map((t) => t.trim().toLowerCase());
     for (const name of [...HOP_BY_HOP, ...named]) if (name && name !== "host") out.delete(name);
+    if (out.has("content-encoding") && !reencodesBodies()) {
+      // `fetch` decompressed the body but kept the origin's framing headers.
+      // Workers re-encodes a body to match `content-encoding`; any other
+      // runtime would send plain bytes labelled as compressed.
+      out.delete("content-encoding");
+      out.delete("content-length");
+    }
     return {
       response: new Response(answer.body, {
         status: answer.status,
@@ -891,11 +927,30 @@ export class EdgeGateway {
   }
 }
 
+/// Whether this runtime re-encodes a returned body to match its
+/// `content-encoding` header. Cloudflare Workers does (its `fetch` decodes a
+/// compressed body as it is read, and its `Response` encodes it again); Node,
+/// Deno and Bun decode and do not re-encode.
+function reencodesBodies() {
+  return globalThis.navigator?.userAgent === "Cloudflare-Workers";
+}
+
 /// The origin's static security headers: each of `SECURITY_HEADERS` and
 /// `content-security-policy` that two `GET`s return with the same values.
-/// A CSP nonce changes, so it is not copied. CORS is never copied.
-export async function probeStaticHeaders(origin, path = "/") {
-  const get = async () => (await fetch(origin + path, { redirect: "manual" })).headers;
+/// A CSP nonce changes, so it is not copied. CORS is never copied. Each
+/// `GET` that has not answered within `timeoutMs` fails the probe.
+export async function probeStaticHeaders(origin, path = "/", timeoutMs = PROBE_TIMEOUT_MS) {
+  const get = async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const answer = await fetch(origin + path, { redirect: "manual", signal: controller.signal });
+      await answer.body?.cancel();
+      return answer.headers;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const first = await get();
   const second = await get();
   const out = [];

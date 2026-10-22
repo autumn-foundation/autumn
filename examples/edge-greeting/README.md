@@ -155,7 +155,7 @@ curl -X POST http://127.0.0.1:8788/feedback -d x # sent to the origin
 ```
 
 `npx wrangler deploy` deploys the same directory. Bind a KV namespace as
-`AUTUMN_EDGE_KV` in `wrangler.toml` to give `/note/{key}` its store; without
+`EDGE_KV` in `wrangler.toml` to give `/note/{key}` its store; without
 one, `/note/{key}` falls through to the origin.
 
 ## Running the conformance suite

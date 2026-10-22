@@ -3095,8 +3095,8 @@ jobs:
             --origin http://127.0.0.1:3000 --out "$out" \
             --response-header 'access-control-allow-origin: *'
           cd "$out"
-          printf '\n[[kv_namespaces]]\nbinding = "AUTUMN_EDGE_KV"\nid = "ci"\n' >> wrangler.toml
-          npx --yes wrangler@4.152.0 kv key put --local --binding AUTUMN_EDGE_KV greeting "from workers kv"
+          printf '\n[[kv_namespaces]]\nbinding = "EDGE_KV"\nid = "ci"\n' >> wrangler.toml
+          npx --yes wrangler@4.152.0 kv key put --local --binding EDGE_KV greeting "from workers kv"
           npx --yes wrangler@4.152.0 dev --port 8788 --ip 127.0.0.1 > wrangler.log 2>&1 &
           wait_for http://127.0.0.1:8788/greet/ci
           check() { # path, expected status, expected body substring, edge|origin
