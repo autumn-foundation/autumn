@@ -497,6 +497,26 @@ fn decimal_field_is_an_inline_scalar_matching_its_serde_output() {
     }
 }
 
+/// A real round trip: the value serde writes decodes back, and its JSON kind is
+/// the kind the schema names. The expected shape for this workspace is pinned,
+/// so a feature change that flips it fails here, not in a client.
+#[test]
+fn decimal_wire_value_round_trips_and_matches_the_schema_kind() {
+    let amount = rust_decimal::Decimal::new(12345, 2);
+    let wire = serde_json::to_value(amount).unwrap();
+    let back: rust_decimal::Decimal = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(back, amount);
+
+    let schema = <Priced as OpenApiSchema>::schema();
+    let kind = schema["properties"]["amount"]["type"].as_str().unwrap();
+    let wire_kind = if wire.is_string() { "string" } else { "number" };
+    assert_eq!(kind, wire_kind);
+    assert_eq!(
+        wire_kind, "string",
+        "this workspace enables rust_decimal `serde` only: {wire}"
+    );
+}
+
 #[test]
 fn optional_decimal_field_stays_nullable_scalar() {
     let schema = <Priced as OpenApiSchema>::schema();
