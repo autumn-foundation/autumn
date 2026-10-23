@@ -302,17 +302,31 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 /// Split a normalized `ALTER TABLE` statement into individual subcommand strings.
 ///
 /// Strips the `alter table <name>` prefix and splits the remaining text on
-/// commas that are not enclosed in parentheses, trimming each segment.
-fn alter_table_subcommands(normalized: &str) -> Vec<&str> {
+/// commas outside parentheses, trimming each segment. With `quote_aware`, a
+/// comma in quoted text does not split. Only `SQLite` input sets it. The
+/// scanner does not know Postgres dollar quotes or `E'..\'` escapes, and a
+/// wrong guess there could merge a `DROP COLUMN` into its neighbour.
+fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
     let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
     let subcommands_start = after_prefix.find(' ').map_or(after_prefix.len(), |i| i + 1);
     let subcommands = &after_prefix[subcommands_start..];
 
     let mut result = Vec::new();
     let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
     let mut start = 0;
     for (i, c) in subcommands.char_indices() {
+        // In quoted text, only the closing quote counts. A doubled quote
+        // closes and reopens the text.
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
         match c {
+            '\'' | '"' | '`' if quote_aware => quote = Some(c),
+            '[' if quote_aware => quote = Some(']'),
             '(' => depth += 1,
             ')' => depth -= 1,
             ',' if depth == 0 => {
@@ -354,21 +368,31 @@ fn is_known_alter_subcommand(backend: DatabaseBackend, subcommand: &str) -> bool
 
 /// Rewrite `SQLite`'s optional-`COLUMN` `ALTER TABLE` spellings into the
 /// canonical ones, so `ADD title TEXT` classifies exactly as
-/// `ADD COLUMN title TEXT`. `ADD CONSTRAINT` and `DROP CONSTRAINT` are left
-/// alone: they are Postgres-only, and the grammar rule must still reject them.
+/// `ADD COLUMN title TEXT`, and `RENAME a TO b` as `RENAME COLUMN a TO b`.
+/// `ADD CONSTRAINT` and `DROP CONSTRAINT` are left alone: they are
+/// Postgres-only, and the grammar rule must still reject them.
 fn canonical_sqlite_alter(normalized: &str) -> String {
     if !normalized.starts_with("alter table ") {
         return normalized.to_owned();
     }
-    let subcommands = alter_table_subcommands(normalized);
+    let subcommands = alter_table_subcommands(normalized, true);
     if subcommands.is_empty() {
         return normalized.to_owned();
     }
-    let head_len = normalized.len() - subcommands.join(", ").len();
+    // The subcommands borrow from `normalized`, so the first one marks the end
+    // of the head, whatever spacing the commas had.
+    let head_len = subcommands[0].as_ptr() as usize - normalized.as_ptr() as usize;
     let head = &normalized[..head_len];
     let rewritten: Vec<String> = subcommands
         .iter()
         .map(|sub| {
+            if let Some(rest) = sub.strip_prefix("rename ")
+                && !rest.starts_with("column ")
+                && !rest.starts_with("to ")
+                && rest.contains(" to ")
+            {
+                return format!("rename column {rest}");
+            }
             for verb in ["add", "drop"] {
                 let prefix = format!("{verb} ");
                 if let Some(rest) = sub.strip_prefix(&prefix)
@@ -995,7 +1019,7 @@ fn classify_statement(
     // spelling, ADD/DROP CONSTRAINT, SET SCHEMA, OWNER TO — is a parse error, so
     // one rule covers them all rather than a list that can fall behind Postgres.
     if sqlite && normalized.starts_with("alter table") {
-        let subcommands = alter_table_subcommands(normalized);
+        let subcommands = alter_table_subcommands(normalized, sqlite);
         // SQLite takes exactly one action per ALTER TABLE; Postgres allows a
         // comma-separated list.
         if subcommands.len() > 1 {
@@ -1054,7 +1078,7 @@ fn classify_statement(
     //     function per-row and cannot use the fast constant-default path (PG 11+),
     //     so the table is still rewritten under the exclusive lock.
     if normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized) {
+        for subcommand in alter_table_subcommands(normalized, sqlite) {
             if subcommand.starts_with("add column ") && subcommand.contains("not null") {
                 // SQLite drops a literal `DEFAULT NULL` before applying the
                 // NOT NULL check, so it is not a default there.
@@ -1129,7 +1153,7 @@ fn classify_statement(
     // ADD COLUMN with inline UNIQUE — implicitly builds a non-concurrent unique index
     // ADD COLUMN with inline REFERENCES — scans existing rows to validate the FK
     if normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized) {
+        for subcommand in alter_table_subcommands(normalized, sqlite) {
             if !subcommand.starts_with("add column ") {
                 continue;
             }
@@ -1224,7 +1248,7 @@ fn classify_statement(
     // prevents a known-safe subcommand (e.g. ADD COLUMN) from hiding an unknown one
     // (e.g. DROP CONSTRAINT) in the same multi-action ALTER TABLE.
     if normalized.starts_with("alter table") {
-        let subcommands = alter_table_subcommands(normalized);
+        let subcommands = alter_table_subcommands(normalized, sqlite);
         let all_known = subcommands
             .iter()
             .all(|s| is_known_alter_subcommand(backend, s));
@@ -2969,6 +2993,146 @@ mod tests {
                 .any(|f| f.risk == RiskLevel::Unsupported),
             "got {:?}",
             sqlite_ops(sql)
+        );
+    }
+
+    #[test]
+    fn sqlite_bare_rename_is_a_rename_column() {
+        // SQLite accepts `RENAME old TO new` without `COLUMN` (#2580).
+        let f = sqlite_finding(
+            "ALTER TABLE posts RENAME title TO headline;",
+            "RENAME COLUMN",
+        )
+        .expect("a bare column rename must be flagged");
+        assert_eq!(f.risk, RiskLevel::Irreversible);
+    }
+
+    #[test]
+    fn sqlite_bare_rename_is_not_a_rename_table() {
+        let ops = sqlite_ops("ALTER TABLE posts RENAME title TO headline;");
+        assert!(
+            !ops.iter().any(|o| o.starts_with("RENAME TABLE")),
+            "{ops:?}"
+        );
+        // `RENAME TO` still renames the table.
+        assert!(sqlite_finding("ALTER TABLE posts RENAME TO articles;", "RENAME TABLE").is_some());
+    }
+
+    #[test]
+    fn alter_table_subcommands_ignores_a_comma_in_a_string_literal() {
+        let subs =
+            alter_table_subcommands("alter table posts add column l text default 'a,b'", true);
+        assert_eq!(subs, ["add column l text default 'a,b'"]);
+        let subs = alter_table_subcommands(
+            "alter table posts add column l text default 'it''s,x'",
+            true,
+        );
+        assert_eq!(subs.len(), 1, "{subs:?}");
+        let subs = alter_table_subcommands("alter table posts drop column \"a,b\"", true);
+        assert_eq!(subs.len(), 1, "{subs:?}");
+    }
+
+    #[test]
+    fn alter_table_subcommands_splits_after_an_escaped_quote() {
+        let subs = alter_table_subcommands(
+            "alter table posts add column a text default 'it''s', add column b text",
+            true,
+        );
+        assert_eq!(
+            subs,
+            ["add column a text default 'it''s'", "add column b text"]
+        );
+        let subs = alter_table_subcommands(
+            "alter table posts add column a text default 'it''s,x'",
+            true,
+        );
+        assert_eq!(subs, ["add column a text default 'it''s,x'"]);
+    }
+
+    #[test]
+    fn alter_table_subcommands_ignores_a_comma_in_backtick_and_bracket_names() {
+        for sql in [
+            "alter table posts drop `a,b`",
+            "alter table posts drop [a,b]",
+        ] {
+            assert_eq!(alter_table_subcommands(sql, true).len(), 1, "{sql}");
+        }
+    }
+
+    #[test]
+    fn sqlite_rewrite_keeps_the_head_for_odd_comma_spacing() {
+        assert_eq!(
+            canonical_sqlite_alter("alter table posts add a text,add b text"),
+            "alter table posts add column a text, add column b text"
+        );
+        assert_eq!(
+            canonical_sqlite_alter("alter table posts add a text , add b text"),
+            "alter table posts add column a text, add column b text"
+        );
+    }
+
+    #[test]
+    fn sqlite_rename_edge_spellings() {
+        for sql in [
+            "ALTER TABLE posts RENAME COLUMN a TO b;",
+            "ALTER TABLE posts RENAME \"to\" TO headline;",
+            "ALTER TABLE posts RENAME \"a to b\" TO c;",
+        ] {
+            assert!(
+                sqlite_finding(sql, "RENAME COLUMN").is_some(),
+                "{sql} -> {:?}",
+                sqlite_ops(sql)
+            );
+        }
+        let sql = "ALTER TABLE posts RENAME TO \"a to b\";";
+        assert!(sqlite_finding(sql, "RENAME TABLE").is_some());
+        assert!(sqlite_finding(sql, "RENAME COLUMN").is_none());
+    }
+
+    #[test]
+    fn postgres_dollar_quote_cannot_hide_a_drop_column() {
+        // Quote tracking is SQLite-only. On Postgres the apostrophe in `$$..$$`
+        // must not merge the DROP COLUMN into the ADD COLUMN.
+        let f = classify_sql_for(
+            DatabaseBackend::Postgres,
+            "ALTER TABLE t ADD COLUMN a text DEFAULT $$it's$$, DROP COLUMN b;",
+        );
+        assert!(f.iter().any(|f| f.operation == "DROP COLUMN"), "{f:?}");
+    }
+
+    #[test]
+    fn postgres_alter_classification_is_unchanged() {
+        let ops = |sql: &str| -> Vec<String> {
+            classify_sql_for(DatabaseBackend::Postgres, sql)
+                .into_iter()
+                .map(|f| f.operation)
+                .collect()
+        };
+        let quoted = ops("ALTER TABLE posts ADD COLUMN l text DEFAULT 'a,b';");
+        assert!(
+            !quoted.iter().any(|o| o.starts_with("Multi-action")),
+            "{quoted:?}"
+        );
+        // Postgres has no canonicalization, so a bare rename stays unrewritten.
+        let bare = ops("ALTER TABLE posts RENAME title TO headline;");
+        assert!(!bare.iter().any(|o| o == "RENAME COLUMN"), "{bare:?}");
+    }
+
+    #[test]
+    fn sqlite_comma_in_a_default_literal_is_not_multi_action() {
+        let sql = "ALTER TABLE posts ADD COLUMN label TEXT DEFAULT 'a,b';";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, sql).is_empty(),
+            "{:?}",
+            sqlite_ops(sql)
+        );
+        // A real second action still trips the rule.
+        assert!(
+            sqlite_finding(
+                "ALTER TABLE posts ADD COLUMN a TEXT DEFAULT 'x,y', ADD COLUMN b TEXT;",
+                "Multi-action ALTER TABLE (unsupported on SQLite)",
+            )
+            .is_some()
         );
     }
 

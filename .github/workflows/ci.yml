@@ -2598,6 +2598,11 @@ jobs:
             generate::provenance:: generate::emit:: \
             | tee "$RUNNER_TEMP/cli-generate-sweep-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-sweep-cov.log"
+          # Issue #2580: same gap for the migration safety classifier
+          # (`migrate::safety::`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- migrate::safety:: \
+            | tee "$RUNNER_TEMP/cli-migrate-safety-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-migrate-safety-cov.log"
           # Issue #2553: the SQLite scrub runs through the `cli_tests` binary,
           # which no other lane instruments. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- db_scrub_sqlite:: \
