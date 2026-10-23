@@ -16136,6 +16136,33 @@ async fn main() {
     }
 
     #[test]
+    fn commentable_scaffold_hints_an_audit_clean_comment_router_mount() {
+        // The generic comment router is a `nest`, which `autumn routes audit`
+        // cannot see into. The hint must pair it with the declaration that
+        // makes the mount enumerable, or the app it scaffolds fails its own
+        // CI audit step.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "comments:commentable".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let hint = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("commentable::router"))
+            .unwrap_or_else(|| panic!("no comment-router hint: {:?}", plan.warnings));
+        assert!(
+            hint.contains(
+                ".declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))"
+            ),
+            "{hint}"
+        );
+    }
+
+    #[test]
     fn execute_self_referential_reference_keeps_select_without_target_model() {
         // A self-referential column targets the scaffold's own table, whose
         // schema entry this very command generates — it is never "missing",
