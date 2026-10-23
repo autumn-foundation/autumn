@@ -64,7 +64,7 @@ const COMPATIBILITY_DATE: &str = "2026-09-01";
 pub fn run(options: &BundleOptions<'_>) {
     let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match bundle(options, &project) {
-        Ok(report) => print_report(options, &report),
+        Ok(report) => print!("{}", report_text(options, &report)),
         Err(err) => {
             eprintln!("\u{2717} {err}");
             std::process::exit(1);
@@ -72,41 +72,51 @@ pub fn run(options: &BundleOptions<'_>) {
     }
 }
 
-fn print_report(options: &BundleOptions<'_>, report: &BundleReport) {
-    println!(
-        "\u{1F342} Edge bundle ({}) in {} — capsule {} KB",
-        match options.target {
-            BundleTarget::Cloudflare => "cloudflare",
-        },
+/// What `run` prints for a written bundle.
+fn report_text(options: &BundleOptions<'_>, report: &BundleReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let target = match options.target {
+        BundleTarget::Cloudflare => "cloudflare",
+    };
+    let _ = writeln!(
+        out,
+        "\u{1F342} Edge bundle ({target}) in {} — capsule {} KB",
         report.out.display(),
         report.capsule_bytes / 1024
     );
     for file in &report.written {
-        println!("  wrote {file}");
+        let _ = writeln!(out, "  wrote {file}");
     }
     if report.config_written {
-        println!(
+        let _ = writeln!(
+            out,
             "  wrote {} (yours to edit; later bundles keep it)",
             report.config_file
         );
     } else {
-        println!(
+        let _ = writeln!(
+            out,
             "  kept {} (delete it to have it generated again)",
             report.config_file
         );
         if options.origin.is_some() {
-            println!(
+            let _ = writeln!(
+                out,
                 "  note: --origin was not applied; set {ORIGIN_VAR} in the kept {} instead",
                 report.config_file
             );
         }
     }
-    println!(
+    let _ = writeln!(
+        out,
         "\nDeploy it:\n  cd {} && npx wrangler deploy\n\
          Bind a KV namespace as {KV_BINDING} in {WRANGLER_FILE} to give `needs(kv)` routes \
          their store.",
         report.out.display()
     );
+    out
 }
 
 /// Write the bundle under `project`. `Err` is a message for the author.
@@ -512,6 +522,41 @@ mod tests {
         for bad in ["", "-x", "x-", "A", &"a".repeat(64)] {
             assert!(worker_name(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_report_names_what_was_written_and_how_to_deploy() {
+        let dir = project(OK_CAPSULE);
+        let first = options(Some("https://o.example"), &[]);
+        let report = bundle(&first, dir.path()).unwrap();
+        let text = report_text(&first, &report);
+        assert!(text.contains("Edge bundle (cloudflare)"), "{text}");
+        for file in [
+            "edge-capsule.wasm",
+            "autumn-edge-host.mjs",
+            "worker.mjs",
+            ".gitignore",
+        ] {
+            assert!(text.contains(&format!("  wrote {file}")), "{file}: {text}");
+        }
+        assert!(
+            text.contains("wrote wrangler.toml (yours to edit"),
+            "{text}"
+        );
+        assert!(text.contains("npx wrangler deploy"), "{text}");
+        assert!(!text.contains("note: --origin"), "{text}");
+
+        // Bundling again with --origin keeps the config and says the flag
+        // did not apply.
+        let again = bundle(&first, dir.path()).unwrap();
+        let text = report_text(&first, &again);
+        assert!(text.contains("kept wrangler.toml"), "{text}");
+        assert!(
+            text.contains("note: --origin was not applied; set ORIGIN_URL"),
+            "{text}"
+        );
+        let quiet = options(None, &[]);
+        assert!(!report_text(&quiet, &again).contains("note: --origin"));
     }
 
     #[test]

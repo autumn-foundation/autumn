@@ -2594,6 +2594,13 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::tests:: \
             | tee "$RUNNER_TEMP/cli-generate-tests-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-tests-cov.log"
+          # ADR-0024: same gap for `autumn edge bundle` (`edge_bundle::`), the
+          # header parser it shares with `edge serve` (`edge::tests`), and the
+          # `edge` subcommand shapes (`tests::parse_edge`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- edge_bundle:: edge::tests \
+            tests::parse_edge \
+            | tee "$RUNNER_TEMP/cli-edge-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-edge-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
