@@ -2412,9 +2412,13 @@ jobs:
             --test scoped_tokens_db -- --ignored
           # Issue #3072: the shard-local job runtime and the tenant DB
           # bulkhead run only in these Docker tests of the consolidated
-          # binary; so does the ledger's Postgres fork (#2319). A filter that matches nothing exits 0, so check the count.
+          # binary; so does the ledger's Postgres fork (#2319). The Postgres
+          # data-capsule round trip (`data_capsule_pg`, the only test of
+          # `gdpr/portability/pg.rs` import) joins them: the `Test (Docker)`
+          # sweep runs it without coverage, so the patch gate saw none of that
+          # file. A filter that matches nothing exits 0, so check the count.
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
-            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: \
+            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: data_capsule_pg:: \
             | tee "$RUNNER_TEMP/isolation-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
           # Issue #2555: the Postgres `TestDb::reset_table` runs only in this
