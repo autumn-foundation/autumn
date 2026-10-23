@@ -37,9 +37,9 @@
 //! | any pure rendering | the `Clock`/`Rng` extractors, outbound HTTP |
 //!
 //! Ambient time and randomness (`SystemTime::now()`, `getrandom`) *compile* at
-//! the edge but return whatever the host decides — the reference host pins
-//! them for determinism, a real edge host will not — so keep them out of
-//! handlers (see `docs/guide/edge.md`).
+//! the edge but return whatever the host decides — Autumn's two hosts pin them
+//! for determinism, a third-party host may not — so keep them out of handlers
+//! (see `docs/guide/edge.md`).
 //!
 //! The restriction is enforced by the type system: an edge handler must be an
 //! `axum` handler over the unit [`EdgeState`], so a native-only extractor
@@ -107,6 +107,9 @@ pub mod gateway;
 #[cfg(feature = "node")]
 #[cfg_attr(docsrs, doc(cfg(feature = "node")))]
 pub mod node;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod js;
 
 /// The route macros an edge-safe handler module needs.
 ///

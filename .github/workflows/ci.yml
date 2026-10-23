@@ -970,6 +970,12 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
+      - uses: actions/setup-node@v4
+        # `autumn-edge`'s JS host suite (`tests/js_host.rs`) runs the
+        # web-standard host under Node and fails under CI without one (ADR-0024).
+        # Installed after the cleanup above, which removes /opt/hostedtoolcache.
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -2596,6 +2602,13 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::tests:: \
             | tee "$RUNNER_TEMP/cli-generate-tests-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-tests-cov.log"
+          # ADR-0024: same gap for `autumn edge bundle` (`edge_bundle::`), the
+          # header parser it shares with `edge serve` (`edge::tests`), and the
+          # `edge` subcommand shapes (`tests::parse_edge`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- edge_bundle:: edge::tests \
+            tests::parse_edge \
+            | tee "$RUNNER_TEMP/cli-edge-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-edge-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2973,8 +2986,11 @@ jobs:
   # capsule in front of the origin, and a generated tier sends 10,000
   # requests through every lane. Tier E runs the edge node over real HTTP
   # against an origin with a simulated distance, and needs a >= 50% lower
-  # median TTFB (the success metric). The last steps run the real
-  # `autumn build`, then `autumn edge serve` and `autumn edge ttfb`.
+  # median TTFB (the success metric). Tier J runs the web-standard JS host
+  # (ADR-0024) over the corpus and the generated requests and requires the
+  # reference host's outcome for each. The last steps run the real
+  # `autumn build`, then `autumn edge serve`, `autumn edge ttfb` and
+  # `autumn edge bundle`.
   #
   # Its own job because it is the only lane that installs a second target, and
   # NOT path-filtered on purpose: byte-identity between the origin and the edge
@@ -2992,6 +3008,11 @@ jobs:
         with:
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2.7.8
+      - uses: actions/setup-node@v4
+        # Tier J runs the web-standard JS host (`autumn-edge/js`, ADR-0024)
+        # over the same corpus as the reference host.
+        with:
+          node-version: 22
       - name: Build the edge capsule
         # Ahead of the suite (which builds it too) so a wasm-only compile break
         # reports as a build failure rather than as a conformance failure.
@@ -3067,6 +3088,50 @@ jobs:
               exit 1
             fi
           done
+      - name: autumn edge bundle runs in Cloudflare's runtime (workerd)
+        # ADR-0024: the bundle needs no vendor SDK and no glue. `wrangler dev`
+        # runs it in workerd, the open-source Workers runtime, against the
+        # real origin binary, with a seeded local KV namespace. An edge answer
+        # carries no `x-request-id` (only the origin's middleware mints one);
+        # a decline, a write and a trap reach the origin unchanged.
+        working-directory: examples/edge-greeting
+        run: |
+          wait_for() {
+            for _ in $(seq 1 120); do curl -sf -o /dev/null "$1" && return 0; sleep 1; done
+            echo "::error::$1 did not answer"; return 1
+          }
+          curl -sf -o /dev/null http://127.0.0.1:3000/greet/ci || {
+            ../../target/debug/edge-greeting &
+            wait_for http://127.0.0.1:3000/greet/ci
+          }
+          out="$RUNNER_TEMP/edge-bundle"
+          ../../target/debug/autumn edge bundle \
+            --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+            --origin http://127.0.0.1:3000 --out "$out" \
+            --response-header 'access-control-allow-origin: *'
+          cd "$out"
+          printf '\n[[kv_namespaces]]\nbinding = "EDGE_KV"\nid = "ci"\n' >> wrangler.toml
+          npx --yes wrangler@4.152.0 kv key put --local --binding EDGE_KV greeting "from workers kv"
+          npx --yes wrangler@4.152.0 dev --port 8788 --ip 127.0.0.1 > wrangler.log 2>&1 &
+          wait_for http://127.0.0.1:8788/greet/ci
+          check() { # path, expected status, expected body substring, edge|origin
+            headers=$(curl -s -D - -o body.txt "${@:5}" "http://127.0.0.1:8788$1")
+            status=$(printf '%s' "$headers" | head -1 | cut -d' ' -f2)
+            lane=edge; printf '%s' "$headers" | grep -qi '^x-request-id:' && lane=origin
+            if [ "$status" != "$2" ] || ! grep -q "$3" body.txt || [ "$lane" != "$4" ]; then
+              cat wrangler.log; printf '%s\n' "$headers"; cat body.txt
+              echo "::error::$1: wanted $2 from the $4 lane containing '$3', got $status from $lane"
+              exit 1
+            fi
+          }
+          check /greet/ada 200 'Hello, ada!' edge
+          check '/stats?tag=one&tag=two' 200 'tags=\[tag=one tag=two\]' edge
+          check /note/greeting 200 'from workers kv' edge
+          check /nope 404 '' origin
+          check /boom 500 '' origin
+          check /feedback 200 '' origin -X POST -d msg=hi
+          curl -s -D - -o /dev/null http://127.0.0.1:8788/greet/ada | grep -qi '^x-frame-options: DENY' \
+            || { echo "::error::the probed security headers are missing at the edge"; exit 1; }
 
   sqlite-fleet-windows:
     name: SQLite fleet (windows-latest)
