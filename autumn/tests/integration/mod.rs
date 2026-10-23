@@ -203,6 +203,7 @@ mod job_retry_jitter_pg;
 mod job_retry_jitter_redis;
 mod job_tenant_scope;
 mod job_tracking_route;
+mod job_tracking_settle_ack;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod lease_lock;

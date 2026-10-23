@@ -2442,6 +2442,13 @@ jobs:
             --test integration_tests -- --ignored experiments_pg_integration:: \
             | tee "$RUNNER_TEMP/experiments-pg-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/experiments-pg-cov.log"
+          # Issue #2583: the tracked-status settle after the queue ack on the
+          # Postgres and Redis backends runs only in these Docker tests. Check
+          # the count: a filter that matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored job_tracking_settle_ack:: \
+            | tee "$RUNNER_TEMP/settle-ack-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/settle-ack-cov.log"
           # Issue #2875: the Postgres tracking store's database-clock expiry
           # runs only in these Docker tests. Check the count: a filter that
           # matches nothing exits 0.
