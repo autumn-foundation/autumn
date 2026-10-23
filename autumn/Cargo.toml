@@ -688,6 +688,11 @@ required-features = ["markdown"]
 # attributable in a profiler. Asserts nothing — see the file header for the
 # exact commands.
 [[bench]]
+name = "mcp_search"
+harness = false
+required-features = ["mcp"]
+
+[[bench]]
 name = "csrf_verify"
 harness = false
 
