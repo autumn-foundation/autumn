@@ -46,7 +46,38 @@ quarantine, per the rule above.
 
 ## Open entries
 
-None.
+### `postgresql_embedded` build script: `version not found for '*'` (observed, not quarantined)
+
+- **Observed**: 2026-10-22, trunk-dev run 39808879528 (head `84cd1e7f`), job
+  `Test (Docker)`, step "Run Docker-dependent tests", 16:35Z. Nothing was
+  skipped or ignored; this entry exists so the signature is on record before
+  it recurs.
+- **Owner**: Semaphore (CI-health routine) — triage only, no fix yet.
+- **Diagnose-by**: 2026-11-06. If still n=1 by then, close as "transient,
+  unreproduced"; if it recurs, root-cause before touching `ci.yml`.
+- **Rerun-rate baseline**: 1 occurrence in the 40 most recent `ci.yml` runs
+  (2026-10-22 13:10Z to 2026-10-23 04:02Z). Not a same-commit rerun rate:
+  the identical commit was not rerun, and trunk-dev `69ea7fe1` (next
+  non-cancelled run) passed the same job. Other failures in the window
+  (Windows `SQLite fleet`, a Dependabot `getrandom` bump failing
+  clippy/MSRV/sqlite build, a `Test (Docker)` failure on run 39812278823
+  whose signature I could not read from the log tail) are NOT shown to share
+  it.
+- **Failure signature**: `failed to run custom build command for
+  `postgresql_embedded v0.19.0``, stderr `Error: version not found for '*'`
+  (`stage_postgresql_archive`), after the build script printed
+  `PostgreSQL version: *`.
+- **Mechanism (if known)**: undiagnosed. It is NOT the 403 rate limit closed
+  below (#2833): `GITHUB_TOKEN` is already set on this step and the error text
+  differs. Hypotheses to test: the GitHub releases listing for
+  `theseus-rs/postgresql-binaries` returned a page with no release matching
+  `x86_64-unknown-linux-gnu`, or a truncated/empty listing; both are an
+  unpinned external service. Pinning `POSTGRESQL_VERSION` (the build script
+  reads it via `rerun-if-env-changed`) would make the build deterministic but
+  was not applied here, since one occurrence is not enough to justify a CI
+  change.
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none; the test still runs.
 
 ## Closed entries
 
