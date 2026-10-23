@@ -81,6 +81,18 @@ quarantine, per the rule above.
 
 ## Closed entries
 
+### RUSTSEC-2026-0385 (`ctutils` 0.4.2) fails the advisory gates on every branch
+
+- **Not a flake — a deterministic external-advisory outage.** Published
+  between 2026-10-23 04:03Z (Dependabot run 39898208365, `Supply chain
+  (cargo-deny)`) and 10:10Z (this PR, runs 39937184909 / 39937184851); every
+  branch with the old lock fails `Dependency advisory gate`.
+- **Mechanism**: `ctutils` 0.4.2 reaches the tree via `digest` 0.11.3
+  (`postgres-protocol`, `lopdf`, `tungstenite`). Fixed in >= 0.4.4.
+- **Fix**: `cargo update -p ctutils --precise 0.4.4` in `Cargo.lock` and
+  `fuzz/Cargo.lock`; `cargo check -p autumn-web --locked` passes.
+- **Closed**: 2026-10-23, this PR (🚦 Semaphore).
+
 ### `distributed_lock::cancelled_release_does_not_leak_lock`
 
 - **Quarantined**: pre-existing before this ledger; exact date/PR not
