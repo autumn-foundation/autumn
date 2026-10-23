@@ -66,6 +66,7 @@ use super::layout::{
 /// URL, which needs `[seo] base_url` from `autumn.toml` at run time.
 ///
 /// See `docs/guide/seo.md`.
+#[public]
 #[get(
     "/",
     seo(
@@ -923,6 +924,7 @@ pub async fn submit(
 
 /// Redirects `/posts/{post_id}` to the canonical `/r/{sub_slug}/posts/{post_slug}`.
 /// Used by live OOB fragments that only have a post id in scope.
+#[public]
 #[get("/posts/{post_id}")]
 pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Redirect> {
     let (post_slug, subreddit_id): (String, i64) = posts::table
@@ -955,6 +957,7 @@ pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Re
 ///
 /// See `docs/guide/seo.md`.
 #[allow(clippy::too_many_lines)] // Template-heavy function
+#[public]
 #[get(
     "/r/{sub_slug}/posts/{post_slug}",
     // `og_type = "article"` is the right Open Graph type for a post. The card

@@ -256,6 +256,7 @@ offer a reply the server would refuse.
 ```rust,ignore
 AppBuilder::new()
     .nest("/comments", autumn_web::commentable::router(Default::default()))
+    .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
 ```
 
 mounts **one** pair of routes for the whole binary:
@@ -268,6 +269,11 @@ mounts **one** pair of routes for the whole binary:
 `commentable_type` is matched against the registry, so an unregistered type is
 a `404` — the router can only ever reach a model that really declared
 `#[commentable]`. Adding a third commentable model changes nothing here.
+
+`autumn routes audit` cannot see inside a `nest`ed router, and fails closed on
+one. `commentable::route_infos` declares the two routes so the audit can
+classify them: reading a thread is `public`, and posting is `gated` with
+`provenance: "declared"`, because the session check lives in the handler body.
 
 **Mount it behind whatever authentication and CSRF middleware your app already
 uses.** The `POST` handler reads the author's id from the session key named by

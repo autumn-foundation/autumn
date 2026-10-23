@@ -5,7 +5,7 @@
 //! features used in this Reddit clone example.
 
 use autumn_web::seo::SeoMeta;
-use autumn_web::{Markup, html, static_get};
+use autumn_web::{Markup, html, public, static_get};
 
 use super::layout::layout_with_seo;
 
@@ -22,6 +22,7 @@ use super::layout::layout_with_seo;
 /// sitemap entry for each `#[static_get]` path when `[seo] base_url` is set,
 /// so `RedditSitemapSource` does not list this page. See `docs/guide/seo.md`.
 #[allow(clippy::too_many_lines)] // Template-heavy function
+#[public]
 #[static_get(
     "/about",
     seo(

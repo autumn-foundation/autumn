@@ -519,7 +519,11 @@ extractor across one. `autumn_web::commentable::router(cfg)` serves
 single mount; it authorizes the **tenant**, never the record, so an app with
 private records must set `CommentsConfig::authorize(...)`. Build a host page's
 own thread with `commentable::thread_dom_id`/`thread_action` so the router's
-re-render lands on the same element. See `docs/guide/commentable.md`.
+re-render lands on the same element. Pair the `nest` with
+`.declare_plugin_routes(commentable::route_infos("/comments"))` (trunk-dev):
+the nested router is opaque to `autumn routes audit`, which fails without it.
+`GET` is `public`; `POST` is `gated` with `provenance: "declared"`. See
+`docs/guide/commentable.md`.
 
 **(0.7.0)** — `#[votable]` reaction helpers (#1362): declaring
 `#[votable(by = User, aggregate = sum|count)]` on a `#[model]` emits a

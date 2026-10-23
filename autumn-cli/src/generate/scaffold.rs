@@ -873,7 +873,8 @@ fn plan_scaffold_with_options_impl(
                     "Added the shared `{table}` table. Every `#[commentable]` model \
                      attaches to it, so later models need no migration of their own. \
                      Mount the framework's comment routes once, e.g. \
-                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))`, \
+                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))\
+                     .declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))`, \
                      and render a thread with \
                      `autumn_web::widgets::comment_thread`.",
                     table = super::commentable::COMMENTS_TABLE,
@@ -16131,6 +16132,33 @@ async fn main() {
         assert!(
             !routes.contains(".override_field(\"post_id\""),
             "the missing target's column must keep the derived number input: {routes}"
+        );
+    }
+
+    #[test]
+    fn commentable_scaffold_hints_an_audit_clean_comment_router_mount() {
+        // The generic comment router is a `nest`, which `autumn routes audit`
+        // cannot see into. The hint must pair it with the declaration that
+        // makes the mount enumerable, or the app it scaffolds fails its own
+        // CI audit step.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "comments:commentable".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let hint = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("commentable::router"))
+            .unwrap_or_else(|| panic!("no comment-router hint: {:?}", plan.warnings));
+        assert!(
+            hint.contains(
+                ".declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))"
+            ),
+            "{hint}"
         );
     }
 
