@@ -190,6 +190,42 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Jobs: `JobTrackingStore::reset_for_retry` takes a `RetryToken`
+
+**Why:** The old check compared `updated_at`. That value can repeat: two
+writes in one millisecond, or a frozen clock, leave it unchanged. A retry could
+then overwrite a job that a worker had already started (issue #2581). A
+`RetryToken` is a write counter. It changes on every write.
+
+**Before (`0.8`):**
+
+```rust
+let record = store.get(key).await?.expect("record");
+store.reset_for_retry(key, record.owner, record.updated_at).await?;
+```
+
+**After (`0.9`):**
+
+```rust
+let (record, token) = store.get_with_token(key).await?.expect("record");
+store.reset_for_retry(key, record.owner, token).await?;
+```
+
+Only code that implements `JobTrackingStore` must change. Add
+`get_with_token`. Return a `RetryToken` that changes on every write. Make
+`reset_for_retry` do nothing if the stored token is different. The built-in
+stores do this.
+
+Apps that use the built-in stores change no code. Postgres apps must run
+`autumn migrate` (migration `add_version_to_job_tracking`) **before** they
+deploy the new binary. The new binary reads the `version` column. SQLite adds
+the column by itself. A Redis record that has no counter reads as `0`.
+
+Do not run old and new binaries together for long. An old binary does not
+change the counter, so a retry can then overwrite a newer write.
+
+**Automation:** `manual` — update each custom `JobTrackingStore`.
+
 ### Jobs: `JobInfo` has a new `timeout` field
 
 **Why:** A job can now set the longest time one run may take (issue #3051).

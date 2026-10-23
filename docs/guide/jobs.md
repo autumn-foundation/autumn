@@ -1165,6 +1165,8 @@ The migration is bundled with the framework and is applied automatically by
 works the same way regardless of `jobs.backend` — the framework migration
 also creates `autumn_job_tracking`, the table the Postgres-backed tracking
 store uses (see [Tracked jobs and progress polling](#tracked-jobs-and-progress-polling)).
+A later migration adds its `version` column. Run `autumn migrate` before you
+deploy a new binary.
 
 ---
 

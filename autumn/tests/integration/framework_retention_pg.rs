@@ -31,6 +31,8 @@ use tokio::sync::Mutex;
 const JOBS_DDL: &str = include_str!("../../migrations/20260513000000_create_job_queue/up.sql");
 const JOB_TRACKING_DDL: &str =
     include_str!("../../migrations/20260702000000_create_job_tracking/up.sql");
+const JOB_TRACKING_VERSION_DDL: &str =
+    include_str!("../../migrations/20261022120000_add_version_to_job_tracking/up.sql");
 const EXPERIMENTS_DDL: &str =
     include_str!("../../migrations/20260530300000_create_experiments/up.sql");
 const COMMIT_HOOKS_DDL: &str =
@@ -97,6 +99,7 @@ async fn start_pg() -> (
         JOBS_DDL,
         UNIQUENESS_DDL,
         JOB_TRACKING_DDL,
+        JOB_TRACKING_VERSION_DDL,
         EXPERIMENTS_DDL,
         COMMIT_HOOKS_DDL,
         RETENTION_INDEX_DDL,
