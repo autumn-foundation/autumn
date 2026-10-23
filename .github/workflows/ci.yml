@@ -2311,9 +2311,11 @@ jobs:
           # and per-database replication (`db::fleet`, `db::fleet_replication`)
           # and the boot wiring are measured by the same leg, so no second
           # lib-test build.
+          # `db::sqlite_types::` (#2582) measures the `SQLite` wrappers' schema
+          # impls and their unit tests.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
-            fleet_layout:: app::fleet_boot_tests
+            fleet_layout:: app::fleet_boot_tests db::sqlite_types::
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
