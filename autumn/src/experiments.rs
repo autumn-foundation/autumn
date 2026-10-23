@@ -1980,6 +1980,17 @@ pub mod pg {
     /// [`ExperimentStore::preload`], and
     /// [`spawn_poll_listener`](Self::spawn_poll_listener) refreshes on each
     /// interval. Replicas see a remote write on their next refresh.
+    ///
+    /// Clone class: shares its snapshot-and-poll shape with `PgFlagStore`
+    /// (`autumn/src/feature_flags.rs` — see its doc for the full
+    /// cross-reference and the #3262/#3273 port history) and, less closely,
+    /// with `PgConfigStore` (`autumn/src/runtime_config.rs`). `retry_delay`,
+    /// `with_connect_timeout` and `STATEMENT_TIMEOUT_MS` are imported from
+    /// `feature_flags::pg` rather than redefined here. Unlike `PgFlagStore`,
+    /// this store has no local-write fast path: every write ends in
+    /// `refresh_after_write`, a full reload serialized through the same
+    /// `refresh_conn` lock the background poll uses, so it needs no
+    /// `generation`/`write_lock` pair to stay race-free.
     #[derive(Debug)]
     pub struct PgExperimentStore {
         shared: Arc<Shared>,
