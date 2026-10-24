@@ -453,10 +453,7 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// one memcpy and no allocation of its own.
 fn escape_into(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && !NEEDS_ATTENTION[bytes[i] as usize] {
-        i += 1;
-    }
+    let mut i = skip_clean(bytes, 0);
     if i == bytes.len() {
         out.push_str(s);
         return;
@@ -466,10 +463,6 @@ fn escape_into(out: &mut String, s: &str) {
     // `push_str` each, flushing only around a dropped or escaped character.
     let mut run_start = 0;
     while i < bytes.len() {
-        if !NEEDS_ATTENTION[bytes[i] as usize] {
-            i += 1;
-            continue;
-        }
         let (replacement, len) = match bytes[i] {
             b'&' => ("&amp;", 1),
             b'<' => ("&lt;", 1),
@@ -478,7 +471,7 @@ fn escape_into(out: &mut String, s: &str) {
             b'\'' => ("&apos;", 1),
             0xEF if bytes[i + 1] == 0xBF && matches!(bytes[i + 2], 0xBE | 0xBF) => ("", 3),
             0xEF => {
-                i += 1;
+                i = skip_clean(bytes, i + 1);
                 continue;
             }
             _ => ("", 1),
@@ -487,8 +480,28 @@ fn escape_into(out: &mut String, s: &str) {
         out.push_str(replacement);
         i += len;
         run_start = i;
+        i = skip_clean(bytes, i);
     }
     out.push_str(&s[run_start..]);
+}
+
+/// Index of the first byte at or after `from` that `NEEDS_ATTENTION`, or
+/// `bytes.len()`. Folds eight table lookups into one branch.
+fn skip_clean(bytes: &[u8], mut from: usize) -> usize {
+    while let Some(chunk) = bytes.get(from..from + 8) {
+        let mut hit = false;
+        for &b in chunk {
+            hit |= NEEDS_ATTENTION[b as usize];
+        }
+        if hit {
+            break;
+        }
+        from += 8;
+    }
+    while from < bytes.len() && !NEEDS_ATTENTION[bytes[from] as usize] {
+        from += 1;
+    }
+    from
 }
 
 /// Append `prefix`, the escaped `text`, then `suffix` to `out`. Escaping in
