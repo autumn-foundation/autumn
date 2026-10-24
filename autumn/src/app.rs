@@ -4473,6 +4473,18 @@ impl AppBuilder {
             state.begin_shutdown();
         }
 
+        // Clone class: this interceptor-wiring block (mail/job/db/channels,
+        // including the channels -> presence -> collab backend swap, and
+        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
+        // and `run_one_off_task_mode()`. It was born duplicated by #862,
+        // whose own follow-up commit ("fix: wire interceptors into
+        // one-off task mode") is a missed-fix this duplication already
+        // produced once: the one-off task path first shipped without this
+        // block, so its interceptors were silently inert. #1806 later had
+        // to hand-repeat the channels/presence/collab swap in all three
+        // copies again. Change one, change the other two --
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
+        // below fails if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -6765,6 +6777,18 @@ impl AppBuilder {
             state.log_levels().attach_reload_handle(handle);
         }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
+        // Clone class: this interceptor-wiring block (mail/job/db/channels,
+        // including the channels -> presence -> collab backend swap, and
+        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
+        // and `run_one_off_task_mode()`. It was born duplicated by #862,
+        // whose own follow-up commit ("fix: wire interceptors into
+        // one-off task mode") is a missed-fix this duplication already
+        // produced once: the one-off task path first shipped without this
+        // block, so its interceptors were silently inert. #1806 later had
+        // to hand-repeat the channels/presence/collab swap in all three
+        // copies again. Change one, change the other two --
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
+        // below fails if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -8436,6 +8460,18 @@ impl AppBuilder {
         if let Some(handle) = telemetry_guard.filter_reload.clone() {
             state.log_levels().attach_reload_handle(handle);
         }
+        // Clone class: this interceptor-wiring block (mail/job/db/channels,
+        // including the channels -> presence -> collab backend swap, and
+        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
+        // and `run_one_off_task_mode()`. It was born duplicated by #862,
+        // whose own follow-up commit ("fix: wire interceptors into
+        // one-off task mode") is a missed-fix this duplication already
+        // produced once: the one-off task path first shipped without this
+        // block, so its interceptors were silently inert. #1806 later had
+        // to hand-repeat the channels/presence/collab swap in all three
+        // copies again. Change one, change the other two --
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
+        // below fails if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -18519,6 +18555,59 @@ mod tests {
         assert!(
             task_initializer < task_job,
             "task runner startup must install state-initialized resources before job workers start"
+        );
+    }
+
+    #[test]
+    fn optional_interceptor_wiring_matches_across_all_three_run_modes() {
+        // See the clone-class comment above the `mail_interceptor` arm in
+        // each of the three functions: this exact block (mail/job/db/
+        // channels+presence+collab/http) is meant to stay byte-for-byte
+        // identical across `run()`, `run_build_mode()` and
+        // `run_one_off_task_mode()`. #862's own history shows what drift
+        // here costs (a silently-inert one-off-task interceptor), so pin
+        // the invariant rather than rely on reviewers to notice a divergent
+        // copy-paste.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let start_marker =
+            "#[cfg(feature = \"mail\")]\n        if let Some(interceptor) = mail_interceptor {";
+        let end_marker = "if let Some(interceptor) = http_interceptor {\n            \
+                           state.insert_extension(interceptor);\n        }\n";
+
+        let run_start = source.find("pub async fn run(self)").expect("run() exists");
+        let build_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("run_build_mode() follows run()");
+        let task_start = source
+            .find("async fn run_one_off_task_mode(self, requested_name: String)")
+            .expect("run_one_off_task_mode() follows run_build_mode()");
+
+        let extract = |region: &str| -> String {
+            let s = region
+                .find(start_marker)
+                .expect("the interceptor-wiring block starts with the mail arm");
+            let e = region[s..]
+                .find(end_marker)
+                .map(|offset| s + offset + end_marker.len())
+                .expect("the interceptor-wiring block ends with the http arm");
+            region[s..e].to_owned()
+        };
+
+        let run_block = extract(&source[run_start..build_start]);
+        let build_block = extract(&source[build_start..task_start]);
+        // `run_one_off_task_mode` is the last fn in this `impl AppBuilder`;
+        // a generous bound stands in for hunting down the next `fn`.
+        let task_block = extract(&source[task_start..(task_start + 20_000).min(source.len())]);
+
+        assert_eq!(
+            run_block, build_block,
+            "run() and run_build_mode() must wire the five optional interceptors identically"
+        );
+        assert_eq!(
+            run_block, task_block,
+            "run() and run_one_off_task_mode() must wire the five optional interceptors \
+             identically (this exact drift shipped once, fixed by #862's \"wire interceptors \
+             into one-off task mode\")"
         );
     }
 
