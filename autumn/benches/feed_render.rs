@@ -25,6 +25,11 @@
 //! After escaping straight into the output buffer (`escape_into`), same
 //! method: 197,727 instructions, 196 allocations and 61.0 KB per iteration.
 //!
+//! Re-measured 2026-10-24 (rustc stable, valgrind 3.22.0, callgrind
+//! `--iterations 1000` minus `--iterations 0`): 199,054 instructions per
+//! iteration (209,410,656 - 10,356,600 over 1000). `feed::push_escaped`
+//! (the inlined `escape_into` byte scan) is 82.4M Ir, 39.4% of the total.
+//!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing: it is a workload to point a profiler at.
 //!
