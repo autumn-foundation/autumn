@@ -1486,7 +1486,8 @@ fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 stack.push(path);
-            } else if let Ok(body) = fs::read_to_string(&path) {
+            } else {
+                let bytes = fs::read(&path).expect("readable file");
                 // The migration directory embeds a generation timestamp to
                 // the SECOND (`migrations/20260827030722_create_posts/`), and
                 // the two scaffolds this compares are two separate process
@@ -1498,9 +1499,15 @@ fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
                 let rel = normalized_relative_path(&path, root);
                 // Freshly generated secrets differ by construction; every
                 // other file is the generator's own output.
-                if rel.contains("master.key") || rel.contains("credentials.enc") {
+                if rel == "config/master.key"
+                    || (rel.starts_with("config/credentials/") && rel.ends_with(".enc"))
+                {
                     continue;
                 }
+                // A non-UTF-8 file is compared as hex.
+                let body = String::from_utf8(bytes).unwrap_or_else(|e| {
+                    e.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+                });
                 // The bodies carry the migration timestamp too — the
                 // manifest keys a digest table on each generated path — so
                 // they need the same normalization the path got.
@@ -1539,8 +1546,26 @@ fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// RED stub.
-fn wait_for_next_second() {}
+/// Block until the wall clock is in a later second. The next stamp is then
+/// different from every stamp written before the call.
+fn wait_for_next_second() {
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    let secs = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_secs()
+    };
+    let start = secs();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while secs() <= start {
+        assert!(
+            Instant::now() < deadline,
+            "the wall clock did not advance in 5 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 /// The sorted 14-digit stamps of the migration dirs under `root`.
 fn migration_stamps(root: &Path) -> Vec<String> {
