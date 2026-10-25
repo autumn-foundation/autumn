@@ -1276,8 +1276,18 @@ fn assert_no_import_surface(project: &Path, expect_no_multipart: bool) {
     assert!(!test.contains("csv_import"), "{test}");
 }
 
-/// The path of `path` under `root`, with `/` as the separator. A 14-digit
-/// stamp in the dir directly under `migrations/` becomes `<timestamp>`.
+/// The length of the migration version at the start of `name`: 14 or more
+/// digits, then `_`. A generator can add digits to the 14-digit stamp to set
+/// the order of two migrations (`{ts}1_`, `{ts}2_`). Only the first 14 digits
+/// come from the clock.
+fn version_len(name: &str) -> Option<usize> {
+    let len = name.bytes().take_while(u8::is_ascii_digit).count();
+    (len >= 14 && name.as_bytes().get(len) == Some(&b'_')).then_some(len)
+}
+
+/// The path of `path` under `root`, with `/` as the separator. In the
+/// directory directly under `migrations/`, the 14-digit stamp becomes
+/// `<timestamp>`. Digits after the stamp stay.
 ///
 /// The rule walks path components. A `"migrations/"` string match fails on
 /// Windows, where the separator is `\`.
@@ -1289,20 +1299,15 @@ fn normalized_relative_path(path: &Path, root: &Path) -> String {
         .collect();
     if parts.first().map(String::as_str) == Some("migrations")
         && let Some(dir) = parts.get_mut(1)
-        && let Some((stamp, tail)) = dir.clone().split_once('_')
-        && stamp.len() == 14
-        && stamp.bytes().all(|b| b.is_ascii_digit())
+        && version_len(dir).is_some()
     {
-        *dir = format!("<timestamp>_{tail}");
+        *dir = format!("<timestamp>{}", &dir[14..]);
     }
     parts.join("/")
 }
 
-/// The normalization above is what a Windows CI run caught: it used to strip a
-/// literal `"migrations/"` prefix, which never matched a `\`-separated path, so
-/// the timestamp survived and a second-boundary straddle became a hard failure
-/// on the slowest runner. `PathBuf` joining is separator-correct per platform,
-/// so building the fixture that way exercises the real shape on each one.
+/// The fixture uses `PathBuf::join`, so the test uses the separator of each
+/// platform.
 #[test]
 fn normalized_relative_path_is_separator_agnostic() {
     let root = PathBuf::from("root");
@@ -1334,10 +1339,17 @@ fn normalized_relative_path_is_separator_agnostic() {
         normalized_relative_path(&elsewhere, &root),
         "data/20260827030722_export.csv"
     );
+
+    // An order digit after the stamp stays.
+    let ordered = root.join("migrations").join("202608270307221_add_count");
+    assert_eq!(
+        normalized_relative_path(&ordered, &root),
+        "migrations/<timestamp>1_add_count"
+    );
 }
 
-/// The body-side twin of [`normalized_relative_path`]: each
-/// `migrations/<14 digits>_` in `body` becomes `migrations/<timestamp>_`.
+/// The body-side twin of [`normalized_relative_path`]: in each
+/// `migrations/<version>_` in `body`, the 14-digit stamp becomes `<timestamp>`.
 ///
 /// `.autumn/generated.toml` keys its tables on each generated path. It always
 /// writes `/`, so one string rule is correct on all platforms.
@@ -1348,11 +1360,7 @@ fn normalized_timestamps(body: &str) -> String {
     while let Some(at) = rest.find(PREFIX) {
         let (head, tail) = rest.split_at(at + PREFIX.len());
         out.push_str(head);
-        let is_stamp = tail.len() >= 15
-            && tail.is_char_boundary(14)
-            && tail.as_bytes()[..14].iter().all(u8::is_ascii_digit)
-            && tail.as_bytes()[14] == b'_';
-        if is_stamp {
+        if version_len(tail).is_some() {
             out.push_str("<timestamp>");
             rest = &tail[14..];
         } else {
@@ -1363,11 +1371,8 @@ fn normalized_timestamps(body: &str) -> String {
     out
 }
 
-/// A second Windows CI failure found the same second-boundary straddle in the
-/// manifest BODY that the path normalization above already covered: two runs
-/// wrote `migrations/20260907015549_create_posts` and `…550_create_posts`, so
-/// the digest tables were keyed differently and the byte-identity gate failed
-/// for a reason the flag under test does not control.
+/// Two runs wrote `…549_create_posts` and `…550_create_posts` in the manifest
+/// (issue #2590). Both must normalize to one string.
 #[test]
 fn normalized_timestamps_rewrites_only_a_migration_stamp() {
     assert_eq!(
@@ -1408,6 +1413,16 @@ fn normalized_timestamps_rewrites_only_a_migration_stamp() {
         "data/20260907015549_export.csv"
     );
 
+    // An order digit after the stamp stays, so `{ts}1_` and `{ts}2_` differ.
+    assert_eq!(
+        normalized_timestamps("migrations/202609070155491_add_count/up.sql"),
+        "migrations/<timestamp>1_add_count/up.sql"
+    );
+    assert_ne!(
+        normalized_timestamps("migrations/202609070155491_a"),
+        normalized_timestamps("migrations/202609070155492_a")
+    );
+
     // A truncated tail must not panic or invent a token.
     assert_eq!(normalized_timestamps("migrations/"), "migrations/");
     assert_eq!(
@@ -1416,23 +1431,26 @@ fn normalized_timestamps_rewrites_only_a_migration_stamp() {
     );
 }
 
-/// The files under `root` as sorted `(path, body)` pairs, for a byte-identity
-/// compare of two generated trees.
+/// The files and directories under `root` as sorted `(path, body)` pairs, for
+/// a comparison of two generated trees. A directory is a `"<path>/"` entry.
 ///
 /// Each migration stamp in a path or a body becomes `<timestamp>`, because two
-/// runs can be in different seconds. All other bytes stay. The fresh secrets
-/// are skipped, and the manifest drops the lines that hash the command.
+/// runs can be in different seconds. The fresh secrets are skipped. In
+/// `.autumn/generated.toml`, the `invocation =` lines and the `[[runs.`
+/// headers are removed. All other bytes stay.
 fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).expect("readable dir") {
             let path = entry.expect("dir entry").path();
+            let rel = normalized_relative_path(&path, root);
             if path.is_dir() {
+                // An empty dir is part of the tree shape too.
+                out.push((format!("{rel}/"), String::new()));
                 stack.push(path);
                 continue;
             }
-            let rel = normalized_relative_path(&path, root);
             // `autumn new` writes new secrets on each run.
             if rel == "config/master.key"
                 || (rel.starts_with("config/credentials/")
@@ -1446,15 +1464,14 @@ fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
                 Err(e) => format!("<non-UTF-8 {:02x?}>", e.as_bytes()),
             };
             // The manifest records the command (issue #1835), and the run id
-            // hashes it. The two runs use different commands by design. The
-            // digests and the edits stay in the compare (issue #2560).
+            // is a hash of it. The two runs use different commands by design.
+            // The digests and the edits stay in the comparison (issue #2560).
             let body = if rel == ".autumn/generated.toml" {
-                body.lines()
+                body.split_inclusive('\n')
                     .filter(|line| {
                         !line.starts_with("invocation = ") && !line.starts_with("[[runs.")
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .collect()
             } else {
                 body
             };
@@ -1465,44 +1482,40 @@ fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// Block until the wall clock is in a later second. The next stamp is then
-/// different from every stamp written before the call.
-fn wait_for_next_second() {
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-    let secs = || {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after 1970")
-            .as_secs()
-    };
-    let start = secs();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while secs() <= start {
+/// Wait until the clock gives a stamp later than `stamp`. A generator run
+/// that starts after this call then writes a different stamp.
+///
+/// The wait compares with `stamp`, not with the start time, so a clock step
+/// back does not end the wait too early.
+fn wait_until_after(stamp: &str) {
+    use std::time::{Duration, Instant};
+    let now = || chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while now().as_str() <= stamp {
         assert!(
-            Instant::now() < deadline,
-            "the wall clock did not advance in 5 s"
+            Instant::now() < deadline || now().as_str() > stamp,
+            "the clock did not pass {stamp} in 30 s"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// The sorted 14-digit stamps of the migration dirs under `root`.
+/// The sorted 14-digit stamps of the migration directories under `root`.
 fn migration_stamps(root: &Path) -> Vec<String> {
     let mut stamps: Vec<String> = fs::read_dir(root.join("migrations"))
         .into_iter()
         .flatten()
         .filter_map(|entry| {
             let name = entry.ok()?.file_name().into_string().ok()?;
-            let (stamp, _) = name.split_once('_')?;
-            (stamp.len() == 14 && stamp.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| stamp.to_owned())
+            version_len(&name)?;
+            Some(name[..14].to_owned())
         })
         .collect();
     stamps.sort();
     stamps
 }
 
-/// Write `files` under a new tempdir. A path uses `/`.
+/// Write `files` in a new temporary directory. A path uses `/`.
 fn fixture_tree(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     for (rel, body) in files {
@@ -1573,6 +1586,48 @@ fn tree_snapshot_ignores_only_the_migration_stamp() {
     assert_ne!(snapshot_of(&at_49), snapshot_of(&added));
 }
 
+/// An added empty dir changes the tree shape.
+#[test]
+fn tree_snapshot_sees_an_empty_dir() {
+    let files = stamped_tree("20260907015549", "ab");
+    let plain = snapshot_of(&files);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(rel, body)| (rel.as_str(), body.as_slice()))
+        .collect();
+    let tmp = fixture_tree(&refs);
+    fs::create_dir_all(tmp.path().join("src/imports")).expect("mkdir");
+    assert_ne!(plain, tree_snapshot(tmp.path()));
+}
+
+/// The manifest filter drops only the command lines. A changed edit record
+/// under a run still fails the compare (issue #2560).
+#[test]
+fn tree_snapshot_compares_the_manifest_edits() {
+    let manifest = |invocation: &str, run: &str, revert: &str| {
+        let mut files = stamped_tree("20260907015549", "ab");
+        files[1].1 = format!(
+            "[files.\"src/routes/posts.rs\"]\n\
+             digest = \"ab\"\n\
+             invocation = \"{invocation}\"\n\
+             \n\
+             [[runs.{run}]]\n\
+             path = \"src/main.rs\"\n\
+             revert = \"{revert}\"\n"
+        )
+        .into_bytes();
+        snapshot_of(&files)
+    };
+    let base = manifest("scaffold --import", "h1", "MainRoute(a)");
+    assert_eq!(base, manifest("scaffold", "h2", "MainRoute(a)"));
+    assert_ne!(base, manifest("scaffold", "h2", "MainRoute(b)"));
+    assert!(
+        base.iter()
+            .any(|(_, body)| body.ends_with("revert = \"MainRoute(a)\"\n")),
+        "the manifest keeps its last newline: {base:?}"
+    );
+}
+
 /// A file that is not UTF-8 is part of the tree too.
 #[test]
 fn tree_snapshot_sees_a_non_utf8_file() {
@@ -1625,17 +1680,18 @@ fn migration_stamps_reads_only_real_stamps() {
         ("migrations/20260907015549_create_users/up.sql", b""),
         ("migrations/readme_notes/up.sql", b""),
         ("migrations/2026090701554_short/up.sql", b""),
+        ("migrations/202609070155511_add_count/up.sql", b""),
     ]);
     assert_eq!(
         migration_stamps(tmp.path()),
-        ["20260907015549", "20260907015550"]
+        ["20260907015549", "20260907015550", "20260907015551"]
     );
     let empty = tempfile::tempdir().expect("tempdir");
     assert!(migration_stamps(empty.path()).is_empty());
 }
 
-/// The strongest form of "additive": for a variant that cannot have the import,
-/// `--import` must change NOTHING in the generated tree.
+/// For a variant that cannot have the import, `--import` must not change the
+/// generated tree.
 ///
 /// The two scaffolds always run in different seconds, so their migration stamps
 /// always differ. A stamp that the snapshot does not normalize then fails on
@@ -1643,14 +1699,17 @@ fn migration_stamps_reads_only_real_stamps() {
 fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
     let mut flags = vec!["--import"];
     flags.extend_from_slice(extra);
-    // The SAME project name for both, in their own tempdirs: `autumn new` stamps
-    // the name into `.env.example`, `Cargo.toml` and the README, so two names
-    // would differ for reasons that have nothing to do with the flag.
+    // The SAME project name for both: `autumn new` writes the name into
+    // `.env.example`, `Cargo.toml` and the README. Two names would differ for a
+    // reason other than the flag.
     let with_flag = scaffold_project(name, &default_cols(), &flags);
-    wait_for_next_second();
+    let stamps_a = migration_stamps(&with_flag.1);
+    let last = stamps_a
+        .last()
+        .expect("the scaffold must write a migration");
+    wait_until_after(last);
     let without = scaffold_project(name, &default_cols(), extra);
-    let (stamps_a, stamps_b) = (migration_stamps(&with_flag.1), migration_stamps(&without.1));
-    assert!(!stamps_a.is_empty(), "the scaffold must write a migration");
+    let stamps_b = migration_stamps(&without.1);
     assert_ne!(
         stamps_a, stamps_b,
         "the two runs must be in different seconds, or this gate tests nothing"
