@@ -653,6 +653,7 @@ pub enum SchemaDirection {
 /// `#[model]` submits one when the request and response shapes of a type can
 /// differ. A reference in [`Self::direction`] uses it. All other references
 /// use the [`DerivedSchemaDescriptor`].
+#[doc(hidden)]
 pub struct DirectionalSchemaDescriptor {
     /// The type identity (`type_name`), as in [`DerivedSchemaDescriptor::identity`].
     pub identity: fn() -> &'static str,
@@ -1056,13 +1057,14 @@ fn qualified_suffix_key(identity: &str, depth: usize) -> String {
 
 /// Build the identity→display-key map for every schema referenced by `routes`.
 ///
-/// Pure over the route set. A request component key never takes a key that a
-/// user or route registration owns: use [`schema_component_index_for`] to get
-/// the index that [`generate_spec`] uses.
+/// Pure over the route set. This index does not see user or route
+/// registrations, so a request key can be equal to one of their keys. Use
+/// [`schema_component_index_for`] to get the index that [`generate_spec`]
+/// uses.
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex {
-    build_schema_component_index_reserving(routes, &std::collections::BTreeSet::new())
+    build_schema_component_index_reserving(routes, &BTreeMap::new())
 }
 
 /// The component index [`generate_spec`] uses for `config` and `routes`.
@@ -1096,23 +1098,20 @@ fn seeded_registry_and_index(
             (register)(&mut registry);
         }
     }
-    let reserved: std::collections::BTreeSet<String> = registry.schemas().keys().cloned().collect();
-    let index = build_schema_component_index_reserving(routes, &reserved);
+    let index = build_schema_component_index_reserving(routes, registry.schemas());
     (registry, index)
 }
 
+/// Build the index. `registered` holds the user and route registrations. Their
+/// keys are reserved, and their refs are response uses.
 #[cfg(feature = "openapi")]
 fn build_schema_component_index_reserving(
     routes: &[&ApiDoc],
-    reserved: &std::collections::BTreeSet<String>,
+    registered: &BTreeMap<String, serde_json::Value>,
 ) -> SchemaComponentIndex {
     // Collect (identity, base-display) for every referenced Ref entry, deduped
     // by identity, and each direction it is referenced in (issue #2607).
-    let mut refs: Vec<(String, String)> = Vec::new();
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut uses: std::collections::BTreeSet<(String, SchemaDirection)> =
-        std::collections::BTreeSet::new();
-    let mut queue: Vec<(String, SchemaDirection)> = Vec::new();
+    let mut graph = IdentityGraph::default();
     for api_doc in routes {
         if api_doc.hidden {
             continue;
@@ -1124,51 +1123,62 @@ fn build_schema_component_index_reserving(
         ] {
             let Some(entry) = entry else { continue };
             for e in flatten_ref_entries(entry) {
-                let identity = e.identity_key().to_owned();
-                if seen.insert(identity.clone()) {
-                    refs.push((identity.clone(), component_key(e.name)));
-                }
-                if uses.insert((identity.clone(), direction)) {
-                    queue.push((identity, direction));
-                }
+                graph.add(e.identity_key(), component_key(e.name), direction);
             }
         }
     }
 
-    // Close the identity graph: a `$ref` emitted *inside* a derived schema body
-    // (a nested named-struct field) can reference an identity that no route
-    // mentions directly. Fetch each derived body and recursively collect the
-    // identities it refers to, to a fixpoint, so nested-only types participate
-    // in collision detection and each earns its own component (issue #1972).
-    // A nested reference has the direction of the body it is in (issue #2607).
-    let mut bodies: BTreeMap<(String, SchemaDirection), Option<serde_json::Value>> =
-        BTreeMap::new();
-    while let Some((identity, direction)) = queue.pop() {
-        let body = registered_derived_schema_for(&identity, direction);
-        if let Some(body) = &body {
-            let mut nested: Vec<String> = Vec::new();
-            collect_body_ref_identities(body, &mut nested);
-            for n in nested {
-                if seen.insert(n.clone()) {
-                    let base = base_display_for_identity(&n);
-                    refs.push((n.clone(), base));
-                }
-                if uses.insert((n.clone(), direction)) {
-                    queue.push((n, direction));
-                }
+    // A registered component is a response component: the rewrite treats it
+    // as one. Thus a ref in it is a response use. An example is the short
+    // `<Model>` ref of the `<Model>Page` envelope. Without this rule, a type
+    // that only a list route returns is request-only, and its one component
+    // gets the request shape.
+    let mut registered_refs: Vec<String> = Vec::new();
+    for body in registered.values() {
+        collect_body_ref_identities(body, &mut registered_refs);
+    }
+    let by_identity = loop {
+        graph.close();
+        let by_identity = assign_display_keys(&graph.refs);
+        let mut grew = false;
+        for target in &registered_refs {
+            let identity = if graph.seen.contains(target) {
+                Some(target.clone())
+            } else {
+                by_identity
+                    .iter()
+                    .find(|(_, key)| *key == target)
+                    .map(|(identity, _)| identity.clone())
+            };
+            if let Some(identity) = identity {
+                grew |= graph.add_use(identity, SchemaDirection::Response);
             }
         }
-        bodies.insert((identity, direction), body);
-    }
+        if !grew {
+            break by_identity;
+        }
+    };
 
-    let by_identity = assign_display_keys(&refs);
-    let request_only = seen
+    let request_only = graph
+        .seen
         .iter()
-        .filter(|identity| !uses.contains(&((*identity).clone(), SchemaDirection::Response)))
+        .filter(|identity| {
+            !graph
+                .uses
+                .contains(&((*identity).clone(), SchemaDirection::Response))
+        })
         .cloned()
         .collect();
-    let request_by_identity =
-        assign_request_keys(&split_identities(&uses, &bodies), &by_identity, reserved);
+    // A registration on the main key replaces the schema in both directions.
+    // Such a type does not split, so its request refs use that registration.
+    let fixed: std::collections::BTreeSet<String> = by_identity
+        .iter()
+        .filter(|(_, key)| registered.contains_key(*key))
+        .map(|(identity, _)| identity.clone())
+        .collect();
+    let split = split_identities(&graph.uses, &graph.bodies, &fixed);
+    let reserved: std::collections::BTreeSet<String> = registered.keys().cloned().collect();
+    let request_by_identity = assign_request_keys(&split, &by_identity, &reserved);
 
     SchemaComponentIndex {
         by_identity,
@@ -1177,15 +1187,71 @@ fn build_schema_component_index_reserving(
     }
 }
 
+/// The referenced identities, their directions, and their derived bodies.
+#[cfg(feature = "openapi")]
+#[derive(Default)]
+struct IdentityGraph {
+    /// `(identity, base display key)`, one entry for each identity.
+    refs: Vec<(String, String)>,
+    seen: std::collections::BTreeSet<String>,
+    uses: std::collections::BTreeSet<(String, SchemaDirection)>,
+    queue: Vec<(String, SchemaDirection)>,
+    bodies: BTreeMap<(String, SchemaDirection), Option<serde_json::Value>>,
+}
+
+#[cfg(feature = "openapi")]
+impl IdentityGraph {
+    /// Record a reference to `identity` in `direction`.
+    fn add(&mut self, identity: &str, base: String, direction: SchemaDirection) {
+        if self.seen.insert(identity.to_owned()) {
+            self.refs.push((identity.to_owned(), base));
+        }
+        self.add_use(identity.to_owned(), direction);
+    }
+
+    /// Record a use of a known identity. Returns `true` for a new use.
+    fn add_use(&mut self, identity: String, direction: SchemaDirection) -> bool {
+        let new = self.uses.insert((identity.clone(), direction));
+        if new {
+            self.queue.push((identity, direction));
+        }
+        new
+    }
+
+    /// Close the identity graph: a `$ref` emitted *inside* a derived schema
+    /// body (a nested named-struct field) can reference an identity that no
+    /// route mentions directly. Fetch each derived body and recursively collect
+    /// the identities it refers to, to a fixpoint, so nested-only types
+    /// participate in collision detection and each earns its own component
+    /// (issue #1972). A nested reference has the direction of the body it is
+    /// in (issue #2607).
+    fn close(&mut self) {
+        while let Some((identity, direction)) = self.queue.pop() {
+            let body = registered_derived_schema_for(&identity, direction);
+            if let Some(body) = &body {
+                let mut nested: Vec<String> = Vec::new();
+                collect_body_ref_identities(body, &mut nested);
+                for n in nested {
+                    let base = base_display_for_identity(&n);
+                    self.add(&n, base, direction);
+                }
+            }
+            self.bodies.insert((identity, direction), body);
+        }
+    }
+}
+
 /// The identities that need a separate request component (issue #2607).
 ///
 /// An identity splits when both directions reference it and either its two
 /// schemas differ, or a type it references splits. The second rule finds an
-/// asymmetric type inside a symmetric wrapper.
+/// asymmetric type inside a symmetric wrapper. An identity in `fixed` never
+/// splits.
 #[cfg(feature = "openapi")]
 fn split_identities(
     uses: &std::collections::BTreeSet<(String, SchemaDirection)>,
     bodies: &BTreeMap<(String, SchemaDirection), Option<serde_json::Value>>,
+    fixed: &std::collections::BTreeSet<String>,
 ) -> std::collections::BTreeSet<String> {
     let body = |identity: &str, direction| {
         bodies
@@ -1197,6 +1263,7 @@ fn split_identities(
         .filter(|(identity, direction)| {
             *direction == SchemaDirection::Request
                 && uses.contains(&(identity.clone(), SchemaDirection::Response))
+                && !fixed.contains(identity)
         })
         .map(|(identity, _)| identity.as_str())
         .collect();
@@ -2547,7 +2614,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let split = split_identities(&uses, &bodies);
+        let split = split_identities(&uses, &bodies, &std::collections::BTreeSet::new());
         let split: Vec<&str> = split.iter().map(String::as_str).collect();
         assert_eq!(split, vec!["app::Inner", "app::Outer"]);
     }

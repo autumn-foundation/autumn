@@ -10499,8 +10499,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // it just cannot be `required`, because a response that trips the predicate
     // omits it and a strict client would reject that response.
     //
-    // Sound because this schema describes a RESPONSE only. A request to the
-    // query struct uses the separate request schema below (#2607).
+    // Sound because this schema describes a RESPONSE only. A request body of
+    // the model type uses the request schema below (#2607).
     // `#[derive(OpenApiSchema)]` has one schema for both directions, so it
     // refuses the shape instead: serde still rejects a request that omits the
     // field.
@@ -10579,7 +10579,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // builder makes one component when the two schemas are equal.
     //
     // A deserialize-side adapter makes the field types wrong for a request.
-    // Then the override has no schema, and the request is the placeholder.
+    // An `alias` adds a second accepted name. Then the override has no schema,
+    // and the request is the placeholder. `#[derive(OpenApiSchema)]` refuses
+    // the same attributes.
     let request_field_refs: Vec<&&Field> = all_field_refs
         .iter()
         .filter(|f| serde_bare_word(&f.attrs, &["skip", "skip_deserializing"]).is_none())
@@ -10589,7 +10591,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         || serde_valued_key(outer_attrs, &["from", "try_from", "tag"]).is_some()
         || request_field_refs.iter().any(|f| {
             serde_bare_word(&f.attrs, &["flatten"]).is_some()
-                || serde_valued_key(&f.attrs, &["with", "deserialize_with"]).is_some()
+                || serde_valued_key(&f.attrs, &["with", "deserialize_with", "alias"]).is_some()
         });
     let request_schema_descriptor = if request_reshaped {
         quote! {
@@ -10610,6 +10612,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             request_rename_all_rule.as_deref(),
             &|f: &Field| container_default || has_serde_default(&f.attrs),
         );
+        // `deny_unknown_fields` rejects every key not in the schema.
+        let request_schema_body =
+            if serde_bare_word(outer_attrs, &["deny_unknown_fields"]).is_some() {
+                quote! {{
+                    let mut __autumn_request = { #request_schema_body };
+                    if let ::core::option::Option::Some(__autumn_object) =
+                        __autumn_request.as_object_mut()
+                    {
+                        __autumn_object.insert(
+                            "additionalProperties".to_owned(),
+                            ::autumn_web::reexports::serde_json::json!(false),
+                        );
+                    }
+                    __autumn_request
+                }}
+            } else {
+                request_schema_body
+            };
         quote! {
             impl #name {
                 #[doc(hidden)]
@@ -10631,7 +10651,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // #2607: `NewModel` skips a classified field on serialize. Thus a response
-    // does not have it, but the request schema requires it. Submit a response
+    // does not have it, but its one schema requires it. Submit a response
     // schema without those fields. With no classified field, submit nothing.
     let new_response_hidden: Vec<String> = fields_for_new
         .iter()

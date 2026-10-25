@@ -1266,8 +1266,8 @@ pub fn emit_schema_fn_body_named(
             schema_property_name(f, rename_all_rule)
         }
     };
-    // Raw names mean the struct does not carry the field's serde attributes,
-    // so its `skip_serializing_if` has no effect there.
+    // With raw names, the struct does not copy the serde attributes of the
+    // field. Thus `skip_serializing_if` does not make the field optional.
     emit_schema_body(
         fields,
         all_optional,
@@ -1304,8 +1304,8 @@ pub fn emit_request_schema_fn_body(
 
 /// The shared emitter behind the public schema-body functions.
 ///
-/// `skip_if_is_optional` is `true` when the schema describes a struct that
-/// carries the field's `skip_serializing_if`, and describes what it writes.
+/// Set `skip_if_is_optional` to `true` for a response schema of a struct that
+/// keeps the `skip_serializing_if` of the field.
 fn emit_schema_body(
     fields: &[&&Field],
     all_optional: bool,
