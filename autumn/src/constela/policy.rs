@@ -135,9 +135,9 @@ pub const ALLOWED_URL_SCHEMES: &[&str] = &["http", "https", "mailto", "tel"];
 /// The longest portal `target` validation accepts, in bytes.
 ///
 /// A target is `body`, `head`, or a CSS selector that names a place in the
-/// host layout. Upstream allows any selector, so there is no allowlist. A
-/// longer target names nothing a layout has, and each rendered portal keeps
-/// a copy of it.
+/// host layout. Upstream allows any selector, so there is no allowlist. No
+/// real layout uses a selector this long. Each rendered portal keeps a copy
+/// of its target.
 pub const MAX_PORTAL_TARGET_BYTES: usize = 256;
 
 /// Attributes whose value is an element id (or a space-separated list of them)

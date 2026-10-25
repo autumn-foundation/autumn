@@ -1,10 +1,11 @@
 //! Isolated test: a Constela document in, bounded memory out (#2626).
 //!
 //! Each case builds a hostile document from a known amplification shape, then
-//! measures the peak live bytes of parse, validate, render and dispatch. The
-//! peak must stay under [`bound`]. Example tests cover the shapes we know;
-//! this test varies their sizes so that a path that keeps bytes without a
-//! charge fails here.
+//! measures the peak live bytes of parse (with validation), render and each
+//! dispatch. Each peak must stay under [`bound`]. The largest-size test
+//! separates the fixed code from the old code by a wide margin. The proptest
+//! varies the sizes; at small sizes a leak can stay under the bound, so it
+//! finds large leaks only.
 //!
 //! Own binary: `allocation-counter` installs a global allocator. See
 //! CLAUDE.md, "Isolated Integration Tests". Counting is per thread.
@@ -22,7 +23,7 @@ const FIXED: u64 = 40 * 1024 * 1024;
 const PER_INPUT_BYTE: u64 = 24;
 
 /// The peak live bytes a case may reach.
-fn bound(source: &str, state_bytes: usize) -> u64 {
+const fn bound(source: &str, state_bytes: usize) -> u64 {
     FIXED + PER_INPUT_BYTE * (source.len() as u64 + state_bytes as u64)
 }
 
@@ -66,7 +67,8 @@ fn read_fan_out(n: usize, blob: usize) -> Case {
     }
 }
 
-/// Finding 2: an `each` of `n` empty portals, each with a long target.
+/// Finding 2: an `each` of `n` empty portals, each with a long target. A
+/// target over 256 bytes fails validation; a shorter one reaches the render.
 fn portal_targets(n: usize, target: usize) -> Case {
     let source = format!(
         r#"{{"version":"1.0",
@@ -159,39 +161,52 @@ fn param_chain(depth: usize, blob: usize) -> Case {
     }
 }
 
-/// Parse, render, and dispatch every action. Errors are expected: a hostile
-/// document should fail, and fail cheaply.
-fn run(case: &Case) {
-    let Ok(document) = Document::parse(&case.source, &Limits::unbounded()) else {
-        return;
-    };
-    let mut ctx = RenderContext {
-        state: document.initial_state(),
-        ..RenderContext::default()
-    };
-    ctx.state
-        .extend(case.state.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let _ = std::hint::black_box(document.render(&ctx));
-    let names: Vec<String> = document
-        .action_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    for name in names {
-        let _ = std::hint::black_box(document.dispatch(&name, &mut ctx.state, &Map::new()));
-    }
-}
-
+/// Measure parse, render and each dispatch as separate steps, and check each
+/// one against the bound. Each step gets its own budget, so each is measured
+/// alone. Errors are expected: a hostile document should fail, and fail
+/// cheaply. The host state is built outside the measured steps.
 fn check(case: &Case) -> Result<(), TestCaseError> {
-    let info = allocation_counter::measure(|| run(case));
     let limit = bound(&case.source, case.state_bytes);
-    prop_assert!(
-        info.bytes_max <= limit,
-        "peak {} bytes, bound {} bytes, source {} bytes",
-        info.bytes_max,
-        limit,
-        case.source.len()
-    );
+    let mut steps = Vec::new();
+
+    let mut parsed = None;
+    let info = allocation_counter::measure(|| {
+        parsed = Document::parse(&case.source, &Limits::unbounded()).ok();
+    });
+    steps.push(("parse".to_string(), info.bytes_max));
+
+    if let Some(document) = parsed {
+        let mut ctx = RenderContext {
+            state: document.initial_state(),
+            ..RenderContext::default()
+        };
+        ctx.state
+            .extend(case.state.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let info = allocation_counter::measure(|| {
+            drop(std::hint::black_box(document.render(&ctx)));
+        });
+        steps.push(("render".to_string(), info.bytes_max));
+
+        for name in document.action_names() {
+            let mut state = ctx.state.clone();
+            let info = allocation_counter::measure(|| {
+                drop(std::hint::black_box(document.dispatch(
+                    name,
+                    &mut state,
+                    &Map::new(),
+                )));
+            });
+            steps.push((format!("dispatch {name}"), info.bytes_max));
+        }
+    }
+
+    for (step, peak) in steps {
+        prop_assert!(
+            peak <= limit,
+            "{step}: peak {peak} bytes, bound {limit} bytes, source {} bytes",
+            case.source.len()
+        );
+    }
     Ok(())
 }
 
@@ -199,6 +214,7 @@ fn cases() -> impl Strategy<Value = Case> {
     prop_oneof![
         (500usize..=2_000, 16usize..=64).prop_map(|(n, kib)| read_fan_out(n, kib * 1024)),
         (1_000usize..=5_000, 1usize..=64).prop_map(|(n, kib)| portal_targets(n, kib * 1024)),
+        (1_000usize..=5_000, 1usize..=256).prop_map(|(n, bytes)| portal_targets(n, bytes)),
         (500usize..=2_000, 8usize..=50).prop_map(|(n, kib)| missing_props(n, kib * 1024)),
         (8usize..=20, 256usize..=1_024).prop_map(|(d, kib)| nested_loops(d, kib * 1024)),
         (8usize..=40, 256usize..=1_024).prop_map(|(d, kib)| param_chain(d, kib * 1024)),
@@ -221,7 +237,8 @@ proptest! {
 fn each_shape_at_its_largest_size_is_bounded() {
     let cases = [
         ("read fan-out", read_fan_out(2_000, 64 * 1024)),
-        ("portal targets", portal_targets(5_000, 64 * 1024)),
+        ("long portal targets", portal_targets(5_000, 64 * 1024)),
+        ("rendered portal targets", portal_targets(5_000, 256)),
         ("missing props", missing_props(2_000, 50 * 1024)),
         ("nested loops", nested_loops(20, 1024 * 1024)),
         ("param chain", param_chain(40, 1024 * 1024)),
@@ -234,8 +251,8 @@ fn each_shape_at_its_largest_size_is_bounded() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// A legitimate document stays well under the bound. Without this, a bound
-/// set too high would pass every hostile case too.
+/// A small, ordinary document uses less than 1 MiB. This checks that the
+/// measurement sees the pipeline at all.
 #[test]
 fn an_ordinary_document_is_far_under_the_bound() {
     let case = Case {
@@ -248,7 +265,16 @@ fn an_ordinary_document_is_far_under_the_bound() {
         state: Map::new(),
         state_bytes: 0,
     };
-    let info = allocation_counter::measure(|| run(&case));
+    let info = allocation_counter::measure(|| {
+        let document = Document::parse(&case.source, &Limits::default()).expect("valid");
+        let ctx = RenderContext {
+            state: document.initial_state(),
+            ..RenderContext::default()
+        };
+        let ui = document.render(&ctx).expect("renders");
+        assert_eq!(ui.body.0, "<p>a</p><p>b</p><p>c</p>");
+    });
+    assert!(info.bytes_max > 0, "the allocator counted nothing");
     assert!(
         info.bytes_max < 1024 * 1024,
         "peak {} bytes",

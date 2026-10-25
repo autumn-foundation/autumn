@@ -51,13 +51,11 @@
     )
 )]
 
-use std::borrow::Cow;
-
 use serde_json::{Map, Value};
 
 use super::ast::{ActionStep, Expr, HttpMethod, StorageArea, StorageOperation, UpdateOperation};
 use super::budget::Budget;
-use super::error::{ConstelaError, Diagnostic, codes};
+use super::error::{ConstelaError, Diagnostic, codes, excerpt};
 use super::eval::{
     Env, EvalCtx, RouteValues, coerce, eval, eval_ref, js_string, number_value, truthy,
 };
@@ -202,13 +200,9 @@ const fn eval_ctx<'c>(
 /// is converted.
 fn kept_text(expr: &Expr, eval_ctx: &EvalCtx<'_>, path: &str) -> Result<String, ConstelaError> {
     let value = eval_ref(expr, eval_ctx, path)?;
-    match coerce(&value, eval_ctx.budget, path)? {
-        Cow::Borrowed(text) => {
-            eval_ctx.budget.charge(text.len(), path)?;
-            Ok(text.to_string())
-        }
-        Cow::Owned(text) => Ok(text),
-    }
+    eval_ctx
+        .budget
+        .own_str(coerce(&value, eval_ctx.budget, path)?, path)
 }
 
 /// Run `steps` against `state`.
@@ -304,7 +298,7 @@ fn run_step(
             // The conversion allocates one string per segment, so the path is
             // charged before it is split.
             ctx.budget.charge_value(&segments, &segments_path)?;
-            let segments = path_segments(&segments);
+            let segments = path_segments(&segments, ctx.depth);
             let value = eval(value, &eval_ctx(state, env, ctx), &format!("{path}.value"))?;
 
             // The depth of the *structure*, not just of the walk. `set_at_path`
@@ -316,17 +310,16 @@ fn run_step(
             // connection to the document that caused it. Refusing the write is
             // the only fix that holds: no legitimate UI addresses a field two
             // hundred thousand levels down.
-            if segments.len() > ctx.depth {
+            let Some(segments) = segments else {
                 return Err(ConstelaError::Render(Diagnostic::new(
                     format!("{path}.path"),
                     codes::RENDER_LIMIT,
                     format!(
-                        "`setPath` path has {} segments, over the {} the depth limit allows",
-                        segments.len(),
+                        "`setPath` path has more than the {} segments the depth limit allows",
                         ctx.depth
                     ),
                 )));
-            }
+            };
 
             // The path's own length plus the value's depth is what the
             // written state ends up nesting to.
@@ -532,7 +525,10 @@ fn check_url(url: &str, path: &str) -> Result<(), ConstelaError> {
         Err(ConstelaError::Render(Diagnostic::new(
             path,
             codes::URL_SCHEME,
-            format!("computed URL {url:?} uses a scheme that is not allowed"),
+            format!(
+                "computed URL {:?} uses a scheme that is not allowed",
+                excerpt(url)
+            ),
         )))
     }
 }
@@ -653,15 +649,29 @@ fn array_index(value: &Value) -> Option<usize> {
 }
 
 /// Read a `setPath` path as segments: an array of values, or a dotted string.
-fn path_segments(value: &Value) -> Vec<String> {
+///
+/// `None` when the path has more than `limit` segments. Checked before the
+/// segments are built, so a long path is refused without one string per
+/// segment.
+fn path_segments(value: &Value, limit: usize) -> Option<Vec<String>> {
     match value {
-        Value::Array(items) => items.iter().map(js_string).collect(),
-        other => js_string(other)
-            .split('.')
-            .filter(|segment| !segment.is_empty())
-            .map(ToString::to_string)
-            .collect(),
+        Value::Array(items) => {
+            (items.len() <= limit).then(|| items.iter().map(js_string).collect())
+        }
+        Value::String(text) => split_segments(text, limit),
+        other => split_segments(&js_string(other), limit),
     }
+}
+
+/// Split a dotted path, keeping at most `limit` non-empty segments.
+fn split_segments(text: &str, limit: usize) -> Option<Vec<String>> {
+    let segments: Vec<String> = text
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .take(limit.saturating_add(1))
+        .map(ToString::to_string)
+        .collect();
+    (segments.len() <= limit).then_some(segments)
 }
 
 /// Write `value` at `segments` within `slot`, creating intermediate objects
@@ -963,12 +973,19 @@ mod tests {
     #[test]
     fn path_segments_accepts_dotted_strings_and_arrays() {
         assert_eq!(
-            path_segments(&json!("a.b.c")),
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            path_segments(&json!("a.b.c"), 8),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
         );
         assert_eq!(
-            path_segments(&json!(["a", 0, "c"])),
-            vec!["a".to_string(), "0".to_string(), "c".to_string()]
+            path_segments(&json!(["a", 0, "c"]), 8),
+            Some(vec!["a".to_string(), "0".to_string(), "c".to_string()])
         );
+    }
+
+    #[test]
+    fn path_segments_refuses_a_path_over_the_limit() {
+        assert_eq!(path_segments(&json!("a.b.c"), 2), None);
+        assert_eq!(path_segments(&json!(["a", "b", "c"]), 2), None);
+        assert!(path_segments(&json!("a.b"), 2).is_some());
     }
 }

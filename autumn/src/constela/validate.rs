@@ -55,10 +55,10 @@ pub const SUPPORTED_VERSIONS: &[&str] = &["1.0"];
 
 /// The most faults one [`ConstelaError::Invalid`] reports.
 ///
-/// A hostile document can hold thousands of faults, and an error is the path
-/// it takes by design. After this many, validation keeps no more and adds one
-/// [`codes::LIMIT`] diagnostic. A generator fixes these and sends the document
-/// again.
+/// A hostile document can have thousands of faults. After this many,
+/// validation keeps no more and adds one [`codes::LIMIT`] diagnostic, so the
+/// list holds at most `MAX_DIAGNOSTICS + 1` entries. The generator must fix
+/// these faults and send the document again.
 pub const MAX_DIAGNOSTICS: usize = 256;
 
 /// What is in lexical scope at a point in the view tree.
@@ -89,6 +89,9 @@ struct Scope<'a> {
     /// an ordering mistake, not a payload key, and it is caught against
     /// [`Validator::action_results`].
     allow_unbound_vars: bool,
+    /// Whether this node can render more than one time: inside an `each`
+    /// body, and not under an `if` there. A literal `id` here repeats.
+    repeats: bool,
 }
 
 impl Scope<'_> {
@@ -99,6 +102,7 @@ impl Scope<'_> {
             params: None,
             in_component: false,
             allow_unbound_vars: false,
+            repeats: false,
         }
     }
 }
@@ -352,6 +356,7 @@ impl<'a> Validator<'a> {
             params: None,
             in_component: false,
             allow_unbound_vars: true,
+            repeats: false,
         };
 
         match step {
@@ -619,6 +624,7 @@ impl<'a> Validator<'a> {
                 params: Some(&component.params),
                 in_component: true,
                 allow_unbound_vars: false,
+                repeats: false,
             };
             self.check_node(
                 &component.view,
@@ -742,10 +748,14 @@ impl<'a> Validator<'a> {
                 otherwise,
             } => {
                 self.check_expr(condition, &format!("{path}.condition"), scope);
+                // A branch can select one pass of a loop, so a literal id in
+                // it is not a sure repeat. The render-time check covers it.
+                let repeats = std::mem::replace(&mut scope.repeats, false);
                 self.check_node(then, &format!("{path}.then"), scope);
                 if let Some(otherwise) = otherwise {
                     self.check_node(otherwise, &format!("{path}.else"), scope);
                 }
+                scope.repeats = repeats;
             }
             Node::Each {
                 items,
@@ -943,7 +953,9 @@ impl<'a> Validator<'a> {
         if let Some(key) = key {
             self.check_expr(key, &format!("{path}.key"), scope);
         }
+        let repeats = std::mem::replace(&mut scope.repeats, true);
         self.check_node(body, &format!("{path}.body"), scope);
+        scope.repeats = repeats;
         scope.vars.truncate(restore);
     }
 
@@ -1062,6 +1074,19 @@ impl<'a> Validator<'a> {
                 }
                 if policy::is_url_attr(&canonical) {
                     self.check_literal_url(expr, path);
+                }
+                // Found here, not only at render time: a loop over a list that
+                // is empty now renders, and fails later when the list grows.
+                if canonical == "id"
+                    && scope.repeats
+                    && let Expr::Lit { value } = expr
+                    && value.as_str().is_some_and(|id| !id.is_empty())
+                {
+                    self.error(
+                        path,
+                        codes::DUPLICATE,
+                        "a literal id in an `each` body repeats on each pass; set \"index\": \"i\" on the `each` and build the id with `concat`",
+                    );
                 }
                 self.check_expr(expr, path, scope);
             }

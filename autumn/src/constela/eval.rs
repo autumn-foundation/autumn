@@ -111,8 +111,7 @@ impl<'a> From<Cow<'a, Value>> for Bound<'a> {
 ///
 /// Cloned when entering a component or a loop body, so a nested scope can
 /// never leak a binding back out to its parent. A clone copies no value: a
-/// loop pass shares the outer bindings. Before #2626 each pass copied every
-/// outer binding, so nested loops over one large row kept `depth²` copies.
+/// loop pass shares the outer bindings.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Env<'a> {
     /// Parameters of the innermost enclosing component, empty at the top level.
@@ -243,7 +242,9 @@ pub fn text_of(value: &Value) -> String {
 }
 
 /// [`js_string`], without a copy for a string. Another value is charged to
-/// `budget` before it is converted, because the conversion allocates.
+/// `budget` before it is converted, because the conversion allocates. The
+/// result is then owned and already charged: a caller that keeps it charges
+/// only a borrowed result.
 pub(crate) fn coerce<'v>(
     value: &'v Value,
     budget: &Budget,
@@ -492,11 +493,16 @@ pub(crate) fn eval_ref<'a>(
             let mut out = String::new();
             for (i, item) in items.iter().enumerate() {
                 let value = eval_ref(item, &inner, &format!("{path}.items[{i}]"))?;
-                let piece = text_coerce(&value, ctx.budget, path)?;
                 // Charged per piece, so the string is refused as it grows
-                // rather than after it is whole.
-                ctx.budget.charge(piece.len(), path)?;
-                out.push_str(&piece);
+                // rather than after it is whole. A converted piece was
+                // charged when it was converted.
+                match text_coerce(&value, ctx.budget, path)? {
+                    Cow::Borrowed(piece) => {
+                        ctx.budget.charge(piece.len(), path)?;
+                        out.push_str(piece);
+                    }
+                    Cow::Owned(piece) => out.push_str(&piece),
+                }
             }
             Ok(Cow::Owned(Value::String(out)))
         }
@@ -669,8 +675,14 @@ fn eval_binary<'a>(
             } else {
                 let left = coerce(&left, ctx.budget, path)?;
                 let right = coerce(&right, ctx.budget, path)?;
+                // A converted operand was charged when it was converted.
+                let borrowed = |text: &Cow<'_, str>| match text {
+                    Cow::Borrowed(text) => text.len(),
+                    Cow::Owned(_) => 0,
+                };
+                ctx.budget
+                    .charge(borrowed(&left).saturating_add(borrowed(&right)), path)?;
                 let len = left.len().saturating_add(right.len());
-                ctx.budget.charge(len, path)?;
                 let mut joined = String::with_capacity(len);
                 joined.push_str(&left);
                 joined.push_str(&right);

@@ -55,15 +55,15 @@
 )]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use maud::{Markup, PreEscaped};
 use serde_json::{Map, Value};
 
 use super::ast::{EventHandler, Expr, Node, PayloadSpec, Prop};
-use super::budget::{Budget, Output};
-use super::error::{ConstelaError, Diagnostic, codes};
+use super::budget::{Budget, ChargingWriter, Output};
+use super::error::{ConstelaError, Diagnostic, codes, excerpt};
 use super::eval::{Bound, Env, EvalCtx, RouteValues, eval_ref, text_coerce, truthy};
 use super::policy;
 
@@ -254,10 +254,9 @@ pub struct Renderer<'a> {
     /// Markup bytes, for the body and every portal together. Each write goes
     /// through it. See [`Output`].
     output: &'a Output,
-    /// Each element id this render wrote, prefixed. A second write of one id
-    /// is an error: HTML ids are unique, and a `<label for>` finds only the
-    /// first.
-    ids: BTreeSet<String>,
+    /// Each element id this render wrote, prefixed, and the path of its first
+    /// use. See [`Self::record_id`].
+    ids: BTreeMap<String, String>,
 }
 
 /// Render `document` against `ctx`.
@@ -280,7 +279,7 @@ pub fn render(
         portals: Vec::new(),
         budget: &budget,
         output: &output,
-        ids: BTreeSet::new(),
+        ids: BTreeMap::new(),
     };
     let env = Env::default();
 
@@ -641,28 +640,18 @@ impl<'a> Renderer<'a> {
         out: &mut String,
     ) -> Result<(), ConstelaError> {
         let items = self.eval_ref(items, env, &format!("{path}.items"), depth)?;
-        // A non-list renders nothing. Upstream's client runtime would throw
-        // here; rendering an empty list is the behaviour that degrades a
-        // generated page rather than losing it.
-        let Value::Array(list) = &*items else {
-            return Ok(());
-        };
-        if list.len() > self.ctx.limits.max_each_items {
-            return Err(ConstelaError::Render(Diagnostic::new(
-                path,
-                codes::RENDER_LIMIT,
-                format!(
-                    "`each` would iterate {} times, over the {} limit",
-                    list.len(),
-                    self.ctx.limits.max_each_items
-                ),
-            )));
-        }
         let passes: Box<dyn Iterator<Item = Bound<'_>> + '_> = match items {
-            Cow::Borrowed(Value::Array(list)) => Box::new(list.iter().map(Bound::Borrowed)),
+            Cow::Borrowed(Value::Array(list)) => {
+                self.check_iterations(list.len(), path)?;
+                Box::new(list.iter().map(Bound::Borrowed))
+            }
             Cow::Owned(Value::Array(list)) => {
+                self.check_iterations(list.len(), path)?;
                 Box::new(list.into_iter().map(|item| Bound::Shared(Rc::new(item))))
             }
+            // A non-list renders nothing. Upstream's client runtime would
+            // throw here; rendering an empty list is the behaviour that
+            // degrades a generated page rather than losing it.
             _ => return Ok(()),
         };
         for (i, item) in passes.enumerate() {
@@ -671,6 +660,22 @@ impl<'a> Renderer<'a> {
                 inner = inner.with_var(index_name, Bound::Shared(Rc::new(Value::from(i))));
             }
             self.node(body, &inner, slot, &format!("{path}.body[{i}]"), depth, out)?;
+        }
+        Ok(())
+    }
+
+    /// Fail if an `each` would run more than [`RenderLimits::max_each_items`]
+    /// passes.
+    fn check_iterations(&self, len: usize, path: &str) -> Result<(), ConstelaError> {
+        if len > self.ctx.limits.max_each_items {
+            return Err(ConstelaError::Render(Diagnostic::new(
+                path,
+                codes::RENDER_LIMIT,
+                format!(
+                    "`each` would iterate {len} times, over the {} limit",
+                    self.ctx.limits.max_each_items
+                ),
+            )));
         }
         Ok(())
     }
@@ -788,6 +793,9 @@ impl<'a> Renderer<'a> {
                     }
                     let attr_path = format!("{path}.props.{raw_name}");
                     let value = self.eval_ref(expr, env, &attr_path, depth)?;
+                    if name == "id" && !self.record_id(&value, &attr_path)? {
+                        continue;
+                    }
                     if let Some(rendered) =
                         self.attribute_value(&name, &value, pending, &attr_path)?
                     {
@@ -802,7 +810,7 @@ impl<'a> Renderer<'a> {
             attrs.push(("data-constela-ref".to_string(), Some(escape_attr(name))));
         }
         for (_, handler) in &handlers {
-            self.push_handler_attrs(handler, env, path, depth, &mut attrs)?;
+            self.push_handler_attrs(handler, env, path, depth, &mut attrs, &mut pending)?;
         }
         harden_blank_target(&mut attrs);
 
@@ -816,10 +824,6 @@ impl<'a> Renderer<'a> {
             .fold(0usize, usize::saturating_add);
         self.output
             .check(attr_bytes.saturating_add(tag.len()).saturating_add(2), path)?;
-
-        if let Some((_, Some(id))) = attrs.iter().find(|(name, _)| name == "id") {
-            self.record_id(id, path)?;
-        }
 
         self.write(out, "<", path)?;
         self.write(out, &tag, path)?;
@@ -865,27 +869,56 @@ impl<'a> Renderer<'a> {
         self.write(out, ">", path)
     }
 
-    /// Record a rendered id, or fail if this render already wrote it.
+    /// Check an element id, and record it for the whole render. Returns
+    /// whether to write the attribute.
     ///
-    /// The set is kept for the whole render, so each entry charges the
-    /// budget. An empty id names nothing and is not recorded.
-    fn record_id(&mut self, id: &str, path: &str) -> Result<(), ConstelaError> {
+    /// `false`, `null`, `true` and `""` name no element, so the attribute is
+    /// omitted. An id with whitespace is an error: an id is one token. A
+    /// second element with the same id is an error: HTML ids are unique, and a
+    /// `<label for>` finds only the first. Ids are not renamed per call; see
+    /// ADR 0025.
+    ///
+    /// The map is kept for the whole render, so each entry charges the
+    /// budget.
+    fn record_id(&mut self, value: &Value, path: &str) -> Result<bool, ConstelaError> {
+        let id = match value {
+            Value::Bool(_) | Value::Null => return Ok(false),
+            other => self.text(other, path)?,
+        };
         if id.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        if self.ids.contains(id) {
+        if id.chars().any(char::is_whitespace) {
             return Err(ConstelaError::Render(Diagnostic::new(
-                format!("{path}.props.id"),
+                path,
+                codes::EVAL,
+                format!("id {:?} has whitespace; an id is one token", excerpt(&id)),
+            )));
+        }
+        let prefix = &self.ctx.id_prefix;
+        self.budget.charge(
+            prefix
+                .len()
+                .saturating_add(id.len())
+                .saturating_add(path.len())
+                .saturating_add(2 * size_of::<String>()),
+            path,
+        )?;
+        let rendered = format!("{prefix}{id}");
+        if let Some(first) = self.ids.get(&rendered) {
+            return Err(ConstelaError::Render(Diagnostic::new(
+                path,
                 codes::DUPLICATE,
                 format!(
-                    "id {id:?} is rendered more than once; an id must be unique, so pass it as a component param or derive it from the loop index"
+                    "id {:?} (rendered {:?}) is already used at {}; give each use its own id: pass a different param value to each use, or build it from the loop index",
+                    excerpt(&id),
+                    excerpt(&rendered),
+                    excerpt(first)
                 ),
             )));
         }
-        self.budget
-            .charge(id.len().saturating_add(size_of::<String>()), path)?;
-        self.ids.insert(id.to_string());
-        Ok(())
+        self.ids.insert(rendered, path.to_string());
+        Ok(true)
     }
 
     /// Turn an evaluated prop into an escaped attribute value, or `None` to
@@ -917,7 +950,10 @@ impl<'a> Renderer<'a> {
             return Err(ConstelaError::Render(Diagnostic::new(
                 path,
                 codes::URL_SCHEME,
-                format!("computed URL {text:?} uses a scheme that is not allowed"),
+                format!(
+                    "computed URL {:?} uses a scheme that is not allowed",
+                    excerpt(&text)
+                ),
             )));
         }
 
@@ -926,7 +962,12 @@ impl<'a> Renderer<'a> {
             .check(pending.saturating_add(text.len()), path)?;
 
         let text = if policy::is_id_ref_attr(name) {
-            Cow::Owned(prefix_id_refs(&self.ctx.id_prefix, &text))
+            let prefix = &self.ctx.id_prefix;
+            // Measured first: a value of many short ids grows by one prefix
+            // per id.
+            self.output
+                .check(pending.saturating_add(prefixed_len(prefix, &text)), path)?;
+            Cow::Owned(prefix_id_refs(prefix, &text))
         } else if policy::is_url_attr(name) {
             prefix_fragment_link(&self.ctx.id_prefix, text)
         } else {
@@ -947,6 +988,7 @@ impl<'a> Renderer<'a> {
         path: &str,
         depth: usize,
         attrs: &mut Vec<(String, Option<String>)>,
+        pending: &mut usize,
     ) -> Result<(), ConstelaError> {
         let event = policy::canonical_event(&handler.event);
         if event.is_empty() {
@@ -958,34 +1000,28 @@ impl<'a> Renderer<'a> {
         ));
         if let Some(payload) = &handler.payload {
             let payload_path = format!("{path}.payload");
-            // Serialized from borrowed values, so no value is copied. The
-            // serialized text is kept, so each value charges the budget
-            // before it is written out.
+            // Serialized from borrowed values, so no value is copied. The text
+            // is kept, so it charges the budget for each chunk as it is
+            // written.
+            let writer = ChargingWriter::new(self.budget, &payload_path);
             let serialized = match payload {
                 PayloadSpec::Single(expr) => {
                     let value = self.eval_ref(expr, env, &payload_path, depth)?;
-                    self.budget.charge_value(&value, &payload_path)?;
-                    serde_json::to_string(&*value)
+                    writer.serialize(&value)?
                 }
                 PayloadSpec::Map(props) => {
                     let mut map = BTreeMap::new();
                     for (key, expr) in props {
                         let entry_path = format!("{payload_path}.{key}");
-                        let value = self.eval_ref(expr, env, &entry_path, depth)?;
-                        self.budget.charge(key.len(), &entry_path)?;
-                        self.budget.charge_value(&value, &entry_path)?;
-                        map.insert(key.as_str(), value);
+                        map.insert(key.as_str(), self.eval_ref(expr, env, &entry_path, depth)?);
                     }
-                    serde_json::to_string(&map)
+                    writer.serialize(&map)?
                 }
-            }
-            .map_err(|err| {
-                ConstelaError::Render(Diagnostic::new(
-                    payload_path.as_str(),
-                    codes::EVAL,
-                    format!("payload could not be serialized: {err}"),
-                ))
-            })?;
+            };
+            let escaped_bytes = escaped_len(&serialized);
+            self.output
+                .check(pending.saturating_add(escaped_bytes), &payload_path)?;
+            *pending = pending.saturating_add(escaped_bytes);
             attrs.push((
                 format!("data-constela-payload-{event}"),
                 Some(escape_attr(&serialized)),
@@ -1081,13 +1117,27 @@ fn prefix_fragment_link<'t>(prefix: &str, value: Cow<'t, str>) -> Cow<'t, str> {
     }
 }
 
-/// Prefix each whitespace-separated id in `value`.
-fn prefix_id_refs(prefix: &str, value: &str) -> String {
+/// The length of `prefix_id_refs(prefix, value)`, measured without building
+/// it.
+fn prefixed_len(prefix: &str, value: &str) -> usize {
     value
         .split_whitespace()
-        .map(|id| format!("{prefix}{id}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .map(|id| prefix.len().saturating_add(id.len()).saturating_add(1))
+        .fold(0usize, usize::saturating_add)
+        .saturating_sub(1)
+}
+
+/// Prefix each whitespace-separated id in `value`, into one buffer.
+fn prefix_id_refs(prefix: &str, value: &str) -> String {
+    let mut out = String::with_capacity(prefixed_len(prefix, value));
+    for id in value.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(prefix);
+        out.push_str(id);
+    }
+    out
 }
 
 /// Give every `target="_blank"` link `rel="noopener noreferrer"`.
@@ -1149,6 +1199,13 @@ mod tests {
         assert_eq!(prefix_id_refs("c-", "a"), "c-a");
         assert_eq!(prefix_id_refs("c-", "a  b"), "c-a c-b");
         assert_eq!(prefix_id_refs("c-", ""), "");
+        for value in ["", "a", "a  b", " a b c "] {
+            assert_eq!(
+                prefixed_len("c-", value),
+                prefix_id_refs("c-", value).len(),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

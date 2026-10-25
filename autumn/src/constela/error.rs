@@ -103,7 +103,23 @@ impl Diagnostic {
     }
 }
 
+/// The first bytes of `text`, at most 256 and cut at a character boundary.
+///
+/// For a message that quotes a value: format the excerpt, not the value, so a
+/// large value is not copied into a message that is then cut.
+pub(crate) fn excerpt(text: &str) -> &str {
+    const MAX: usize = 256;
+    let mut end = text.len().min(MAX);
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text.get(..end).unwrap_or_default()
+}
+
 /// Cut `text` to [`MAX_DIAGNOSTIC_FIELD_BYTES`], at a character boundary.
+///
+/// The caller formats the full text first. That copy is short-lived; only the
+/// cut text is kept.
 fn clip(mut text: String) -> String {
     const MARK: &str = "…";
     if text.len() <= MAX_DIAGNOSTIC_FIELD_BYTES {
@@ -114,8 +130,8 @@ fn clip(mut text: String) -> String {
         end = end.saturating_sub(1);
     }
     text.truncate(end);
-    text.shrink_to_fit();
     text.push_str(MARK);
+    text.shrink_to_fit();
     text
 }
 
@@ -239,6 +255,15 @@ mod tests {
         assert!(d.message.len() <= MAX_DIAGNOSTIC_FIELD_BYTES);
         assert!(d.path.ends_with('…'));
         assert!(d.message.starts_with("mmm"));
+    }
+
+    #[test]
+    fn an_excerpt_is_short_and_whole_characters() {
+        assert_eq!(excerpt("short"), "short");
+        let long = "€".repeat(200);
+        let cut = excerpt(&long);
+        assert!(cut.len() <= 256);
+        assert!(cut.chars().all(|c| c == '€'));
     }
 
     #[test]

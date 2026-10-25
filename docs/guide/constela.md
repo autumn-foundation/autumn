@@ -145,11 +145,16 @@ Association inside the fragment keeps working; collision with the host page
 becomes impossible.
 
 An id must be unique in one render. If two elements get the same id, the
-render fails with `constela.duplicate`. This occurs when a component with a
-literal `id` is used two times, or when a loop body has one. Pass the id as a
-component param, or derive it from the loop index
-(`concat("row-", var i)`). We do not rename ids for you: a renamed id changes
-when the document changes, and the host page cannot then target `#c-email`.
+render fails with `constela.duplicate`. This occurs when you use a component
+with a literal `id` two times. Validation also rejects an element with a
+literal `id` in a loop body. Give each use its own id: pass a different param
+value to each use, or set `"index": "i"` on the `each` and build the id with
+`concat`. The renderer does not rename ids. A renamed id changes when the
+document changes. Then the host page cannot find `#c-email`.
+
+An id must be one token, so a value with whitespace fails with
+`constela.eval`. `true` and `""` name no element, so the attribute is
+omitted, as for `false` and `null`.
 
 If a page embeds more
 than one document, give each its own prefix:
@@ -351,12 +356,13 @@ single expression may *build* — `concat`, `array`, `obj` and string `+` assemb
 a finished value inside the evaluator before any of it reaches the output
 buffer, so bounding only the output would leave the allocation unbounded.
 
-The same 4 MiB also bounds what one render or one dispatch *keeps*: each
-value an expression builds or copies, route metadata, handler payloads, portal
-targets and rendered ids. A read that only shows a value borrows it and costs
-nothing. A copy costs its size, for example `set t = state(blob)`. One budget
-covers all of these, in `constela::budget`, so a new path that keeps bytes
-goes through the same check (issue #2626).
+The same 4 MiB also bounds what one render *keeps*: each value an expression
+builds or copies, route metadata, handler payloads, portal targets and
+rendered ids. A dispatch always uses 4 MiB. A read that only shows a string
+does not copy it, and does not charge the budget. A copy costs about its JSON
+size, for example `set t = state(blob)`. A number or a list shown as text
+costs the text it makes. The module `constela::budget` holds this one
+budget. Each new path that keeps bytes must charge it (issue #2626).
 
 Two more bounds apply at validation. A portal `target` is at most 256 bytes. A
 failed validation reports at most 256 faults (`MAX_DIAGNOSTICS`), and then one

@@ -13,8 +13,8 @@ must treat each document as hostile. Before this ADR, the module had several
 separate bounds: parse `Limits`, `RenderLimits`, and an allocation budget for
 values that `concat`, `array`, `obj` and string `+` build.
 
-Each bound was added for one path. Review of #2623 found four paths that kept
-document-controlled bytes and did not pass a bound:
+Each bound was added for one path. Review of #2623 found three paths that
+kept document bytes without a bound. It also found one accessibility bug:
 
 1. A `state`, `var` or `param` read copied its value and charged nothing.
 2. Each rendered portal kept a copy of its `target` string.
@@ -22,7 +22,8 @@ document-controlled bytes and did not pass a bound:
 4. A component with a literal `id`, used two times, rendered the same id two
    times.
 
-Items 1 to 3 are memory exhaustion. Item 4 is an accessibility bug.
+The memory test for this ADR found two more paths. Each loop pass copied
+every outer binding, and each component call copied its params.
 
 ## Decision
 
@@ -62,27 +63,43 @@ use an allowlist. Validation rejects a target longer than
 `MAX_PORTAL_TARGET_BYTES` (256). Each rendered portal also charges its target
 and a fixed overhead to the budget.
 
-### Duplicate ids are a render error
+### Duplicate ids are an error
 
 The renderer records each rendered `id`. A second element with the same id
-stops the render with `constela.duplicate`.
+stops the render with `constela.duplicate`. The message gives the document id,
+the rendered id, and the path of the first use.
+
+Validation also rejects a literal `id` in an `each` body, when no `if` is
+between them. A loop over an empty list renders, so only validation can find
+this before the list grows.
+
+An id must be one token, so a value with whitespace stops the render with
+`constela.eval`. `true` and `""` name no element, so the attribute is omitted,
+as for `false` and `null`.
 
 We compared these options:
 
 | Option | Result |
 | --- | --- |
 | Scope ids per component call or loop pass | Rejected. Ids change when the document changes. A host that targets `#c-email` with htmx or CSS breaks. A `for` that points out of the scope breaks. |
-| Reject at validation | Rejected. Validation cannot see computed ids or loop counts. |
-| Reject at render | **Accepted.** HTML requires unique ids. The error tells the generator to pass the id as a param or derive it from the loop index. The id to host mapping stays `prefix + id`. |
+| Reject at validation only | Rejected. Validation cannot see computed ids or loop counts. |
+| Reject at render, and reject sure repeats at validation | **Accepted.** HTML requires unique ids in one page; this check covers one render. A rendered id is always `id_prefix` followed by the document id. |
 
 ## Consequences
 
 - A new path that copies or keeps a value must call the budget. The memory
   property test (`autumn/tests/constela_memory.rs`) and the `constela` fuzz
-  target fail when a path does not.
-- Reads now count against the budget. An action that copies a state value
-  larger than 4 MiB fails. Before, the copy was free.
+  target can find a path that does not. They do not prove that each path
+  charges.
+- Copies now count against the budget. A read that only shows a value does
+  not. An action that copies a state value larger than 4 MiB fails. Before,
+  the copy was free.
 - A document that rendered duplicate ids now fails. The migration guide
   (`docs/migrations/next.md`) gives the fix.
-- Paths are still built as strings for each node. A very long key makes each
-  path long. This costs CPU, not retained memory. A follow-up issue tracks it.
+- The budget bounds what is kept, not the work done. Paths are still built
+  as strings for each node, so a very long key makes each path long, and
+  comparisons are not metered. With the default `Limits` this costs CPU.
+  Under `Limits::unbounded()` it also costs memory. Issue #3445 tracks a work
+  meter and lazy paths.
+- A `markdown` node is checked on its source length. The shared sanitizer is
+  quadratic on deep nesting. Issue #3446 tracks it.

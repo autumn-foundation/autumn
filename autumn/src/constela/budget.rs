@@ -2,8 +2,9 @@
 //!
 //! Each copy of a value, and each value that the pipeline keeps, charges a
 //! [`Budget`] **before** it allocates. A new path that copies or keeps bytes
-//! calls this module, or the memory property test
-//! (`autumn/tests/constela_memory.rs`) fails. See
+//! must call this module. The memory property test
+//! (`autumn/tests/constela_memory.rs`) and the `constela` fuzz target can find
+//! a path that does not. They do not prove that each path charges. See
 //! `docs/adr/0025-constela-retention-accounting.md`.
 //!
 //! Two meters, because they bound two different things:
@@ -41,8 +42,12 @@ use serde_json::Value;
 
 use super::error::{ConstelaError, Diagnostic, codes};
 
-/// The bytes one value slot costs, before its contents.
-pub const SLOT_BYTES: usize = size_of::<Value>();
+/// The nominal bytes one value slot costs, before its contents.
+///
+/// Nominal, not `size_of::<Value>()`: with this weight a charge stays near the
+/// JSON size of the value, which is what a document author can see. The
+/// bound stays linear in the real size, which is what it is for.
+pub const SLOT_BYTES: usize = 8;
 
 /// Bytes that a render or a dispatch may build, copy or keep.
 ///
@@ -97,18 +102,73 @@ impl Budget {
         }
     }
 
-    /// Own `text`. Borrowed text is charged, then copied.
+    /// Own `text`. Borrowed text is charged, then copied. Owned text was
+    /// charged when it was built.
     pub fn own_str(&self, text: Cow<'_, str>, path: &str) -> Result<String, ConstelaError> {
         match text {
-            Cow::Owned(text) => {
-                self.charge(text.len(), path)?;
-                Ok(text)
-            }
+            Cow::Owned(text) => Ok(text),
             Cow::Borrowed(text) => {
                 self.charge(text.len(), path)?;
                 Ok(text.to_string())
             }
         }
+    }
+}
+
+/// A JSON writer that charges a [`Budget`] for each chunk before it keeps it.
+///
+/// For text whose size is known only while it is written, such as a
+/// serialized payload. The charge is exact.
+pub struct ChargingWriter<'b> {
+    budget: &'b Budget,
+    path: &'b str,
+    out: Vec<u8>,
+    refused: Option<ConstelaError>,
+}
+
+impl<'b> ChargingWriter<'b> {
+    /// A writer that charges `budget`, and reports at `path`.
+    pub const fn new(budget: &'b Budget, path: &'b str) -> Self {
+        Self {
+            budget,
+            path,
+            out: Vec::new(),
+            refused: None,
+        }
+    }
+
+    /// Serialize `value`, charging each chunk as it is written.
+    ///
+    /// # Errors
+    ///
+    /// [`codes::RENDER_LIMIT`] when the text goes over the budget, or
+    /// [`codes::EVAL`] when the value cannot be serialized.
+    pub fn serialize(mut self, value: &impl serde::Serialize) -> Result<String, ConstelaError> {
+        let written = serde_json::to_writer(&mut self, value);
+        if let Some(refused) = self.refused {
+            return Err(refused);
+        }
+        let path = self.path;
+        let failed =
+            |message: String| ConstelaError::Render(Diagnostic::new(path, codes::EVAL, message));
+        written.map_err(|err| failed(format!("value could not be serialized: {err}")))?;
+        String::from_utf8(self.out)
+            .map_err(|err| failed(format!("serialized value is not UTF-8: {err}")))
+    }
+}
+
+impl std::io::Write for ChargingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Err(refused) = self.budget.charge(buf.len(), self.path) {
+            self.refused = Some(refused);
+            return Err(std::io::Error::other("allocation budget spent"));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -169,22 +229,23 @@ pub fn approx_bytes(value: &Value, cap: usize) -> usize {
     let mut stack = vec![value];
     while let Some(current) = stack.pop() {
         total = total.saturating_add(match current {
-            Value::Null | Value::Bool(_) | Value::Number(_) => 8,
+            Value::Null | Value::Bool(_) | Value::Number(_) => SLOT_BYTES,
             Value::String(text) => text.len(),
-            Value::Array(items) => {
-                stack.extend(items.iter());
-                SLOT_BYTES.saturating_mul(items.len())
-            }
-            Value::Object(entries) => {
-                stack.extend(entries.iter().map(|(_, value)| value));
-                entries
-                    .keys()
-                    .map(|key| key.len().saturating_add(SLOT_BYTES))
-                    .fold(0usize, usize::saturating_add)
-            }
+            Value::Array(items) => SLOT_BYTES.saturating_mul(items.len()),
+            Value::Object(entries) => entries
+                .keys()
+                .map(|key| key.len().saturating_add(SLOT_BYTES))
+                .fold(0usize, usize::saturating_add),
         });
+        // Checked before the children are stacked, so a huge container is
+        // refused without a stack entry for each child.
         if total > cap {
             return total;
+        }
+        match current {
+            Value::Array(items) => stack.extend(items.iter()),
+            Value::Object(entries) => stack.extend(entries.iter().map(|(_, value)| value)),
+            _ => {}
         }
     }
     total
@@ -235,6 +296,28 @@ mod tests {
     }
 
     #[test]
+    fn a_charging_writer_charges_the_exact_text() {
+        let budget = Budget::new(100);
+        let text = ChargingWriter::new(&budget, "p")
+            .serialize(&json!({"a": "x\"y"}))
+            .expect("fits");
+        assert_eq!(text, r#"{"a":"x\"y"}"#);
+        budget
+            .charge(100 - text.len(), "p")
+            .expect("charged exactly");
+        budget.charge(1, "p").expect_err("nothing left");
+    }
+
+    #[test]
+    fn a_charging_writer_stops_at_the_budget() {
+        let budget = Budget::new(10);
+        let err = ChargingWriter::new(&budget, "p")
+            .serialize(&json!("x".repeat(100)))
+            .expect_err("over");
+        assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    }
+
+    #[test]
     fn output_counts_every_buffer_against_one_limit() {
         let output = Output::new(8);
         let mut body = String::new();
@@ -251,7 +334,7 @@ mod tests {
     #[test]
     fn approx_bytes_counts_strings_keys_and_slots() {
         let value = json!({"ab": ["xyz", 1]});
-        let expected = (2 + SLOT_BYTES) + 2 * SLOT_BYTES + 3 + 8;
+        let expected = (2 + SLOT_BYTES) + 2 * SLOT_BYTES + 3 + SLOT_BYTES;
         assert_eq!(approx_bytes(&value, usize::MAX), expected);
     }
 
