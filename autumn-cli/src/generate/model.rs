@@ -4496,7 +4496,7 @@ mod tests {
             let ctx = SchemaContext::from_tables(&desired.tables, &baseline);
             let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
             assert!(
-                up.contains("as plain TEXT"),
+                up.contains("writes a new decimal CHECK for column(s) price."),
                 "the up SQL has no advisory: {up}"
             );
             conn.batch_execute(&up).expect("apply the rebuild");
