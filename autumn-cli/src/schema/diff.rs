@@ -7949,6 +7949,131 @@ PRAGMA foreign_keys=ON;
         assert!(up.contains("ADD COLUMN bio TEXT NULL"), "{up}");
     }
 
+    // -- #2598: the SQLite decimal CHECK on the declarative lane -------------
+
+    const PRICE: ColumnType = ColumnType::Decimal {
+        precision: 10,
+        scale: 2,
+    };
+
+    /// The generator's `CHECK` for `price decimal{10,2}`: the one builder both
+    /// lanes share.
+    fn price_check() -> String {
+        crate::generate::schema_edit::sqlite_decimal_check("price", 10, 2)
+    }
+
+    /// `CREATE TABLE` and `ADD COLUMN` on `SQLite` put the generator's decimal
+    /// `CHECK` on the column, byte for byte. Postgres gets `NUMERIC` and no
+    /// `CHECK`.
+    #[test]
+    fn sqlite_decimal_column_renders_the_generator_check() {
+        let table = sqlite_table("products", vec![col("price", PRICE)], vec![]);
+        let mut cost = col("cost", PRICE);
+        cost.nullable = true;
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![
+                SchemaChange::CreateTable(table.clone()),
+                SchemaChange::AddColumn {
+                    table: "products".to_owned(),
+                    column: cost,
+                },
+            ],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains(&format!("    price TEXT NOT NULL {}", price_check())),
+            "CREATE TABLE carries the generator CHECK: {up}"
+        );
+        let cost_check = crate::generate::schema_edit::sqlite_decimal_check("cost", 10, 2);
+        assert!(
+            up.contains(&format!("ADD COLUMN cost TEXT NULL {cost_check};")),
+            "ADD COLUMN carries the generator CHECK: {up}"
+        );
+
+        let mut pg_table = table;
+        pg_table.backend = Backend::Postgres;
+        let pg = emit_create_table(&pg_table, Backend::Postgres);
+        assert!(pg.contains("price NUMERIC(10,2) NOT NULL"), "{pg}");
+        assert!(!pg.contains("CHECK"), "Postgres needs no CHECK: {pg}");
+    }
+
+    /// A rebuild for an unrelated change keeps the decimal `CHECK`, also when
+    /// the baseline lost the decimal shape: `--dev-url` and `schema pull` read
+    /// the column back as plain `TEXT`, and an old snapshot has the `{12, 2}`
+    /// default. The desired shape decides the `CHECK` in both legs.
+    #[test]
+    fn sqlite_rebuild_keeps_the_desired_decimal_check() {
+        let stale = ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        };
+        for baseline_ty in [PRICE, ColumnType::Text, stale] {
+            let baseline = sqlite_table(
+                "products",
+                vec![col("views", ColumnType::Int32), col("price", baseline_ty.clone())],
+                vec![],
+            );
+            let desired = sqlite_table(
+                "products",
+                vec![col("views", ColumnType::Int64), col("price", PRICE)],
+                vec![],
+            );
+            let plan = diff_schema(
+                std::slice::from_ref(&baseline),
+                &parsed(vec![desired.clone()], vec![]),
+                DiffOptions::default(),
+            );
+            assert_eq!(
+                plan.changes.len(),
+                1,
+                "only `views` changes for a `{baseline_ty:?}` baseline: {:?}",
+                plan.changes
+            );
+            let ctx = SchemaContext::from_tables(
+                std::slice::from_ref(&desired),
+                std::slice::from_ref(&baseline),
+            );
+            let stale_check = crate::generate::schema_edit::sqlite_decimal_check("price", 12, 2);
+            for (leg, sql) in [
+                ("up", emit_up_sql_with_context(&plan, &ctx).expect("emit up")),
+                ("down", emit_down_sql_with_context(&plan, &ctx).expect("emit down")),
+            ] {
+                assert!(
+                    sql.contains(&format!("    price TEXT NOT NULL {}", price_check())),
+                    "the {leg} rebuild keeps the CHECK for a `{baseline_ty:?}` baseline: {sql}"
+                );
+                assert!(
+                    !sql.contains(&stale_check),
+                    "the {leg} rebuild does not use the stale shape: {sql}"
+                );
+            }
+        }
+    }
+
+    /// The desired decimal shape replaces only a column of the same storage
+    /// class. A real type change (`INTEGER` to `TEXT`) stays the baseline type
+    /// in the down leg.
+    #[test]
+    fn sqlite_rebuild_down_leg_keeps_a_changed_column_type() {
+        let baseline = sqlite_table("products", vec![col("price", ColumnType::Int64)], vec![]);
+        let desired = sqlite_table("products", vec![col("price", PRICE)], vec![]);
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            DiffOptions::default(),
+        );
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        assert!(up.contains(&price_check()), "the up leg adds the CHECK: {up}");
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+        assert!(down.contains("    price INTEGER NOT NULL"), "{down}");
+        assert!(!down.contains("CHECK"), "the down leg restores INTEGER: {down}");
+    }
+
     #[test]
     fn sqlite_add_not_null_without_default_is_unsupported() {
         let plan = MigrationPlan {

@@ -2333,6 +2333,101 @@ mod tests {
         );
     }
 
+    /// #2598: `#[decimal_shape]` carries the declared `decimal{p,s}`. The Rust
+    /// type does not, so without it every decimal reads as `{12, 2}`.
+    #[test]
+    fn decimal_shape_attr_sets_precision_and_scale() {
+        let src = r#"
+            #[model]
+            pub struct Product {
+                #[id]
+                pub id: i64,
+                #[decimal_shape(precision = 10, scale = 2)]
+                pub price: rust_decimal::Decimal,
+                #[decimal_shape(precision = 5, scale = 0)]
+                pub qty: Option<autumn_web::db::sqlite_types::SqliteDecimal>,
+                pub plain: rust_decimal::Decimal,
+            }
+        "#;
+        let table = parse_one(src);
+        assert_eq!(
+            col(&table, "price").ty,
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        let qty = col(&table, "qty");
+        assert_eq!(
+            qty.ty,
+            ColumnType::Decimal {
+                precision: 5,
+                scale: 0
+            }
+        );
+        assert!(qty.nullable);
+        // No attribute: the bare `decimal` default.
+        assert_eq!(
+            col(&table, "plain").ty,
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+    }
+
+    /// #2598: a bad `#[decimal_shape]` skips the column with a diagnostic. A
+    /// silent `{12, 2}` fallback gives a wrong `SQLite` `CHECK`.
+    #[test]
+    fn malformed_decimal_shape_attr_skips_the_column() {
+        for attr in [
+            "#[decimal_shape(precision = 10)]",
+            "#[decimal_shape(scale = 2)]",
+            "#[decimal_shape(precision = 10, scale = 2, extra = 1)]",
+            "#[decimal_shape(precision = \"ten\", scale = 2)]",
+            "#[decimal_shape(precision = 0, scale = 0)]",
+            "#[decimal_shape(precision = 29, scale = 2)]",
+            "#[decimal_shape(precision = 300, scale = 2)]",
+            "#[decimal_shape(precision = 4, scale = 5)]",
+            "#[decimal_shape]",
+        ] {
+            let src = format!(
+                "#[model]\npub struct Product {{\n    #[id]\n    pub id: i64,\n    \
+                 {attr}\n    pub price: rust_decimal::Decimal,\n}}\n"
+            );
+            let parsed = parse_model_source(&src, Backend::Sqlite).expect("parse");
+            assert!(
+                parsed.tables[0].columns.iter().all(|c| c.name != "price"),
+                "`{attr}` must skip the column"
+            );
+            assert_eq!(parsed.diagnostics.len(), 1, "`{attr}` must add a diagnostic");
+            assert_eq!(parsed.diagnostics[0].field, "price");
+            assert!(
+                parsed.diagnostics[0].message.contains("decimal_shape"),
+                "the diagnostic names the attribute: {}",
+                parsed.diagnostics[0].message
+            );
+        }
+    }
+
+    /// #2598: `#[decimal_shape]` on a field that is not a decimal changes
+    /// nothing. The `#[model]` macro ignores it there too.
+    #[test]
+    fn decimal_shape_attr_on_a_non_decimal_field_is_ignored() {
+        let src = r#"
+            #[model]
+            pub struct Product {
+                #[id]
+                pub id: i64,
+                #[decimal_shape(precision = 10, scale = 2)]
+                pub name: String,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(col(&parsed.tables[0], "name").ty, ColumnType::Text);
+    }
+
     #[test]
     fn unknown_field_type_produces_diagnostic_not_wrong_mapping() {
         let src = r#"

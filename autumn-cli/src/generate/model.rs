@@ -4370,6 +4370,124 @@ mod tests {
         });
     }
 
+    /// #2598 round trip. The generator writes a `decimal{10,2}` table on
+    /// `SQLite`. The declarative lane then (1) sees no spurious diff, and (2)
+    /// keeps the generator `CHECK` through a rebuild for an unrelated change.
+    /// The rebuilt table must still reject what the `CHECK` rejects.
+    #[test]
+    fn sqlite_decimal_check_survives_a_declarative_rebuild() {
+        use crate::generate::schema_edit::sqlite_decimal_check;
+        use crate::schema::diff::{
+            DiffOptions, SchemaChange, SchemaContext, diff_schema, emit_up_sql_with_context,
+            guard_plan,
+        };
+        use crate::schema::parse::parse_models_path;
+        use autumn_schema_core::Backend;
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        #[derive(QueryableByName)]
+        struct Sql {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            sql: String,
+        }
+        let table_sql = |conn: &mut SqliteConnection| -> String {
+            let rows: Vec<Sql> =
+                diesel::sql_query("SELECT sql FROM sqlite_master WHERE name = 'products'")
+                    .load(conn)
+                    .expect("read sqlite_master");
+            rows.into_iter().next().expect("products exists").sql
+        };
+
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model(
+                tmp.path(),
+                "Product",
+                &["title:String".into(), "price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .expect("execute");
+
+            let generated_up = fs::read_dir(tmp.path().join("migrations"))
+                .expect("migrations dir")
+                .map(|entry| entry.expect("entry").path().join("up.sql"))
+                .find(|path| path.exists())
+                .expect("the generator wrote an up.sql");
+            let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+            conn.batch_execute(&fs::read_to_string(generated_up).expect("read up.sql"))
+                .expect("apply the generated migration");
+            let check = sqlite_decimal_check("price", 10, 2);
+            assert!(table_sql(&mut conn).contains(&check), "the generator wrote the CHECK");
+
+            // The baseline `autumn schema snapshot` writes from these models.
+            let models = tmp.path().join("src/models");
+            let snapshot = parse_models_path(&models, Backend::Sqlite).expect("parse models");
+            assert!(snapshot.diagnostics.is_empty(), "{:?}", snapshot.diagnostics);
+            let clean = diff_schema(&snapshot.tables, &snapshot, DiffOptions::default());
+            assert!(clean.changes.is_empty(), "spurious diff: {:?}", clean.changes);
+
+            // An unrelated change that SQLite can only apply with a rebuild.
+            let model_path = models.join("product.rs");
+            let model = fs::read_to_string(&model_path).expect("read model");
+            assert!(model.contains("pub title: String,"), "{model}");
+            fs::write(
+                &model_path,
+                model.replace("pub title: String,", "pub title: Option<String>,"),
+            )
+            .expect("edit model");
+            let desired = parse_models_path(&models, Backend::Sqlite).expect("parse models");
+            let plan = diff_schema(&snapshot.tables, &desired, DiffOptions::default());
+            assert!(
+                matches!(
+                    plan.changes.as_slice(),
+                    [SchemaChange::DropNotNull { column, .. }] if column == "title"
+                ),
+                "{:?}",
+                plan.changes
+            );
+            guard_plan(&plan, DiffOptions::default()).expect("guard");
+            let ctx = SchemaContext::from_tables(&desired.tables, &snapshot.tables);
+            let rebuild = emit_up_sql_with_context(&plan, &ctx).expect("emit rebuild");
+            conn.batch_execute("INSERT INTO products (title, price) VALUES ('a', '19.99');")
+                .expect("seed a row");
+            conn.batch_execute(&rebuild).expect("apply the rebuild");
+
+            assert!(
+                table_sql(&mut conn).contains(&check),
+                "the rebuild keeps the generator CHECK byte for byte"
+            );
+            let insert = |conn: &mut SqliteConnection, value: &str| {
+                conn.batch_execute(&format!(
+                    "INSERT INTO products (title, price) VALUES (NULL, {value});"
+                ))
+                .is_ok()
+            };
+            for value in ["'0.5'", "'-19.99'", "'12345678.99'", "19.99"] {
+                assert!(insert(&mut conn, value), "{value} is in shape");
+            }
+            // Out of shape and non-TEXT values from
+            // `sqlite_decimal_check_enforces_precision_scale_and_shape`.
+            for value in [
+                "'123456789.99'",
+                "'19.999'",
+                "''",
+                "'-'",
+                "'--1'",
+                "'1.2.3'",
+                "'abc'",
+                "'19.90'",
+                "'007.5'",
+                "'-0'",
+                "x'31392e3939'",
+            ] {
+                assert!(!insert(&mut conn, value), "{value} must be rejected");
+            }
+        });
+    }
+
     /// The last three kinds #1924 un-rejects — `Uuid`, `Decimal`, and `Enum` —
     /// now plan cleanly on a `SQLite` app and render types that compile there.
     ///

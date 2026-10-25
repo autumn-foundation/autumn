@@ -1015,7 +1015,7 @@ fn column_check_suffix(field: &Field, backend: DatabaseBackend) -> Option<String
 /// queries issue (`'19.90'` vs `'19.9'`), or admitted twice by a `:unique`
 /// index while Rust equality says they are the same value.
 /// `NULL` passes; the column's own `NOT NULL` decides that.
-fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
+pub(crate) fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
     // The unsigned text. Repeated rather than named: a SQLite `CHECK` has no `let`.
     let abs = format!("replace({column},'-','')");
     let frac_len =
