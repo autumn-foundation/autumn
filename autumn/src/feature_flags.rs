@@ -462,7 +462,7 @@ impl FlagStore for InMemoryFlagStore {
 /// in-memory snapshot of all flags. A refresh loads the snapshot off the
 /// request path. Replicas see a remote write on their next refresh. Each write
 /// also sends `NOTIFY autumn_flags`; Autumn does not `LISTEN` for it.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub mod pg {
     use super::{FlagChangeRecord, FlagConfig, FlagStore, FlagStoreError};
     use diesel::connection::SimpleConnection;

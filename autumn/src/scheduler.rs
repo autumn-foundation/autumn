@@ -97,7 +97,7 @@ pub struct SchedulerLease {
     fencing_token: Option<i64>,
     #[cfg(test)]
     release_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     postgres: Option<PostgresTickRow>,
     #[cfg(feature = "sqlite")]
     sqlite: Option<SqliteTableLease>,
@@ -111,7 +111,7 @@ impl SchedulerLease {
             fencing_token: None,
             #[cfg(test)]
             release_count: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             postgres: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -138,7 +138,7 @@ impl SchedulerLease {
     }
 
     /// A lease granted by the Postgres tick-table coordinator.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     fn postgres(leader_id: impl Into<String>, row: PostgresTickRow) -> Self {
         Self {
             fencing_token: Some(row.generation),
@@ -229,7 +229,7 @@ impl SchedulerLease {
         reason = "only the postgres and sqlite rows await in the body"
     )]
     pub(crate) async fn free(&self) -> AutumnResult<()> {
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         if let Some(row) = self.postgres.as_ref() {
             row.free().await?;
         }
@@ -381,7 +381,7 @@ impl SchedulerCoordinator for InProcessSchedulerCoordinator {
 /// The claim keeps no session state and holds no connection while the tick
 /// runs. Thus, it works behind a transaction-mode `PgBouncer`. The fencing
 /// token is the row's `generation`. See [`SchedulerLease::fencing_token`].
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 pub struct PostgresTickSchedulerCoordinator {
     pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
@@ -392,7 +392,7 @@ pub struct PostgresTickSchedulerCoordinator {
 }
 
 /// Old name of [`PostgresTickSchedulerCoordinator`].
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[deprecated(
     since = "0.9.0",
     note = "renamed to PostgresTickSchedulerCoordinator: it uses a tick table, not \
@@ -402,11 +402,11 @@ pub type PostgresAdvisorySchedulerCoordinator = PostgresTickSchedulerCoordinator
 
 /// How long a tick row stays when no retention is set. Matches the default
 /// `scheduler.lease_ttl_secs`.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const DEFAULT_TICK_RETENTION: Duration = Duration::from_secs(300);
 
 /// Floor on the tick-row retention.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const MIN_TICK_RETENTION: Duration = Duration::from_secs(1);
 
 /// Cap on how long a tick row stays: 100 years. A longer interval is out of
@@ -425,7 +425,7 @@ fn tick_hold(retention: Duration, period: Duration) -> Duration {
 
 /// A claimed Postgres tick row, kept so that
 /// [`SchedulerLease::release_and_free`] can delete it.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 struct PostgresTickRow {
     pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     key_prefix: String,
@@ -434,7 +434,7 @@ struct PostgresTickRow {
     generation: i64,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl PostgresTickRow {
     /// Delete this row. The `generation` match keeps a row that another
     /// replica claimed after this one expired.
@@ -469,7 +469,7 @@ impl PostgresTickRow {
 ///
 /// If the app's database role cannot run `CREATE TABLE`, apply this before
 /// the deploy. The runtime then finds the table and sends no DDL.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub const PG_TICK_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS autumn_scheduler_ticks (
     key_prefix TEXT        NOT NULL,
@@ -485,10 +485,10 @@ CREATE INDEX IF NOT EXISTS idx_autumn_scheduler_ticks_expires_at
     ON autumn_scheduler_ticks (expires_at);";
 
 /// Advisory key that serializes the runtime `CREATE TABLE` across replicas.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub(crate) const PG_TICK_DDL_LOCK_KEY: i64 = 3_052_305_230_523_052;
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl PostgresTickSchedulerCoordinator {
     /// Create a Postgres tick-table coordinator.
     ///
@@ -530,7 +530,7 @@ impl PostgresTickSchedulerCoordinator {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct TableExistsRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -546,7 +546,7 @@ struct TableExistsRow {
 /// The DDL goes as one simple query, which Postgres runs as one implicit
 /// transaction. The advisory lock holds until the last statement ends. Thus,
 /// two replicas that start together do not both run `CREATE TABLE`.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn create_tick_table(conn: &mut diesel_async::AsyncPgConnection) -> AutumnResult<()> {
     use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 
@@ -570,14 +570,14 @@ async fn create_tick_table(conn: &mut diesel_async::AsyncPgConnection) -> Autumn
     .map_err(setup_error)
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct TickGenerationRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     generation: i64,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
     fn backend(&self) -> &'static str {
         "postgres"
@@ -1340,7 +1340,7 @@ mod tests {
     // Issue #3052: the hold adds the period to the retention, so a replica
     // whose clock is behind still finds the tick claimed. It is capped, so a
     // huge `lease_ttl_secs` cannot overflow the Postgres interval.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[test]
     fn tick_hold_adds_the_period_and_is_capped() {
         let minute = Duration::from_secs(60);

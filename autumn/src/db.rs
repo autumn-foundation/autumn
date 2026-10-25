@@ -37,10 +37,8 @@
 
 use axum::extract::FromRequestParts;
 use diesel;
-// Named by the default Postgres pool builder/TLS connector and by the
-// Postgres migration connection (`MigrationConnection`), which stays compiled
-// under the `sqlite` feature (diesel's `postgres` backend is still in the graph
-// via `db`), so this import is used on both builds.
+// Named by the Postgres pool builder, TLS connector and migration connection.
+#[cfg(feature = "postgres")]
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 #[cfg(not(feature = "sqlite"))]
@@ -1375,6 +1373,7 @@ where
 /// [`tokio_postgres::error::DbError`] in turn. Shared by [`is_query_canceled`]
 /// and [`is_retryable_txn_error`] — both need the same downcast-through-the-
 /// chain strategy, only with a different SQLSTATE to look for.
+#[cfg(feature = "postgres")]
 fn source_chain_has_sqlstate(
     err: &(dyn std::error::Error + 'static),
     predicate: impl Fn(&tokio_postgres::error::SqlState) -> bool,
@@ -1414,9 +1413,17 @@ fn is_query_canceled(err: &diesel::result::Error) -> bool {
         return true;
     }
 
-    source_chain_has_sqlstate(err, |state| {
-        *state == tokio_postgres::error::SqlState::QUERY_CANCELED
-    })
+    // Without the Postgres client there is no SQLSTATE to read.
+    #[cfg(feature = "postgres")]
+    {
+        source_chain_has_sqlstate(err, |state| {
+            *state == tokio_postgres::error::SqlState::QUERY_CANCELED
+        })
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        false
+    }
 }
 
 /// Error type for pool creation failures.
@@ -2709,13 +2716,8 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// domain/validation error as a transient conflict, silently re-running a
 /// non-idempotent closure and delaying the response.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
+#[must_use]
 pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
-    use tokio_postgres::error::SqlState;
-
-    fn is_retryable_sqlstate(state: &SqlState) -> bool {
-        *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
-    }
-
     if let Some(diesel_err) = err.downcast_chain_ref::<diesel::result::Error>() {
         return match diesel_err {
             // Fast path: diesel-async maps 40001 to SerializationFailure from
@@ -2736,7 +2738,7 @@ pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
                 diesel::result::DatabaseErrorKind::Unknown,
                 info,
             ) => {
-                source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate)
+                chain_has_retryable_sqlstate(diesel_err)
                     || info
                         .message()
                         .trim()
@@ -2745,19 +2747,47 @@ pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
             // Any other kind (UniqueViolation, NotNullViolation, ...) is
             // authoritatively non-retryable — no string matching against its
             // message/constraint text.
-            _ => source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate),
+            _ => chain_has_retryable_sqlstate(diesel_err),
         };
     }
 
-    // No `diesel::result::Error` anywhere in the chain — check for a raw
-    // `tokio_postgres` SQLSTATE directly. No text-based fallback beyond this;
-    // see the doc comment above for why.
+    raw_error_has_retryable_sqlstate(err)
+}
+
+/// Whether a Postgres `40001` or `40P01` SQLSTATE is in `err`'s source chain.
+#[cfg(feature = "postgres")]
+fn chain_has_retryable_sqlstate(err: &(dyn std::error::Error + 'static)) -> bool {
+    source_chain_has_sqlstate(err, is_retryable_sqlstate)
+}
+
+/// Without the Postgres client there is no SQLSTATE to read.
+#[cfg(not(feature = "postgres"))]
+fn chain_has_retryable_sqlstate(_err: &(dyn std::error::Error + 'static)) -> bool {
+    false
+}
+
+#[cfg(feature = "postgres")]
+fn is_retryable_sqlstate(state: &tokio_postgres::error::SqlState) -> bool {
+    use tokio_postgres::error::SqlState;
+    *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
+}
+
+/// A raw `tokio_postgres` error with a retryable SQLSTATE (no diesel error in
+/// the chain).
+#[cfg(feature = "postgres")]
+fn raw_error_has_retryable_sqlstate(err: &AutumnError) -> bool {
+    // No text-based fallback; see `is_retryable_txn_error` for why.
     err.downcast_chain_ref::<tokio_postgres::Error>()
         .and_then(tokio_postgres::Error::code)
         .is_some_and(is_retryable_sqlstate)
         || err
             .downcast_chain_ref::<tokio_postgres::error::DbError>()
             .is_some_and(|db| is_retryable_sqlstate(db.code()))
+}
+
+#[cfg(not(feature = "postgres"))]
+const fn raw_error_has_retryable_sqlstate(_err: &AutumnError) -> bool {
+    false
 }
 
 /// Run `f` inside a transaction on `conn`, adapting the `ScopedBoxFuture`
@@ -7278,6 +7308,7 @@ mod tests {
 // `pub(crate)` so the failure-capsule recording pool can reuse the same
 // `sslmode` classification when deciding whether a database URL can be teed
 // (#1598) instead of re-implementing the parse.
+#[cfg(feature = "postgres")]
 pub(crate) mod tls {
     use std::sync::Arc;
 
@@ -7883,6 +7914,7 @@ pub(crate) mod tls {
 ///
 /// [`AsyncConnectionWrapper`]:
 ///     diesel_async::async_connection_wrapper::AsyncConnectionWrapper
+#[cfg(feature = "postgres")]
 #[allow(clippy::large_enum_variant)] // short-lived, one per migration target
 pub(crate) enum MigrationConnection {
     /// The historical libpq-backed connection (TLS posture `Off`).
@@ -7910,6 +7942,7 @@ pub(crate) enum MigrationConnection {
 /// rustls wrapper rather than the native libpq path. Split out of
 /// [`establish_migration_connection`] so the path selection is unit-testable
 /// without a server.
+#[cfg(feature = "postgres")]
 fn migration_connection_needs_rustls(database_url: &str) -> bool {
     !matches!(
         tls::TlsPosture::from_database_url(database_url),
@@ -7953,6 +7986,7 @@ fn migration_connection_needs_rustls(database_url: &str) -> bool {
 /// which fail with their documented guidance).
 ///
 /// [`TlsPosture::Unsupported`]: tls::TlsPosture::Unsupported
+#[cfg(feature = "postgres")]
 pub(crate) fn establish_migration_connection(
     database_url: &str,
 ) -> Result<MigrationConnection, diesel::ConnectionError> {
@@ -8024,7 +8058,7 @@ pub(crate) fn establish_sqlite_migration_connection(
     Ok(conn)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod migration_connection_tests {
     use super::migration_connection_needs_rustls;
 

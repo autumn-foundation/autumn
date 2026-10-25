@@ -190,6 +190,60 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Features: `db` has no Postgres client; enable `postgres`
+
+**Why:** `db` compiled `pq-sys`, `tokio-postgres` and diesel's Postgres backend
+into every build, also a SQLite build (issue #2605). Now `db` is the shared
+database layer only. The new `postgres` feature adds the Postgres client. It
+is a default feature.
+
+**Who must change:** only an app or crate that turns default features off and
+enables `db`, `seed`, `repl`, `offline-sync` or `ledger-profile` without
+`sqlite`. With default features on, nothing changes. Such a build now stops
+with this error:
+
+```text
+autumn-web: the `db` feature needs a database backend. Enable `postgres` (a default feature) or `sqlite`.
+```
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["db", "maud"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["db", "postgres", "maud"] }
+```
+
+**SQLite apps:** to build with no Postgres client, turn default features off
+and enable `sqlite` without `postgres`:
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = [
+    "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
+] }
+```
+
+A build without `postgres` does not have the Postgres-only items:
+`DbApiTokenStore`, `feature_flags::pg`, `experiments::pg`,
+`runtime_config::pg`, `PgSyncBackend`, `PgSuppressionStore`,
+`PostgresIsrCoordinator`, `PostgresTickSchedulerCoordinator`,
+`PgJobTrackingStore`, the `migrate` functions that take a Postgres connection
+or URL, and `job::enqueue_on_conn` and its siblings. These items refuse a
+SQLite target at run time, so a SQLite app did not use them.
+
+**Workspace `diesel`:** the root `Cargo.toml` entries for `diesel` and
+`diesel-async` no longer enable `postgres`. A workspace crate that inherits
+them and uses `diesel::pg` gets it through `autumn-web`'s default features. A
+crate that turns those off must add `features = ["postgres"]` to its own
+`diesel` entry.
+
+**Automation:** `manual` — this is a Cargo feature change; `autumn upgrade`
+rewrites Rust source, not `Cargo.toml` feature lists.
+
 ### Jobs: `JobTrackingStore::reset_for_retry` takes a `RetryToken`
 
 **Why:** The old check compared `updated_at`. That value can repeat: two

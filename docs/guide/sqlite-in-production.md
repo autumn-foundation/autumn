@@ -43,6 +43,22 @@ guide is the published contract for exactly which is which.
 
 Enable the runtime by building the application with the `sqlite` cargo feature (it must be enabled only by the end application, never by a library). Autumn then boots and serves against a `sqlite://` URL:
 
+- **No Postgres client (#2605).** The `postgres` feature adds `pq-sys`,
+  `tokio-postgres` and diesel's Postgres backend. It is a default feature. To
+  compile none of them, turn default features off and do not enable
+  `postgres`:
+
+  ```toml
+  autumn-web = { version = "0.8", default-features = false, features = [
+      "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
+  ] }
+  ```
+
+  If you keep default features on, the runtime is still SQLite, but the build
+  also compiles the Postgres client. A build without `postgres` does not have
+  the Postgres-only items (for example `DbApiTokenStore`, the `pg` stores and
+  `PgSyncBackend`). CI checks this build with `cargo tree`.
+
 - **Connection type.** A `RuntimeConnection` alias abstracts the backend: `diesel_async::AsyncPgConnection` by default, and a `SyncConnectionWrapper<SqliteConnection>` under the `sqlite` feature. Generated repositories and hand-written queries take `&mut RuntimeConnection`, so they compile against either backend.
 - **Pool pragmas.** Each pooled connection is set up with `PRAGMA busy_timeout = 5000` (first, so later statements queue on it), `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA foreign_keys = ON`. A read-only SQLite target skips the two writing pragmas (WAL + `synchronous`). An in-memory database is pinned to a single pooled connection.
 - **Migrations.** Startup migrations run through diesel's `MigrationHarness` on a plain `SqliteConnection` with **no advisory lock** (SQLite is single-writer, so there is nothing to coordinate). Only `busy_timeout` is set on the migration connection — `foreign_keys = ON` is deliberately *omitted* there because it breaks table-recreating migrations. This applies to **file-backed** SQLite only: an **in-memory** target (`sqlite::memory:` / `:memory:` / `file::memory:`, including `cache=shared`) with registered startup migrations is **refused at boot** (`std::process::exit(1)`), because the schema is applied on a transient migration connection and is lost before the runtime pool anchors it. An in-memory target with *no* registered migrations is unaffected (it is the default test-harness configuration).

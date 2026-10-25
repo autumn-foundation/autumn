@@ -124,9 +124,31 @@ fn ci_builds_and_checks_the_pure_sqlite_graph() {
     let ci = std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
         .expect("read .github/workflows/ci.yml");
     for command in [
-        "cargo clippy -p autumn-web --no-default-features --features sqlite --lib",
-        "cargo tree -p autumn-web --no-default-features --features sqlite",
+        r#"cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib"#,
+        r#"cargo tree -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES""#,
     ] {
         assert!(ci.contains(command), "ci.yml must run `{command}`");
+    }
+
+    let line = ci
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("SQLITE_ONLY_FEATURES:"))
+        .expect("ci.yml must set SQLITE_ONLY_FEATURES");
+    let lane: Vec<&str> = line.trim().split(',').collect();
+    assert!(lane.contains(&"sqlite"), "{lane:?}");
+    let features = autumn_features();
+    for feature in &lane {
+        assert!(
+            features.contains_key(*feature),
+            "SQLITE_ONLY_FEATURES names an unknown feature `{feature}`"
+        );
+        let leaked: Vec<String> = closure(&features, feature)
+            .into_iter()
+            .filter(|entry| POSTGRES_ONLY.contains(&entry.as_str()))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "SQLITE_ONLY_FEATURES entry `{feature}` reaches {leaked:?}"
+        );
     }
 }

@@ -4578,10 +4578,10 @@ pub mod suppression {
         Ok(())
     }
 
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pub use pg::PgSuppressionStore;
 
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     mod pg {
         use std::future::Future;
         use std::pin::Pin;
@@ -4733,12 +4733,19 @@ pub mod db_suppression {
 
     use super::{MailError, SuppressionStore};
 
+    // No query here reads or writes `unsubscribed_at`. Without `postgres`,
+    // diesel has no `Timestamptz`, so use SQLite's type.
+    #[cfg(feature = "postgres")]
+    type UnsubscribedAt = diesel::sql_types::Timestamptz;
+    #[cfg(not(feature = "postgres"))]
+    type UnsubscribedAt = diesel::sql_types::TimestamptzSqlite;
+
     diesel::table! {
         mail_unsubscribes (id) {
             id -> Int8,
             subscriber -> Text,
             list_id -> Text,
-            unsubscribed_at -> Timestamptz,
+            unsubscribed_at -> crate::mail::db_suppression::UnsubscribedAt,
         }
     }
 

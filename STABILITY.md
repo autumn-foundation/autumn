@@ -311,11 +311,19 @@ combinations is also checked on every PR:
 |---|---|
 | `--no-default-features` (no flags) | bare-minimum compile |
 | each flag alone | isolation regression guard |
-| `db` | db-only API server |
+| `db,postgres` | db-only API server on Postgres |
+| `db,sqlite` | db-only API server on SQLite |
 | `mail` | mail without the full default set |
-| `storage,db` | file storage backed by database |
+| `storage,db,postgres` | file storage backed by database |
 | `maud,htmx` | minimal web front-end |
 | `telemetry-otlp` | standalone telemetry |
+| `seed,repl,ledger-profile` + each backend | `db` features on each backend |
+| `offline-sync,reporting` + each backend | offline sync on each backend |
+
+`db` alone selects no backend, so it stops at a `compile_error!`. The sweep
+skips it and the features that only add `db` (`seed`, `repl`,
+`offline-sync`, `ledger-profile`). The combinations above build them with a
+backend.
 
 ### Unsupported feature combinations (CI excluded)
 

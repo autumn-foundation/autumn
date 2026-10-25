@@ -12953,6 +12953,7 @@ async fn resolve_shard_set(
                     // Detach: the listener runs for the life of the process;
                     // dropping the JoinHandle leaves the task running rather than
                     // aborting it.
+                    #[cfg(feature = "postgres")]
                     drop(
                         crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
                             Arc::clone(&dir_router),
@@ -12960,6 +12961,9 @@ async fn resolve_shard_set(
                             crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL,
                         ),
                     );
+                    // LISTEN is Postgres only. A SQLite build refuses shards at boot.
+                    #[cfg(not(feature = "postgres"))]
+                    let _ = control_url;
                 } else {
                     // Directory routing is active but there is no control URL for
                     // a dedicated LISTEN connection — a custom
@@ -13523,7 +13527,7 @@ fn spawn_derivation_backfill(
 /// `shard:<name>`): the underlying [`MigrationError`](crate::migrate::MigrationError)
 /// can wrap a driver string that embeds the connection URL, and the deploy path
 /// must never print a DB URL or secret.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn apply_pending_or_exit(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -13556,6 +13560,21 @@ fn apply_pending_or_exit(
             std::process::exit(1);
         }
     }
+}
+
+/// A build without `postgres` cannot migrate a Postgres target. Stop.
+#[cfg(all(feature = "db", not(feature = "postgres")))]
+fn apply_pending_or_exit(
+    _database_url: &str,
+    _migrations: impl diesel::migration::MigrationSource<crate::db::RuntimeBackend> + Send,
+    target: &str,
+    _lock_policy: crate::migrate::MigrationLockPolicy,
+) -> usize {
+    eprintln!(
+        "autumn migrate: {} (target {target})",
+        crate::migrate::NO_POSTGRES_MSG
+    );
+    std::process::exit(1);
 }
 
 /// Apply pending migrations for one `SQLite` target in the `AUTUMN_MIGRATE=1`
@@ -14482,7 +14501,7 @@ const fn shard_map_migration_is_required(
 }
 
 /// Row type for reading `_autumn_shard_map`.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct ShardMapRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -14503,7 +14522,7 @@ struct ShardMapRow {
 ///
 /// Returns a `String` error when the computed auto-split map differs from the
 /// stored map, indicating a topology change that would silently misroute data.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn run_shard_map_guard(
     control_pool: &deadpool::managed::Pool<
         diesel_async::pooled_connection::AsyncDieselConnectionManager<
@@ -14699,14 +14718,15 @@ fn shard_applied_sets_include(
     migrations: &[(&'static str, crate::migrate::EmbeddedMigrations)],
     migration_name: &str,
 ) -> bool {
+    use crate::db::RuntimeBackend;
     use diesel::migration::{Migration, MigrationSource as _};
-    use diesel::pg::Pg;
 
     migrations
         .iter()
         .filter(|(_, set)| !migration_set_is_control_framework(set))
         .any(|(_, source)| {
-            let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
+            let Ok(source_migrations): Result<Vec<Box<dyn Migration<RuntimeBackend>>>, _> =
+                source.migrations()
             else {
                 return false;
             };
@@ -14729,11 +14749,12 @@ fn shard_applied_sets_include(
 /// sets and strip them from shards.
 #[cfg(feature = "db")]
 fn migration_set_is_control_framework(set: &crate::migrate::EmbeddedMigrations) -> bool {
+    use crate::db::RuntimeBackend;
     use diesel::migration::{Migration, MigrationSource as _};
-    use diesel::pg::Pg;
 
     fn names(set: &crate::migrate::EmbeddedMigrations) -> std::collections::HashSet<String> {
-        let migrations: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
+        let migrations: Vec<Box<dyn Migration<RuntimeBackend>>> =
+            set.migrations().unwrap_or_default();
         migrations.iter().map(|m| m.name().to_string()).collect()
     }
 

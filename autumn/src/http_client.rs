@@ -688,6 +688,7 @@ static OUTBOUND_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// its real `reqwest` client — and must not let it reach anything the capsule
 /// did not record. There is deliberately no way to unset it: a process that has
 /// started replaying a capsule never goes back to serving traffic.
+#[cfg_attr(not(feature = "reporting"), allow(dead_code))]
 pub(crate) fn block_outbound_for_replay() {
     OUTBOUND_BLOCKED.store(true, Ordering::SeqCst);
 }
@@ -2269,6 +2270,8 @@ impl RequestBuilder {
                 },
             );
         }
+        // Only capsule replay (`reporting`) sets the block.
+        #[cfg(feature = "reporting")]
         if outbound_blocked_for_replay() {
             return Err(ClientError::BlockedDuringReplay(
                 self.method.to_string(),

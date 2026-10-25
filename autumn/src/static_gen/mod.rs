@@ -42,7 +42,7 @@
 //! In **multi-replica** deployments sharing a writable `dist/` volume or
 //! object-backed storage, each replica independently detects staleness and
 //! can race to regenerate the same page. Supply a
-//! [`crate::static_gen::isr_coordinator::PostgresIsrCoordinator`] (feature `db`) via
+//! [`crate::static_gen::isr_coordinator::PostgresIsrCoordinator`] (feature `postgres`) via
 //! [`crate::static_gen::StaticFileLayer::with_isr_coordinator`] so that only one replica wins
 //! the lock per revalidation window:
 //!
@@ -82,7 +82,7 @@ mod types;
 pub struct RenderDeadlineExempt;
 
 pub use build::{BuildError, render_static_routes};
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub use isr_coordinator::PostgresIsrCoordinator;
 pub use isr_coordinator::{
     IsrCoordinator, LocalIsrCoordinator, isr_advisory_lock_key, isr_window_key,

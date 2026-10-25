@@ -115,7 +115,7 @@ impl IsrCoordinator for LocalIsrCoordinator {
 /// Connections held during regeneration are not available to other tasks.
 /// Regeneration tasks that fail to acquire the Postgres lock return their
 /// pooled connection immediately.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub struct PostgresIsrCoordinator {
     pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     /// Connections holding active advisory locks, keyed by advisory lock key.
@@ -129,7 +129,7 @@ pub struct PostgresIsrCoordinator {
     >,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl PostgresIsrCoordinator {
     /// Create a Postgres ISR coordinator backed by the given connection pool.
     #[must_use]
@@ -143,7 +143,7 @@ impl PostgresIsrCoordinator {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl IsrCoordinator for PostgresIsrCoordinator {
     fn backend(&self) -> &'static str {
         "postgres"
@@ -272,17 +272,17 @@ pub fn isr_advisory_lock_key(url_path: &str, window_key: &str) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Postgres helpers (feature = "db")
+// Postgres helpers (feature = "postgres")
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgAdvisoryLockRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     acquired: bool,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn try_pg_advisory_lock(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
     key: i64,
@@ -296,14 +296,14 @@ async fn try_pg_advisory_lock(
     Ok(row.acquired)
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgAdvisoryUnlockRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     released: bool,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn unlock_pg_advisory_lock(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
     key: i64,

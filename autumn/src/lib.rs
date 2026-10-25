@@ -68,6 +68,13 @@
 #[allow(unused_extern_crates)]
 extern crate self as autumn_web;
 
+// `db` is the shared layer only (#2605). It needs a backend.
+#[cfg(all(feature = "db", not(any(feature = "postgres", feature = "sqlite"))))]
+compile_error!(
+    "autumn-web: the `db` feature needs a database backend. Enable `postgres` \
+     (a default feature) or `sqlite`."
+);
+
 /// Typed accessible UI primitives (issue #1706).
 ///
 /// These make the accessible name a compile-time obligation. See [`mod@a11y`].
@@ -1703,7 +1710,7 @@ pub use auth::{
 /// at rest and persists them across restarts. Use with [`API_TOKEN_MIGRATIONS`]
 /// for dev/test startup checks; `autumn migrate` applies the token-table
 /// framework migration in production.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub use auth::DbApiTokenStore;
 
 /// Embedded Diesel migrations for the `api_tokens` table (requires `db` feature).
