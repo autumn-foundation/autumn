@@ -901,7 +901,7 @@ impl<'a> Renderer<'a> {
                 .len()
                 .saturating_add(id.len())
                 .saturating_add(path.len())
-                .saturating_add(2 * size_of::<String>()),
+                .saturating_add(size_of::<String>().saturating_mul(2)),
             path,
         )?;
         let rendered = format!("{prefix}{id}");

@@ -107,7 +107,7 @@ impl Diagnostic {
 ///
 /// For a message that quotes a value: format the excerpt, not the value, so a
 /// large value is not copied into a message that is then cut.
-pub(crate) fn excerpt(text: &str) -> &str {
+pub fn excerpt(text: &str) -> &str {
     const MAX: usize = 256;
     let mut end = text.len().min(MAX);
     while !text.is_char_boundary(end) {
