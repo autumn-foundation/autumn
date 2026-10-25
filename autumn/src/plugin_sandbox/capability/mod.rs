@@ -1418,10 +1418,20 @@ impl CapabilityRuntime {
 
     /// The bytes `call`'s reply may take at its worst, under this plugin's
     /// quotas. See [`CapabilityCall::reply_reserve_for`].
-    #[must_use]
-    pub const fn reply_reserve(&self, call: &CapabilityCall) -> usize {
+    pub(crate) const fn reply_reserve(&self, call: &CapabilityCall) -> usize {
         let quotas = self.quotas();
-        call.reply_reserve_for(quotas.kv_value_bytes as usize, quotas.db_rows as usize)
+        let reserve =
+            call.reply_reserve_for(quotas.kv_value_bytes as usize, quotas.db_rows as usize);
+        match call {
+            // The body is at most `outbound_response_bytes`, and one byte
+            // escapes to at most six. Smaller than `MAX_RESULT_BYTES` when the
+            // plugin asks for small replies.
+            CapabilityCall::HttpFetch { .. } => {
+                let body = (quotas.outbound_response_bytes as usize).saturating_mul(6);
+                reserve.saturating_sub(MAX_RESULT_BYTES.saturating_sub(body))
+            }
+            _ => reserve,
+        }
     }
 
     /// Whether this plugin may use `capability` at all.
@@ -1448,6 +1458,18 @@ impl CapabilityRuntime {
     /// A call whose worst-case reply does not fit is refused before it runs.
     /// See [`CapabilityCall::reply_reserve`].
     pub fn dispatch_within(&mut self, call: &CapabilityCall, reply_room: usize) -> CallResult {
+        self.dispatch_checked(call, reply_room, |_| true)
+    }
+
+    /// As [`dispatch_within`](Self::dispatch_within). `fuel_covers` gets the
+    /// worst-case reply in bytes. When it returns `false`, the call is refused
+    /// before it runs.
+    pub(crate) fn dispatch_checked(
+        &mut self,
+        call: &CapabilityCall,
+        reply_room: usize,
+        fuel_covers: impl FnOnce(usize) -> bool,
+    ) -> CallResult {
         let id = call.id();
         let capability = call.capability();
         // What the call *names*, computed before any check, so every refusal
@@ -1509,15 +1531,28 @@ impl CapabilityRuntime {
 
         // Room for the answer, before anything is charged or committed: once a
         // write has happened its reply can no longer be refused.
-        if reply_room < self.reply_reserve(call) {
+        let reserve = self.reply_reserve(call);
+        if reply_room < reserve {
             return self.record(
                 call,
                 &target,
                 CallResult::denied(
                     id,
                     DenialReason::QuotaExceeded,
-                    "there is not sufficient reply room or fuel for this call's answer; read \
-                     the pending replies, or increase `fuel`",
+                    "there is not room to deliver this call's answer; read the pending replies \
+                     and retry",
+                ),
+            );
+        }
+        if !fuel_covers(reserve) {
+            return self.record(
+                call,
+                &target,
+                CallResult::denied(
+                    id,
+                    DenialReason::QuotaExceeded,
+                    "the fuel left cannot read this call's answer and finish the request; \
+                     increase `fuel`",
                 ),
             );
         }
@@ -1746,20 +1781,20 @@ impl CapabilityRuntime {
             // unreachable: the quotas that would bound it live in the plugin's
             // own manifest, so the plugin sets them.
             //
-            // With its time: the log ingests the request when it ends, and a
+            // Keep the time too. The log ingests the request when it ends. A
             // slow request must not make an old drop look recent (#2523).
-            self.dropped = Some(match self.dropped {
-                Some(dropped) => DroppedCalls {
-                    count: dropped.count.saturating_add(1),
-                    last: at,
-                    ..dropped
-                },
-                None => DroppedCalls {
+            self.dropped = Some(self.dropped.map_or(
+                DroppedCalls {
                     count: 1,
                     first: at,
                     last: at,
                 },
-            });
+                |dropped| DroppedCalls {
+                    count: dropped.count.saturating_add(1),
+                    last: at,
+                    ..dropped
+                },
+            ));
         }
         result
     }
@@ -3944,20 +3979,52 @@ path = "/shop/panel"
             },
         );
         let log = audit::PluginActivityLog::new();
-        for id in 0..(MAX_EVENTS as u64 + 25) {
-            let _ = runtime.dispatch(&CapabilityCall::KvGet {
-                id,
-                key: "k".to_owned(),
-            });
+        let mut kv_get = (0..).map(|id| CapabilityCall::KvGet {
+            id,
+            key: "k".to_owned(),
+        });
+        let start = crate::time::ambient_instant();
+        for call in kv_get.by_ref().take(MAX_EVENTS + 20) {
+            let _ = runtime.dispatch(&call);
         }
-        // The request ends two hours later.
-        clock.advance(2 * hour);
+        // Five more drops 30 minutes later.
+        clock.advance(hour / 2);
+        let later = crate::time::ambient_instant();
+        for call in kv_get.take(5) {
+            let _ = runtime.dispatch(&call);
+        }
+        // The request ends 90 minutes after that.
+        clock.advance(3 * hour / 2);
         let dropped = runtime.dropped_calls().expect("25 calls were dropped");
         assert_eq!(dropped.count, 25);
+        assert_eq!(dropped.first, start);
+        assert_eq!(dropped.last, later);
         log.ingest("shop", runtime.take_events());
         log.ingest_dropped_calls("shop", dropped);
         assert_eq!(log.summary("shop", hour).dropped, 0);
-        assert_eq!(log.summary("shop", 3 * hour).dropped, 25);
+        // The window holds the last drop, not the first.
+        assert_eq!(log.summary("shop", 7 * hour / 4).dropped, 25);
+    }
+
+    #[test]
+    fn the_outbound_reply_reserve_follows_the_response_quota() {
+        let post = CapabilityCall::HttpFetch {
+            id: 1,
+            method: "POST".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let fixture = fixture(&everything(), Some("alpha"));
+        // The default quota escapes past `MAX_RESULT_BYTES`, so that bound holds.
+        assert_eq!(fixture.runtime.reply_reserve(&post), post.reply_reserve());
+        let mut manifest = manifest(&everything());
+        manifest.quotas.outbound_response_bytes = 4096;
+        let small = CapabilityRuntime::new(&manifest, CapabilityServices::none());
+        assert_eq!(
+            small.reply_reserve(&post),
+            6 * 4096 + outbound::MAX_RESPONSE_HEADER_BYTES * 6 + 4096
+        );
     }
 
     #[test]

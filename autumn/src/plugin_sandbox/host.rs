@@ -1118,6 +1118,8 @@ pub struct SandboxOutcome {
     pub activity: Vec<crate::plugin_sandbox::capability::CapabilityEvent>,
     /// Capability calls this request made that the bounded ledger could not
     /// hold, so `activity` is a floor rather than a count.
+    ///
+    /// Has no times. Ingest [`dropped_calls`](Self::dropped_calls) instead.
     pub dropped_activity: u64,
     /// The same calls, with when they occurred. `None` when none was dropped.
     ///
@@ -1171,8 +1173,13 @@ pub struct SandboxRenderOutcome {
     /// Every capability call the hook made.
     pub activity: Vec<crate::plugin_sandbox::capability::CapabilityEvent>,
     /// Calls the bounded ledger could not hold.
+    ///
+    /// Has no times. Ingest [`dropped_calls`](Self::dropped_calls) instead.
     pub dropped_events: u64,
     /// The same calls, with when they occurred. `None` when none was dropped.
+    ///
+    /// Give it to
+    /// [`PluginActivityLog::ingest_dropped_calls`](crate::plugin_sandbox::PluginActivityLog::ingest_dropped_calls).
     pub dropped_calls: Option<crate::plugin_sandbox::capability::DroppedCalls>,
 }
 
@@ -3122,6 +3129,8 @@ struct HostState {
     /// only what the capability channel added, and only while it is still
     /// there: `take_stdin` gives it back as the guest reads.
     queued_replies: usize,
+    /// Whether a call that commits has reached its backend.
+    committed: bool,
     /// Everything the guest reached for and did not get.
     denials: Vec<CapabilityDenial>,
     /// Request-seeded PRNG state, so `random_get` is deterministic without
@@ -3173,6 +3182,7 @@ impl HostState {
             pending_charge: 0,
             pending_calls: VecDeque::new(),
             queued_replies: 0,
+            committed: false,
             denials: Vec::new(),
             random_state: Self::seed_from(frame),
             limiter: MemoryLimiter {
@@ -3272,23 +3282,28 @@ impl HostState {
         let queue_room = MAX_QUEUED_REPLY_BYTES.saturating_sub(self.queued_replies);
         // A quarter of the budget at most, so a small budget still serves calls.
         let allowance = FINISH_ALLOWANCE_FUEL.min(self.limits.fuel / 4);
-        let read = if call.commits() {
-            u64::try_from(self.runtime.reply_reserve(call))
-                .unwrap_or(u64::MAX)
-                .saturating_mul(GUEST_READ_FUEL_PER_BYTE)
-        } else {
-            0
-        };
-        let fuel_room = usize::try_from(
+        // After a write has run, any call can still fail the request, so every
+        // call keeps the read fuel. The guest must read its unread replies too.
+        let keep_read = self.committed || call.commits();
+        let unread = u64::try_from(self.queued_replies).unwrap_or(u64::MAX);
+        let fuel_covers = |reserve: usize| {
+            let reserve = u64::try_from(reserve).unwrap_or(u64::MAX);
+            let read = if keep_read {
+                reserve
+                    .saturating_add(unread)
+                    .saturating_mul(GUEST_READ_FUEL_PER_BYTE)
+            } else {
+                0
+            };
             fuel_left
-                .saturating_sub(allowance)
-                .saturating_sub(read)
-                .saturating_mul(BYTES_PER_FUEL),
-        )
-        .unwrap_or(usize::MAX);
-        let result = self
-            .runtime
-            .dispatch_within(call, queue_room.min(fuel_room));
+                >= allowance
+                    .saturating_add(read)
+                    .saturating_add(reserve.div_ceil(BYTES_PER_FUEL))
+        };
+        let result = self.runtime.dispatch_checked(call, queue_room, fuel_covers);
+        if call.commits() && reached_backend(&result) {
+            self.committed = true;
+        }
         let line = match to_line(&HostFrame::CallResult(result)) {
             Ok(line) => line,
             Err(err) => {
@@ -3832,6 +3847,23 @@ fn instantiation_fuel(
         .saturating_add(imports)
         .saturating_add(globals)
         .saturating_add(1)
+}
+
+/// Whether `result` comes from a call that reached its backend.
+///
+/// A denial that comes before dispatch did not. A backend error may have: an
+/// outbound request can fail after the upstream got it.
+const fn reached_backend(result: &super::capability::CallResult) -> bool {
+    !matches!(
+        result.denial(),
+        Some(
+            super::capability::DenialReason::CapabilityNotGranted
+                | super::capability::DenialReason::NotInGrant
+                | super::capability::DenialReason::QuotaExceeded
+                | super::capability::DenialReason::Malformed
+                | super::capability::DenialReason::Unavailable
+        )
+    )
 }
 
 /// Charge the guest's fuel budget for `bytes` of host-side work.
@@ -8069,7 +8101,7 @@ name = "hello"
 version = "0.1.0"
 wire_version = 1
 prefix = "/hello"
-capabilities = ["http-request", "http-outbound"]
+capabilities = ["http-request", "http-outbound", "kv"]
 sha256 = "{digest}"
 
 [[routes]]
@@ -8086,6 +8118,8 @@ hosts = ["api.example.com"]
         let services = crate::plugin_sandbox::CapabilityServices {
             http: Some(std::sync::Arc::clone(&http)
                 as std::sync::Arc<dyn crate::plugin_sandbox::OutboundHttp>),
+            kv: Some(crate::plugin_sandbox::MemoryKvStore::new()
+                as std::sync::Arc<dyn crate::plugin_sandbox::KvStore>),
             ..crate::plugin_sandbox::CapabilityServices::none()
         };
         let mut state = HostState::new(
@@ -8180,27 +8214,87 @@ hosts = ["api.example.com"]
         assert_eq!(http.seen().len(), 1);
     }
 
+    /// What the host queued for the guest, as text.
+    fn queued_text(state: &HostState) -> String {
+        String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned()
+    }
+
+    /// Fuel to price `call`, write the answer, and read `unread` bytes plus the
+    /// reply.
+    fn with_read(call: &crate::plugin_sandbox::CapabilityCall, unread: usize) -> u64 {
+        priced(call) + (call.reply_reserve() + unread) as u64 * GUEST_READ_FUEL_PER_BYTE
+    }
+
     #[test]
-    fn a_write_refused_for_fuel_is_a_denial_that_names_fuel() {
+    fn a_fuel_refusal_and_a_queue_refusal_say_different_things() {
         let (mut state, http) = outbound_state(0);
         state.service(&post(), priced(&post()));
         assert!(http.seen().is_empty());
         assert!(state.answer.is_none(), "the request must go on");
-        let queued =
-            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned();
-        assert!(queued.contains("quota-exceeded"), "{queued}");
-        assert!(queued.contains("fuel"), "{queued}");
+        let text = queued_text(&state);
+        assert!(text.contains("quota-exceeded"), "{text}");
+        assert!(text.contains("increase `fuel`"), "{text}");
+        assert!(!text.contains("pending replies"), "{text}");
+
+        let (mut state, _) = outbound_state(MAX_QUEUED_REPLY_BYTES - 1024);
+        state.service(&post(), u64::MAX);
+        let text = queued_text(&state);
+        assert!(text.contains("pending replies"), "{text}");
+        assert!(!text.contains("fuel"), "{text}");
     }
 
     #[test]
-    fn the_read_rate_covers_a_measured_escape_heavy_reply() {
-        // A Rust guest (serde_json) spent 106 fuel per byte to read a reply of
-        // escaped quotes, and 77 for escaped NULs. Plain text cost 6.
-        let rate = GUEST_READ_FUEL_PER_BYTE;
-        assert!(
-            rate >= 106,
-            "{rate} fuel per byte is below the measured cost"
+    fn a_write_keeps_fuel_to_read_the_replies_not_yet_read() {
+        let unread = 10_000;
+        let (mut state, http) = outbound_state(unread);
+        state.service(&post(), with_read(&post(), unread) - 1);
+        assert!(http.seen().is_empty(), "one unit short must not dispatch");
+        let (mut state, http) = outbound_state(unread);
+        state.service(&post(), with_read(&post(), unread));
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn a_read_after_a_write_keeps_fuel_to_read_its_reply() {
+        // The write has run. A read that then fails the request makes a retry
+        // do the write again.
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), u64::MAX);
+        assert_eq!(http.seen().len(), 1);
+        state.service(
+            &get_call(),
+            with_read(&get_call(), state.queued_replies) - 1,
         );
+        assert_eq!(http.seen().len(), 1, "one unit short must not dispatch");
+        state.service(&get_call(), with_read(&get_call(), state.queued_replies));
+        assert_eq!(http.seen().len(), 2);
+    }
+
+    #[test]
+    fn a_write_refused_before_it_runs_does_not_make_reads_keep_fuel() {
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), priced(&post()));
+        assert!(http.seen().is_empty());
+        state.service(&get_call(), priced(&get_call()));
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn the_fuel_edge_for_a_kv_write_is_about_0_6_million() {
+        let set = crate::plugin_sandbox::CapabilityCall::KvSet {
+            id: 1,
+            key: "cart".to_owned(),
+            value: crate::plugin_sandbox::PluginValue::Text("one".to_owned()),
+        };
+        // The guide quotes this number.
+        assert_eq!(with_read(&set, 0), 624_352);
+        let (mut state, _) = outbound_state(0);
+        state.service(&set, with_read(&set, 0) - 1);
+        assert!(queued_text(&state).contains("increase `fuel`"));
+        let (mut state, _) = outbound_state(0);
+        state.service(&set, with_read(&set, 0));
+        let text = queued_text(&state);
+        assert!(text.contains(r#""status":"ok""#), "{text}");
     }
 
     #[test]

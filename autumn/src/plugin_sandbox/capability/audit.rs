@@ -92,16 +92,16 @@ pub struct CapabilityEvent {
 
 /// Calls one request made that its ledger could not hold, and when.
 ///
-/// The span, not the time of each call: the calls were dropped because there
-/// was no room to keep them.
+/// It keeps only the first and last times. The ledger had no room for the time
+/// of each call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DroppedCalls {
     /// How many calls.
     pub count: u64,
-    /// When the first of them ended.
+    /// The time of the first dropped call.
     pub first: Instant,
-    /// When the last of them ended.
+    /// The time of the last dropped call.
     pub last: Instant,
 }
 
@@ -145,7 +145,7 @@ struct LogState {
     /// Counts the full `dropped` ledger folded away, by plugin and hour, with
     /// the newest time folded into each bucket. A summary reports a bucket
     /// while that time is in its window. It can over-report by under one hour
-    /// of drops, and never under-reports.
+    /// plus the longest drop span of one request. It never under-reports.
     folded: BTreeMap<(String, u64), (Instant, u64)>,
     /// The time the hour buckets count from. Set by the first fold.
     origin: Option<Instant>,
@@ -226,9 +226,9 @@ impl PluginActivityLog {
     /// and are not below. An operator reading a summary needs to know that
     /// before they read the counts.
     ///
-    /// Stamps the time of this call. Use
-    /// [`ingest_dropped_calls`](Self::ingest_dropped_calls) when the times of
-    /// the drops are known.
+    /// Records the drops at the current time. Use
+    /// [`ingest_dropped_calls`](Self::ingest_dropped_calls) when you know the
+    /// times of the drops.
     pub fn ingest_dropped(&self, plugin: &str, dropped: u64) {
         if dropped == 0 {
             return;
@@ -239,16 +239,17 @@ impl PluginActivityLog {
 
     /// Record the calls one request's ledger could not hold, at their own times.
     ///
-    /// A slow request ends long after its drops. Stamped at ingest, its old
-    /// drops looked recent (#2523). The record counts while `calls.last` is in
-    /// the window: it can over-report by the span of the drops, and it never
-    /// under-reports.
+    /// A slow request ends long after its drops. This method records the drops
+    /// at their own times, not at the time of ingest (#2523). The record counts
+    /// while `calls.last` is in the window. It can over-report by the span of
+    /// the drops. It never under-reports.
     pub fn ingest_dropped_calls(&self, plugin: &str, calls: DroppedCalls) {
         if calls.count == 0 {
             return;
         }
-        self.lock()
-            .note_dropped(calls.first, calls.last, plugin, calls.count);
+        // Ordered, so the key is never before a drop it counts.
+        let (first, last) = (calls.first.min(calls.last), calls.first.max(calls.last));
+        self.lock().note_dropped(first, last, plugin, calls.count);
     }
 
     /// What `plugin` did within `window`.
@@ -311,32 +312,33 @@ impl PluginActivityLog {
 }
 
 impl LogState {
-    /// Add `count` dropped calls for `plugin`, made from `first` to `at`.
+    /// Add `count` dropped calls for `plugin`, made from `first` to `last`.
     ///
     /// Coalesces into the newest record when it is the same plugin and within
     /// one [`DROPPED_BUCKET`] of that record's first drop. Bounded by
     /// [`MAX_LOG_EVENTS`]: the oldest record, by time, folds into `folded`
     /// rather than vanishing.
-    fn note_dropped(&mut self, first: Instant, at: Instant, plugin: &str, count: u64) {
+    fn note_dropped(&mut self, first: Instant, last: Instant, plugin: &str, count: u64) {
         // Measured from the first drop, not the newest. A steady dropper would
         // otherwise keep one record open for hours.
-        if let Some((&(last, seq), record)) = self.dropped.last_key_value()
+        if let Some((&(newest, seq), record)) = self.dropped.last_key_value()
             && record.plugin == plugin
             && apart(first, record.first) < DROPPED_BUCKET
-            && apart(at, record.first) < DROPPED_BUCKET
-            && apart(at, last) < DROPPED_BUCKET
+            && apart(last, record.first) < DROPPED_BUCKET
+            && apart(last, newest) < DROPPED_BUCKET
         {
             // Keyed by the newer time: the record counts while any drop in it
             // is inside the window.
-            if let Some(mut record) = self.dropped.remove(&(last, seq)) {
+            if let Some(mut record) = self.dropped.remove(&(newest, seq)) {
                 record.count = record.count.saturating_add(count);
-                self.dropped.insert((last.max(at), seq), record);
+                record.first = record.first.min(first);
+                self.dropped.insert((newest.max(last), seq), record);
             }
             return;
         }
         self.seq = self.seq.wrapping_add(1);
         self.dropped.insert(
-            (at, self.seq),
+            (last, self.seq),
             DroppedRecord {
                 plugin: plugin.to_owned(),
                 count,
