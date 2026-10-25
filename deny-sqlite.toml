@@ -84,6 +84,17 @@ ignore = [
     # The fix needs a postgresql_embedded/sqlx release on webpki-roots 1.x.
     # Review-by: 2026-11-04 (or when such a release ships).
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 -> postgresql_embedded (managed-pg); no patched 0.26.x; the 1.x copy is fixed at 1.0.10; needs a sqlx/postgresql_embedded bump; review-by 2026-11-04" },
+    # RUSTSEC-2026-0387 — crypto-bigint secret-dependent branches in nominally
+    # constant-time operations. Fixed only in >=0.7.6; no 0.4.x/0.5.x release
+    # carries it. Two copies: 0.4.9 via aws-sigv4 -> p256 0.11 (SigV4a ECDSA
+    # signing, which Autumn does not use; it signs with HMAC SigV4), and 0.5.5
+    # via elliptic-curve 0.13 <- p256/p384 <- jsonwebtoken (ES256/ES384 JWT) and
+    # aws-sigv4. The jsonwebtoken copy IS on autumn-web's JWT path, so this is a
+    # real if low-practicality exposure (microarchitectural timing on ECDSA
+    # secrets; no network-reachable signing oracle). Remediation needs the
+    # RustCrypto elliptic-curve stack to move to crypto-bigint >=0.7.6.
+    # Review-by: 2026-11-08.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.4.9/0.5.5 only, via aws-sigv4 (SigV4a ECDSA path, unused by Autumn HMAC SigV4) and jsonwebtoken ES256/ES384 -> p256/p384 -> elliptic-curve 0.13; no patched 0.4.x/0.5.x; review-by 2026-11-08" },
 ]
 
 [licenses]
