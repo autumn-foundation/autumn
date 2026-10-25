@@ -102,6 +102,16 @@ ignore = [
     # passed, take the newest autumn-web and re-run the audit.
     # Review-by: 2026-11-12.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (not a vulnerability); reaches this app only through autumn-web's serde_yaml, which serializes the OpenAPI document and parses no untrusted YAML; no safe upgrade; review-by 2026-11-12" },
+    # RUSTSEC-2026-0387 — `crypto-bigint` has secret-dependent branches in
+    # nominally constant-time operations.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0387
+    #
+    # Ships pre-waived because the fix is only in crypto-bigint >=0.7.6 and the
+    # RustCrypto elliptic-curve stack that autumn-web's `jsonwebtoken`
+    # (ES256/ES384) uses is still on 0.5.x. A microarchitectural timing leak on
+    # ECDSA secrets; no network-reachable signing oracle. Drop this waiver when
+    # `cargo update` resolves crypto-bigint >=0.7.6. Review-by: 2026-11-08.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x via jsonwebtoken ES256/ES384 -> p256/p384 -> elliptic-curve 0.13; fix needs crypto-bigint >=0.7.6; review-by 2026-11-08" },
     # >>> autumn:bundled-pg-waiver
     # RUSTSEC-2024-0384 — `instant` is unmaintained.
     # https://rustsec.org/advisories/RUSTSEC-2024-0384
