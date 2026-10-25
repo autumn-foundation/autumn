@@ -246,49 +246,64 @@ const MAX_GENERATE_EPOCH: u64 = 253_402_300_799;
 ///
 /// If [`GENERATE_EPOCH_ENV`] is set, its value replaces the system clock.
 pub fn timestamp_now() -> String {
+    let (secs, message) = generation_clock(std::env::var(GENERATE_EPOCH_ENV), system_clock_secs);
+    if let Some(message) = message {
+        eprintln!("{message}");
+    }
+    timestamp_from_unix(secs)
+}
+
+fn system_clock_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let clock = || {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    };
-    let pinned = match std::env::var(GENERATE_EPOCH_ENV) {
-        Ok(value) => parse_generate_epoch(Some(&value)),
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The generation time, and the message for stderr if there is one.
+///
+/// `pinned` is the result of reading [`GENERATE_EPOCH_ENV`]. `clock` gives
+/// the system time when the variable is not set, is empty or is not valid.
+fn generation_clock(
+    pinned: Result<String, std::env::VarError>,
+    clock: impl FnOnce() -> u64,
+) -> (u64, Option<String>) {
+    let parsed = match pinned {
+        Ok(value) => parse_generate_epoch(&value),
         Err(std::env::VarError::NotPresent) => Ok(None),
         // A value that is not UTF-8 is not a number of Unix seconds.
         Err(std::env::VarError::NotUnicode(_)) => Err(()),
     };
-    let secs = match pinned {
-        Ok(Some(secs)) => {
-            eprintln!(
+    match parsed {
+        Ok(Some(secs)) => (
+            secs,
+            Some(format!(
                 "note: {GENERATE_EPOCH_ENV} is set. New migration versions start with {}. \
                  Unset it after the test.",
                 timestamp_from_unix(secs)
-            );
-            secs
-        }
-        Ok(None) => clock(),
-        Err(()) => {
-            eprintln!(
+            )),
+        ),
+        Ok(None) => (clock(), None),
+        Err(()) => (
+            clock(),
+            Some(format!(
                 "warning: {GENERATE_EPOCH_ENV} is not a number of Unix seconds from 0 to \
                  {MAX_GENERATE_EPOCH}. The generators use the wall clock."
-            );
-            clock()
-        }
-    };
-    timestamp_from_unix(secs)
+            )),
+        ),
+    }
 }
 
 /// Parse the value of [`GENERATE_EPOCH_ENV`].
 ///
-/// Returns `Ok(None)` if the value is not set or is empty after trimming.
-/// Returns `Err` if the value is not a number of Unix seconds from 0 to
-/// [`MAX_GENERATE_EPOCH`].
-fn parse_generate_epoch(value: Option<&str>) -> Result<Option<u64>, ()> {
-    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+/// Returns `Ok(None)` if the value is empty after trimming. Returns `Err` if
+/// the value is not a number of Unix seconds from 0 to [`MAX_GENERATE_EPOCH`].
+fn parse_generate_epoch(value: &str) -> Result<Option<u64>, ()> {
+    let value = value.trim();
+    if value.is_empty() {
         return Ok(None);
-    };
+    }
     // `u64::from_str` accepts a leading `+`. This function accepts only ASCII
     // digits.
     if !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -970,29 +985,25 @@ mod tests {
     // Issue #2601: `AUTUMN_GENERATE_EPOCH` sets the generation clock to a fixed
     // time.
     #[test]
-    fn generate_epoch_unset_or_empty_uses_the_clock() {
-        assert_eq!(parse_generate_epoch(None), Ok(None));
-        assert_eq!(parse_generate_epoch(Some("")), Ok(None));
-        assert_eq!(parse_generate_epoch(Some("  ")), Ok(None));
+    fn generate_epoch_empty_uses_the_clock() {
+        assert_eq!(parse_generate_epoch(""), Ok(None));
+        assert_eq!(parse_generate_epoch("  "), Ok(None));
     }
 
     #[test]
     fn generate_epoch_accepts_unix_seconds() {
+        assert_eq!(parse_generate_epoch("1788755613"), Ok(Some(1_788_755_613)));
         assert_eq!(
-            parse_generate_epoch(Some("1788755613")),
+            parse_generate_epoch(" 1788755613\n"),
             Ok(Some(1_788_755_613))
         );
-        assert_eq!(
-            parse_generate_epoch(Some(" 1788755613\n")),
-            Ok(Some(1_788_755_613))
-        );
-        assert_eq!(parse_generate_epoch(Some("0")), Ok(Some(0)));
+        assert_eq!(parse_generate_epoch("0"), Ok(Some(0)));
     }
 
     #[test]
     fn generate_epoch_rejects_a_value_that_is_not_unix_seconds() {
         for bad in ["abc", "-1", "1.5", "20260907043333x", "+1"] {
-            assert_eq!(parse_generate_epoch(Some(bad)), Err(()), "{bad}");
+            assert_eq!(parse_generate_epoch(bad), Err(()), "{bad}");
         }
     }
 
@@ -1000,13 +1011,56 @@ mod tests {
     fn generate_epoch_keeps_the_stamp_at_14_digits() {
         // 9999-12-31T23:59:59Z is the last 14-digit stamp.
         assert_eq!(
-            parse_generate_epoch(Some("253402300799")),
+            parse_generate_epoch("253402300799"),
             Ok(Some(253_402_300_799))
         );
         assert_eq!(timestamp_from_unix(253_402_300_799), "99991231235959");
         // One second later, the year has 5 digits. Autumn's migration tools do
         // not read a version of that length.
-        assert_eq!(parse_generate_epoch(Some("253402300800")), Err(()));
+        assert_eq!(parse_generate_epoch("253402300800"), Err(()));
+    }
+
+    /// The system clock in these tests. A value that differs from every pin.
+    const CLOCK: u64 = 1_700_000_000;
+
+    #[test]
+    fn generation_clock_unset_uses_the_clock_silently() {
+        let got = generation_clock(Err(std::env::VarError::NotPresent), || CLOCK);
+        assert_eq!(got, (CLOCK, None));
+        let got = generation_clock(Ok(String::new()), || CLOCK);
+        assert_eq!(got, (CLOCK, None));
+    }
+
+    #[test]
+    fn generation_clock_pinned_uses_the_pin_and_says_so() {
+        let (secs, message) = generation_clock(Ok("1788755613".to_owned()), || {
+            panic!("a pinned clock must not read the system clock")
+        });
+        assert_eq!(secs, 1_788_755_613);
+        let message = message.expect("a pinned clock writes a note");
+        assert!(
+            message.starts_with("note: AUTUMN_GENERATE_EPOCH is set."),
+            "{message}"
+        );
+        assert!(message.contains("start with 20260907043333."), "{message}");
+    }
+
+    #[test]
+    fn generation_clock_invalid_warns_and_uses_the_clock() {
+        let not_utf8 = Err(std::env::VarError::NotUnicode(std::ffi::OsString::new()));
+        for pinned in [Ok("abc".to_owned()), not_utf8] {
+            let (secs, message) = generation_clock(pinned, || CLOCK);
+            assert_eq!(secs, CLOCK);
+            let message = message.expect("a value that is not valid writes a warning");
+            assert!(
+                message.starts_with("warning: AUTUMN_GENERATE_EPOCH"),
+                "{message}"
+            );
+            assert!(
+                message.contains("The generators use the wall clock."),
+                "{message}"
+            );
+        }
     }
 
     #[test]
