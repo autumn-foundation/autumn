@@ -3741,6 +3741,9 @@ safe = ["note_tag_id", "voter"]
 /// Chain length of the tall-tree fixture: one walk pass per level.
 const TALL_TREE_DEPTH: i64 = 300;
 
+/// The most node rows one walk pass may read in the tall-tree fixture.
+const MAX_NODE_READS_PER_PASS: i64 = 300;
+
 /// A deep walk must read each reached row a bounded number of times (#2599).
 ///
 /// One pass descends one level, so this tree needs about 300 passes. A pass
@@ -3748,7 +3751,7 @@ const TALL_TREE_DEPTH: i64 = 300;
 /// quadratic in the depth. A pass that joins only the frontier reads each row
 /// a constant number of times.
 ///
-/// The test pastes the printed SQL without its `COMMIT` and reads this
+/// The test runs the printed SQL without its `COMMIT` and reads this
 /// session's own table counters (`pg_stat_xact_user_tables`) before the
 /// rollback. These counters are exact and need no stats flush.
 #[tokio::test]
@@ -3842,11 +3845,11 @@ async fn a_deep_walk_reads_each_reached_row_a_bounded_number_of_times() {
         kept, TALL_TREE_DEPTH,
         "the printed SQL must keep what the command keeps"
     );
-    // Each pass reads a fixed number of node rows per statement (about 80 on
-    // PostgreSQL 11), so the total grows with the depth: about 30 000 here.
-    // A walk that re-joins every reached row on each pass grows with the
-    // square of the depth: 1 136 286 here. The bound is between the two.
-    let bound = 300 * TALL_TREE_DEPTH;
+    // Each pass reads about 100 node rows on PostgreSQL 11, so the total
+    // grows with the depth: about 30 000 here. A walk that joins every key
+    // found so far on each pass grows with the square of the depth:
+    // 1 136 286 here. The bound is between the two.
+    let bound = MAX_NODE_READS_PER_PASS * TALL_TREE_DEPTH;
     assert!(
         read <= bound,
         "the walk read {read} node row(s) for a {TALL_TREE_DEPTH}-level chain; \

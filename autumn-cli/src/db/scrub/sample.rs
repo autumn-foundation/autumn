@@ -28,9 +28,9 @@
 //! data) start with every row selected and are never descended from;
 //! `never_include` tables (audit logs) are emptied.
 //!
-//! Each pass joins only the frontier: the keys the previous pass added. A key
-//! added earlier was walked already, so a pass costs the rows it adds, not
-//! every row reached so far (#2599).
+//! Each pass joins only the frontier: the keys that the previous pass and this
+//! pass added. The walk joined older keys before. Thus a pass reads the new
+//! rows, not every row found so far (#2599).
 //!
 //! # Fail-closed
 //!
@@ -1515,9 +1515,9 @@ fn join_on(edge: &ForeignKeyConstraint, child: &str, parent: &str) -> String {
 
 /// The frontier of `set`: the keys a pass walks from.
 ///
-/// It holds the keys the previous pass added, plus the keys this pass added
-/// so far. A key added two or more passes ago was walked through every edge
-/// already, so a join against it finds nothing new (#2599).
+/// It holds the keys that the previous pass and this pass added. The walk
+/// joined each older key through every edge before, so a join against it
+/// finds nothing new (#2599).
 fn frontier_of(set: &str) -> String {
     format!("{set}_front")
 }
@@ -1580,8 +1580,8 @@ impl SamplePlan {
     /// `INSERT INTO set` from `select`, which yields only keys not in `set`.
     ///
     /// When `set` is in `frontiers`, the same statement also writes the new
-    /// keys to its frontier and its next set. One statement cannot write the
-    /// set and skip the frontier, so no key is left unwalked.
+    /// keys to its frontier and its next set. One statement writes all three,
+    /// so the walk reads each new key.
     fn insert_into(frontiers: &[String], tag: &str, set: &str, select: &str) -> String {
         if frontiers.iter().any(|f| f == set) {
             format!(
@@ -1666,6 +1666,9 @@ impl SamplePlan {
     /// Make the keys this pass added the next frontier. Run after each pass,
     /// before [`Self::analyze_statements`].
     ///
+    /// Without this step the result does not change, but each pass joins
+    /// every key found so far again.
+    ///
     /// `TRUNCATE`, not `DELETE`: autovacuum never touches a temporary table,
     /// so deleted rows stay in it and every later scan reads them again.
     #[must_use]
@@ -1682,6 +1685,16 @@ impl SamplePlan {
                 ]
             })
             .collect()
+    }
+
+    /// What runs after each pass, in order: [`Self::rotate_statements`],
+    /// then [`Self::analyze_statements`]. `apply` and the printed loop both
+    /// use this list, so the two cannot drift apart.
+    #[must_use]
+    pub fn end_of_pass_statements(&self) -> Vec<String> {
+        let mut out = self.rotate_statements();
+        out.extend(self.analyze_statements());
+        out
     }
 
     /// Seed the roots (deterministically) and the always-include tables.
@@ -1734,12 +1747,12 @@ impl SamplePlan {
 
     /// One closure pass: ascend then descend over every walked edge. Run
     /// repeatedly until a pass selects nothing new, with
-    /// [`Self::rotate_statements`] after each pass.
+    /// [`Self::end_of_pass_statements`] after each pass.
     ///
-    /// Each join reads the frontier, not the full set, so a pass costs the
-    /// rows the previous pass added rather than every row reached so far. The
-    /// `NOT EXISTS` still reads the full set. A statement inserts the same rows
-    /// as a join against the full set, so the pass count does not change.
+    /// Each join reads the frontier, not the full set, so a pass reads the new
+    /// rows, not every row found so far. The `NOT EXISTS` still reads the full
+    /// set. A statement inserts the same rows as a join against the full set,
+    /// so the pass count does not change.
     #[must_use]
     pub fn walk_statements(&self) -> Vec<String> {
         let frontiers = self.frontier_sets();
@@ -1807,9 +1820,8 @@ impl SamplePlan {
     /// key and every integrity assertion still passes.
     ///
     /// So the dry run emits this instead of the bare statements: the same
-    /// walk, the same per-pass frontier move and `ANALYZE`, and the same
-    /// `MAX_PASSES` ceiling,
-    /// wrapped in the loop that makes them a fixpoint.
+    /// walk, the same [`Self::end_of_pass_statements`], and the same
+    /// `MAX_PASSES` ceiling, wrapped in the loop that makes them a fixpoint.
     #[must_use]
     pub fn walk_loop_statement(&self) -> String {
         let mut body = vec![
@@ -1827,11 +1839,7 @@ impl SamplePlan {
             body.push("    GET DIAGNOSTICS moved = ROW_COUNT;".to_owned());
             body.push("    total := total + moved;".to_owned());
         }
-        for statement in self
-            .rotate_statements()
-            .into_iter()
-            .chain(self.analyze_statements())
-        {
+        for statement in self.end_of_pass_statements() {
             body.push(format!("    {statement};"));
         }
         body.push("    passes := passes + 1;".to_owned());
@@ -2185,15 +2193,14 @@ pub fn apply(
     }
 
     let walk = plan.walk_statements();
-    let rotate = plan.rotate_statements();
-    let analyze = plan.analyze_statements();
+    let end_of_pass = plan.end_of_pass_statements();
     let mut passes = 0;
     loop {
         let mut selected = 0;
         for statement in &walk {
             selected += sql_query(statement).execute(conn)?;
         }
-        for statement in rotate.iter().chain(&analyze) {
+        for statement in &end_of_pass {
             sql_query(statement).execute(conn)?;
         }
         passes += 1;
@@ -4377,9 +4384,10 @@ mod tests {
         // A key that reaches the set but not the frontier is never walked
         // from. Its rows are then deleted, and no foreign key check sees it.
         let plan = self_referential_plan();
-        let (users_keep, users_descend) = sets_of(&plan, "users");
         let walk = plan.walk_statements();
-        for set in [&users_keep, &users_descend] {
+        let frontiers = plan.frontier_sets();
+        assert_eq!(frontiers.len(), 3, "users' two sets and comments' keep set");
+        for set in &frontiers {
             let into = format!("INSERT INTO {} (k)", quote_ident(set));
             let writers: Vec<&String> = walk.iter().filter(|s| s.contains(&into)).collect();
             assert!(!writers.is_empty(), "the fixture must write {set}");
@@ -4425,9 +4433,14 @@ mod tests {
         // their seeded keys must be the first frontier.
         let plan = self_referential_plan();
         let seed = plan.seed_statements(&BTreeMap::new());
+        let frontier_names: Vec<String> = plan
+            .frontier_sets()
+            .iter()
+            .map(|set| quote_ident(&frontier_of(set)))
+            .collect();
         let last_root_seed = seed
             .iter()
-            .rposition(|s| !s.contains("_front"))
+            .rposition(|s| !frontier_names.iter().any(|f| s.contains(f.as_str())))
             .expect("roots are seeded");
         for set in plan.frontier_sets() {
             let copy = format!(
@@ -4512,6 +4525,85 @@ mod tests {
                 .count(),
             walk.len(),
             "{loop_sql}"
+        );
+    }
+
+    #[test]
+    fn apply_and_the_printed_loop_share_one_end_of_pass_list() {
+        // Without the rotate the result does not change, but each pass joins
+        // every key found so far again. No result check can see that.
+        let plan = self_referential_plan();
+        let mut expected = plan.rotate_statements();
+        expected.extend(plan.analyze_statements());
+        assert_eq!(plan.end_of_pass_statements(), expected);
+        let loop_sql = plan.walk_loop_statement();
+        let body: String = expected
+            .iter()
+            .fold(String::new(), |body, s| body + "    " + s + ";\n");
+        assert!(
+            loop_sql.contains(&body),
+            "the loop must run the end-of-pass list in order:\n{loop_sql}"
+        );
+    }
+
+    #[test]
+    fn a_full_copy_child_seeds_its_whole_keep_set_into_the_frontier() {
+        // `user_flags` is copied whole and references `users`, so the first
+        // pass ascends from every flag. Its keep set holds every row after
+        // the seed, so the frontier must start with every row too.
+        let (mut tables, mut keys) = schema();
+        tables.push(table("user_flags", &["id"]));
+        keys.push(fk(
+            "user_flags_user_fk",
+            "user_flags",
+            "user_id",
+            "users",
+            "id",
+        ));
+        let rules = SampleRules {
+            always_include: vec!["countries".to_owned(), "user_flags".to_owned()],
+            never_include: vec!["audit_logs".to_owned()],
+        };
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &rules,
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (flags_keep, flags_descend) = sets_of(&plan, "user_flags");
+        assert!(plan.frontier_sets().contains(&flags_keep));
+        assert!(
+            !plan.frontier_sets().contains(&flags_descend),
+            "nothing descends out of a full-copy table"
+        );
+        let seed = plan.seed_statements(&BTreeMap::new());
+        let fill = seed
+            .iter()
+            .position(|s| {
+                s.starts_with(&format!(
+                    "INSERT INTO {} (k) SELECT",
+                    quote_ident(&flags_keep)
+                ))
+            })
+            .expect("the full copy is seeded");
+        let copy = seed
+            .iter()
+            .position(|s| {
+                *s == format!(
+                    "INSERT INTO {} (k) SELECT k FROM {}",
+                    quote_ident(&frontier_of(&flags_keep)),
+                    quote_ident(&flags_keep)
+                )
+            })
+            .expect("the frontier copies the full keep set");
+        assert!(copy > fill, "{seed:?}");
+        assert!(
+            joined(&plan.walk_statements()).contains(&format!(
+                "JOIN {} AS ck",
+                quote_ident(&frontier_of(&flags_keep))
+            )),
+            "the ascend out of the full copy reads its frontier"
         );
     }
 }
