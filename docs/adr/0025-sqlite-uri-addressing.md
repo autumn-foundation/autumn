@@ -65,7 +65,9 @@ A spike on SQLite 3.45.1 showed:
    longest prefix that exists, so an absent `shared/data` under a symlinked
    `app_dir` still resolves. A database is in `shared/data` when its parent is
    the resolved `shared/data` (a volume link) or `shared/data` under the
-   resolved `app_dir` (an absent volume). A relative database keeps the
+   resolved `app_dir` (an absent volume). Any other place in the app dir is
+   refused first, so a `shared/data` link into `releases/` (or to an ancestor)
+   admits nothing. A relative database keeps the
    lexical check, because it is in `shared/data` by construction.
 
 ## Planning

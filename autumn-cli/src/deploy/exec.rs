@@ -2037,25 +2037,24 @@ pub fn sqlite_data_adopted_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComman
         "record-data-adopted",
         format!(
             "{resolve} \
-             case \"$dir\" in {SHARED_DATA_ARMS}) \
-             if [ -e \"$db\" ]; then : > {marker_q} || exit 1; fi ;; esac",
+             if [ \"$place\" = managed ] && [ -e \"$db\" ]; then \
+             : > {marker_q} || exit 1; fi",
             resolve = host_data_paths_shell(cfg, db),
         ),
     ))
 }
 
-/// `case` arms for "the database parent is in `shared/data`": the resolved
-/// `shared/data` (a mounted volume can be a symlink), or that name under the
-/// resolved app dir (an absent volume).
-const SHARED_DATA_ARMS: &str = "\"$data\"|\"$data/\"*|\"$pre/shared/data\"|\"$pre/shared/data/\"*";
-
-/// Shell that sets `$app`, `$data`, `$db` and `$dir` to the host's resolved
-/// app dir, `shared/data`, database and database parent, and `$pre` to `$app`
-/// without a final `/` (#2589 item 19).
+/// Shell that resolves the app dir, `shared/data` and the database on the host,
+/// and sets `$place` for the database parent (#2589 item 19):
 ///
-/// A `shared/data` link that resolves to another place in the app dir (such
-/// as `releases/r1`) is not a volume, and pruning can delete it. Then `$data`
-/// keeps its own name, so a database there falls to the app-dir refusal.
+/// - `managed`: in `shared/data` under the resolved app dir, or in the
+///   resolved `shared/data` (a mounted volume can be a symlink).
+/// - `app`: anywhere else in the app dir. Pruning can delete it.
+/// - `other`: outside the app dir. The operator owns it.
+///
+/// `app` is tested BEFORE the resolved `shared/data`. So a `shared/data` link
+/// into `releases/`, or to an ancestor of the app dir, cannot admit a database
+/// that pruning deletes.
 ///
 /// One resolver for every op that asks "is this in `shared/data`?", so the
 /// ops cannot disagree.
@@ -2076,11 +2075,11 @@ fn host_data_paths_shell(cfg: &ResolvedDeployConfig, db: &str) -> String {
          r=$(readlink -f \"$p\" 2>/dev/null) || r=$p; \
          if [ -z \"$s\" ]; then printf '%s' \"$r\"; else printf '%s%s' \"${{r%/}}\" \"$s\"; fi; }}; \
          app=$(autumn_resolve {app_dir_q}); pre=${{app%/}}; \
-         data=$(autumn_resolve {data_q}); \
-         case \"$data\" in \"$pre/shared/data\"|\"$pre/shared/data/\"*) ;; \
-         \"$app\"|\"$pre/\"*) data=$pre/shared/data ;; esac; \
-         db=$(autumn_resolve {db_q}); \
-         dir=$(dirname \"$db\");",
+         data=$(autumn_resolve {data_q}); db=$(autumn_resolve {db_q}); \
+         dir=$(dirname \"$db\"); \
+         case \"$dir\" in \"$pre/shared/data\"|\"$pre/shared/data/\"*) place=managed ;; \
+         \"$app\"|\"$pre/\"*) place=app ;; \
+         \"$data\"|\"$data/\"*) place=managed ;; *) place=other ;; esac;",
         app_dir_q = shell_quote(&cfg.app_dir),
         data_q = shell_quote(&cfg.shared_data_dir()),
         db_q = shell_quote(db),
@@ -2162,13 +2161,13 @@ pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComm
         // `host_data_paths_shell`.
         format!(
             "{resolve} \
-             case \"$dir\" in \
-             {SHARED_DATA_ARMS}) \
+             case \"$place\" in \
+             managed) \
              if [ -e \"$db\" ]; then : > {marker_q} || exit 1; \
              elif [ -e {marker_q} ]; then \
              echo {missing_refusal_q} >&2; echo {missing_recovery_q} >&2; exit 1; fi; \
              mkdir -p \"$dir\" || exit 1 ;; \
-             \"$app\"|\"$pre/\"*) echo {refusal_q} >&2; exit 1 ;; \
+             app) echo {refusal_q} >&2; exit 1 ;; \
              esac",
             resolve = host_data_paths_shell(cfg, path),
             marker_q = shell_quote(&marker),
@@ -9352,6 +9351,39 @@ mod tests {
         assert!(
             !app.join("shared/sqlite-data-adopted").exists(),
             "a database in releases/ is not adopted"
+        );
+    }
+
+    /// `shared/data` linked to an ANCESTOR of the app dir must not let a
+    /// database in `releases/` match the volume arm (Codex review on #3449).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_data_link_to_an_ancestor_does_not_admit_a_release() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = tmp.path().join("srv/myapp");
+        std::fs::create_dir_all(app.join("releases/r1")).expect("release dir");
+        std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+        std::os::unix::fs::symlink(tmp.path().join("srv"), app.join("shared/data"))
+            .expect("link to an ancestor");
+        std::fs::write(app.join("releases/r1/app.db"), b"LIVE").expect("db");
+
+        let mut cfg = resolved();
+        cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data = SqliteDataPlacement::Persistent(
+            app.join("shared/data/myapp/releases/r1/app.db")
+                .to_str()
+                .expect("utf-8")
+                .to_owned(),
+        );
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run check-data-dir");
+        assert!(
+            !out.status.success(),
+            "a database in releases/ must be refused"
         );
     }
 
