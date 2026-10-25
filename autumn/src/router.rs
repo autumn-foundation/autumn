@@ -17361,7 +17361,12 @@ mod framework_scripts_tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&body[..], asset.bytes());
         }
-        assert_eq!(seen, 5, "htmx, sse, idiomorph, csrf helper, widgets");
+        // The `webmcp` feature adds the WebMCP shim (#2619).
+        let expected = 5 + usize::from(cfg!(feature = "webmcp"));
+        assert_eq!(
+            seen, expected,
+            "htmx, sse, idiomorph, csrf helper, widgets (+ webmcp)"
+        );
     }
 
     #[tokio::test]
