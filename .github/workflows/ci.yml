@@ -2704,12 +2704,14 @@ jobs:
         run: cargo clippy -p autumn-web --features "sqlite,telemetry-otlp" --lib -- -D warnings
       - name: Clippy autumn-web as a SQLite-only app (no Postgres client)
         # Issue #2605. Default features are off, so `postgres` is off. The list
-        # is the default set without `postgres`, plus each additive feature
-        # that is not Postgres-only. `cargo tree` then shows that no Postgres
-        # crate is in the graph. The tree goes to a file first, so a failed
-        # `cargo tree` fails the step and does not pass as "no match".
+        # is the default set without `postgres`, plus each feature that does
+        # not need Postgres, except the test-only features.
+        # `autumn/tests/integration/sqlite_postgres_free.rs` keeps it complete.
+        # `cargo tree` then shows that no Postgres crate is in the graph. The
+        # step writes the tree to a file. Then a failed `cargo tree` fails the
+        # step.
         env:
-          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile
         run: |
           cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
           tree="${RUNNER_TEMP}/sqlite-only-tree.txt"

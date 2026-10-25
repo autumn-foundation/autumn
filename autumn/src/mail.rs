@@ -4297,7 +4297,7 @@ fn unsubscribe_error_html(detail: &str) -> String {
 ///
 /// [`InMemorySuppressionStore`] is the zero-config default (process-local,
 /// lost on restart — perfect for a single instance, tests, and review apps).
-/// [`PgSuppressionStore`](suppression::PgSuppressionStore) (feature `db`) persists to a `mail_suppressions`
+/// [`PgSuppressionStore`](suppression::PgSuppressionStore) (feature `postgres`) persists to a `mail_suppressions`
 /// table for multi-instance deploys, mirroring the memory/durable split used
 /// by sessions and jobs. That table is **not** auto-created — provision it
 /// yourself (see [`PgSuppressionStore`](suppression::PgSuppressionStore)).

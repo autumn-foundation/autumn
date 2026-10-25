@@ -335,7 +335,7 @@ impl StaticFileLayer {
     /// The default is [`LocalIsrCoordinator`], which is suitable for
     /// single-replica and development deployments. For multi-replica
     /// deployments sharing a writable `dist/` volume, supply a distributed
-    /// backend such as `PostgresIsrCoordinator` (feature `db`) to prevent
+    /// backend such as `PostgresIsrCoordinator` (feature `postgres`) to prevent
     /// stampede writes.
     ///
     /// # Example (production multi-replica)

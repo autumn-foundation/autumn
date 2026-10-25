@@ -792,11 +792,16 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
         Some(toml::Value::Table(t)) => table_default_features(t),
         _ => None,
     };
-    let default_features_part =
+    // With defaults off, `offline-sync` needs a backend (#2605). Name
+    // `postgres`, as `db` did before.
+    let (default_features_part, shell_features) =
         if member_default_features.or(resolved_default_features) == Some(false) {
-            "default-features = false, "
+            (
+                "default-features = false, ",
+                r#""offline-sync", "postgres""#,
+            )
         } else {
-            ""
+            ("", r#""offline-sync""#)
         };
 
     // Path/git sources are mirrored directly onto the shell's edge.
@@ -810,7 +815,7 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
         return ShellAutumnWebDep {
             dep_entry: format!(
                 "autumn-web = {{ {version_part}{source}, \
-                 {default_features_part}features = [\"offline-sync\"] }}"
+                 {default_features_part}features = [{shell_features}] }}"
             ),
             patch_entry: None,
         };
@@ -846,7 +851,7 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
     let registry_entry = |req: &str| {
         format!(
             "autumn-web = {{ version = \"{req}\", \
-             {registry_part}{default_features_part}features = [\"offline-sync\"] }}"
+             {registry_part}{default_features_part}features = [{shell_features}] }}"
         )
     };
     let Some(version) = version else {

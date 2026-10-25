@@ -10,7 +10,8 @@
 #             after exclusions.
 #   Phase B — curated real-world combinations (fixed combos that mirror documented
 #             user journeys: db-only API on each backend, minimal web, mail,
-#             storage+db, telemetry, and each db-needing feature on each backend).
+#             storage+db, telemetry, and each feature that needs `db`, on each
+#             backend).
 #             Each is a discrete `cargo check` so a failure names the exact
 #             --features string.
 #
@@ -20,10 +21,10 @@
 #   system-tests        — pulls chromiumoxide (headless Chromium)
 #   test-support        — dev-only; pulls testcontainers
 #
-# Also excluded from Phase A, because alone they select no database backend
-# and stop at autumn-web's `compile_error!` (#2605): db, seed, repl,
+# Also excluded from Phase A: the features that enable `db` but no backend.
+# Alone, each stops at autumn-web's `compile_error!` (#2605): db, seed, repl,
 # offline-sync, ledger-profile. Phase A still builds `postgres` and `sqlite`
-# alone, and Phase B builds each of these with a backend.
+# alone. Phase B builds each of these with a backend.
 #
 # telemetry-otlp requires protoc; it is swept in Phase A and also verified in
 # Phase B. Install protoc with:

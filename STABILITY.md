@@ -310,18 +310,18 @@ combinations is also checked on every PR:
 | Combination | Rationale |
 |---|---|
 | `--no-default-features` (no flags) | bare-minimum compile |
-| each flag alone | isolation regression guard |
+| each flag alone, except the `db` group below | isolation regression guard |
 | `db,postgres` | db-only API server on Postgres |
 | `db,sqlite` | db-only API server on SQLite |
 | `mail` | mail without the full default set |
 | `storage,db,postgres` | file storage backed by database |
 | `maud,htmx` | minimal web front-end |
 | `telemetry-otlp` | standalone telemetry |
-| `seed,repl,ledger-profile` + each backend | `db` features on each backend |
+| `seed,repl,ledger-profile` + each backend | features that enable `db`, on each backend |
 | `offline-sync,reporting` + each backend | offline sync on each backend |
 
 `db` alone selects no backend, so it stops at a `compile_error!`. The sweep
-skips it and the features that only add `db` (`seed`, `repl`,
+skips it and the features that enable `db` but no backend (`seed`, `repl`,
 `offline-sync`, `ledger-profile`). The combinations above build them with a
 backend.
 

@@ -1174,7 +1174,7 @@ mod tests {
         assert!(!coordinator.is_fleet_distributed());
     }
 
-    // `PostgresTickSchedulerCoordinator` (feature `db`) needs a live pool
+    // `PostgresTickSchedulerCoordinator` (feature `postgres`) needs a live pool
     // to construct — covered by the testcontainer-backed
     // `tests/integration/scheduled_coordination_pg.rs` suite instead. This
     // exercises the same default-method derivation (`backend() == "postgres"`)

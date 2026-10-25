@@ -97,7 +97,7 @@ impl IsrCoordinator for LocalIsrCoordinator {
 /// Postgres advisory-lock ISR coordinator.
 ///
 /// Uses `pg_try_advisory_lock` / `pg_advisory_unlock` to prevent duplicate
-/// regeneration across replicas. Requires the `db` feature.
+/// regeneration across replicas. Requires the `postgres` feature.
 ///
 /// The advisory lock is keyed on [`isr_advisory_lock_key`] which is derived
 /// from (route, window) -- two replicas that see the same stale page in the

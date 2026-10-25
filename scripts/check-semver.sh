@@ -347,10 +347,10 @@ for crate in "${CRATES[@]}"; do
     # Keep the two lists in step: a feature added to the Postgres list belongs
     # here too, against the same demonstrated compile.
     autumn_web_semver_sqlite_features="${autumn_web_semver_features},sqlite"
-    # `db` lost its Postgres client to the new `postgres` feature (#2605), and
-    # `db` alone no longer compiles. The 0.7.0 baseline has no `postgres`
-    # feature, so name it for the current build only. Both passes then check
-    # the same surface as the baseline's `db`.
+    # The `postgres` feature now holds the Postgres client. `db` alone does not
+    # compile (#2605). The 0.7.0 baseline has no `postgres` feature, so name it
+    # for the current build only. Both passes then check the same surface as
+    # the baseline's `db`.
     autumn_web_semver_current_only="postgres"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"

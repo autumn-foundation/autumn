@@ -4144,6 +4144,27 @@ pub(crate) fn should_auto_apply(
     auto_migrate_in_production
 }
 
+/// The message a build without `postgres` gives for a non-SQLite target.
+#[cfg(not(feature = "postgres"))]
+pub(crate) const NO_POSTGRES_MSG: &str = "this build of autumn-web has no Postgres backend; use a \
+     `sqlite://` URL or enable the `postgres` feature";
+
+/// A build without `postgres` cannot migrate a Postgres target. It logs an
+/// error and exits.
+#[cfg(not(feature = "postgres"))]
+pub(crate) fn auto_migrate(
+    _database_url: &str,
+    _profile: Option<&str>,
+    _auto_migrate: Option<bool>,
+    _auto_migrate_in_production: bool,
+    _migrations: impl MigrationSource<crate::db::RuntimeBackend> + Send,
+    target: &str,
+    _policy: MigrationLockPolicy,
+) {
+    tracing::error!(target = %target, "{NO_POSTGRES_MSG}");
+    std::process::exit(1);
+}
+
 /// Run migrations according to the active profile and migration policy
 /// (decision by [`should_auto_apply`], issue #1903).
 ///
@@ -4162,26 +4183,6 @@ pub(crate) fn should_auto_apply(
 ///
 /// Called internally by [`AppBuilder::run`](crate::app::AppBuilder::run)
 /// when migrations are registered via `.migrations()`.
-/// The message a build without `postgres` gives for a non-SQLite target.
-#[cfg(not(feature = "postgres"))]
-pub(crate) const NO_POSTGRES_MSG: &str = "this target is not SQLite, and this build of autumn-web \
-     has no Postgres backend; use a `sqlite://` URL or enable the `postgres` feature";
-
-/// A build without `postgres` cannot migrate a Postgres target. Stop.
-#[cfg(not(feature = "postgres"))]
-pub(crate) fn auto_migrate(
-    _database_url: &str,
-    _profile: Option<&str>,
-    _auto_migrate: Option<bool>,
-    _auto_migrate_in_production: bool,
-    _migrations: impl MigrationSource<crate::db::RuntimeBackend> + Send,
-    target: &str,
-    _policy: MigrationLockPolicy,
-) {
-    tracing::error!(target = %target, "{NO_POSTGRES_MSG}");
-    std::process::exit(1);
-}
-
 #[allow(clippy::cognitive_complexity)]
 #[cfg(feature = "postgres")]
 pub(crate) fn auto_migrate(

@@ -193,18 +193,24 @@ codemod, or a rename-level change left `manual` with no reason (issue #1629).
 ### Features: `db` has no Postgres client; enable `postgres`
 
 **Why:** `db` compiled `pq-sys`, `tokio-postgres` and diesel's Postgres backend
-into every build, also a SQLite build (issue #2605). Now `db` is the shared
-database layer only. The new `postgres` feature adds the Postgres client. It
-is a default feature.
+into every build. This included a SQLite build (issue #2605). Now `db` is the
+shared database layer only. The new `postgres` feature adds the Postgres
+client. It is a default feature.
 
-**Who must change:** only an app or crate that turns default features off and
-enables `db`, `seed`, `repl`, `offline-sync` or `ledger-profile` without
-`sqlite`. With default features on, nothing changes. Such a build now stops
-with this error:
+**Who must change:** only a build that turns default features off. With
+default features on, nothing changes. Such a build must add `postgres` when:
 
-```text
-autumn-web: the `db` feature needs a database backend. Enable `postgres` (a default feature) or `sqlite`.
-```
+- it enables `db`, `seed`, `repl`, `offline-sync` or `ledger-profile` without
+  `sqlite`. The build stops with this error:
+
+  ```text
+  autumn-web: the `db` feature needs a database backend. Enable `postgres` (a default feature) or `sqlite`.
+  ```
+
+- it enables `sqlite` and also uses a Postgres-only item (see the list below).
+
+This also applies to `autumn console` on a project with default features off
+and no backend: its `playground` feature enables `seed`.
 
 **Before (`{X.Y}`):**
 
@@ -227,19 +233,20 @@ autumn-web = { version = "{(X+1).0}", default-features = false, features = [
 ] }
 ```
 
-A build without `postgres` does not have the Postgres-only items:
-`DbApiTokenStore`, `feature_flags::pg`, `experiments::pg`,
-`runtime_config::pg`, `PgSyncBackend`, `PgSuppressionStore`,
-`PostgresIsrCoordinator`, `PostgresTickSchedulerCoordinator`,
-`PgJobTrackingStore`, the `migrate` functions that take a Postgres connection
-or URL, and `job::enqueue_on_conn` and its siblings. These items refuse a
-SQLite target at run time, so a SQLite app did not use them.
+A build without `postgres` does not have the items that need a Postgres
+connection:
 
-**Workspace `diesel`:** the root `Cargo.toml` entries for `diesel` and
-`diesel-async` no longer enable `postgres`. A workspace crate that inherits
-them and uses `diesel::pg` gets it through `autumn-web`'s default features. A
-crate that turns those off must add `features = ["postgres"]` to its own
-`diesel` entry.
+- `DbApiTokenStore`, `PgSyncBackend`, `PgSuppressionStore`,
+  `PostgresIsrCoordinator`, `PgJobTrackingStore`;
+- `PostgresTickSchedulerCoordinator` and its deprecated alias
+  `PostgresAdvisorySchedulerCoordinator`;
+- the `feature_flags::pg`, `experiments::pg` and `runtime_config::pg`
+  modules;
+- most `migrate` items, for example `run_pending`, `pending_migrations`, the
+  checksum functions and `MigrationLockGuard`;
+- `job::enqueue_on_conn` and its siblings;
+- the `transition_<field>_to_on_conn` method that `#[model]` makes for a state
+  machine with effects. It takes an `AsyncPgConnection`.
 
 **Automation:** `manual` — this is a Cargo feature change; `autumn upgrade`
 rewrites Rust source, not `Cargo.toml` feature lists.

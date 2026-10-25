@@ -12961,7 +12961,7 @@ async fn resolve_shard_set(
                             crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL,
                         ),
                     );
-                    // LISTEN is Postgres only. A SQLite build refuses shards at boot.
+                    // LISTEN needs `postgres`. Without it, no listener starts.
                     #[cfg(not(feature = "postgres"))]
                     let _ = control_url;
                 } else {
@@ -13562,7 +13562,8 @@ fn apply_pending_or_exit(
     }
 }
 
-/// A build without `postgres` cannot migrate a Postgres target. Stop.
+/// A build without `postgres` cannot migrate a Postgres target. It prints an
+/// error and exits.
 #[cfg(all(feature = "db", not(feature = "postgres")))]
 fn apply_pending_or_exit(
     _database_url: &str,

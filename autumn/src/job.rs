@@ -27183,7 +27183,7 @@ mod lease_tests {
     /// Stale recovery requeues a job this process was running; the old
     /// worker then loses its lease; the replacement starts here and also
     /// loses its lease. Each start must be balanced exactly once.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn requeue_recovery_then_two_lease_losses_balance_in_flight() {
         let state = AppState::for_test();
@@ -27234,7 +27234,7 @@ mod lease_tests {
             "attempt 1 is balanced, attempt 2 runs"
         );
 
-        #[cfg(feature = "postgres")]
+        #[cfg(feature = "db")]
         record_recovered_requeue("leased", &id, 2, &state, &admin);
         record_lease_lost("leased", &id, 1, &state, &admin);
         assert_eq!(
@@ -27268,7 +27268,7 @@ mod lease_tests {
     /// The handler finished, but stale recovery took the claim first, so the
     /// ack or nack applies to nothing. Recovery in this process already moved
     /// the record on; the old worker must not count its start again.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn a_lost_ack_after_recovery_counts_nothing_again() {
         let state = AppState::for_test();
@@ -27438,7 +27438,7 @@ mod lease_tests {
         assert_eq!(in_flight(&state), 1);
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn requeue_recovery_leaves_counts_alone_for_a_job_started_elsewhere() {
         let state = AppState::for_test();
@@ -27514,7 +27514,7 @@ mod lease_tests {
 
     /// Issue #3166: terminal recovery, then the old worker's ack applies to
     /// nothing.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn terminal_recovery_then_lost_ack_balances_once_without_a_record() {
         let state = AppState::for_test();
@@ -27540,7 +27540,7 @@ mod lease_tests {
 
     /// A lost ack for a claim that recovery in another process took still
     /// balances this process's start.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn lost_ack_after_recovery_elsewhere_balances_the_start_once() {
         let state = AppState::for_test();
@@ -27583,7 +27583,7 @@ mod lease_tests {
         assert_eq!(status.dead_letters, 1);
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn requeue_recovery_of_a_claim_started_here_balances_it_once_without_a_record() {
         let state = AppState::for_test();
@@ -27618,7 +27618,7 @@ mod lease_tests {
     }
 
     /// A settled claim leaves no note behind.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn an_applied_ack_drops_the_claim_note() {
         let state = AppState::for_test();
@@ -27644,7 +27644,7 @@ mod lease_tests {
     /// The note decides, not the record: a record that no longer shows the
     /// attempt as running does not stop recovery from balancing a start this
     /// process made.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn requeue_recovery_balances_a_noted_start_whatever_the_record_shows() {
         let state = AppState::for_test();
@@ -27660,7 +27660,7 @@ mod lease_tests {
     }
 
     /// The worker settled first, so recovery finds no note.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn recovery_after_the_worker_settled_balances_nothing() {
         let state = AppState::for_test();
@@ -27689,7 +27689,7 @@ mod lease_tests {
     /// The retry of attempt 1 commits and a sibling worker here claims attempt
     /// 2 before attempt 1 finishes its bookkeeping. The start of attempt 2
     /// balanced attempt 1. The late applied ack must not balance it again.
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "db")]
     #[test]
     fn a_late_applied_ack_does_not_balance_a_successor_attempt() {
         let state = AppState::for_test();

@@ -12,7 +12,7 @@ name: Feature Combination Compile Gate
 #   Phase B — curated combos that mirror documented user journeys:
 #             db-only API on each backend, minimal web (maud+htmx), mail
 #             without defaults, storage+db, telemetry-otlp only, and each
-#             db-needing feature on each backend (#2605).
+#             feature that needs `db`, on each backend (#2605).
 #
 # Excluded features (documented unsupported-in-CI in STABILITY.md):
 #   managed-pg / managed-pg-bundled  — download / embed Postgres binaries

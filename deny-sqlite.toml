@@ -12,10 +12,11 @@
 # to triage a failing check.
 
 [graph]
-# The SQLite backend graph: default features + autumn-web/sqlite. NOT the
-# additive Postgres set (sqlite flips the backend and is mutually exclusive with
-# managed-pg/pq-sys), and NOT --all-features. Purpose: catch any dependency
-# reachable only from the sqlite backend (the `SQLite runtime` CI job builds it).
+# The SQLite backend graph: default features + autumn-web/sqlite. NOT
+# managed-pg (it does not compile with sqlite), and NOT --all-features. Default
+# features keep `postgres` on, so this graph is a superset of a SQLite-only app
+# (#2605). Purpose: catch any dependency reachable only from the sqlite backend
+# (the `SQLite runtime` CI job builds it).
 all-features = false
 no-default-features = false
 features = ["autumn-web/sqlite"]

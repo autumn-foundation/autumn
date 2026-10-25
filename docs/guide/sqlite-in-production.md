@@ -57,7 +57,7 @@ Enable the runtime by building the application with the `sqlite` cargo feature (
   If you keep default features on, the runtime is still SQLite, but the build
   also compiles the Postgres client. A build without `postgres` does not have
   the Postgres-only items (for example `DbApiTokenStore`, the `pg` stores and
-  `PgSyncBackend`). CI checks this build with `cargo tree`.
+  `PgSyncBackend`). CI checks a SQLite-only build with `cargo tree`.
 
 - **Connection type.** A `RuntimeConnection` alias abstracts the backend: `diesel_async::AsyncPgConnection` by default, and a `SyncConnectionWrapper<SqliteConnection>` under the `sqlite` feature. Generated repositories and hand-written queries take `&mut RuntimeConnection`, so they compile against either backend.
 - **Pool pragmas.** Each pooled connection is set up with `PRAGMA busy_timeout = 5000` (first, so later statements queue on it), `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA foreign_keys = ON`. A read-only SQLite target skips the two writing pragmas (WAL + `synchronous`). An in-memory database is pinned to a single pooled connection.
