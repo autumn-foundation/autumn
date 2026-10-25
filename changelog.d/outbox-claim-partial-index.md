@@ -8,5 +8,6 @@
   grows with them. New installs get the index from the schema. On an
   existing install, `outbox::ensure_schema` builds it in a background task with
   `CREATE INDEX CONCURRENTLY` at boot, and only logs a warning when the role
-  cannot create indexes. The index adds about 66 bytes of WAL to each
+  cannot create indexes or the pool has a single connection. The index adds
+  about 66 bytes of WAL to each
   enqueued message. [no-plugin]

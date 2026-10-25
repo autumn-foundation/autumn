@@ -175,6 +175,15 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
                 // Off the startup path: the build waits for every older
                 // transaction on the table, however long that takes.
                 let pool = pool.clone();
+                // The build holds a pooled connection until every older
+                // transaction on the table ends. A pool of one has none to spare.
+                if pool.status().max_size < 2 {
+                    tracing::warn!(
+                        "pool too small to build idx_autumn_outbox_claim in the background; run \
+                         `{CLAIM_INDEX_SQL}` by hand to speed up the outbox claim"
+                    );
+                    return Ok(());
+                }
                 tokio::spawn(async move {
                     match pool.get().await {
                         Ok(mut conn) => ensure_claim_index(&mut conn).await,
