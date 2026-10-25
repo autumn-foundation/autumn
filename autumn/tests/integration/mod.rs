@@ -502,6 +502,7 @@ mod sim_testapp_jobs;
 #[cfg(feature = "sla")]
 mod sla_obligation_macro;
 mod sqlite_ci_coverage;
+mod sqlite_postgres_free;
 #[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]
