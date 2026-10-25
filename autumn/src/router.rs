@@ -320,6 +320,10 @@ pub struct RouterContext {
     /// Gated behind the `mcp` feature.
     #[cfg(feature = "mcp")]
     pub mcp: Option<crate::mcp::McpRuntime>,
+    /// `WebMCP` settings (from `AppBuilder::mount_webmcp`). With `Some`, the
+    /// router serves the tool list at `/_autumn/webmcp/tools.json`.
+    #[cfg(feature = "webmcp")]
+    pub webmcp: Option<crate::webmcp::WebMcpRuntime>,
 }
 
 /// Checked variant of [`build_router`] that returns configuration errors
@@ -380,6 +384,8 @@ pub fn try_build_router_with_layers(
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -446,6 +452,8 @@ pub fn try_build_router_merged(
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -681,6 +689,17 @@ fn build_router_pre_state(
     } else {
         None
     };
+
+    // WebMCP (#2619): derive the page tools with the `/mcp` derivation and keep
+    // the list in state. The fallback serves it, so a user route wins. The AEO
+    // site below reads the names so its script does not register them twice.
+    #[cfg(feature = "webmcp")]
+    if let Some(rt) = ctx.webmcp.take() {
+        let docs = collect_openapi_docs(&route_list, &ctx.scoped_groups);
+        crate::webmcp::install(state, &docs, rt, ctx.openapi.as_ref(), config);
+    } else {
+        crate::webmcp::install_empty(state, config);
+    }
 
     // Agent readiness (AEO): record what the app has before `route_list` is
     // consumed. The documents are served from the router fallback and the
@@ -1608,6 +1627,10 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
             .unwrap_or_default(),
         ..SiteFacts::default()
     };
+    #[cfg(feature = "webmcp")]
+    if let Some(manifest) = state.extension::<crate::webmcp::WebMcpManifest>() {
+        facts.webmcp_projected = manifest.names().to_vec();
+    }
     if let Some(api) = openapi {
         api.fill(&mut facts);
     }
@@ -5687,6 +5710,13 @@ fn apply_middleware(
                     return crate::plugin_sandbox::mounts_fallback(axum::extract::State(app), req)
                         .await;
                 }
+                #[cfg(feature = "webmcp")]
+                if let Some(res) = crate::webmcp::serve_manifest(
+                    app.extension::<crate::webmcp::WebMcpManifest>(),
+                    &req,
+                ) {
+                    return res;
+                }
                 #[cfg(not(feature = "plugin-sandbox"))]
                 let _ = app;
                 match crate::aeo::serve_document(site, &req) {
@@ -6606,6 +6636,8 @@ pub fn try_build_router_with_static(
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         },
     )
 }
@@ -10770,6 +10802,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("scope '/api' + child '/' should collide with openapi path '/api'");
@@ -10808,6 +10842,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
             "openapi_json_path colliding with the widget stylesheet route should be rejected",
@@ -10846,6 +10882,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
             "openapi_json_path colliding with the flash stylesheet route should be rejected",
@@ -11221,6 +11259,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
             .expect_err("user-owned path should prevent OpenAPI mount");
@@ -11250,6 +11290,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("framework-owned path should prevent OpenAPI mount");
@@ -11303,6 +11345,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
             .expect_err("swagger ui asset path should be reserved");
@@ -11335,6 +11379,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("htmx csrf helper path should be reserved");
@@ -11373,6 +11419,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("OpenAPI path under a nest prefix should collide");
@@ -11412,6 +11460,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("unsubscribe endpoint path should be reserved");
@@ -11448,6 +11498,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("job status endpoint path should be reserved");
@@ -11485,6 +11537,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("story gallery path should be reserved while stories are enabled");
@@ -11522,6 +11576,8 @@ enabled = true
             openapi: Some(openapi),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
             "story gallery demo search path should be reserved while stories are enabled",
@@ -11560,6 +11616,8 @@ enabled = true
                     openapi: Some(openapi),
                     #[cfg(feature = "mcp")]
                     mcp: None,
+                    #[cfg(feature = "webmcp")]
+                    webmcp: None,
                 };
                 let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
                     .expect_err("dev reload path should be reserved");
@@ -11642,6 +11700,8 @@ enabled = true
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         }
     }
 
@@ -16169,6 +16229,8 @@ mod trusted_host_tests {
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         }
     }
 
@@ -16474,6 +16536,8 @@ mod trusted_host_tests {
                 expose_all: true,
                 ..crate::mcp::McpRuntime::new("/mcp")
             }),
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
 
         let (_tmp, dist) = build_empty_dist();
@@ -16630,6 +16694,8 @@ mod trusted_host_tests {
                 expose_all: true,
                 ..crate::mcp::McpRuntime::new("/mcp")
             }),
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         };
         let (_tmp, dist) = build_empty_dist();
         let app = super::try_build_router_with_static_inner(

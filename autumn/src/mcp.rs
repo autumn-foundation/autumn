@@ -921,6 +921,24 @@ impl McpToolInfo {
         &self.path_template
     }
 
+    /// Path parameter names, in template order. A catch-all keeps its `*`.
+    #[must_use]
+    pub fn path_params(&self) -> &[String] {
+        &self.path_params
+    }
+
+    /// Whether the tool sends a JSON body (the `body` argument).
+    #[must_use]
+    pub const fn has_body(&self) -> bool {
+        self.has_body
+    }
+
+    /// Whether the tool sends a query string (the `query` argument).
+    #[must_use]
+    pub const fn has_query(&self) -> bool {
+        self.has_query
+    }
+
     /// Whether this is a streaming (`Sse`) tool.
     #[must_use]
     pub const fn streams(&self) -> bool {

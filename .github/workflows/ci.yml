@@ -1180,6 +1180,7 @@ jobs:
             acme,
             sla,
             repl,
+            webmcp,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1503,6 +1504,36 @@ jobs:
           cargo test -p autumn-web --features sla --test integration_tests compile_fail::obligation \
             | tee "${RUNNER_TEMP}/sla-compile-fail.log"
           assert_ran "${RUNNER_TEMP}/sla-compile-fail.log" "obligation_compile_fail_tests"
+      - name: Set up Node for the WebMCP shim cases
+        if: matrix.lane == 'webmcp'
+        # The free-disk step removes /opt/hostedtoolcache. The shim cases
+        # run the served script under Node.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run WebMCP-gated tests (in-page tool projection)
+        if: matrix.lane == 'webmcp'
+        # `webmcp` (#2619) is off by default. The todo-app example turns it on,
+        # so `cargo test --workspace` compiles it today by feature unification.
+        # That is accidental. Name it here so the suite stays covered on
+        # purpose. `assert_ran`: a filter that matches nothing exits 0. The
+        # browser cases need Chromium and run in publish-gate.yml.
+        env:
+          AUTUMN_REQUIRE_NODE: "1"
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features webmcp --lib -- webmcp agent_authority \
+            | tee "${RUNNER_TEMP}/webmcp-lib.log"
+          assert_ran "${RUNNER_TEMP}/webmcp-lib.log" "autumn-web webmcp unit tests"
+          cargo test -p autumn-web --features webmcp --test integration_tests webmcp \
+            | tee "${RUNNER_TEMP}/webmcp-integration.log"
+          assert_ran "${RUNNER_TEMP}/webmcp-integration.log" "webmcp integration tests"
+          grep -q 'shim_behaviour_cases_pass_under_node ... ok' "${RUNNER_TEMP}/webmcp-integration.log" \
+            || { echo "::error::the WebMCP shim cases did not run"; exit 1; }
       - name: Run REPL-gated tests (console Rhai prompt)
         if: matrix.lane == 'repl'
         # `repl` (#2148) is off by default, so the `test` job compiles none of
@@ -2174,7 +2205,7 @@ jobs:
       # Coverage is not bound by the crates.io baseline, so this list is a
       # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
       # `acme`, `managed-pg*`, `system-tests`, `test-support`, ...).
-      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
+      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,webmcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
       # `postgresql_embedded`'s build script downloads Postgres binaries via
       # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
       # fails the build with a 403. Authenticate with the job's token to get

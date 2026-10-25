@@ -113,7 +113,7 @@ pub const OPENAPI_UNAVAILABLE_UNCONFIGURED: &str =
 #[derive(Clone, Debug, Default)]
 // A flat, generated metadata descriptor. Each boolean flag (hidden, secured,
 // sunset_opt_out, has_policy, public, mcp_tool, mcp_exclude, mcp_stream,
-// mcp_task, mcp_core) models a distinct route property. A sub-struct would
+// mcp_task, mcp_core, webmcp_tool, webmcp_exclude) models a distinct route property. A sub-struct would
 // obscure them.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
@@ -224,6 +224,13 @@ pub struct ApiDoc {
     /// loads it first. In the progressive catalog, `tools/list` holds the core
     /// tools and the two meta-tools. The flag does not opt the endpoint in.
     pub mcp_core: bool,
+    /// True when the endpoint opts in to `WebMCP` exposure via
+    /// `#[api_doc(webmcp)]`. `mcp` does not imply it: a page agent runs with
+    /// the session of the user.
+    pub webmcp_tool: bool,
+    /// True for `#[api_doc(webmcp = false)]`. It wins over the
+    /// `expose_all_as_webmcp` hatch.
+    pub webmcp_exclude: bool,
     /// Build-time authority envelope proved for this handler by
     /// `#[agent_operable(grant = ...)]` (issue #1691), or `None` for a handler
     /// that declares none.

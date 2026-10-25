@@ -20,6 +20,22 @@
 4. Run `cargo test --workspace` to verify the embed still works.
 5. Commit both the JS file and the version bump together.
 
+## Autumn WebMCP shim
+
+- **File:** `autumn-webmcp.js`. Autumn's own code, not a third-party file.
+- **Tracks:** the W3C WebMCP community-group draft of 2026-04-23
+  (<https://webmachinelearning.github.io/webmcp/>).
+- **Served at:** `/static/js/autumn-webmcp.js` and its hashed URL, with the
+  `webmcp` feature.
+
+### How to update
+
+1. Read the draft change log. Change the shim when the API changes.
+2. Change the draft date in each file that names it
+   (`grep -rn 2026-04-23 autumn docs STABILITY.md`).
+3. Run `node autumn/tests/fixtures/webmcp/shim_harness.js autumn/vendor/autumn-webmcp.js`.
+4. Run `cargo test -p autumn-web --features webmcp --test integration_tests webmcp`.
+
 ## Swagger UI
 
 - **Version:** 5.32.4

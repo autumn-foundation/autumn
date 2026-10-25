@@ -981,6 +981,10 @@ pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
 pub mod webhook_outbound;
+/// Project tagged routes as `WebMCP` tools for the agent in the user's
+/// browser. Enable with the Cargo feature `webmcp` (it implies `mcp`).
+#[cfg(feature = "webmcp")]
+pub mod webmcp;
 #[cfg(feature = "ws")]
 pub mod ws;
 

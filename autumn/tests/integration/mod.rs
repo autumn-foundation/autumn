@@ -558,6 +558,12 @@ mod validate_patch_option_ip;
 mod webhook_outbound;
 #[cfg(feature = "db")]
 mod webhook_outbound_dispatch_fanout_profile;
+#[cfg(feature = "webmcp")]
+mod webmcp;
+#[cfg(all(feature = "system-tests", feature = "webmcp"))]
+mod webmcp_browser;
+#[cfg(feature = "webmcp")]
+mod webmcp_shim;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
 #[cfg(feature = "maud")]

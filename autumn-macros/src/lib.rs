@@ -1458,6 +1458,7 @@ pub fn cached_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `stream` | flag / bool | With `mcp`: the tool returns an `Sse` stream, sent as MCP progress. |
 /// | `task` | flag / bool | With `mcp`: the tool can return a task handle (MCP Tasks extension). |
 /// | `core` | flag / bool | With `mcp`: a core tool. A client that defers tools loads it first. |
+/// | `webmcp` | flag / bool | Expose this endpoint as a `WebMCP` tool in the page (`webmcp = false` force-excludes it). `mcp` does not imply it. Requires the `webmcp` feature and a `mount_webmcp` call. |
 ///
 /// # Examples
 ///

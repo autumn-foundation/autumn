@@ -118,6 +118,8 @@ pub(crate) static FRAMEWORK_SCRIPTS: crate::assets::PluginAssets =
         ("js/autumn-widgets.js", AUTUMN_WIDGETS_JS),
         ("js/autumn-htmx-csrf.js", HTMX_CSRF_JS.as_bytes()),
         ("js/idiomorph.min.js", IDIOMORPH_JS),
+        #[cfg(feature = "webmcp")]
+        ("js/autumn-webmcp.js", crate::webmcp::SHIM_JS.as_bytes()),
     ]);
 
 /// `true` when the framework serves `logical_path` itself. htmx is the one

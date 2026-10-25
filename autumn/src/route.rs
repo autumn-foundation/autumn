@@ -293,4 +293,25 @@ impl Route {
         self.api_doc.mcp_core = true;
         self
     }
+
+    /// Make this route a `WebMCP` tool, equal to `#[api_doc(webmcp)]`.
+    ///
+    /// The eligibility rules of [`mcp()`](Self::mcp) apply. The page gets the
+    /// tool only when the host enables the `webmcp` feature and calls
+    /// `mount_webmcp`. The agent-authority manifest lists the route as a
+    /// `WebMCP` tool in all cases, as it does for `mcp()`.
+    #[must_use]
+    pub const fn webmcp(mut self) -> Self {
+        self.api_doc.webmcp_tool = true;
+        self
+    }
+
+    /// Never make this route a `WebMCP` tool, equal to
+    /// `#[api_doc(webmcp = false)]`. It wins over the hatch and over
+    /// [`webmcp()`](Self::webmcp).
+    #[must_use]
+    pub const fn webmcp_exclude(mut self) -> Self {
+        self.api_doc.webmcp_exclude = true;
+        self
+    }
 }

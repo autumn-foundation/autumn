@@ -151,6 +151,7 @@ Looking for the API reference instead? That is
 
 - [OpenAPI Spec Generation](openapi.md) — the spec Autumn derives from your handlers, and Swagger UI
 - [Exposing Your API as MCP Tools](mcp.md) — projecting typed endpoints into a Model Context Protocol server
+- [WebMCP](webmcp.md) — routes and forms as tools for the agent in the user's browser, with the user's own session
 - [The Agent Authority Envelope](agent-authority.md) — bounding what an agent-callable handler is allowed to do
 - [Wire Contracts](wire-contracts.md) — failing a caller's build when a request or response field stops matching
 - [Signed Webhook Intake](signed-webhooks.md) — verifying a sender's signature on webhooks arriving in

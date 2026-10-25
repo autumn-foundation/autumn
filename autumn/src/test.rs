@@ -732,6 +732,8 @@ pub struct TestApp {
     openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "mcp")]
     mcp: Option<crate::mcp::McpRuntime>,
+    #[cfg(feature = "webmcp")]
+    webmcp: Option<crate::webmcp::WebMcpRuntime>,
     #[cfg(feature = "db")]
     pool: Option<Pool<crate::db::RuntimeConnection>>,
     #[cfg(feature = "db")]
@@ -842,6 +844,8 @@ impl TestApp {
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
             #[cfg(feature = "db")]
             pool: None,
             #[cfg(feature = "db")]
@@ -979,6 +983,26 @@ impl TestApp {
         } else {
             self.mcp = Some(crate::mcp::McpRuntime::new(path));
         }
+        self
+    }
+
+    /// Serve the `WebMCP` tool list, as
+    /// [`AppBuilder::mount_webmcp`](crate::app::AppBuilder::mount_webmcp)
+    /// does.
+    #[cfg(feature = "webmcp")]
+    #[must_use]
+    pub fn mount_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default);
+        self
+    }
+
+    /// Make each eligible `GET` a `WebMCP` tool, as
+    /// [`AppBuilder::expose_all_as_webmcp`](crate::app::AppBuilder::expose_all_as_webmcp)
+    /// does.
+    #[cfg(feature = "webmcp")]
+    #[must_use]
+    pub fn expose_all_as_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default).expose_all = true;
         self
     }
 
@@ -2684,6 +2708,8 @@ impl TestApp {
                 openapi: self.openapi,
                 #[cfg(feature = "mcp")]
                 mcp: self.mcp,
+                #[cfg(feature = "webmcp")]
+                webmcp: self.webmcp,
             },
         )
         .expect("failed to build test router");

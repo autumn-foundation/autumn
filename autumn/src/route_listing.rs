@@ -828,6 +828,8 @@ pub(crate) fn append_framework_routes_with_env(
             crate::htmx::HTMX_CSRF_JS_PATH => "htmx_csrf",
             crate::htmx::IDIOMORPH_JS_PATH => "idiomorph",
             crate::htmx::HTMX_SSE_JS_PATH => "htmx_sse",
+            #[cfg(feature = "webmcp")]
+            crate::webmcp::SHIM_PATH => "webmcp",
             _ => "autumn_widgets",
         };
         infos.push(RouteInfo::framework_get(
