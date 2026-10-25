@@ -581,6 +581,19 @@ autumn generate migration BackfillSomething      # → 20260831191622_backfill_s
 autumn schema diff --write-migration --name x    # → same convention
 ```
 
+Set `AUTUMN_GENERATE_EPOCH` to a number of Unix seconds to get the same version
+in two runs. Use it only in a test that compares generator output, in a
+throwaway project. The generators and `autumn schema diff --write-migration`
+use that time, not the wall clock, and write a note to stderr. `autumn migrate
+new` does not use it. If the variable stays set, all new migrations get the
+same version. The fixed time also sets the sort order: a time in the past puts
+the new migration before the migrations that exist. If the value is not
+valid, the generators write a warning and use the wall clock.
+
+```bash
+AUTUMN_GENERATE_EPOCH=1788755613 autumn generate migration X   # → 20260907043333_x
+```
+
 If you have already created a directory by hand, rename it to a real
 timestamp before committing:
 

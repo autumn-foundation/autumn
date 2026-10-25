@@ -229,15 +229,75 @@ pub fn ensure_project_root(dir: &Path) -> Result<(), GenerateError> {
     }
 }
 
+/// The environment variable that sets the generation clock to a fixed Unix
+/// time, in seconds (issue #2601).
+///
+/// Use it only in tests that compare two generator runs. Do not keep it set.
+/// If it stays set, all new migrations get the same version.
+pub const GENERATE_EPOCH_ENV: &str = "AUTUMN_GENERATE_EPOCH";
+
+/// The last second with a 4-digit year (9999-12-31T23:59:59Z). A later value
+/// gives a stamp longer than 14 digits, and Autumn's migration tools do not
+/// read that version.
+const MAX_GENERATE_EPOCH: u64 = 253_402_300_799;
+
 /// Generate a 14-digit UTC timestamp prefix, matching Diesel's convention
 /// (`YYYYMMDDHHMMSS`).
+///
+/// If [`GENERATE_EPOCH_ENV`] is set, its value replaces the system clock.
 pub fn timestamp_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let clock = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
+    let pinned = match std::env::var(GENERATE_EPOCH_ENV) {
+        Ok(value) => parse_generate_epoch(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        // A value that is not UTF-8 is not a number of Unix seconds.
+        Err(std::env::VarError::NotUnicode(_)) => Err(()),
+    };
+    let secs = match pinned {
+        Ok(Some(secs)) => {
+            eprintln!(
+                "note: {GENERATE_EPOCH_ENV} is set. New migration versions start with {}. \
+                 Unset it after the test.",
+                timestamp_from_unix(secs)
+            );
+            secs
+        }
+        Ok(None) => clock(),
+        Err(()) => {
+            eprintln!(
+                "warning: {GENERATE_EPOCH_ENV} is not a number of Unix seconds from 0 to \
+                 {MAX_GENERATE_EPOCH}. The generators use the wall clock."
+            );
+            clock()
+        }
+    };
     timestamp_from_unix(secs)
+}
+
+/// Parse the value of [`GENERATE_EPOCH_ENV`].
+///
+/// Returns `Ok(None)` if the value is not set or is empty after trimming.
+/// Returns `Err` if the value is not a number of Unix seconds from 0 to
+/// [`MAX_GENERATE_EPOCH`].
+fn parse_generate_epoch(value: Option<&str>) -> Result<Option<u64>, ()> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    // `u64::from_str` accepts a leading `+`. This function accepts only ASCII
+    // digits.
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    match value.parse::<u64>() {
+        Ok(secs) if secs <= MAX_GENERATE_EPOCH => Ok(Some(secs)),
+        _ => Err(()),
+    }
 }
 
 /// Convert a Unix timestamp (seconds) to a `YYYYMMDDHHMMSS` string.
@@ -905,6 +965,48 @@ mod tests {
     fn timestamp_handles_leap_year() {
         // 2024-02-29T12:34:56Z = 1709210096
         assert_eq!(timestamp_from_unix(1_709_210_096), "20240229123456");
+    }
+
+    // Issue #2601: `AUTUMN_GENERATE_EPOCH` sets the generation clock to a fixed
+    // time.
+    #[test]
+    fn generate_epoch_unset_or_empty_uses_the_clock() {
+        assert_eq!(parse_generate_epoch(None), Ok(None));
+        assert_eq!(parse_generate_epoch(Some("")), Ok(None));
+        assert_eq!(parse_generate_epoch(Some("  ")), Ok(None));
+    }
+
+    #[test]
+    fn generate_epoch_accepts_unix_seconds() {
+        assert_eq!(
+            parse_generate_epoch(Some("1788755613")),
+            Ok(Some(1_788_755_613))
+        );
+        assert_eq!(
+            parse_generate_epoch(Some(" 1788755613\n")),
+            Ok(Some(1_788_755_613))
+        );
+        assert_eq!(parse_generate_epoch(Some("0")), Ok(Some(0)));
+    }
+
+    #[test]
+    fn generate_epoch_rejects_a_value_that_is_not_unix_seconds() {
+        for bad in ["abc", "-1", "1.5", "20260907043333x", "+1"] {
+            assert_eq!(parse_generate_epoch(Some(bad)), Err(()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn generate_epoch_keeps_the_stamp_at_14_digits() {
+        // 9999-12-31T23:59:59Z is the last 14-digit stamp.
+        assert_eq!(
+            parse_generate_epoch(Some("253402300799")),
+            Ok(Some(253_402_300_799))
+        );
+        assert_eq!(timestamp_from_unix(253_402_300_799), "99991231235959");
+        // One second later, the year has 5 digits. Autumn's migration tools do
+        // not read a version of that length.
+        assert_eq!(parse_generate_epoch(Some("253402300800")), Err(()));
     }
 
     #[test]
