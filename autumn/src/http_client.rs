@@ -8979,7 +8979,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_backoff_past_the_hop_deadline_returns_the_response() {
-            let (url, _hits) = counting(Some(502), &[]).await;
+            let (url, hits) = counting(Some(502), &[]).await;
             let policy = RetryPolicy {
                 max_retries: 20,
                 ..RetryPolicy::default()
@@ -8996,7 +8996,12 @@ mod tests {
                 &HeaderMap::new(),
                 None,
                 &policy,
-                &crate::entropy::SeededEntropy::new(1),
+                // A fixed draw gives the backoffs 97, 199, 400 and 400 ms. The
+                // fourth passes the 1 s deadline, and the last retry starts
+                // with about 300 ms left. A random draw can start a last retry
+                // with only `MIN_ATTEMPT` left, and a Windows timer can use
+                // all of it.
+                &FixedDraw(400),
                 false,
                 Some(crate::time::ambient_instant() + Duration::from_secs(1)),
                 false,
@@ -9011,6 +9016,8 @@ mod tests {
                 Some(502),
                 "the last response, not a deadline error"
             );
+            // The warm-up request, the first attempt and at least one retry.
+            assert!(hits.load(Ordering::SeqCst) >= 3, "no retry ran");
         }
 
         #[tokio::test]
