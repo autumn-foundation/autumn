@@ -1015,7 +1015,7 @@ fn column_check_suffix(field: &Field, backend: DatabaseBackend) -> Option<String
 /// queries issue (`'19.90'` vs `'19.9'`), or admitted twice by a `:unique`
 /// index while Rust equality says they are the same value.
 /// `NULL` passes; the column's own `NOT NULL` decides that.
-pub(crate) fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
+pub fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
     // The unsigned text. Repeated rather than named: a SQLite `CHECK` has no `let`.
     let abs = format!("replace({column},'-','')");
     let frac_len =
@@ -1074,6 +1074,43 @@ pub(crate) fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> 
     ];
     format!("CHECK ({column} IS NULL OR ({}))", conditions.join(" AND "))
 }
+
+/// The text values that `sqlite_decimal_check(_, 10, 2)` rejects (issues #1924,
+/// #2636). The generator test and the declarative-lane tests (#2598) use this
+/// one list.
+#[cfg(test)]
+pub const SQLITE_DECIMAL_10_2_REJECTS: &[&str] = &[
+    // Over budget.
+    "123456789.99",
+    "19.999",
+    "123456.789",
+    // Malformed: no digit, or a stray or duplicated sign.
+    "",
+    "-",
+    ".",
+    "-.",
+    "--1",
+    "-1-",
+    "1.2.3",
+    "abc",
+    // Not canonical: a trailing zero in the fractional part, or a bare
+    // trailing point.
+    "19.90",
+    "0.10",
+    "19.0",
+    "0.0",
+    "19.",
+    "-19.90",
+    // Not canonical: leading zeros in the integer part, or no integer part.
+    "007.5",
+    "0019",
+    "00.5",
+    ".5",
+    "-.5",
+    // Negative zero: `Decimal::normalize` writes 0.
+    "-0",
+    "-0.0",
+];
 
 /// Result of inferring a migration shape from its name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8600,43 +8637,14 @@ fn main() {
         for value in ["0", "0.1", "19.99", "-19.99", "12345678.99", "-0.01"] {
             assert!(accepts(&mut conn, value), "`{value}` is in range");
         }
-        for value in [
-            // Over budget.
-            "123456789.99",
-            "19.999",
-            "123456.789",
-            // Malformed: no digit, or a stray/duplicated sign.
-            "",
-            "-",
-            ".",
-            "-.",
-            "--1",
-            "-1-",
-            "1.2.3",
-            "abc",
-        ] {
+        // Over budget, malformed, and (issue #2636) not canonical. SQLite
+        // compares TEXT byte for byte, so a non-canonical spelling passes every
+        // shape check yet is invisible to the equality lookups the generated
+        // `find_by_*` queries issue — and a `:unique` index would admit both
+        // spellings as distinct rows while Rust equality says they are one
+        // value. Only what `Decimal::normalize` would write may pass.
+        for value in SQLITE_DECIMAL_10_2_REJECTS {
             assert!(!accepts(&mut conn, value), "`{value}` must be rejected");
-        }
-
-        // Canonicality (issue #2636): SQLite compares TEXT byte for byte, so
-        // a non-canonical spelling passes every shape check above yet is
-        // invisible to the equality lookups the generated `find_by_*` queries
-        // issue — and a `:unique` index would admit both spellings as
-        // distinct rows while Rust equality says they are one value. Only
-        // what `Decimal::normalize` would write may pass.
-        for value in [
-            // Trailing zero in the fractional part, or a bare trailing point.
-            "19.90", "0.10", "19.0", "0.0", "19.", "-19.90",
-            // Leading zeros in the integer part, or none at all.
-            "007.5", "0019", "00.5", ".5", "-.5",
-            // Negative zero: `Decimal::normalize` converts -0 to 0, so the
-            // wrapper never writes it.
-            "-0", "-0.0",
-        ] {
-            assert!(
-                !accepts(&mut conn, value),
-                "`{value}` is not what `Decimal::normalize` writes and must be rejected"
-            );
         }
         // The canonical spellings of those same values stay accepted.
         for value in ["19.9", "0.1", "19", "7.5", "0", "0.5", "-0.5", "10", "100"] {

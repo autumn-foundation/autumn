@@ -4370,34 +4370,69 @@ mod tests {
         });
     }
 
+    /// One `TEXT` cell, read with `sql_query`.
+    #[derive(diesel::QueryableByName)]
+    struct TextCell {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        sql: String,
+    }
+
+    /// The `CREATE TABLE` text of `products`, as `SQLite` stores it.
+    fn products_sql(conn: &mut diesel::SqliteConnection) -> String {
+        use diesel::RunQueryDsl as _;
+        let rows: Vec<TextCell> =
+            diesel::sql_query("SELECT sql FROM sqlite_master WHERE name = 'products'")
+                .load(conn)
+                .expect("read sqlite_master");
+        rows.into_iter().next().expect("products exists").sql
+    }
+
+    /// Whether `products` accepts a row with the SQL literal `price`.
+    fn insert_price(conn: &mut diesel::SqliteConnection, price: &str) -> bool {
+        use diesel::connection::SimpleConnection as _;
+        conn.batch_execute(&format!(
+            "INSERT INTO products (title, price) VALUES ('x', {price});"
+        ))
+        .is_ok()
+    }
+
+    /// `products` has the generator `CHECK` for `price decimal{10,2}` byte for
+    /// byte, and the `CHECK` rejects each value of the generator test.
+    fn assert_price_check_holds(conn: &mut diesel::SqliteConnection, when: &str) {
+        use crate::generate::schema_edit::{SQLITE_DECIMAL_10_2_REJECTS, sqlite_decimal_check};
+        assert!(
+            products_sql(conn).contains(&sqlite_decimal_check("price", 10, 2)),
+            "{when}: the table has no generator CHECK"
+        );
+        for value in SQLITE_DECIMAL_10_2_REJECTS {
+            assert!(
+                !insert_price(conn, &format!("'{value}'")),
+                "{when}: the CHECK accepts '{value}'"
+            );
+        }
+        assert!(
+            !insert_price(conn, "x'31392e3939'"),
+            "{when}: the CHECK accepts a blob"
+        );
+    }
+
     /// #2598 round trip. The generator writes a `decimal{10,2}` table on
-    /// `SQLite`. The declarative lane finds no diff. A rebuild for a different
-    /// change keeps the generator `CHECK`. The rebuilt table rejects the values
-    /// that the `CHECK` rejects.
+    /// `SQLite`. The baseline comes from the real database, as `--dev-url` and
+    /// `schema pull` read it, so `price` is plain `TEXT`. The declarative lane
+    /// finds no diff. A rebuild for a different change, and its rollback, keep
+    /// the generator `CHECK`. The rebuilt table rejects the values that the
+    /// `CHECK` rejects.
     #[test]
     fn sqlite_decimal_check_survives_a_declarative_rebuild() {
-        use crate::generate::schema_edit::sqlite_decimal_check;
         use crate::schema::diff::{
-            DiffOptions, SchemaChange, SchemaContext, diff_schema, emit_up_sql_with_context,
-            guard_plan,
+            DiffOptions, SchemaChange, SchemaContext, diff_schema, emit_down_sql_with_context,
+            emit_up_sql_with_context, guard_plan,
         };
+        use crate::schema::introspect::introspect_sqlite_conn;
         use crate::schema::parse::parse_models_path;
         use autumn_schema_core::Backend;
         use diesel::connection::SimpleConnection as _;
         use diesel::prelude::*;
-
-        #[derive(QueryableByName)]
-        struct Sql {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            sql: String,
-        }
-        let table_sql = |conn: &mut SqliteConnection| -> String {
-            let rows: Vec<Sql> =
-                diesel::sql_query("SELECT sql FROM sqlite_master WHERE name = 'products'")
-                    .load(conn)
-                    .expect("read sqlite_master");
-            rows.into_iter().next().expect("products exists").sql
-        };
 
         with_no_db_env(|| {
             let tmp = project_with_db_url("sqlite://app.db");
@@ -4419,38 +4454,28 @@ mod tests {
             let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
             conn.batch_execute(&fs::read_to_string(generated_up).expect("read up.sql"))
                 .expect("apply the generated migration");
-            let check = sqlite_decimal_check("price", 10, 2);
-            assert!(
-                table_sql(&mut conn).contains(&check),
-                "the generator wrote the CHECK"
-            );
+            conn.batch_execute("INSERT INTO products (title, price) VALUES ('a', '19.99');")
+                .expect("seed a row");
+            assert_price_check_holds(&mut conn, "after the generator");
 
-            // Mark the model `managed`. Then parse the baseline that
-            // `autumn schema snapshot` writes.
+            // Mark the model `managed`, so that the declarative lane reads it.
             let models = tmp.path().join("src/models");
             let model_path = models.join("product.rs");
             let model = fs::read_to_string(&model_path).expect("read model");
             assert!(model.contains("#[autumn_web::model]\n"), "{model}");
-            fs::write(
-                &model_path,
-                model.replace("#[autumn_web::model]\n", "#[autumn_web::model(managed)]\n"),
-            )
-            .expect("mark the model managed");
-            let snapshot = parse_models_path(&models, Backend::Sqlite).expect("parse models");
-            assert!(
-                snapshot.diagnostics.is_empty(),
-                "{:?}",
-                snapshot.diagnostics
-            );
-            let clean = diff_schema(&snapshot.tables, &snapshot, DiffOptions::default());
+            let model = model.replace("#[autumn_web::model]\n", "#[autumn_web::model(managed)]\n");
+            fs::write(&model_path, &model).expect("mark the model managed");
+            let desired = parse_models_path(&models, Backend::Sqlite).expect("parse models");
+            assert!(desired.diagnostics.is_empty(), "{:?}", desired.diagnostics);
+            let baseline = introspect_sqlite_conn(&mut conn).expect("introspect");
+            let clean = diff_schema(&baseline, &desired, DiffOptions::default());
             assert!(
                 clean.changes.is_empty(),
-                "the diff is not empty: {:?}",
+                "the generator table and the model have a diff: {:?}",
                 clean.changes
             );
 
             // A different change. SQLite applies it only with a rebuild.
-            let model = fs::read_to_string(&model_path).expect("read model");
             assert!(model.contains("pub title: String,"), "{model}");
             fs::write(
                 &model_path,
@@ -4458,7 +4483,7 @@ mod tests {
             )
             .expect("edit model");
             let desired = parse_models_path(&models, Backend::Sqlite).expect("parse models");
-            let plan = diff_schema(&snapshot.tables, &desired, DiffOptions::default());
+            let plan = diff_schema(&baseline, &desired, DiffOptions::default());
             assert!(
                 matches!(
                     plan.changes.as_slice(),
@@ -4468,43 +4493,29 @@ mod tests {
                 plan.changes
             );
             guard_plan(&plan, DiffOptions::default()).expect("guard");
-            let ctx = SchemaContext::from_tables(&desired.tables, &snapshot.tables);
-            let rebuild = emit_up_sql_with_context(&plan, &ctx).expect("emit rebuild");
-            conn.batch_execute("INSERT INTO products (title, price) VALUES ('a', '19.99');")
-                .expect("seed a row");
-            conn.batch_execute(&rebuild).expect("apply the rebuild");
-
+            let ctx = SchemaContext::from_tables(&desired.tables, &baseline);
+            let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
             assert!(
-                table_sql(&mut conn).contains(&check),
-                "the rebuild keeps the generator CHECK byte for byte"
+                up.contains("as plain TEXT"),
+                "the up SQL has no advisory: {up}"
             );
-            let insert = |conn: &mut SqliteConnection, value: &str| {
-                conn.batch_execute(&format!(
-                    "INSERT INTO products (title, price) VALUES (NULL, {value});"
-                ))
-                .is_ok()
-            };
-            for value in ["'0.5'", "'-19.99'", "'12345678.99'", "19.99"] {
-                assert!(insert(&mut conn, value), "the CHECK rejects {value}");
-            }
-            // These values come from
-            // `sqlite_decimal_check_enforces_precision_scale_and_shape`. Each
-            // value is out of shape or is not TEXT.
-            for value in [
-                "'123456789.99'",
-                "'19.999'",
-                "''",
-                "'-'",
-                "'--1'",
-                "'1.2.3'",
-                "'abc'",
-                "'19.90'",
-                "'007.5'",
-                "'-0'",
-                "x'31392e3939'",
-            ] {
-                assert!(!insert(&mut conn, value), "the CHECK accepts {value}");
-            }
+            conn.batch_execute(&up).expect("apply the rebuild");
+            assert_price_check_holds(&mut conn, "after the rebuild");
+            assert!(insert_price(&mut conn, "'0.5'"), "the CHECK rejects '0.5'");
+
+            let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+            conn.batch_execute(&down).expect("apply the rollback");
+            assert_price_check_holds(&mut conn, "after the rollback");
+            let titles: Vec<TextCell> =
+                diesel::sql_query("SELECT title AS sql FROM products ORDER BY id")
+                    .load(&mut conn)
+                    .expect("read rows");
+            let titles: Vec<&str> = titles.iter().map(|row| row.sql.as_str()).collect();
+            assert_eq!(
+                titles,
+                ["a", "x"],
+                "the rebuild and the rollback keep the rows"
+            );
         });
     }
 

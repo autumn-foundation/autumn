@@ -401,12 +401,21 @@ as `TEXT`. A `CHECK` enforces the precision and scale. `schema diff` writes the
 same `CHECK` as `autumn generate`, in `CREATE TABLE`, `ADD COLUMN` and the
 table-recreate. The parser reads the precision and scale from the
 `#[decimal_shape(precision = p, scale = s)]` attribute that `autumn generate`
-writes on the field. A decimal field without the attribute is `{12, 2}`. The
-table-recreate uses the model precision and scale. This is also true when the
-baseline reads the column as plain `TEXT` (`--dev-url`, `schema pull`). The
-rollback table-recreate in `down.sql` also writes the model `CHECK`. If a row
-does not agree with the `CHECK`, the copy into the new table fails and the
-migration stops.
+writes on the field. The precision is 1 to 28, and the scale is 0 to the
+precision. A bad attribute skips the column with a diagnostic. A decimal field
+without the attribute is `{12, 2}`.
+
+- A change of precision or scale is a type change. On SQLite, `schema diff`
+  writes a table-recreate with the new `CHECK`. The `down.sql` writes the old
+  `CHECK` again.
+- `--dev-url` and `schema pull` read a decimal column as plain `TEXT`. Then the
+  table-recreate takes the precision and scale from the model, in `up.sql` and
+  in `down.sql`. The SQL has an `-- autumn-safety:` line for each such
+  table-recreate, because the table can have rows that the `CHECK` rejects.
+- If a row does not agree with the `CHECK`, the copy into the new table fails
+  and the migration stops.
+- If the parser skipped a decimal column, `schema diff` refuses a
+  table-recreate of its table. Correct the attribute first.
 
 ---
 
