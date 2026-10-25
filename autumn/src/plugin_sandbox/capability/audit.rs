@@ -90,6 +90,18 @@ pub struct CapabilityEvent {
     pub at: Instant,
 }
 
+/// Calls one request made that its ledger could not hold, and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DroppedCalls {
+    /// How many calls.
+    pub count: u64,
+    /// When the first of them ended.
+    pub first: Instant,
+    /// When the last of them ended.
+    pub last: Instant,
+}
+
 /// The most events one plugin's log holds.
 ///
 /// Bounded, because the log is fed by an untrusted plugin's call rate and an
@@ -216,6 +228,11 @@ impl PluginActivityLog {
         }
         self.lock()
             .note_dropped(crate::time::ambient_instant(), plugin, dropped);
+    }
+
+    /// Record the calls one request's ledger could not hold, at their own times.
+    pub fn ingest_dropped_calls(&self, plugin: &str, calls: DroppedCalls) {
+        self.ingest_dropped(plugin, calls.count);
     }
 
     /// What `plugin` did within `window`.
@@ -572,6 +589,46 @@ mod tests {
         let summary = log.summary("shop", hour);
         assert_eq!(summary.allowed.get("kv-get"), None);
         assert_eq!(summary.dropped, 0);
+    }
+
+    #[test]
+    fn a_request_s_drops_count_while_its_last_drop_is_in_the_window() {
+        // #2523 finding 18. The span of one request's drops is known, not the
+        // time of each drop. Key the record at the last drop: never under-report.
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let minute = Duration::from_secs(60);
+        let clock = TickingClock::starting_at(
+            chrono::Utc
+                .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
+                .single()
+                .expect("a valid date"),
+        );
+        let _clock = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+        let first = crate::time::ambient_instant();
+        clock.advance(90 * minute);
+        let last = crate::time::ambient_instant();
+        clock.advance(30 * minute);
+        log.ingest_dropped_calls(
+            "shop",
+            DroppedCalls {
+                count: 4,
+                first,
+                last,
+            },
+        );
+        // The request ended now, but its last drop was 30 minutes ago.
+        assert_eq!(log.summary("shop", 40 * minute).dropped, 4);
+        assert_eq!(log.summary("shop", 20 * minute).dropped, 0);
+        // A drop on the eviction path later still makes a record of its own.
+        log.ingest_dropped("shop", 1);
+        assert_eq!(log.summary("shop", 20 * minute).dropped, 1);
+        assert_eq!(log.summary("shop", 40 * minute).dropped, 5);
     }
 
     #[test]

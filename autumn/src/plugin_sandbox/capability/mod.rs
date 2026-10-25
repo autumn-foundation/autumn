@@ -87,7 +87,8 @@ use super::manifest::{SandboxCapability, SandboxManifest};
 use quota::QuotaLedger;
 
 pub use audit::{
-    ActivitySummary, CapabilityEvent, CapabilityOutcome, MAX_LOG_EVENTS, PluginActivityLog,
+    ActivitySummary, CapabilityEvent, CapabilityOutcome, DroppedCalls, MAX_LOG_EVENTS,
+    PluginActivityLog,
 };
 // Aliased for use *inside* this module only, so the `pub use` above can carry
 // the real names without shadowing itself.
@@ -927,6 +928,12 @@ impl CapabilityCall {
             Self::JobEnqueue { .. } => "job-enqueue",
         }
     }
+
+    /// Whether this call can change state outside the guest.
+    #[must_use]
+    pub fn commits(&self) -> bool {
+        false
+    }
 }
 
 // ── The results ──────────────────────────────────────────────────────────
@@ -1379,6 +1386,18 @@ impl CapabilityRuntime {
     #[must_use]
     pub const fn dropped_events(&self) -> u64 {
         self.dropped_events
+    }
+
+    /// As [`dropped_events`](Self::dropped_events), with the times of the
+    /// first and last dropped call. `None` when no call was dropped.
+    #[must_use]
+    pub fn dropped_calls(&self) -> Option<DroppedCalls> {
+        let now = crate::time::ambient_instant();
+        (self.dropped_events > 0).then_some(DroppedCalls {
+            count: self.dropped_events,
+            first: now,
+            last: now,
+        })
     }
 
     /// Whether this plugin may use `capability` at all.
@@ -3860,6 +3879,126 @@ path = "/shop/panel"
         assert_eq!(summary.dropped, 25);
         let rendered = summary.to_string();
         assert!(rendered.contains("floor"), "{rendered}");
+    }
+
+    #[test]
+    fn a_dropped_call_keeps_its_own_time_not_the_time_of_ingest() {
+        // #2523 finding 18. The log ingests a request when it ends. A slow
+        // request must not make its old drops look recent.
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let hour = std::time::Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(
+            chrono::Utc
+                .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
+                .single()
+                .expect("a valid date"),
+        );
+        let _clock = install_ambient(Arc::new(clock.clone()));
+        let mut manifest = manifest(&everything());
+        manifest.quotas.calls = MAX_QUOTA;
+        manifest.quotas.kv_reads = MAX_QUOTA;
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            },
+        );
+        let log = audit::PluginActivityLog::new();
+        for id in 0..(MAX_EVENTS as u64 + 25) {
+            let _ = runtime.dispatch(&CapabilityCall::KvGet {
+                id,
+                key: "k".to_owned(),
+            });
+        }
+        // The request ends two hours later.
+        clock.advance(2 * hour);
+        let dropped = runtime.dropped_calls().expect("25 calls were dropped");
+        assert_eq!(dropped.count, 25);
+        log.ingest("shop", runtime.take_events());
+        log.ingest_dropped_calls("shop", dropped);
+        assert_eq!(log.summary("shop", hour).dropped, 0);
+        assert_eq!(log.summary("shop", 3 * hour).dropped, 25);
+    }
+
+    #[test]
+    fn a_call_commits_when_it_can_change_state_outside_the_guest() {
+        let fetch = |method: &str| CapabilityCall::HttpFetch {
+            id: 1,
+            method: method.to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let table = || "orders".to_owned();
+        let commits = [
+            CapabilityCall::KvSet {
+                id: 1,
+                key: "k".to_owned(),
+                value: PluginValue::Null,
+            },
+            CapabilityCall::KvDelete {
+                id: 1,
+                key: "k".to_owned(),
+            },
+            CapabilityCall::DbInsert {
+                id: 1,
+                table: table(),
+                row: PluginRow::new(),
+            },
+            CapabilityCall::DbUpdate {
+                id: 1,
+                table: table(),
+                row_id: "r1".to_owned(),
+                row: PluginRow::new(),
+            },
+            CapabilityCall::DbDelete {
+                id: 1,
+                table: table(),
+                row_id: "r1".to_owned(),
+            },
+            CapabilityCall::JobEnqueue {
+                id: 1,
+                job_type: "reindex".to_owned(),
+                payload: PluginRow::new(),
+            },
+            fetch("POST"),
+            fetch("PUT"),
+            fetch("PATCH"),
+            fetch("DELETE"),
+            // An unknown method is refused later. Here it counts as a write.
+            fetch("BREW"),
+        ];
+        for call in &commits {
+            assert!(call.commits(), "{call:?}");
+        }
+        let reads = [
+            CapabilityCall::KvGet {
+                id: 1,
+                key: "k".to_owned(),
+            },
+            CapabilityCall::DbGet {
+                id: 1,
+                table: table(),
+                row_id: "r1".to_owned(),
+            },
+            CapabilityCall::DbQuery {
+                id: 1,
+                table: table(),
+                filter: PluginRow::new(),
+                limit: 0,
+                after: None,
+            },
+            fetch("GET"),
+            fetch("HEAD"),
+            fetch("get"),
+        ];
+        for call in &reads {
+            assert!(!call.commits(), "{call:?}");
+        }
     }
 
     #[test]

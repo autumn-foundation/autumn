@@ -74,12 +74,12 @@ pub use artifact::{
 pub use capability::{
     ActivitySummary, CacheKvStore, CallResult, CallValue, CapabilityCall, CapabilityEvent,
     CapabilityOutcome, CapabilityRateLimiter, CapabilityRuntime, CapabilityServices, DenialReason,
-    FragmentNode, JobSink, KvStore, MAX_DETAIL_CHARS, MAX_EVENTS, MAX_KV_KEY_BYTES, MAX_LOG_EVENTS,
-    MAX_OUTBOUND_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_RESULT_BYTES, MAX_ROW_BYTES,
-    MAX_ROW_COLUMNS, MAX_ROW_ID_BYTES, MAX_TARGET_CHARS, MAX_VALUE_TEXT_BYTES, MemoryJobSink,
-    MemoryKvStore, MemoryPluginStore, NO_TENANT, OutboundHttp, OutboundRequest, OutboundResponse,
-    PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue, QueryPage, RecordingHttp,
-    RenderError, Scope, StoreError, bounded_rows, row_weight, tenant_segment,
+    DroppedCalls, FragmentNode, JobSink, KvStore, MAX_DETAIL_CHARS, MAX_EVENTS, MAX_KV_KEY_BYTES,
+    MAX_LOG_EVENTS, MAX_OUTBOUND_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_RESULT_BYTES,
+    MAX_ROW_BYTES, MAX_ROW_COLUMNS, MAX_ROW_ID_BYTES, MAX_TARGET_CHARS, MAX_VALUE_TEXT_BYTES,
+    MemoryJobSink, MemoryKvStore, MemoryPluginStore, NO_TENANT, OutboundHttp, OutboundRequest,
+    OutboundResponse, PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue, QueryPage,
+    RecordingHttp, RenderError, Scope, StoreError, bounded_rows, row_weight, tenant_segment,
 };
 pub use dynamic::{
     MountError, MountedPluginInfo, PluginMounts, framework_prefixes, mounts_fallback,

@@ -432,6 +432,10 @@ const CAPABILITY_CALL_FUEL: u64 = 2_000;
 /// guest's own parsing of a large reply is the guest's to budget.
 const FINISH_ALLOWANCE_FUEL: u64 = 100_000;
 
+/// Fuel per reply byte that a guest keeps to read the reply of a call that
+/// commits.
+const GUEST_READ_FUEL_PER_BYTE: u64 = 0;
+
 /// Refuse a request whose body is over the manifest's declared ceiling.
 ///
 /// The ceiling is enforced here, not only in the Axum adapter. The adapter
@@ -8103,17 +8107,71 @@ hosts = ["api.example.com"]
         state.service(&post(), u64::MAX);
         assert_eq!(http.seen().len(), 1);
     }
-    #[test]
-    fn the_fuel_edge_for_a_reply_is_exact() {
-        let reserve = post().reply_reserve();
+    /// Fuel to price `call`'s worst-case reply and write the answer.
+    fn priced(call: &crate::plugin_sandbox::CapabilityCall) -> u64 {
         let allowance = FINISH_ALLOWANCE_FUEL.min(ResourceLimits::default().fuel / 4);
-        let need = allowance + (reserve as u64).div_ceil(BYTES_PER_FUEL);
+        allowance + (call.reply_reserve() as u64).div_ceil(BYTES_PER_FUEL)
+    }
+
+    fn get_call() -> crate::plugin_sandbox::CapabilityCall {
+        crate::plugin_sandbox::CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_fuel_edge_for_a_write_includes_the_guest_s_read() {
+        // #2523 finding 7. Fuel to price the reply is not fuel to read it. A
+        // POST that commits and then runs out of fuel in the guest fails, and a
+        // retry sends it again.
+        let need = priced(&post()) + post().reply_reserve() as u64 * GUEST_READ_FUEL_PER_BYTE;
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), priced(&post()));
+        assert!(http.seen().is_empty(), "the guest could not read the reply");
         let (mut state, http) = outbound_state(0);
         state.service(&post(), need - 1);
         assert!(http.seen().is_empty(), "one unit short must not dispatch");
         let (mut state, http) = outbound_state(0);
         state.service(&post(), need);
         assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn the_fuel_edge_for_a_read_is_its_price() {
+        // A read that fails commits nothing, so it keeps no fuel to be read.
+        let (mut state, http) = outbound_state(0);
+        state.service(&get_call(), priced(&get_call()) - 1);
+        assert!(http.seen().is_empty(), "one unit short must not dispatch");
+        let (mut state, http) = outbound_state(0);
+        state.service(&get_call(), priced(&get_call()));
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn a_write_refused_for_fuel_is_a_denial_that_names_fuel() {
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), priced(&post()));
+        assert!(http.seen().is_empty());
+        assert!(state.answer.is_none(), "the request must go on");
+        let queued =
+            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned();
+        assert!(queued.contains("quota-exceeded"), "{queued}");
+        assert!(queued.contains("fuel"), "{queued}");
+    }
+
+    #[test]
+    fn the_read_rate_covers_a_measured_escape_heavy_reply() {
+        // A Rust guest (serde_json) spent 106 fuel per byte to read a reply of
+        // escaped quotes, and 77 for escaped NULs. Plain text cost 6.
+        let rate = GUEST_READ_FUEL_PER_BYTE;
+        assert!(
+            rate >= 106,
+            "{rate} fuel per byte is below the measured cost"
+        );
     }
 
     #[test]
