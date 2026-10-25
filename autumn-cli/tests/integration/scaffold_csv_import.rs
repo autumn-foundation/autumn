@@ -1478,6 +1478,215 @@ fn normalized_timestamps_rewrites_only_a_migration_stamp() {
     );
 }
 
+fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("readable dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(body) = fs::read_to_string(&path) {
+                // The migration directory embeds a generation timestamp to
+                // the SECOND (`migrations/20260827030722_create_posts/`), and
+                // the two scaffolds this compares are two separate process
+                // runs — so they straddle a second boundary often enough to
+                // matter, and the raw paths would then differ for a reason
+                // that has nothing to do with the flag under test. Normalize
+                // the timestamp away; the rest of the path (and every file
+                // body) is still compared exactly.
+                let rel = normalized_relative_path(&path, root);
+                // Freshly generated secrets differ by construction; every
+                // other file is the generator's own output.
+                if rel.contains("master.key") || rel.contains("credentials.enc") {
+                    continue;
+                }
+                // The bodies carry the migration timestamp too — the
+                // manifest keys a digest table on each generated path — so
+                // they need the same normalization the path got.
+                let body = normalized_timestamps(&body);
+                // `.autumn/generated.toml` records the digest of each file
+                // AND the command that wrote it (issue #1835). The two runs
+                // type different commands by construction — that is the
+                // flag under test — so the recorded command differs while
+                // the digests, which describe the output this gate is
+                // about, must not. Compare the digests, drop the command.
+                //
+                // Its table keys embed the migration directory too
+                // (`[files."migrations/20260907011642_create_posts/up.sql"]`),
+                // so the same second-boundary straddle the path
+                // normalization above guards against would otherwise
+                // survive inside this file's body — which is exactly what
+                // a Windows CI run caught (issue #2590).
+                let body = if rel.ends_with(".autumn/generated.toml") {
+                    body.lines()
+                        // The run id hashes the command. The edits listed
+                        // under it are compared (issue #2560).
+                        .filter(|line| {
+                            !line.starts_with("invocation = ") && !line.starts_with("[[runs.")
+                        })
+                        .map(normalize_migration_stamp)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    body
+                };
+                out.push((rel, body));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// RED stub.
+fn wait_for_next_second() {}
+
+/// The sorted 14-digit stamps of the migration dirs under `root`.
+fn migration_stamps(root: &Path) -> Vec<String> {
+    let mut stamps: Vec<String> = fs::read_dir(root.join("migrations"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            let (stamp, _) = name.split_once('_')?;
+            (stamp.len() == 14 && stamp.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| stamp.to_owned())
+        })
+        .collect();
+    stamps.sort();
+    stamps
+}
+
+/// Write `files` under a new tempdir. A path uses `/`.
+fn fixture_tree(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (rel, body) in files {
+        let path = tmp.path().join(rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, body).expect("write");
+    }
+    tmp
+}
+
+const MANIFEST: &str = ".autumn/generated.toml";
+
+/// A scaffold-shaped tree whose migration has `stamp`.
+fn stamped_tree(stamp: &str, digest: &str) -> Vec<(String, Vec<u8>)> {
+    let manifest = format!(
+        "[files.\"migrations/{stamp}_create_posts/up.sql\"]\n\
+         digest = \"{digest}\"\n\
+         invocation = \"scaffold\"\n"
+    );
+    vec![
+        (
+            format!("migrations/{stamp}_create_posts/up.sql"),
+            b"CREATE TABLE posts ();".to_vec(),
+        ),
+        (MANIFEST.to_owned(), manifest.into_bytes()),
+        ("src/routes/posts.rs".to_owned(), b"pub fn index() {}".to_vec()),
+    ]
+}
+
+fn snapshot_of(files: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(rel, body)| (rel.as_str(), body.as_slice()))
+        .collect();
+    let tmp = fixture_tree(&refs);
+    tree_snapshot(tmp.path())
+}
+
+/// Two runs one second apart compare equal. A real change does not.
+#[test]
+fn tree_snapshot_ignores_only_the_migration_stamp() {
+    let at_49 = stamped_tree("20260907015549", "ab");
+    let at_50 = stamped_tree("20260907015550", "ab");
+    assert_eq!(snapshot_of(&at_49), snapshot_of(&at_50));
+
+    // A changed digest.
+    assert_ne!(
+        snapshot_of(&at_49),
+        snapshot_of(&stamped_tree("20260907015550", "cd"))
+    );
+
+    // A changed body.
+    let mut body = at_50.clone();
+    body[2].1 = b"pub fn index() { todo!() }".to_vec();
+    assert_ne!(snapshot_of(&at_49), snapshot_of(&body));
+
+    // A renamed migration.
+    let mut renamed = at_50.clone();
+    renamed[0].0 = "migrations/20260907015550_create_articles/up.sql".to_owned();
+    assert_ne!(snapshot_of(&at_49), snapshot_of(&renamed));
+
+    // An added file.
+    let mut added = at_50;
+    added.push(("src/routes/import.rs".to_owned(), b"".to_vec()));
+    assert_ne!(snapshot_of(&at_49), snapshot_of(&added));
+}
+
+/// A file that is not UTF-8 is part of the tree too.
+#[test]
+fn tree_snapshot_sees_a_non_utf8_file() {
+    let plain = stamped_tree("20260907015549", "ab");
+    let mut with_binary = plain.clone();
+    with_binary.push(("static/icon.bin".to_owned(), vec![0xff, 0xfe, 0x00]));
+    assert_ne!(
+        snapshot_of(&plain),
+        snapshot_of(&with_binary),
+        "an added non-UTF-8 file must change the snapshot"
+    );
+
+    let mut changed = with_binary.clone();
+    changed.last_mut().expect("binary").1 = vec![0xff, 0xfe, 0x01];
+    assert_ne!(
+        snapshot_of(&with_binary),
+        snapshot_of(&changed),
+        "a changed non-UTF-8 file must change the snapshot"
+    );
+}
+
+/// `autumn new` writes fresh secrets on each run. They are the only files the
+/// snapshot skips. The paths are the ones `autumn new` writes.
+#[test]
+fn tree_snapshot_skips_only_the_fresh_secrets() {
+    let mut a = stamped_tree("20260907015549", "ab");
+    let mut b = a.clone();
+    a.push(("config/master.key".to_owned(), b"aaaa".to_vec()));
+    b.push(("config/master.key".to_owned(), b"bbbb".to_vec()));
+    a.push((
+        "config/credentials/development.toml.enc".to_owned(),
+        vec![0xff, 0x01],
+    ));
+    b.push((
+        "config/credentials/development.toml.enc".to_owned(),
+        vec![0xff, 0x02],
+    ));
+    assert_eq!(snapshot_of(&a), snapshot_of(&b));
+
+    // A file that only looks like a secret is still compared.
+    let mut c = a.clone();
+    c.push(("docs/master.key.md".to_owned(), b"notes".to_vec()));
+    assert_ne!(snapshot_of(&a), snapshot_of(&c));
+}
+
+#[test]
+fn migration_stamps_reads_only_real_stamps() {
+    let tmp = fixture_tree(&[
+        ("migrations/20260907015550_create_posts/up.sql", b""),
+        ("migrations/20260907015549_create_users/up.sql", b""),
+        ("migrations/readme_notes/up.sql", b""),
+        ("migrations/2026090701554_short/up.sql", b""),
+    ]);
+    assert_eq!(
+        migration_stamps(tmp.path()),
+        ["20260907015549", "20260907015550"]
+    );
+    let empty = tempfile::tempdir().expect("tempdir");
+    assert!(migration_stamps(empty.path()).is_empty());
+}
+
 fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
     let mut flags = vec!["--import"];
     flags.extend_from_slice(extra);
@@ -1485,69 +1694,16 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
     // the name into `.env.example`, `Cargo.toml` and the README, so two names
     // would differ for reasons that have nothing to do with the flag.
     let with_flag = scaffold_project(name, &default_cols(), &flags);
+    wait_for_next_second();
     let without = scaffold_project(name, &default_cols(), extra);
-    let files = |root: &Path| -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in fs::read_dir(&dir).expect("readable dir") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if let Ok(body) = fs::read_to_string(&path) {
-                    // The migration directory embeds a generation timestamp to
-                    // the SECOND (`migrations/20260827030722_create_posts/`), and
-                    // the two scaffolds this compares are two separate process
-                    // runs — so they straddle a second boundary often enough to
-                    // matter, and the raw paths would then differ for a reason
-                    // that has nothing to do with the flag under test. Normalize
-                    // the timestamp away; the rest of the path (and every file
-                    // body) is still compared exactly.
-                    let rel = normalized_relative_path(&path, root);
-                    // Freshly generated secrets differ by construction; every
-                    // other file is the generator's own output.
-                    if rel.contains("master.key") || rel.contains("credentials.enc") {
-                        continue;
-                    }
-                    // The bodies carry the migration timestamp too — the
-                    // manifest keys a digest table on each generated path — so
-                    // they need the same normalization the path got.
-                    let body = normalized_timestamps(&body);
-                    // `.autumn/generated.toml` records the digest of each file
-                    // AND the command that wrote it (issue #1835). The two runs
-                    // type different commands by construction — that is the
-                    // flag under test — so the recorded command differs while
-                    // the digests, which describe the output this gate is
-                    // about, must not. Compare the digests, drop the command.
-                    //
-                    // Its table keys embed the migration directory too
-                    // (`[files."migrations/20260907011642_create_posts/up.sql"]`),
-                    // so the same second-boundary straddle the path
-                    // normalization above guards against would otherwise
-                    // survive inside this file's body — which is exactly what
-                    // a Windows CI run caught (issue #2590).
-                    let body = if rel.ends_with(".autumn/generated.toml") {
-                        body.lines()
-                            // The run id hashes the command. The edits listed
-                            // under it are compared (issue #2560).
-                            .filter(|line| {
-                                !line.starts_with("invocation = ") && !line.starts_with("[[runs.")
-                            })
-                            .map(normalize_migration_stamp)
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    } else {
-                        body
-                    };
-                    out.push((rel, body));
-                }
-            }
-        }
-        out.sort();
-        out
-    };
-    let a = files(&with_flag.1);
-    let b = files(&without.1);
+    let (stamps_a, stamps_b) = (migration_stamps(&with_flag.1), migration_stamps(&without.1));
+    assert!(!stamps_a.is_empty(), "the scaffold must write a migration");
+    assert_ne!(
+        stamps_a, stamps_b,
+        "the two runs must be in different seconds, or this gate tests nothing"
+    );
+    let a = tree_snapshot(&with_flag.1);
+    let b = tree_snapshot(&without.1);
     assert_eq!(
         a.len(),
         b.len(),
