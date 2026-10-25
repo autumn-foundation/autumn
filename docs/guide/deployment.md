@@ -1311,6 +1311,10 @@ autumn deploy plan
 
 `plan` is a pure dry-run: it prints a **representative** systemd unit and the
 ordered zero-downtime rollout steps for review, without connecting to the host.
+For a SQLite app it reads `[database]` under the deploy profile and shows the
+data-file steps (`link-data` or `check-data-dir`, and `record-data-adopted`) in
+the order the deploy runs them, or the reason preflight refuses the database. If
+that config does not load, `plan` says so and shows the other steps.
 The printed unit is illustrative — it mirrors the shape of what gets installed
 (`User`, working directory, `EnvironmentFile`, restart policy) but is **not**
 byte-for-byte what a real `deploy up` writes. Live deploys write **slot-specific**
@@ -1376,7 +1380,9 @@ created, and never guarded. It has to: if `app_dir`
 is itself a symlink (`/srv/autumn/myapp -> /mnt/apps/myapp`) and your database URL
 uses the resolved spelling, the CLI compares two unrelated strings and sees a file
 outside the app dir — while release retention walks the symlink to the same
-directory and deletes it. Only the host can resolve that.
+directory and deletes it. Only the host can resolve that. The host also decides
+when to record `sqlite-data-adopted`, with the same resolver, so both steps agree
+on what is in `shared/data`. `shared/data` can be a symlink to a mounted volume.
 
 `shared/` is created by the deploy's `prepare-dirs` step, is never pruned, and is
 seen by both blue/green slots, so the file a release writes is the file the next

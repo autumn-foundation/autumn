@@ -647,27 +647,6 @@ impl ResolvedDeployConfig {
             .map(|rel| format!("{}/{rel}", self.shared_data_dir()))
     }
 
-    /// The `SQLite` database this deploy MANAGES inside `shared/data`, whichever
-    /// way it was configured (issue #1909, #2589 round 20).
-    ///
-    /// BOTH placements can land there: a relative path is kept there by
-    /// construction, and an absolute one may name it outright. The deploy creates
-    /// that directory and guards what lives in it, so both need the same
-    /// treatment — keying the adoption marker on the relative case alone left an
-    /// absolute database with no marker, no missing-volume refusal, and a
-    /// `mkdir -p` that recreated its mount point underneath it.
-    ///
-    /// `None` for a database outside `shared/data`: that one is the operator's,
-    /// and the deploy neither creates its directory nor guards it.
-    #[must_use]
-    pub fn managed_sqlite_data_file(&self) -> Option<String> {
-        if let Some(shared) = self.shared_sqlite_data_file() {
-            return Some(shared);
-        }
-        let path = lexically_normalized(self.persistent_sqlite_data_file()?);
-        within(&path, &lexically_normalized(&self.shared_data_dir())).then_some(path)
-    }
-
     /// Marker recording that the shared `SQLite` database has been seen to exist
     /// (issue #1909, #2589 item 17).
     ///
@@ -1577,7 +1556,7 @@ pub fn render_app_unit(
 /// must never imply the candidate binds the live `server.port`.
 #[must_use]
 pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
-    vec![
+    let mut steps = vec![
         DeployStep::new(
             "build",
             "Build the embedded single-binary release locally (`autumn build --embed`)",
@@ -1640,7 +1619,57 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
                 cfg.keep_releases
             ),
         ),
-    ]
+    ];
+    insert_sqlite_data_steps(cfg, &mut steps);
+    steps
+}
+
+/// Add the `SQLite` data-file steps where the deploy runs them (#2589 item 5):
+/// the data step before `upload`, and the marker after `migrate`.
+fn insert_sqlite_data_steps(cfg: &ResolvedDeployConfig, steps: &mut Vec<DeployStep>) {
+    let data = if let Some(shared) = cfg.shared_sqlite_data_file() {
+        let rel = cfg.relative_sqlite_data_file().unwrap_or_default();
+        DeployStep::new(
+            "link-data",
+            format!(
+                "Link the release's {rel} at the persistent {shared}. Refuses when {current}/{rel} \
+                 is a real file or links elsewhere (a one-time adoption the refusal explains), or \
+                 when {shared} is gone but {marker} records that it existed",
+                current = cfg.current_symlink(),
+                marker = cfg.sqlite_data_marker_file(),
+            ),
+        )
+    } else if let Some(path) = cfg.persistent_sqlite_data_file() {
+        DeployStep::new(
+            "check-data-dir",
+            format!(
+                "Check on the host that {path} resolves outside {releases}, and create its \
+                 directory when it is in {data}",
+                releases = cfg.releases_dir(),
+                data = cfg.shared_data_dir(),
+            ),
+        )
+    } else {
+        return;
+    };
+    let at = |label: &str, steps: &[DeployStep]| steps.iter().position(|s| s.label == label);
+    if let Some(upload) = at("upload", steps) {
+        steps.insert(upload, data);
+    }
+    if let Some(migrate) = at("migrate", steps) {
+        steps.insert(
+            migrate.saturating_add(1),
+            DeployStep::new(
+                "record-data-adopted",
+                format!(
+                    "Record {} once the database exists in {}, so a later missing volume is \
+                     refused, not replaced with an empty database",
+                    cfg.sqlite_data_marker_file(),
+                    cfg.shared_data_dir()
+                ),
+            ),
+        );
+    }
 }
 
 /// Build the rollback plan, mirroring [`exec::rollback_ops`]'s actual sequence:
@@ -1825,11 +1854,27 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
     // introduce. The load stays fail-closed where it IS relevant (`plan`/`up`): a
     // present-but-invalid `[media]` table still aborts those two.
     match action {
-        // `plan` is a pure dry-run over `resolved` alone — it never grades or
-        // uploads runtime VALUES, so it needs no reload under the target profile.
+        // `plan` is a dry-run: it never grades or uploads runtime VALUES. It loads
+        // the target profile only to classify `[database]`, so it shows the SQLite
+        // data steps the deploy runs (#2589 item 5). A config that does not load
+        // costs only those steps, and the plan says so.
         DeployAction::Plan => {
             let (media_cfg, _ffmpeg_bin) = load_media_host_config(&resolved)?;
-            print_plan(&resolved, &host_list, &media_cfg);
+            let (planned, note) = match load_runtime_config(&resolved.profile) {
+                Ok(config) => (
+                    with_sqlite_data_contract(&resolved, &config),
+                    sqlite_plan_note(&config, &resolved),
+                ),
+                Err(e) => (
+                    resolved.clone(),
+                    Some(format!(
+                        "the `{}` profile config did not load, so SQLite data steps are not \
+                         shown: {e}",
+                        resolved.profile
+                    )),
+                ),
+            };
+            print_plan(&planned, &host_list, &media_cfg, note.as_deref());
             Ok(())
         }
         // `check`/`rollback`/`up` grade and (for `up`) upload the signing secret
@@ -2394,6 +2439,31 @@ fn sqlite_data_placement(
     }
 }
 
+/// Attach the `SQLite` data-file contract to `resolved` (issue #1909).
+///
+/// `up`, `rollback` and `plan` all call this, so the plan shows the same data
+/// steps the deploy runs (#2589 item 5). A Postgres app gets no change.
+fn with_sqlite_data_contract(
+    resolved: &ResolvedDeployConfig,
+    config: &AutumnConfig,
+) -> ResolvedDeployConfig {
+    resolved
+        .clone()
+        .with_release_payloads(release_payload_basenames(config, resolved))
+        .with_sqlite_data_placement(sqlite_data_placement(config, resolved))
+}
+
+/// The reason preflight refuses the `SQLite` database, for `deploy plan`.
+/// `None` when it is not refused.
+fn sqlite_plan_note(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Option<String> {
+    match classify_sqlite_data_file(resolve_writable_db_url(&config.database), resolved) {
+        SqliteDataFile::Refused(reason) => Some(reason),
+        SqliteDataFile::NotSqlite | SqliteDataFile::Relative(_) | SqliteDataFile::Persistent(_) => {
+            None
+        }
+    }
+}
+
 /// How a `SQLite` app's configured data file relates to the deploy layout
 /// (issue #1909).
 ///
@@ -2513,6 +2583,12 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
     // resolved `..`; what is left must still name a file INSIDE the release dir,
     // so a leading `..` (which normalization keeps, having nothing to cancel it
     // against) and an empty path are both refused.
+    //
+    // This lexical normalization matches `SQLite`, not the kernel. The unix VFS
+    // normalizes the name before `open(2)`, so `data/nested/../app.db` opens
+    // `data/app.db` even when `data/nested` does not exist. `link-data` creates
+    // only `release/data` because of that. Check this again for a platform or a
+    // VFS that does not normalize lexically (#2589).
     if text.is_empty() || text == ".." || text.starts_with("../") {
         return SqliteDataFile::Refused(format!(
             "the configured SQLite database path {text:?} does not name a file inside the \
@@ -2963,6 +3039,7 @@ fn print_plan(
     resolved: &ResolvedDeployConfig,
     hosts: &[String],
     media_cfg: &media::MediaMtxHostConfig,
+    sqlite_note: Option<&str>,
 ) {
     println!("\u{1F342} autumn deploy plan (dry-run)\n");
     println!("systemd unit ({}.service):\n", resolved.service_name);
@@ -2971,6 +3048,9 @@ fn print_plan(
     println!("Deploy steps (zero-downtime):");
     for (i, step) in build_deploy_plan(resolved).iter().enumerate() {
         println!("  {}. [{}] {}", i + 1, step.label, step.description);
+    }
+    if let Some(note) = sqlite_note {
+        println!("\n  SQLite data file: {note}");
     }
 
     // Fleet rollout (issue #1621, AC-4): the steps above are what EACH host runs;
@@ -3732,10 +3812,7 @@ fn run_up(
     // Attach the SQLite data-file contract (#1909) BEFORE the fleet is built, so
     // every host's config carries it and every host links the same path. A
     // Postgres app resolves `None` and nothing below changes.
-    let resolved = &resolved
-        .clone()
-        .with_release_payloads(release_payload_basenames(config, resolved))
-        .with_sqlite_data_placement(sqlite_data_placement(config, resolved));
+    let resolved = &with_sqlite_data_contract(resolved, config);
 
     // The rollout targets, in declaration order. A single-host config resolves to
     // a one-host fleet whose only element IS today's `resolved`, so everything
@@ -5486,10 +5563,7 @@ fn run_rollback(
     // BEFORE the data file was adopted into `shared/` holds no file at that path
     // any more, so the rolled-back release is re-linked at it rather than
     // starting against a fresh, empty database.
-    let resolved = &resolved
-        .clone()
-        .with_release_payloads(release_payload_basenames(config, resolved))
-        .with_sqlite_data_placement(sqlite_data_placement(config, resolved));
+    let resolved = &with_sqlite_data_contract(resolved, config);
 
     // The rollback targets, in declaration order. A single-host config (either
     // spelling) resolves to a one-host fleet whose only element IS today's
@@ -8955,6 +9029,48 @@ mod tests {
         assert!(notice.contains("autumn.toml"));
         assert!(notice.contains("autumn-prod.toml"));
         assert!(!notice.contains("no autumn.toml"));
+    }
+
+    /// #2589 item 5: `deploy plan` shows the `SQLite` data steps in the order the
+    /// real deploy runs them.
+    #[test]
+    fn deploy_plan_renders_the_sqlite_data_steps() {
+        let labels = |url: &str| -> Vec<&'static str> {
+            let mut config = AutumnConfig::default();
+            config.database.url = Some(url.to_owned());
+            let cfg = with_sqlite_data_contract(&resolved_defaults(), &config);
+            build_deploy_plan(&cfg).iter().map(|s| s.label).collect()
+        };
+        let position = |labels: &[&str], label: &str| {
+            labels
+                .iter()
+                .position(|l| *l == label)
+                .unwrap_or_else(|| panic!("no {label} step: {labels:?}"))
+        };
+
+        let relative = labels("sqlite://app.db");
+        assert!(position(&relative, "link-data") < position(&relative, "upload"));
+        assert!(position(&relative, "migrate") < position(&relative, "record-data-adopted"));
+
+        let absolute = labels("sqlite:///var/lib/myapp/app.db");
+        assert!(position(&absolute, "check-data-dir") < position(&absolute, "upload"));
+        assert!(!absolute.contains(&"link-data"), "{absolute:?}");
+
+        let postgres = labels("postgres://db.example.com/app");
+        for label in ["link-data", "check-data-dir", "record-data-adopted"] {
+            assert!(!postgres.contains(&label), "{postgres:?}");
+        }
+    }
+
+    /// #2589 item 5: a refused `SQLite` database is named in the plan.
+    #[test]
+    fn deploy_plan_names_a_refused_sqlite_database() {
+        let mut config = AutumnConfig::default();
+        config.database.url = Some("sqlite::memory:".to_owned());
+        let note = sqlite_plan_note(&config, &resolved_defaults()).expect("a note");
+        assert!(note.contains("IN-MEMORY"), "{note}");
+        config.database.url = Some("sqlite://app.db".to_owned());
+        assert_eq!(sqlite_plan_note(&config, &resolved_defaults()), None);
     }
 
     #[test]

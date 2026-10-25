@@ -439,6 +439,12 @@ no SQLite equivalent of installing `postgresql-client`.
 autumn db backup --keep 7 --dir /var/backups/myapp
 ```
 
+The backup opens the database with the same URI options the app uses (for
+example `vfs=unix-dotfile`), so its locks match the app's. It opens the file with
+`mode=rw`, so it never creates a database: a file that is removed before the
+backup opens it fails the run. The `--dir` path is used exactly, also when it is not UTF-8
+or starts with `file:`.
+
 The run directory is the same one Postgres backups write — `manifest.json` plus
 one artifact per target — except the artifact is `control.sqlite`, a real SQLite
 database you can open with any tool, and the manifest records
@@ -451,8 +457,11 @@ says `SQLite snapshot` so there is no ambiguity).
 touching the database, stages a copy beside the target, verifies that copy too,
 removes the target's `-wal`, `-shm` and `-journal` — a leftover journal describes
 pages of the file being replaced, and SQLite would replay it onto the restored one
-— and renames the copy into place, keeping the target's mode and owner. A restore
-refused at verification leaves the target byte-identical. The production guard is
+— and renames the copy into place, keeping the target's mode and owner. When the
+restore cannot give the copy to the old owner (only root can `chown`) and the mode
+does not let that owner read and write it, the restore stops before the rename and
+tells you which account to use. A restore refused at verification leaves the
+target byte-identical. The production guard is
 the same as Postgres: a non-dev/test profile needs `--force`.
 
 **Stop the app before restoring.** A running process keeps open handles to the
@@ -460,7 +469,10 @@ old file, so after the rename it serves the pre-restore database and loses every
 write it makes. This differs from Postgres, where `pg_restore` goes through the
 server.
 
-An **in-memory** database is refused by both: there is no file to snapshot.
+An **in-memory** database is refused by both: there is no file to snapshot. The
+check reads the URI as SQLite does: option names and values are percent-decoded,
+the last `mode` and the last `vfs` win, and `mode=memory` or `vfs=memdb` is in
+memory. On Windows, `file:///C:/data/app.db` names `C:\data\app.db`.
 
 [`db scrub`](./data-scrubbing.md#sqlite) (#1602) and the
 [retention sweeps](./data-retention.md) (#1605) run against the SQLite file
