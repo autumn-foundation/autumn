@@ -423,18 +423,25 @@ const CAPABILITY_EVENT_BYTES: usize =
 /// the cost of writing a few hundred bytes to stdout.
 const CAPABILITY_CALL_FUEL: u64 = 2_000;
 
-/// Fuel a guest keeps after a call's reply is priced, so it can read the reply
-/// and write its answer.
+/// Fuel a guest keeps after a call's reply is priced, so it can write its
+/// answer.
 ///
 /// The host reserves it before dispatching: a call whose reply the budget could
 /// pay for but whose guest could not then finish would commit and then end the
-/// request as `FuelExhausted`. It covers the host's side of that promise. The
-/// guest's own parsing of a large reply is the guest's to budget.
+/// request as `FuelExhausted`. A call that commits also keeps
+/// [`GUEST_READ_FUEL_PER_BYTE`] to read its reply.
 const FINISH_ALLOWANCE_FUEL: u64 = 100_000;
 
 /// Fuel per reply byte that a guest keeps to read the reply of a call that
-/// commits.
-const GUEST_READ_FUEL_PER_BYTE: u64 = 0;
+/// commits (#2523).
+///
+/// Measured: a Rust guest that reads the line and parses it with `serde_json`
+/// spent 6 fuel per byte on plain text, 77 on escaped NULs and 106 on escaped
+/// quotes. A JSON body is escape-heavy, so the rate covers the worst case.
+///
+/// Only for a call that commits. A read that fails changed nothing, so the
+/// host does not refuse it for this fuel.
+const GUEST_READ_FUEL_PER_BYTE: u64 = 128;
 
 /// Refuse a request whose body is over the manifest's declared ceiling.
 ///
@@ -1112,6 +1119,11 @@ pub struct SandboxOutcome {
     /// Capability calls this request made that the bounded ledger could not
     /// hold, so `activity` is a floor rather than a count.
     pub dropped_activity: u64,
+    /// The same calls, with when they occurred. `None` when none was dropped.
+    ///
+    /// Give it to
+    /// [`PluginActivityLog::ingest_dropped_calls`](crate::plugin_sandbox::PluginActivityLog::ingest_dropped_calls).
+    pub dropped_calls: Option<crate::plugin_sandbox::capability::DroppedCalls>,
 }
 
 impl SandboxOutcome {
@@ -1130,6 +1142,7 @@ impl SandboxOutcome {
             stderr: String::new(),
             activity: Vec::new(),
             dropped_activity: 0,
+            dropped_calls: None,
         }
     }
 }
@@ -1159,6 +1172,8 @@ pub struct SandboxRenderOutcome {
     pub activity: Vec<crate::plugin_sandbox::capability::CapabilityEvent>,
     /// Calls the bounded ledger could not hold.
     pub dropped_events: u64,
+    /// The same calls, with when they occurred. `None` when none was dropped.
+    pub dropped_calls: Option<crate::plugin_sandbox::capability::DroppedCalls>,
 }
 
 // ── The host ─────────────────────────────────────────────────────────────
@@ -1559,6 +1574,7 @@ impl SandboxHost {
             stderr: String::new(),
             activity: Vec::new(),
             dropped_events: 0,
+            dropped_calls: None,
         };
 
         // Checked here rather than left to the guest: a plugin that was not
@@ -1629,6 +1645,7 @@ impl SandboxHost {
                 let peak_memory_bytes = record_limiter_refusals(&mut state, limits);
                 let activity = state.runtime.take_events();
                 let dropped_events = state.runtime.dropped_events();
+                let dropped_calls = state.runtime.dropped_calls();
                 let max_bytes = state.runtime.quotas().render_bytes as usize;
                 let fragment = match result {
                     Ok(GuestAnswer::Fragment(nodes)) => {
@@ -1652,6 +1669,7 @@ impl SandboxHost {
                     stderr,
                     activity,
                     dropped_events,
+                    dropped_calls,
                 }
             }
         }
@@ -1882,6 +1900,7 @@ fn finish(
 
     let activity = state.runtime.take_events();
     let dropped_activity = state.runtime.dropped_events();
+    let dropped_calls = state.runtime.dropped_calls();
     let result = match result {
         Ok(GuestAnswer::Fragment(_)) => Err(SandboxFailure::MalformedFrame(
             "a request is answered with a `response` frame, not a `fragment`".to_owned(),
@@ -1949,6 +1968,7 @@ fn finish(
         stderr,
         activity,
         dropped_activity,
+        dropped_calls,
     }
 }
 
@@ -3246,14 +3266,23 @@ impl HostState {
         // fails over a committed write is retried by the caller. So a call is
         // dispatched only when the worst-case reply fits the unread-reply queue
         // and the fuel left covers pricing it plus a fixed finishing allowance
-        // for the guest. A call that does not fit is answered with a denial the
+        // for the guest. A call that commits also keeps the fuel to read that
+        // reply (#2523). A call that does not fit is answered with a denial the
         // guest can read, and nothing runs.
         let queue_room = MAX_QUEUED_REPLY_BYTES.saturating_sub(self.queued_replies);
         // A quarter of the budget at most, so a small budget still serves calls.
         let allowance = FINISH_ALLOWANCE_FUEL.min(self.limits.fuel / 4);
+        let read = if call.commits() {
+            u64::try_from(self.runtime.reply_reserve(call))
+                .unwrap_or(u64::MAX)
+                .saturating_mul(GUEST_READ_FUEL_PER_BYTE)
+        } else {
+            0
+        };
         let fuel_room = usize::try_from(
             fuel_left
                 .saturating_sub(allowance)
+                .saturating_sub(read)
                 .saturating_mul(BYTES_PER_FUEL),
         )
         .unwrap_or(usize::MAX);

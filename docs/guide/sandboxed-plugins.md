@@ -544,6 +544,16 @@ appended to the guest's stdin; the `id` is the guest's to choose and is echoed
 back. **Read each answer before making the next call**: a guest that writes calls
 and never reads them fills a bounded queue and the request is ended.
 
+**A write keeps fuel to read its answer.** A call that changes state —
+`kv-set`, `kv-delete`, `db-insert`, `db-update`, `db-delete`, `job-enqueue`, or
+an outbound call that is not `GET` or `HEAD` — runs only when the fuel left can
+also read its largest reply, at 128 units per reply byte. If it cannot, the call
+comes back `quota-exceeded` and nothing changes. Otherwise the write could
+occur, and the guest could then use all its fuel to read the reply: the request
+fails, and a retry does the write again. With the default quotas, an outbound
+write needs about 74 million units and a KV, DB or job write about 0.6 million.
+A read does not keep this fuel, because a read that fails changes nothing.
+
 A `call_result` carries one of six value kinds: `done` (a write or delete),
 `value` (from `kv-get`, with a `found` flag so a stored `null` is not a miss),
 `row-id` (from `db-insert`), `rows` (from `db-get` and `db-query`), `http`, and

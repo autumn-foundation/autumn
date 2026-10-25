@@ -930,9 +930,23 @@ impl CapabilityCall {
     }
 
     /// Whether this call can change state outside the guest.
+    ///
+    /// A failed request that made such a call can make it again on retry. An
+    /// outbound `GET` or `HEAD` is a read. An unknown method counts as a write.
     #[must_use]
     pub fn commits(&self) -> bool {
-        false
+        match self {
+            Self::KvGet { .. } | Self::DbGet { .. } | Self::DbQuery { .. } => false,
+            Self::HttpFetch { method, .. } => {
+                !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"))
+            }
+            Self::KvSet { .. }
+            | Self::KvDelete { .. }
+            | Self::DbInsert { .. }
+            | Self::DbUpdate { .. }
+            | Self::DbDelete { .. }
+            | Self::JobEnqueue { .. } => true,
+        }
     }
 }
 
@@ -1252,8 +1266,9 @@ pub struct CapabilityRuntime {
     quotas: QuotaLedger,
     rate: Option<Arc<quota::CapabilityRateLimiter>>,
     events: Vec<Event>,
-    /// Calls the ledger could not hold, so a truncated summary says it is one.
-    dropped_events: u64,
+    /// Calls the ledger could not hold, and when, so a truncated summary says
+    /// it is one.
+    dropped: Option<DroppedCalls>,
     /// `(operation, outcome)` pairs already warned about this request.
     warned: Vec<(&'static str, Outcome)>,
 }
@@ -1321,7 +1336,7 @@ impl CapabilityRuntime {
             services,
             quotas: QuotaLedger::new(manifest.quotas),
             events: Vec::new(),
-            dropped_events: 0,
+            dropped: None,
             warned: Vec::new(),
         }
     }
@@ -1385,19 +1400,28 @@ impl CapabilityRuntime {
     /// the one thing an operator must not have to guess at.
     #[must_use]
     pub const fn dropped_events(&self) -> u64 {
-        self.dropped_events
+        match self.dropped {
+            Some(dropped) => dropped.count,
+            None => 0,
+        }
     }
 
     /// As [`dropped_events`](Self::dropped_events), with the times of the
     /// first and last dropped call. `None` when no call was dropped.
+    ///
+    /// Give it to [`PluginActivityLog::ingest_dropped_calls`]. The log then
+    /// windows the drops by when they occurred, not by when the request ended.
     #[must_use]
-    pub fn dropped_calls(&self) -> Option<DroppedCalls> {
-        let now = crate::time::ambient_instant();
-        (self.dropped_events > 0).then_some(DroppedCalls {
-            count: self.dropped_events,
-            first: now,
-            last: now,
-        })
+    pub const fn dropped_calls(&self) -> Option<DroppedCalls> {
+        self.dropped
+    }
+
+    /// The bytes `call`'s reply may take at its worst, under this plugin's
+    /// quotas. See [`CapabilityCall::reply_reserve_for`].
+    #[must_use]
+    pub const fn reply_reserve(&self, call: &CapabilityCall) -> usize {
+        let quotas = self.quotas();
+        call.reply_reserve_for(quotas.kv_value_bytes as usize, quotas.db_rows as usize)
     }
 
     /// Whether this plugin may use `capability` at all.
@@ -1485,18 +1509,15 @@ impl CapabilityRuntime {
 
         // Room for the answer, before anything is charged or committed: once a
         // write has happened its reply can no longer be refused.
-        let quotas = self.quotas();
-        if reply_room
-            < call.reply_reserve_for(quotas.kv_value_bytes as usize, quotas.db_rows as usize)
-        {
+        if reply_room < self.reply_reserve(call) {
             return self.record(
                 call,
                 &target,
                 CallResult::denied(
                     id,
                     DenialReason::QuotaExceeded,
-                    "there is not room to deliver this call's answer; read the pending replies \
-                     and retry",
+                    "there is not sufficient reply room or fuel for this call's answer; read \
+                     the pending replies, or increase `fuel`",
                 ),
             );
         }
@@ -1708,13 +1729,14 @@ impl CapabilityRuntime {
                 self.warned.push((call.operation(), outcome));
             }
         }
+        let at = crate::time::ambient_instant();
         if self.events.len() < MAX_EVENTS {
             self.events.push(Event {
                 capability: call.capability(),
                 operation: call.operation(),
                 target,
                 outcome,
-                at: crate::time::ambient_instant(),
+                at,
             });
         } else {
             // Counted rather than dropped silently. The ledger is bounded
@@ -1723,7 +1745,21 @@ impl CapabilityRuntime {
             // reading a number the plugin chose. `MAX_EVENTS` is not
             // unreachable: the quotas that would bound it live in the plugin's
             // own manifest, so the plugin sets them.
-            self.dropped_events = self.dropped_events.saturating_add(1);
+            //
+            // With its time: the log ingests the request when it ends, and a
+            // slow request must not make an old drop look recent (#2523).
+            self.dropped = Some(match self.dropped {
+                Some(dropped) => DroppedCalls {
+                    count: dropped.count.saturating_add(1),
+                    last: at,
+                    ..dropped
+                },
+                None => DroppedCalls {
+                    count: 1,
+                    first: at,
+                    last: at,
+                },
+            });
         }
         result
     }
