@@ -7126,6 +7126,26 @@ mod tests {
 
     // ── Retryable-error classification ───────────────────────────
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn only_serialization_failure_and_deadlock_sqlstates_are_retryable() {
+        use tokio_postgres::error::SqlState;
+        assert!(is_retryable_sqlstate(&SqlState::T_R_SERIALIZATION_FAILURE));
+        assert!(is_retryable_sqlstate(&SqlState::T_R_DEADLOCK_DETECTED));
+        assert!(!is_retryable_sqlstate(&SqlState::UNIQUE_VIOLATION));
+        assert!(!is_retryable_sqlstate(&SqlState::QUERY_CANCELED));
+    }
+
+    #[test]
+    fn a_plain_diesel_error_is_not_a_cancelled_query() {
+        // No timeout text and no SQLSTATE in the chain.
+        assert!(!is_query_canceled(&diesel::result::Error::NotFound));
+        assert!(is_query_canceled(&diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "canceling statement due to statement timeout",
+        )));
+    }
+
     #[test]
     fn serialization_failure_is_retryable() {
         let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
