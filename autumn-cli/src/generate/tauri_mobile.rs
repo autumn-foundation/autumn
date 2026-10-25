@@ -2856,7 +2856,7 @@ mod tests {
         );
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync"] }"#,
+            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
 
@@ -2868,7 +2868,7 @@ mod tests {
         );
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { path = "../../autumn", default-features = false, features = ["offline-sync"] }"#,
+            r#"autumn-web = { path = "../../autumn", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
 
         // And an edge that does NOT opt out stays unchanged.
@@ -3008,7 +3008,7 @@ mod tests {
         let dep = workspace_dep(r#"{ version = "0.9.1" }"#, ", default-features = false");
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync"] }"#,
+            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
         // Legacy spelling too.
         let dep = workspace_dep(r#"{ version = "0.9.1" }"#, ", default_features = false");
@@ -3266,7 +3266,7 @@ mod tests {
         );
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { version = "0.9.1", registry = "internal", default-features = false, features = ["offline-sync"] }"#,
+            r#"autumn-web = { version = "0.9.1", registry = "internal", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
 
         // Workspace-inherited entries carry their registry key through the
