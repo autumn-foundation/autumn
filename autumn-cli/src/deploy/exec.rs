@@ -2053,6 +2053,10 @@ const SHARED_DATA_ARMS: &str = "\"$data\"|\"$data/\"*|\"$pre/shared/data\"|\"$pr
 /// app dir, `shared/data`, database and database parent, and `$pre` to `$app`
 /// without a final `/` (#2589 item 19).
 ///
+/// A `shared/data` link that resolves to another place in the app dir (such
+/// as `releases/r1`) is not a volume, and pruning can delete it. Then `$data`
+/// keeps its own name, so a database there falls to the app-dir refusal.
+///
 /// One resolver for every op that asks "is this in `shared/data`?", so the
 /// ops cannot disagree.
 ///
@@ -2072,7 +2076,10 @@ fn host_data_paths_shell(cfg: &ResolvedDeployConfig, db: &str) -> String {
          r=$(readlink -f \"$p\" 2>/dev/null) || r=$p; \
          if [ -z \"$s\" ]; then printf '%s' \"$r\"; else printf '%s%s' \"${{r%/}}\" \"$s\"; fi; }}; \
          app=$(autumn_resolve {app_dir_q}); pre=${{app%/}}; \
-         data=$(autumn_resolve {data_q}); db=$(autumn_resolve {db_q}); \
+         data=$(autumn_resolve {data_q}); \
+         case \"$data\" in \"$pre/shared/data\"|\"$pre/shared/data/\"*) ;; \
+         \"$app\"|\"$pre/\"*) data=$pre/shared/data ;; esac; \
+         db=$(autumn_resolve {db_q}); \
          dir=$(dirname \"$db\");",
         app_dir_q = shell_quote(&cfg.app_dir),
         data_q = shell_quote(&cfg.shared_data_dir()),
@@ -9303,6 +9310,49 @@ mod tests {
         std::fs::remove_file(volume.join("app.db")).expect("lose the volume");
         let out = run(sqlite_data_dir_guard_op(&cfg).expect("verified"));
         assert!(!out.status.success(), "a lost volume must stop the deploy");
+    }
+
+    /// `shared/data` linked into `releases/` is not a volume. Pruning deletes
+    /// it, so the guard must refuse it (#2589 item 19, Codex review on #3449).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_data_link_into_a_release_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = tmp.path().join("srv/myapp");
+        std::fs::create_dir_all(app.join("releases/r1")).expect("release dir");
+        std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+        std::os::unix::fs::symlink(app.join("releases/r1"), app.join("shared/data"))
+            .expect("link into a release");
+        std::fs::write(app.join("releases/r1/app.db"), b"LIVE").expect("db");
+
+        let mut cfg = resolved();
+        cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data = SqliteDataPlacement::Persistent(
+            app.join("shared/data/app.db")
+                .to_str()
+                .expect("utf-8")
+                .to_owned(),
+        );
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run check-data-dir");
+        assert!(
+            !out.status.success(),
+            "a database in releases/ must be refused"
+        );
+        let op = sqlite_data_adopted_op(&cfg).expect("recorded");
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .status()
+            .expect("run record-data-adopted");
+        assert!(
+            !app.join("shared/sqlite-data-adopted").exists(),
+            "a database in releases/ is not adopted"
+        );
     }
 
     /// A dangling `shared/data` link is an absent mount. With the marker present
