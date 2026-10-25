@@ -3738,6 +3738,164 @@ safe = ["note_id", "label"]
 safe = ["note_tag_id", "voter"]
 "#;
 
+/// Chain length of the tall-tree fixture: one walk pass per level.
+const TALL_TREE_DEPTH: i64 = 300;
+
+/// A deep walk must read each reached row a bounded number of times (#2599).
+///
+/// One pass descends one level, so this tree needs about 300 passes. A pass
+/// that joins the full keep set reads every row reached so far, which is
+/// quadratic in the depth. A pass that joins only the frontier reads each row
+/// a constant number of times.
+///
+/// The test pastes the printed SQL without its `COMMIT` and reads this
+/// session's own table counters (`pg_stat_xact_user_tables`) before the
+/// rollback. These counters are exact and need no stats flush.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_deep_walk_reads_each_reached_row_a_bounded_number_of_times() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+
+    let mut clients = Vec::new();
+    for name in ["tall_real", "tall_printed"] {
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let client = connect(&format!("{base}/{name}")).await;
+        client.batch_execute(&tall_tree_schema()).await.unwrap();
+        clients.push(client);
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("src").join("models")).unwrap();
+    std::fs::write(
+        dir.join("src").join("models").join("user.rs"),
+        "pub struct User { pub id: i32, pub email: String }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("scrub.toml"), TALL_TREE_SCRUB_TOML).unwrap();
+
+    let args = ["db", "scrub", "--sample", "users=1", "--seed", "7"];
+    let real_url = format!("{base}/tall_real");
+    let (_o, real_err) = run_autumn_ok(dir, &args, &[("AUTUMN_DATABASE__URL", real_url.as_str())]);
+    let passes: i64 = real_err
+        .split("settled in ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the command must report its pass count: {real_err}"));
+    assert!(
+        passes >= TALL_TREE_DEPTH,
+        "the fixture must need one pass per level: {real_err}"
+    );
+
+    // One user, its whole chain, and every item on it; nothing of the other.
+    let expected = [
+        ("users", 1),
+        ("nodes", TALL_TREE_DEPTH),
+        ("items", 2 * TALL_TREE_DEPTH),
+    ];
+    for (table, rows) in expected {
+        let kept = count(&clients[0], &format!("SELECT count(*) FROM {table}")).await;
+        assert_eq!(
+            kept, rows,
+            "{table}: the command kept {kept} row(s)\n{real_err}"
+        );
+    }
+
+    let printed_url = format!("{base}/tall_printed");
+    let mut dry_args = args.to_vec();
+    dry_args.insert(2, "--dry-run");
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &dry_args,
+        &[("AUTUMN_DATABASE__URL", printed_url.as_str())],
+    );
+    let script = printed_transaction(&dry_err);
+    let script = script
+        .strip_suffix("COMMIT;")
+        .expect("the printed transaction ends with its commit");
+    let probe = "SELECT relname::text, (seq_tup_read + coalesce(idx_tup_fetch, 0))::text, \
+                 (SELECT count(*) FROM public.nodes)::text \
+                 FROM pg_stat_xact_user_tables \
+                 WHERE schemaname = 'public' AND relname = 'nodes'";
+    let messages = clients[1]
+        .simple_query(&format!("{script}\n{probe};\nROLLBACK;"))
+        .await
+        .unwrap_or_else(|e| panic!("the printed SQL must run as printed: {e}"));
+    let row = messages
+        .iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("nodes") => {
+                Some(row)
+            }
+            _ => None,
+        })
+        .expect("the probe returns one row for nodes");
+    let read: i64 = row.get(1).unwrap().parse().unwrap();
+    let kept: i64 = row.get(2).unwrap().parse().unwrap();
+    assert_eq!(
+        kept, TALL_TREE_DEPTH,
+        "the printed SQL must keep what the command keeps"
+    );
+    // Each pass reads a fixed number of node rows per statement (about 80 on
+    // PostgreSQL 11), so the total grows with the depth: about 30 000 here.
+    // A walk that re-joins every reached row on each pass grows with the
+    // square of the depth: 1 136 286 here. The bound is between the two.
+    let bound = 300 * TALL_TREE_DEPTH;
+    assert!(
+        read <= bound,
+        "the walk read {read} node row(s) for a {TALL_TREE_DEPTH}-level chain; \
+         the bound is {bound}"
+    );
+}
+
+/// Two users, each with a chain of [`TALL_TREE_DEPTH`] nodes and two items per
+/// node. Only the chain head references its user, so the walk must descend
+/// the chain one level per pass. The foreign key columns are indexed, so a
+/// pass can reach the next level without a scan.
+fn tall_tree_schema() -> String {
+    format!(
+        "CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL); \
+         CREATE TABLE nodes (id int PRIMARY KEY, \
+             owner_id int REFERENCES users(id), parent_id int REFERENCES nodes(id)); \
+         CREATE TABLE items (id int PRIMARY KEY, node_id int NOT NULL REFERENCES nodes(id)); \
+         CREATE INDEX ON nodes(owner_id); \
+         CREATE INDEX ON nodes(parent_id); \
+         CREATE INDEX ON items(node_id); \
+         INSERT INTO users VALUES (1, 'a@example.com'), (2, 'b@example.com'); \
+         INSERT INTO nodes SELECT u * 1000 + d, \
+             CASE WHEN d = 1 THEN u END, \
+             CASE WHEN d = 1 THEN NULL ELSE u * 1000 + d - 1 END \
+             FROM generate_series(1, 2) u, generate_series(1, {TALL_TREE_DEPTH}) d; \
+         INSERT INTO items SELECT n.id * 2 + k, n.id FROM nodes n, generate_series(0, 1) k; \
+         ANALYZE;"
+    )
+}
+
+const TALL_TREE_SCRUB_TOML: &str = r#"
+[defaults]
+safe_columns = ["id"]
+
+[tables.users]
+safe = []
+
+[tables.users.pii]
+email = "email"
+
+[tables.users.encrypted]
+
+[tables.nodes]
+safe = ["owner_id", "parent_id"]
+
+[tables.items]
+safe = ["node_id"]
+"#;
+
 /// The same leak, through a `never_include` table rather than a purged one.
 ///
 /// `never_include` promises the table ends up empty. The sample empties it, but
