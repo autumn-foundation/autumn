@@ -2428,6 +2428,13 @@ jobs:
             --test integration_tests -- --ignored test_db_reset_table:: \
             | tee "$RUNNER_TEMP/test-db-reset-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/test-db-reset-cov.log"
+          # Ledger (outbox claim index): the existing-tables branch of
+          # `outbox::ensure_schema` runs only in this Docker test, so the
+          # `Test (Docker)` sweep alone leaves it out of the patch gate.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored outbox_pg:: \
+            | tee "$RUNNER_TEMP/outbox-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/outbox-pg-cov.log"
           # Issue #3061: the Postgres side of the database idempotency store
           # runs only in these Docker tests, the `--lib` pg_tests and the
           # consolidated binary's idempotency suites. Both filters are checked
