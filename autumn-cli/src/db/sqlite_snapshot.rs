@@ -966,7 +966,10 @@ mod tests {
     }
 
     /// Item 3: a non-UTF-8 `file:` source is backed up.
-    #[cfg(unix)]
+    ///
+    /// Not on macOS: APFS refuses a name that is not UTF-8 (`EILSEQ`), so
+    /// there such a file cannot exist.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn snapshot_reads_a_non_utf8_file_uri_source() {
         use std::os::unix::ffi::OsStrExt as _;
@@ -1010,7 +1013,10 @@ mod tests {
     }
 
     /// Item 15: a non-UTF-8 output directory is used exactly.
-    #[cfg(unix)]
+    ///
+    /// Not on macOS: APFS refuses a name that is not UTF-8 (`EILSEQ`), so
+    /// there such a file cannot exist.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn snapshot_writes_into_a_non_utf8_directory() {
         use std::os::unix::ffi::OsStrExt as _;
