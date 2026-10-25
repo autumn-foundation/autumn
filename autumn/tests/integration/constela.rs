@@ -14,7 +14,8 @@
 //! loudly here.
 
 use autumn_web::constela::{
-    ConstelaError, Document, Effect, Limits, RenderContext, RenderLimits, RouteValues, codes,
+    ConstelaError, Document, Effect, Limits, MAX_DIAGNOSTIC_FIELD_BYTES, MAX_DIAGNOSTICS,
+    RenderContext, RenderLimits, RouteValues, codes,
 };
 use serde_json::{Map, Value, json};
 
@@ -1413,4 +1414,219 @@ fn dispatch_allocation_is_bounded_in_aggregate() {
         .dispatch("grind", &mut state, &Map::new())
         .expect_err("dispatch over the budget");
     assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+// ---------------------------------------------------------------------------
+// Retention accounting (#2626)
+// ---------------------------------------------------------------------------
+//
+// Each test below is one path that kept document-controlled bytes and did not
+// pass a bound. See `docs/adr/0025-constela-retention-accounting.md`.
+
+/// Thousands of `set t_i = state(blob)` steps. Each read copied the blob and
+/// charged nothing, so the state kept `n × blob` bytes.
+#[test]
+fn a_state_read_is_charged_when_it_is_copied() {
+    let fields: Vec<String> = (0..2_000)
+        .map(|i| format!(r#""t{i}":{{"type":"string","initial":""}}"#))
+        .collect();
+    let steps: Vec<String> = (0..2_000)
+        .map(|i| {
+            format!(r#"{{"do":"set","target":"t{i}","value":{{"expr":"state","name":"blob"}}}}"#)
+        })
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+            "state":{{"blob":{{"type":"string","initial":""}},{}}},
+            "actions":[{{"name":"fan","steps":[{}]}}],
+            "view":{{"kind":"element","tag":"div"}}}}"#,
+        fields.join(","),
+        steps.join(",")
+    );
+
+    let document = Document::parse(&source, &Limits::unbounded()).expect("validates");
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(64 * 1024)));
+
+    let err = document
+        .dispatch("fan", &mut state, &Map::new())
+        .expect_err("copies over the budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// The budget charges copies, not reads. One copy of a large field fits.
+#[test]
+fn one_copy_of_a_large_state_field_still_fits_the_budget() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"blob":{"type":"string","initial":""},
+                     "copy":{"type":"string","initial":""}},
+            "actions":[{"name":"keep","steps":[
+              {"do":"set","target":"copy","value":{"expr":"state","name":"blob"}}]}],
+            "view":{"kind":"element","tag":"div"}}"#,
+    );
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(1024 * 1024)));
+
+    document
+        .dispatch("keep", &mut state, &Map::new())
+        .expect("one copy fits");
+    assert_eq!(state["copy"].as_str().map(str::len), Some(1024 * 1024));
+}
+
+/// A text node shows a value. It does not keep a copy, so it does not charge
+/// the allocation budget. Only the output meter sees it.
+#[test]
+fn rendering_a_large_list_does_not_charge_each_item_twice() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"rows":{"type":"list","initial":[]}},
+            "view":{"kind":"each","items":{"expr":"state","name":"rows"},"as":"r",
+              "body":{"kind":"text","value":{"expr":"var","name":"r"}}}}"#,
+    );
+    let mut state = document.initial_state();
+    // About 2.5 MiB of rows: the list is charged once, the output once.
+    let row = "y".repeat(1024);
+    state.insert("rows".into(), Value::Array(vec![Value::String(row); 2_500]));
+
+    let ctx = RenderContext {
+        state,
+        ..RenderContext::default()
+    };
+    let ui = document.render(&ctx).expect("fits both budgets");
+    assert_eq!(ui.body.0.len(), 2_500 * 1024);
+}
+
+/// A target names a destination. A target of a kilobyte names nothing.
+#[test]
+fn a_long_portal_target_is_rejected_at_validation() {
+    let source = view(&format!(
+        r#"{{"kind":"portal","target":"{}","children":[]}}"#,
+        "x".repeat(1024)
+    ));
+    assert!(codes_of(&source).contains(&codes::LIMIT));
+}
+
+/// Upstream allows any CSS selector, so the check is on length only.
+#[test]
+fn a_css_selector_portal_target_is_accepted() {
+    let source = view(r##"{"kind":"portal","target":"#modal-root > .slot","children":[]}"##);
+    assert!(codes_of(&source).is_empty());
+    let source = view(&format!(
+        r#"{{"kind":"portal","target":"{}","children":[]}}"#,
+        "x".repeat(256)
+    ));
+    assert!(codes_of(&source).is_empty(), "256 bytes is the limit");
+}
+
+/// An `each` of empty portals. No content and no output, but each portal kept
+/// its target.
+#[test]
+fn portal_targets_count_against_the_render_budget() {
+    let source = format!(
+        r#"{{"version":"1.0",
+            "state":{{"rows":{{"type":"list","initial":[]}}}},
+            "view":{{"kind":"each","items":{{"expr":"state","name":"rows"}},"as":"r",
+              "body":{{"kind":"portal","target":"{}","children":[]}}}}}}"#,
+        "t".repeat(200)
+    );
+    let document = document(&source);
+    let mut state = document.initial_state();
+    state.insert("rows".into(), Value::Array(vec![json!(1); 5_000]));
+
+    let ctx = RenderContext {
+        state,
+        limits: RenderLimits {
+            max_output_bytes: 64 * 1024,
+            ..RenderLimits::default()
+        },
+        ..RenderContext::default()
+    };
+    let err = document.render(&ctx).expect_err("targets over the budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// One invocation that omits thousands of required props. Each fault made one
+/// diagnostic with a copy of a 50 KiB component name.
+#[test]
+fn validation_diagnostics_are_bounded_in_count_and_bytes() {
+    let name = "C".repeat(50 * 1024);
+    let params: Vec<String> = (0..2_000)
+        .map(|i| format!(r#""p{i}":{{"type":"string"}}"#))
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+            "components":{{"{name}":{{"params":{{{}}},"view":{{"kind":"element","tag":"div"}}}}}},
+            "view":{{"kind":"component","name":"{name}"}}}}"#,
+        params.join(",")
+    );
+
+    let err = Document::parse(&source, &Limits::unbounded()).expect_err("invalid");
+    let diagnostics = err.diagnostics();
+    // The kept faults, plus the one that says the list was cut.
+    assert_eq!(diagnostics.len(), MAX_DIAGNOSTICS + 1);
+    let bytes: usize = diagnostics
+        .iter()
+        .map(|d| d.path.len() + d.message.len())
+        .sum();
+    assert!(
+        bytes <= diagnostics.len() * 2 * MAX_DIAGNOSTIC_FIELD_BYTES,
+        "{bytes} diagnostic bytes"
+    );
+    assert!(
+        !diagnostics[0].message.contains(&name),
+        "the message does not repeat the component name"
+    );
+    assert_eq!(
+        diagnostics.last().map(|d| d.code),
+        Some(codes::LIMIT),
+        "the last diagnostic says the list was cut"
+    );
+}
+
+/// A component with a literal id, used two times, gave two elements one id.
+/// `for` then found only the first.
+#[test]
+fn a_literal_id_rendered_twice_is_a_render_error() {
+    let document = document(
+        r#"{"version":"1.0",
+            "components":{"Field":{"view":{"kind":"element","tag":"input",
+              "props":{"id":{"expr":"lit","value":"email"}}}}},
+            "view":{"kind":"element","tag":"div","children":[
+              {"kind":"component","name":"Field"},
+              {"kind":"component","name":"Field"}]}}"#,
+    );
+    let err = document
+        .render(&RenderContext::default())
+        .expect_err("duplicate id");
+    assert_eq!(err.diagnostics()[0].code, codes::DUPLICATE);
+    assert!(err.diagnostics()[0].message.contains("email"), "{err}");
+}
+
+/// The same fault through a loop.
+#[test]
+fn a_literal_id_in_a_loop_body_is_a_render_error() {
+    let document = document(
+        r#"{"version":"1.0",
+            "view":{"kind":"each","items":{"expr":"lit","value":[1,2]},"as":"r",
+              "body":{"kind":"element","tag":"input",
+                "props":{"id":{"expr":"lit","value":"row"}}}}}"#,
+    );
+    let err = document
+        .render(&RenderContext::default())
+        .expect_err("duplicate id");
+    assert_eq!(err.diagnostics()[0].code, codes::DUPLICATE);
+}
+
+/// The fix the diagnostic asks for: derive the id from the loop index.
+#[test]
+fn ids_derived_from_the_loop_index_render() {
+    let rendered = render(
+        r#"{"version":"1.0",
+            "view":{"kind":"each","items":{"expr":"lit","value":[1,2]},"as":"r","index":"i",
+              "body":{"kind":"element","tag":"input",
+                "props":{"id":{"expr":"concat","items":[
+                  {"expr":"lit","value":"row-"},{"expr":"var","name":"i"}]}}}}}"#,
+    );
+    assert_eq!(rendered, r#"<input id="c-row-0"><input id="c-row-1">"#);
 }

@@ -69,6 +69,13 @@ pub mod codes {
     pub const RENDER_LIMIT: &str = "constela.render_limit";
 }
 
+/// The most bytes [`Diagnostic::new`] keeps of a `path` or a `message`.
+///
+/// A path or a message can quote a name from the document, and a name can be
+/// as long as the document. A longer field is cut at a character boundary and
+/// ends in `…`.
+pub const MAX_DIAGNOSTIC_FIELD_BYTES: usize = 4096;
+
 /// One thing wrong with a document, located.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -85,13 +92,31 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     /// Build a diagnostic.
+    ///
+    /// `path` and `message` are cut to [`MAX_DIAGNOSTIC_FIELD_BYTES`] each.
     pub fn new(path: impl Into<String>, code: &'static str, message: impl Into<String>) -> Self {
         Self {
-            path: path.into(),
+            path: clip(path.into()),
             code,
-            message: message.into(),
+            message: clip(message.into()),
         }
     }
+}
+
+/// Cut `text` to [`MAX_DIAGNOSTIC_FIELD_BYTES`], at a character boundary.
+fn clip(mut text: String) -> String {
+    const MARK: &str = "…";
+    if text.len() <= MAX_DIAGNOSTIC_FIELD_BYTES {
+        return text;
+    }
+    let mut end = MAX_DIAGNOSTIC_FIELD_BYTES.saturating_sub(MARK.len());
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text.truncate(end);
+    text.shrink_to_fit();
+    text.push_str(MARK);
+    text
 }
 
 impl fmt::Display for Diagnostic {
@@ -110,6 +135,9 @@ pub enum ConstelaError {
     /// The input is not valid JSON, or does not match the AST shape.
     Syntax(Diagnostic),
     /// The document parsed but is not valid. Never empty.
+    ///
+    /// Holds at most [`MAX_DIAGNOSTICS`](super::MAX_DIAGNOSTICS) faults. When
+    /// validation finds more, one last [`codes::LIMIT`] diagnostic says so.
     Invalid(Vec<Diagnostic>),
     /// Rendering failed. Carries a single diagnostic: a render aborts at the
     /// first fault rather than producing half a page.
@@ -190,5 +218,34 @@ impl ConstelaError {
     #[must_use]
     pub const fn http_status(&self) -> http::StatusCode {
         http::StatusCode::UNPROCESSABLE_ENTITY
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_field_is_kept_whole() {
+        let d = Diagnostic::new("view", codes::LIMIT, "short");
+        assert_eq!(d.path, "view");
+        assert_eq!(d.message, "short");
+    }
+
+    #[test]
+    fn a_long_field_is_cut_and_marked() {
+        let d = Diagnostic::new("p".repeat(10_000), codes::LIMIT, "m".repeat(10_000));
+        assert!(d.path.len() <= MAX_DIAGNOSTIC_FIELD_BYTES);
+        assert!(d.message.len() <= MAX_DIAGNOSTIC_FIELD_BYTES);
+        assert!(d.path.ends_with('…'));
+        assert!(d.message.starts_with("mmm"));
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_character() {
+        // Three-byte characters, so the cut point falls inside one.
+        let d = Diagnostic::new("", codes::LIMIT, "€".repeat(5_000));
+        assert!(d.message.len() <= MAX_DIAGNOSTIC_FIELD_BYTES);
+        assert!(d.message.trim_end_matches('…').chars().all(|c| c == '€'));
     }
 }

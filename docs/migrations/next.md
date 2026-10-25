@@ -1676,6 +1676,44 @@ writes return `Tie`.
 
 **Automation:** `manual` — add the arm, and the check to a custom store.
 
+### Constela: tighter bounds on what a document keeps
+
+**Why:** Four paths kept document-controlled bytes without a bound (issue
+#2626). A hostile document could make one request keep gigabytes. See
+[ADR 0025](../adr/0025-constela-retention-accounting.md).
+
+**Before (`{X.Y}`):**
+
+- Two elements could render with the same id. A `<label for>` then found only
+  the first.
+- A portal `target` had no length limit.
+- `ConstelaError::Invalid` held every fault.
+- A copy of a `state`, `var` or `param` value was free.
+
+**After (`{(X+1).0}`):**
+
+- A second element with the same id stops the render with
+  `constela.duplicate`. Pass the id as a component param, or derive it from
+  the loop index:
+
+  ```json
+  { "id": { "expr": "concat", "items": [
+      { "expr": "lit", "value": "row-" }, { "expr": "var", "name": "i" } ] } }
+  ```
+
+- A portal `target` longer than 256 bytes fails validation with
+  `constela.limit`.
+- `ConstelaError::Invalid` holds at most `MAX_DIAGNOSTICS` (256) faults, then
+  one `constela.limit` diagnostic. Each `path` and `message` is cut to
+  `MAX_DIAGNOSTIC_FIELD_BYTES` (4096).
+- A copy that a dispatch or a render keeps charges the allocation budget
+  (`RenderLimits::max_output_bytes`, 4 MiB by default). A read that only
+  shows a value does not copy it. An action that copies a state value larger
+  than the budget now fails with `constela.render_limit`.
+
+**Automation:** `manual` — it is a runtime behaviour change. Repair the
+document, or raise `RenderLimits::max_output_bytes` for a render.
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /

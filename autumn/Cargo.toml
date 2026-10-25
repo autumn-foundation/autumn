@@ -776,6 +776,13 @@ path = "tests/cost_reconcile.rs"
 name = "password_policy_alloc_gate"
 path = "tests/password_policy_alloc_gate.rs"
 
+# Constela: a hostile document uses bounded peak memory (issue #2626). Own
+# binary for the `allocation-counter` global-allocator reason above.
+[[test]]
+name = "constela_memory"
+path = "tests/constela_memory.rs"
+required-features = ["constela"]
+
 # Adaptive admission adds no allocations to an admitted request (issue #3068).
 # Own binary for the same `allocation-counter` global-allocator reason as
 # `config_alloc_gate` above.

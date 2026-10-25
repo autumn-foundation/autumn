@@ -53,6 +53,14 @@ use super::policy;
 /// The DSL versions this implementation accepts.
 pub const SUPPORTED_VERSIONS: &[&str] = &["1.0"];
 
+/// The most faults one [`ConstelaError::Invalid`] reports.
+///
+/// A hostile document can hold thousands of faults, and an error is the path
+/// it takes by design. After this many, validation keeps no more and adds one
+/// [`codes::LIMIT`] diagnostic. A generator fixes these and sends the document
+/// again.
+pub const MAX_DIAGNOSTICS: usize = 256;
+
 /// What is in lexical scope at a point in the view tree.
 struct Scope<'a> {
     /// Loop bindings currently in scope.
@@ -104,6 +112,8 @@ struct Validator<'a> {
     /// `result`, anywhere in it. Empty while walking the view.
     action_results: BTreeSet<&'a str>,
     diagnostics: Vec<Diagnostic>,
+    /// Whether a fault was found after [`MAX_DIAGNOSTICS`] were kept.
+    truncated: bool,
 }
 
 /// Whether `name` is usable as a binding, state field, or action name.
@@ -132,6 +142,7 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
         action_names: BTreeSet::new(),
         action_results: BTreeSet::new(),
         diagnostics: Vec::new(),
+        truncated: false,
     };
 
     validator.check_version();
@@ -141,12 +152,12 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
     // Cycles first: the component walk below would not terminate on a cyclic
     // graph, so this is the one check that gates the rest.
     if let Some(cycle) = validator.find_component_cycle() {
-        validator.diagnostics.push(Diagnostic::new(
+        validator.error(
             "components",
             codes::CYCLE,
             format!("components reference each other in a cycle: {cycle}"),
-        ));
-        return Err(ConstelaError::Invalid(validator.diagnostics));
+        );
+        return Err(validator.finish());
     }
 
     validator.check_styles();
@@ -163,13 +174,43 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
     if validator.diagnostics.is_empty() {
         Ok(())
     } else {
-        Err(ConstelaError::Invalid(validator.diagnostics))
+        Err(validator.finish())
     }
 }
 
 impl<'a> Validator<'a> {
+    /// Record one fault. The only way a diagnostic enters the list.
+    ///
+    /// After [`MAX_DIAGNOSTICS`] the fault is not kept. [`Self::finish`] then
+    /// adds one diagnostic that says the list was cut.
     fn error(&mut self, path: impl Into<String>, code: &'static str, message: impl Into<String>) {
+        if self.is_full() {
+            self.truncated = true;
+            return;
+        }
         self.diagnostics.push(Diagnostic::new(path, code, message));
+    }
+
+    /// Whether the list holds [`MAX_DIAGNOSTICS`] faults.
+    ///
+    /// A loop that can report one fault per entry checks this, so that it
+    /// stops formatting messages nobody keeps.
+    const fn is_full(&self) -> bool {
+        self.diagnostics.len() >= MAX_DIAGNOSTICS
+    }
+
+    /// The error for the faults found.
+    fn finish(mut self) -> ConstelaError {
+        if self.truncated {
+            self.diagnostics.push(Diagnostic::new(
+                "",
+                codes::LIMIT,
+                format!(
+                    "validation stopped after {MAX_DIAGNOSTICS} problems; fix these and validate again to see the rest"
+                ),
+            ));
+        }
+        ConstelaError::Invalid(self.diagnostics)
     }
 
     fn check_version(&mut self) {
@@ -748,7 +789,18 @@ impl<'a> Validator<'a> {
                 self.check_expr(language, &format!("{path}.language"), scope);
                 self.check_expr(content, &format!("{path}.content"), scope);
             }
-            Node::Portal { children, .. } => {
+            Node::Portal { target, children } => {
+                if target.len() > policy::MAX_PORTAL_TARGET_BYTES {
+                    self.error(
+                        format!("{path}.target"),
+                        codes::LIMIT,
+                        format!(
+                            "portal target is {} bytes, over the {}-byte limit; name a place in the host layout, e.g. \"body\" or \"#modal-root\"",
+                            target.len(),
+                            policy::MAX_PORTAL_TARGET_BYTES
+                        ),
+                    );
+                }
                 for (i, child) in children.iter().enumerate() {
                     self.check_node(child, &format!("{path}.children[{i}]"), scope);
                 }
@@ -911,23 +963,34 @@ impl<'a> Validator<'a> {
                 format!("no component named {name:?} is declared"),
             ),
             Some(component) => {
+                // One fault per param, so stop once the list is full. The
+                // path names the invocation, so the message does not repeat
+                // the component name: a name can be as long as the document.
                 for (param, def) in &component.params {
                     if def.required && !props.contains_key(param) {
+                        if self.is_full() {
+                            self.truncated = true;
+                            break;
+                        }
                         self.error(
                             format!("{path}.props"),
                             codes::UNKNOWN_REF,
                             format!(
-                                "component {name:?} requires a {param:?} prop, which is not supplied"
+                                "this component requires a {param:?} prop, which is not supplied"
                             ),
                         );
                     }
                 }
                 for supplied in props.keys() {
                     if !component.params.contains_key(supplied) {
+                        if self.is_full() {
+                            self.truncated = true;
+                            break;
+                        }
                         self.error(
                             format!("{path}.props.{supplied}"),
                             codes::UNKNOWN_REF,
-                            format!("component {name:?} declares no parameter {supplied:?}"),
+                            format!("this component declares no parameter {supplied:?}"),
                         );
                     }
                 }
