@@ -1276,25 +1276,11 @@ fn assert_no_import_surface(project: &Path, expect_no_multipart: bool) {
     assert!(!test.contains("csv_import"), "{test}");
 }
 
-/// The strongest form of "additive": for a variant that cannot have the import,
-/// passing `--import` must change NOTHING. A grep only sees the strings it was
-/// told to look for; this compares the whole generated tree.
-/// A path relative to the project root, with a migration directory's 14-digit
-/// generation timestamp replaced by a fixed placeholder and `/` as the
-/// separator on every platform.
+/// The path of `path` under `root`, with `/` as the separator. A 14-digit
+/// stamp in the dir directly under `migrations/` becomes `<timestamp>`.
 ///
-/// Two things it must survive, both learned the hard way:
-///
-/// * the two scaffolds this compares are separate process runs, so they straddle
-///   a second boundary often enough to matter — hence the placeholder;
-/// * this runs on Windows too, where `Path::display()` writes `\` — hence
-///   walking COMPONENTS rather than stripping a `"migrations/"` string prefix,
-///   which silently never matched there and turned the flake into a hard
-///   failure on the slowest runner.
-///
-/// Deliberately narrow: it rewrites only a 14-digit component directly under
-/// `migrations/`, so a digit run anywhere else in a path — or in a file's
-/// contents — is untouched.
+/// The rule walks path components. A `"migrations/"` string match fails on
+/// Windows, where the separator is `\`.
 fn normalized_relative_path(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).expect("under root");
     let mut parts: Vec<String> = rel
@@ -1310,51 +1296,6 @@ fn normalized_relative_path(path: &Path, root: &Path) -> String {
         *dir = format!("<timestamp>_{tail}");
     }
     parts.join("/")
-}
-
-/// `migrations/20260907011642_create_posts` → `migrations/<timestamp>_create_posts`
-/// wherever it appears in `line`. The body-side twin of
-/// [`normalized_relative_path`], for files that embed migration paths
-/// (`.autumn/generated.toml`'s digest table keys).
-fn normalize_migration_stamp(line: &str) -> String {
-    const PREFIX: &str = "migrations/";
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(i) = rest.find(PREFIX) {
-        let (head, tail) = rest.split_at(i + PREFIX.len());
-        out.push_str(head);
-        let stamp_len = tail.bytes().take_while(u8::is_ascii_digit).count();
-        if stamp_len == 14 && tail.as_bytes().get(14) == Some(&b'_') {
-            out.push_str("<timestamp>");
-            rest = &tail[14..];
-        } else {
-            rest = tail;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-#[test]
-fn normalize_migration_stamp_rewrites_only_full_stamps() {
-    assert_eq!(
-        normalize_migration_stamp(r#"[files."migrations/20260907011642_create_posts/up.sql"]"#),
-        r#"[files."migrations/<timestamp>_create_posts/up.sql"]"#
-    );
-    // Two paths on one line, both rewritten.
-    assert_eq!(
-        normalize_migration_stamp("migrations/20260907011642_a migrations/20260907011643_b"),
-        "migrations/<timestamp>_a migrations/<timestamp>_b"
-    );
-    // Not a 14-digit stamp, or no `_` after it: left alone.
-    assert_eq!(
-        normalize_migration_stamp("migrations/2026_x migrations/20260907011642x"),
-        "migrations/2026_x migrations/20260907011642x"
-    );
-    assert_eq!(
-        normalize_migration_stamp("digest = \"abc\""),
-        "digest = \"abc\""
-    );
 }
 
 /// The normalization above is what a Windows CI run caught: it used to strip a
@@ -1395,14 +1336,11 @@ fn normalized_relative_path_is_separator_agnostic() {
     );
 }
 
-/// Replace a 14-digit migration timestamp inside a generated file body with a
-/// fixed token.
+/// The body-side twin of [`normalized_relative_path`]: each
+/// `migrations/<14 digits>_` in `body` becomes `migrations/<timestamp>_`.
 ///
-/// [`normalized_relative_path`] removes that timestamp from the path. The
-/// bodies carry it too: `.autumn/generated.toml` records every generated file
-/// by path, so it keys two tables on the migration directory. The manifest
-/// spells those keys with `/` on every platform, so one string rule serves all
-/// three.
+/// `.autumn/generated.toml` keys its tables on each generated path. It always
+/// writes `/`, so one string rule is correct on all platforms.
 fn normalized_timestamps(body: &str) -> String {
     const PREFIX: &str = "migrations/";
     let mut out = String::with_capacity(body.len());
@@ -1478,6 +1416,12 @@ fn normalized_timestamps_rewrites_only_a_migration_stamp() {
     );
 }
 
+/// The files under `root` as sorted `(path, body)` pairs, for a byte-identity
+/// compare of two generated trees.
+///
+/// Each migration stamp in a path or a body becomes `<timestamp>`, because two
+/// runs can be in different seconds. All other bytes stay. The fresh secrets
+/// are skipped, and the manifest drops the lines that hash the command.
 fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -1486,60 +1430,35 @@ fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 stack.push(path);
-            } else {
-                let bytes = fs::read(&path).expect("readable file");
-                // The migration directory embeds a generation timestamp to
-                // the SECOND (`migrations/20260827030722_create_posts/`), and
-                // the two scaffolds this compares are two separate process
-                // runs — so they straddle a second boundary often enough to
-                // matter, and the raw paths would then differ for a reason
-                // that has nothing to do with the flag under test. Normalize
-                // the timestamp away; the rest of the path (and every file
-                // body) is still compared exactly.
-                let rel = normalized_relative_path(&path, root);
-                // Freshly generated secrets differ by construction; every
-                // other file is the generator's own output.
-                if rel == "config/master.key"
-                    || (rel.starts_with("config/credentials/") && rel.ends_with(".enc"))
-                {
-                    continue;
-                }
-                // A non-UTF-8 file is compared as hex.
-                let body = String::from_utf8(bytes).unwrap_or_else(|e| {
-                    e.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
-                });
-                // The bodies carry the migration timestamp too — the
-                // manifest keys a digest table on each generated path — so
-                // they need the same normalization the path got.
-                let body = normalized_timestamps(&body);
-                // `.autumn/generated.toml` records the digest of each file
-                // AND the command that wrote it (issue #1835). The two runs
-                // type different commands by construction — that is the
-                // flag under test — so the recorded command differs while
-                // the digests, which describe the output this gate is
-                // about, must not. Compare the digests, drop the command.
-                //
-                // Its table keys embed the migration directory too
-                // (`[files."migrations/20260907011642_create_posts/up.sql"]`),
-                // so the same second-boundary straddle the path
-                // normalization above guards against would otherwise
-                // survive inside this file's body — which is exactly what
-                // a Windows CI run caught (issue #2590).
-                let body = if rel.ends_with(".autumn/generated.toml") {
-                    body.lines()
-                        // The run id hashes the command. The edits listed
-                        // under it are compared (issue #2560).
-                        .filter(|line| {
-                            !line.starts_with("invocation = ") && !line.starts_with("[[runs.")
-                        })
-                        .map(normalize_migration_stamp)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    body
-                };
-                out.push((rel, body));
+                continue;
             }
+            let rel = normalized_relative_path(&path, root);
+            // `autumn new` writes new secrets on each run.
+            if rel == "config/master.key"
+                || (rel.starts_with("config/credentials/")
+                    && Path::new(&rel).extension().is_some_and(|ext| ext == "enc"))
+            {
+                continue;
+            }
+            let bytes = fs::read(&path).expect("readable file");
+            let body = match String::from_utf8(bytes) {
+                Ok(text) => normalized_timestamps(&text),
+                Err(e) => format!("<non-UTF-8 {:02x?}>", e.as_bytes()),
+            };
+            // The manifest records the command (issue #1835), and the run id
+            // hashes it. The two runs use different commands by design. The
+            // digests and the edits stay in the compare (issue #2560).
+            let body = if rel == ".autumn/generated.toml" {
+                body.lines()
+                    .filter(|line| {
+                        !line.starts_with("invocation = ") && !line.starts_with("[[runs.")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                body
+            };
+            out.push((rel, body));
         }
     }
     out.sort();
@@ -1609,7 +1528,10 @@ fn stamped_tree(stamp: &str, digest: &str) -> Vec<(String, Vec<u8>)> {
             b"CREATE TABLE posts ();".to_vec(),
         ),
         (MANIFEST.to_owned(), manifest.into_bytes()),
-        ("src/routes/posts.rs".to_owned(), b"pub fn index() {}".to_vec()),
+        (
+            "src/routes/posts.rs".to_owned(),
+            b"pub fn index() {}".to_vec(),
+        ),
     ]
 }
 
@@ -1712,6 +1634,12 @@ fn migration_stamps_reads_only_real_stamps() {
     assert!(migration_stamps(empty.path()).is_empty());
 }
 
+/// The strongest form of "additive": for a variant that cannot have the import,
+/// `--import` must change NOTHING in the generated tree.
+///
+/// The two scaffolds always run in different seconds, so their migration stamps
+/// always differ. A stamp that the snapshot does not normalize then fails on
+/// every run, not only on a slow runner (issue #2600).
 fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
     let mut flags = vec!["--import"];
     flags.extend_from_slice(extra);
