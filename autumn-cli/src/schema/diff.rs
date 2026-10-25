@@ -2664,7 +2664,7 @@ enum RebuildLeg {
 /// shape (`baseline` + this table's diff deltas — the same value the up leg builds
 /// as its target), **not** the parser's partial `ctx.desired`, so a
 /// retained-but-parser-invisible column is copied back on rollback rather than
-/// dropped. Both legs take the decimal shapes from `ctx.desired`
+/// dropped. Both legs take the decimal precision and scale from `ctx.desired`
 /// ([`with_desired_decimal_shapes`]), so the decimal `CHECK` stays.
 fn emit_sqlite_rebuild(
     table: &str,
@@ -2699,8 +2699,9 @@ fn emit_sqlite_rebuild(
             ),
         });
     }
-    // A missing desired shape is a directed error. Neither leg copies columns
-    // from the parser's partial desired table; it gives the decimal shapes only.
+    // A missing desired table is an error. Neither leg copies columns from the
+    // desired table. The desired table supplies only the decimal precision and
+    // scale.
     let desired = ctx
         .desired
         .get(table)
@@ -2852,14 +2853,14 @@ fn baseline_with_changes_applied(
     shape
 }
 
-/// Give a `SQLite` rebuild shape the desired decimal shape of each column that
-/// keeps its storage class (issue #2598).
+/// Copy the desired decimal precision and scale into a `SQLite` rebuild table,
+/// for each column that keeps its storage class (issue #2598).
 ///
-/// The renderer builds the decimal `CHECK` from that shape. The baseline can
-/// lose it: `--dev-url` and `schema pull` read the column as `TEXT`, and an old
-/// snapshot holds the `{12, 2}` default. Without this, a rebuild removes the
-/// `CHECK` or makes it wrong. A column of a different storage class keeps its
-/// type, because that is a real type change.
+/// The renderer builds the decimal `CHECK` from the precision and scale. The
+/// baseline can have wrong values. `--dev-url` and `schema pull` read the column
+/// as `TEXT`, and an old snapshot holds `{12, 2}`. Without this function, a
+/// rebuild removes the `CHECK` or writes a wrong `CHECK`. A column with a
+/// different storage class keeps its baseline type: that is a real type change.
 fn with_desired_decimal_shapes(mut shape: Table, desired: &Table) -> Table {
     for column in &mut shape.columns {
         if let Some(want) = desired.columns.iter().find(|c| c.name == column.name)
@@ -3664,8 +3665,9 @@ fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> 
     if let Some(default) = &column.default {
         let _ = write!(def, " DEFAULT {}", default_sql(default, backend));
     }
-    // #2598: a `SQLite` decimal is `TEXT`, so a `CHECK` holds its shape. The
-    // generator builds the same `CHECK`, so the two lanes cannot drift.
+    // #2598: a `SQLite` decimal is `TEXT`. A `CHECK` enforces its precision and
+    // scale. The generator uses the same builder, so the two lanes write the
+    // same `CHECK`.
     if backend == Backend::Sqlite
         && let ColumnType::Decimal { precision, scale } = column.ty
     {
@@ -8120,10 +8122,7 @@ PRAGMA foreign_keys=ON;
         );
         let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
         assert!(down.contains("    price INTEGER NOT NULL"), "{down}");
-        assert!(
-            !down.contains("CHECK"),
-            "the down leg restores INTEGER: {down}"
-        );
+        assert!(!down.contains("CHECK"), "the down leg has no CHECK: {down}");
     }
 
     #[test]

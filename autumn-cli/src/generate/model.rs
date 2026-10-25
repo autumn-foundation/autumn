@@ -4371,9 +4371,9 @@ mod tests {
     }
 
     /// #2598 round trip. The generator writes a `decimal{10,2}` table on
-    /// `SQLite`. The declarative lane then (1) sees no spurious diff, and (2)
-    /// keeps the generator `CHECK` through a rebuild for an unrelated change.
-    /// The rebuilt table must still reject what the `CHECK` rejects.
+    /// `SQLite`. The declarative lane finds no diff. A rebuild for a different
+    /// change keeps the generator `CHECK`. The rebuilt table rejects the values
+    /// that the `CHECK` rejects.
     #[test]
     fn sqlite_decimal_check_survives_a_declarative_rebuild() {
         use crate::generate::schema_edit::sqlite_decimal_check;
@@ -4425,8 +4425,8 @@ mod tests {
                 "the generator wrote the CHECK"
             );
 
-            // Opt the model in to the declarative lane, then take the
-            // baseline that `autumn schema snapshot` writes.
+            // Mark the model `managed`. Then parse the baseline that
+            // `autumn schema snapshot` writes.
             let models = tmp.path().join("src/models");
             let model_path = models.join("product.rs");
             let model = fs::read_to_string(&model_path).expect("read model");
@@ -4445,11 +4445,11 @@ mod tests {
             let clean = diff_schema(&snapshot.tables, &snapshot, DiffOptions::default());
             assert!(
                 clean.changes.is_empty(),
-                "spurious diff: {:?}",
+                "the diff is not empty: {:?}",
                 clean.changes
             );
 
-            // An unrelated change that SQLite can only apply with a rebuild.
+            // A different change. SQLite applies it only with a rebuild.
             let model = fs::read_to_string(&model_path).expect("read model");
             assert!(model.contains("pub title: String,"), "{model}");
             fs::write(
@@ -4485,10 +4485,11 @@ mod tests {
                 .is_ok()
             };
             for value in ["'0.5'", "'-19.99'", "'12345678.99'", "19.99"] {
-                assert!(insert(&mut conn, value), "{value} is in shape");
+                assert!(insert(&mut conn, value), "the CHECK rejects {value}");
             }
-            // Out of shape and non-TEXT values from
-            // `sqlite_decimal_check_enforces_precision_scale_and_shape`.
+            // These values come from
+            // `sqlite_decimal_check_enforces_precision_scale_and_shape`. Each
+            // value is out of shape or is not TEXT.
             for value in [
                 "'123456789.99'",
                 "'19.999'",
@@ -4502,7 +4503,7 @@ mod tests {
                 "'-0'",
                 "x'31392e3939'",
             ] {
-                assert!(!insert(&mut conn, value), "{value} must be rejected");
+                assert!(!insert(&mut conn, value), "the CHECK accepts {value}");
             }
         });
     }

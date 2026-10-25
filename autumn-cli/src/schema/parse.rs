@@ -1233,8 +1233,9 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             // #1806: same storage contract as `#[translatable]` — `TEXT NOT
             // NULL` with an empty-container default the type cannot carry.
             "collaborative" => out.is_collaborative = true,
-            // #2598: the first attribute wins, as in the `#[model]` macro.
-            "decimal_shape" if out.decimal_shape.is_none() => {
+            // #2598: the first good attribute wins, as in the `#[model]`
+            // macro. A bad attribute counts only when no good one follows.
+            "decimal_shape" if !matches!(out.decimal_shape, Some(Ok(_))) => {
                 out.decimal_shape = Some(parse_decimal_shape(attr));
             }
             "references" => {
@@ -2460,12 +2461,12 @@ mod tests {
             let parsed = parse_model_source(&src, Backend::Sqlite).expect("parse");
             assert!(
                 parsed.tables[0].columns.iter().all(|c| c.name != "price"),
-                "`{attr}` must skip the column"
+                "`{attr}` did not skip the column"
             );
             assert_eq!(
                 parsed.diagnostics.len(),
                 1,
-                "`{attr}` must add a diagnostic"
+                "`{attr}` did not add one diagnostic"
             );
             assert_eq!(parsed.diagnostics[0].field, "price");
             assert!(
