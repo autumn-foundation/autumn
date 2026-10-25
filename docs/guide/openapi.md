@@ -498,6 +498,30 @@ while your hand-written `#/components/schemas/Args` keeps pointing at a key
 nothing defines. **In a manually registered schema, write the
 collision-resolved key you actually want.**
 
+### Request and response components
+
+A type can have two wire shapes. `#[private]`, `#[classified]` and a hidden
+`#[encrypted]` field are skipped on serialize only. Thus a request carries
+them and a response does not.
+
+The generator picks the schema by position. A request body and a `Query<T>`
+use the shape the type deserializes from. A response body uses the shape it
+serializes to. A nested `$ref` has the position of the schema it is in.
+
+| How the type is used | Components |
+|---|---|
+| In one position only | One, with the schema of that position |
+| In both positions, one shape | One (`Widget`) |
+| In both positions, two shapes | Two: `Widget` (response) and `WidgetRequest` |
+
+When `WidgetRequest` is already a key, the request component is
+`WidgetRequest-2`. Your own registrations keep their keys. MCP tool
+`inputSchema` uses the request shape.
+
+A `#[model]` with `#[serde(deserialize_with)]`, `with`, `flatten`, `from`,
+`try_from`, `transparent` or `tag` has no accurate request schema. Its request
+component is the opaque placeholder, and `--strict` reports it.
+
 ---
 
 ## 5. Errors: the shared `ProblemDetails` contract
