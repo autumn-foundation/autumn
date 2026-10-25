@@ -334,8 +334,8 @@ impl Report {
 
 /// Accumulator threaded through the source scan.
 #[derive(Debug, Default)]
-struct Scan {
-    findings: Vec<Finding>,
+pub struct Scan {
+    pub findings: Vec<Finding>,
     files_scanned: usize,
     html_blocks: usize,
     /// Every function declaration seen, for route attribution.
@@ -369,7 +369,7 @@ impl Scan {
 /// fine here and legitimately produces an empty file list (zero findings, exit
 /// 0). Nested subdir read errors *during recursion* remain best-effort
 /// (swallowed by [`collect_rs_files`]), mirroring `autumn i18n check`.
-fn scan_project(root: &Path) -> std::io::Result<Scan> {
+pub fn scan_project(root: &Path) -> std::io::Result<Scan> {
     std::fs::read_dir(root)?;
     let mut scan = Scan::default();
     let mut files = Vec::new();

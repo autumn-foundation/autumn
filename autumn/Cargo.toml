@@ -162,6 +162,9 @@ telemetry-otlp = [
 # `[[bin]]` (W6 PR3), which is a binary and therefore cannot use dev-deps, can
 # depend on it too. `proptest` itself stays out of default builds.
 sim-testing = ["dep:proptest"]
+# Ledger profiling harnesses (`docs/perf/`). Off by default and not part of any
+# CI feature set, so the harness module is only compiled when asked for.
+ledger-profile = ["db"]
 # `dep:rustls` is not optional flavouring: `redis`'s `tokio-rustls-comp`
 # feature makes `rediss://` URLs reachable, and those panic inside
 # `rustls::ClientConfig::builder()` unless a process-level
@@ -438,6 +441,9 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 proptest = { version = "1.4", optional = true }
 serde_urlencoded = "0.7"
+# Form bodies (issue #3394): a fork of `serde_urlencoded` that puts a repeated
+# key into a `Vec<T>` field. Decode only.
+serde_html_form = { version = "0.4.1", default-features = false, features = ["de", "ser", "std"] }
 serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
 fd-lock = { version = "4", optional = true }
@@ -530,6 +536,8 @@ nix = { version = "0.31.2", features = ["resource", "time"] }
 # cannot lift a forbid (E0453). The crate installs its `#[global_allocator]` on
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
+# The SQLite UUID default shared with the generator (tests/sqlite_uuid_primary_key.rs).
+autumn-schema-core = { path = "../autumn-schema-core" }
 # Criterion benches (issue #3068, `benches/admission.rs`). No plots: only the
 # statistics and the `cargo bench` harness.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
@@ -682,6 +690,11 @@ required-features = ["markdown"]
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
 # attributable in a profiler. Asserts nothing — see the file header for the
 # exact commands.
+[[bench]]
+name = "mcp_search"
+harness = false
+required-features = ["mcp"]
+
 [[bench]]
 name = "csrf_verify"
 harness = false
@@ -1193,6 +1206,20 @@ path = "tests/sqlite_searchable_repository.rs"
 [[test]]
 name = "sqlite_immediate_transaction"
 path = "tests/sqlite_immediate_transaction.rs"
+
+# `TestDb` on the SQLite backend (issue #2555): a throwaway tempfile database with
+# the Postgres harness API, so a scaffolded SQLite app can run its smoke test.
+# Run: `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_test_db`.
+[[test]]
+name = "sqlite_test_db"
+path = "tests/sqlite_test_db.rs"
+
+# UUID primary keys on SQLite (issue #2555): the generator's `randomblob` default
+# builds canonical v4 ids through a `#[model]` + `#[repository]`.
+# Run: `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_uuid_primary_key`.
+[[test]]
+name = "sqlite_uuid_primary_key"
+path = "tests/sqlite_uuid_primary_key.rs"
 
 # SQLite `statement_timeout` fail-closed boot guard (issue #1996, item 4). SQLite
 # cannot enforce a per-statement wall-clock timeout through the async connection

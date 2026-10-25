@@ -805,6 +805,66 @@ fn container_test_jobs_pre_pull_their_images() {
     );
 }
 
+/// Body of the top-level job `name` in ci.yml, up to the next job.
+fn ci_job<'a>(ci: &'a str, name: &str) -> &'a str {
+    let head = format!("\n  {name}:\n");
+    let start = ci
+        .find(&head)
+        .unwrap_or_else(|| panic!("ci.yml must define job `{name}`"));
+    let body = &ci[start + head.len()..];
+    let end = body
+        .lines()
+        .scan(0, |off, l| {
+            let at = *off;
+            *off += l.len() + 1;
+            Some((at, l))
+        })
+        .find(|(_, l)| {
+            l.starts_with("  ")
+                && !l.starts_with("   ")
+                && !l.trim_start().starts_with('#')
+                && l.trim_end().ends_with(':')
+        })
+        .map_or(body.len(), |(at, _)| at);
+    &body[..end]
+}
+
+/// `deploy_e2e` builds its own image on top of the sweep's images. This filled
+/// the runner disk (#2547). It must run in its own job on a fresh disk. The
+/// aggregate gate must wait for that job.
+#[test]
+fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
+    let root = workspace_root();
+    // A Windows checkout can turn LF into CRLF.
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
+    let sweep = ci_job(&ci, "test-docker");
+    assert!(
+        !sweep.contains("--test deploy_e2e"),
+        "`test-docker` must not run deploy_e2e: its disk is already full (#2547)"
+    );
+    let job = ci_job(&ci, "test-docker-deploy");
+    assert!(
+        job.contains("cargo test -p autumn-cli --test deploy_e2e -- --ignored"),
+        "`test-docker-deploy` must run the deploy_e2e suite"
+    );
+    assert!(
+        job.contains("Free disk space") && job.contains("df -h"),
+        "`test-docker-deploy` must reclaim disk and report it"
+    );
+    assert!(
+        job.contains("openssh-client") && job.contains("ci-docker-hub-mirror.sh"),
+        "`test-docker-deploy` must install the ssh client and use the Docker Hub mirror"
+    );
+    let gate = ci_job(&ci, "test-gate");
+    assert!(
+        gate.lines()
+            .any(|l| l.trim_start().starts_with("needs:") && l.contains("test-docker-deploy")),
+        "`test-gate` must need `test-docker-deploy`"
+    );
+}
+
 #[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();
@@ -9627,6 +9687,15 @@ fn posture_gate_job_harvests_pull_request_acknowledgments() {
 }
 
 #[test]
+fn posture_gate_job_checks_the_reddit_clone_demo() {
+    let job = posture_gate_job(&workspace_root());
+    assert!(
+        job.contains("run: ./scripts/check-posture-demo.sh"),
+        "the golden diff in docs/guide/posture-gate.md is only real while CI checks it: {job}"
+    );
+}
+
+#[test]
 fn posture_gate_job_takes_a_dispatch_acknowledgment_through_env() {
     let root = workspace_root();
     let workflow = std::fs::read_to_string(root.join(".github/workflows/publish-gate.yml"))
@@ -9664,6 +9733,9 @@ fn posture_gate_script_documents_the_acknowledgment_scope() {
     );
 }
 
+/// The examples `scripts/check-posture-gate.sh` gates, in its `EXAMPLES` order.
+const POSTURE_EXAMPLES: [&str; 5] = ["hello", "flock", "invoice", "todo-app", "reddit-clone"];
+
 /// Run the posture script with a stub `cargo` and a stub `autumn`.
 /// Return the log of stub calls and the script output.
 #[cfg(unix)]
@@ -9679,7 +9751,7 @@ fn run_posture_script_with_stubs(envs: &[(&str, &str)]) -> (String, String) {
         repo.join("scripts/check-posture-gate.sh"),
     )
     .expect("copy script");
-    for example in ["hello", "flock", "invoice", "todo-app"] {
+    for example in POSTURE_EXAMPLES {
         let dir = repo.join("examples").join(example);
         std::fs::create_dir_all(&dir).expect("mkdir example");
         std::fs::write(dir.join("security-posture.json"), "{}").expect("baseline");
@@ -9741,6 +9813,25 @@ exit 0
     (std::fs::read_to_string(&log).unwrap_or_default(), stdout)
 }
 
+/// The stub harness builds one baseline per example. A list that lags the
+/// script fails it with "no committed baseline" instead of testing anything.
+#[test]
+fn posture_examples_match_the_script() {
+    let script = std::fs::read_to_string(workspace_root().join("scripts/check-posture-gate.sh"))
+        .expect("read check-posture-gate.sh");
+    let line = script
+        .lines()
+        .find(|l| l.starts_with("EXAMPLES=("))
+        .expect("the script declares EXAMPLES=(...)");
+    let listed: Vec<&str> = line
+        .trim_start_matches("EXAMPLES=(")
+        .trim_end_matches(')')
+        .split_whitespace()
+        .map(|w| w.trim_matches('"'))
+        .collect();
+    assert_eq!(listed, POSTURE_EXAMPLES);
+}
+
 #[cfg(unix)]
 #[test]
 fn posture_script_passes_the_ack_dir_to_the_diff_and_logs_it() {
@@ -9749,7 +9840,11 @@ fn posture_script_passes_the_ack_dir_to_the_diff_and_logs_it() {
         .lines()
         .filter(|l| l.starts_with("routes posture diff"))
         .collect();
-    assert_eq!(diffs.len(), 4, "one diff per example: {calls}");
+    assert_eq!(
+        diffs.len(),
+        POSTURE_EXAMPLES.len(),
+        "one diff per example: {calls}"
+    );
     assert!(
         diffs.iter().all(|l| l.contains("--ack-dir /acks")),
         "every diff must carry --ack-dir: {diffs:?}"

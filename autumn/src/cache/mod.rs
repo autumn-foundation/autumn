@@ -791,12 +791,14 @@ where
 
 /// [`get_cached`], with a backend failure kept apart from a miss.
 ///
-/// A value that cannot be decoded is a miss, as in [`get_cached`]. A failed
+/// Unlike [`get_cached`], stored bytes that cannot be decoded are an error,
+/// not a miss. The key stays unreadable until a writer replaces it. A failed
 /// read marks a failure capsule incomplete, so replay does not run it.
 ///
 /// # Errors
 ///
-/// [`CacheBackendError`] when the backend could not answer.
+/// [`CacheBackendError`] when the backend could not answer, or the stored
+/// bytes cannot be decoded.
 pub fn try_get_cached<V>(cache: &dyn Cache, key: &str) -> Result<Option<V>, CacheBackendError>
 where
     V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
@@ -811,18 +813,32 @@ where
         let _helper = HelperCall::enter();
         cache.try_get_value(key)
     };
-    let value = match read {
-        Ok(found) => found.and_then(|arc| {
-            if let Some(value) = arc.downcast_ref::<V>() {
-                return Some(value.clone());
-            }
-            arc.downcast_ref::<RawCacheBytes>()
-                .and_then(|raw| serde_json::from_slice::<V>(&raw.0).ok())
-        }),
+    let found = match read {
+        Ok(found) => found,
         Err(error) => {
             mark_failed_cache_op(FAILED_READ_NOTE);
             return Err(error);
         }
+    };
+    let Some(arc) = found else {
+        record_cache_get::<V>(key, None);
+        return Ok(None);
+    };
+    if let Some(value) = arc.downcast_ref::<V>() {
+        let value = Some(value.clone());
+        record_cache_get(key, value.as_ref());
+        return Ok(value);
+    }
+    // Bytes the backend holds but this type cannot read are a fault, not an
+    // absent key. The text is fixed: a guest can read it.
+    let value = if let Some(raw) = arc.downcast_ref::<RawCacheBytes>() {
+        let Ok(value) = serde_json::from_slice::<V>(&raw.0) else {
+            mark_failed_cache_op(FAILED_READ_NOTE);
+            return Err(CacheBackendError::new("the stored value cannot be decoded"));
+        };
+        Some(value)
+    } else {
+        None
     };
     record_cache_get(key, value.as_ref());
     Ok(value)
@@ -2268,6 +2284,44 @@ mod tests {
         assert_eq!(err.reason(), "down");
         let err = try_get_cached::<i64>(&DownBackend, "k").expect_err("read failed");
         assert_eq!(err.reason(), "down");
+    }
+
+    /// Holds bytes that are not JSON.
+    struct CorruptBackend;
+
+    impl Cache for CorruptBackend {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+        fn invalidate(&self, _key: &str) {}
+        fn clear(&self) {}
+        fn try_get_value(
+            &self,
+            _key: &str,
+        ) -> Result<Option<Arc<dyn Any + Send + Sync>>, CacheBackendError> {
+            Ok(Some(Arc::new(RawCacheBytes(b"not json".to_vec()))))
+        }
+    }
+
+    #[test]
+    fn try_get_cached_reports_bytes_it_cannot_decode() {
+        let err = try_get_cached::<i64>(&CorruptBackend, "k").expect_err("corrupt bytes");
+        assert!(err.reason().contains("cannot be decoded"), "{err}");
+    }
+
+    /// A decode fault marks the capsule, as a backend fault does.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_decode_fault_marks_the_capsule_incomplete() {
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                assert!(try_get_cached::<i64>(&CorruptBackend, "k").is_err());
+            },
+        ));
+        assert!(scope.is_truncated());
     }
 
     #[test]

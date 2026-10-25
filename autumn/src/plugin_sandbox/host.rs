@@ -70,7 +70,7 @@ use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 use super::artifact::SandboxArtifact;
 use super::manifest::{ResourceLimits, SandboxManifest};
 use super::wire::{
-    GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_line, to_exact_line, to_line,
+    GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_guest_line, to_exact_line, to_line,
 };
 
 /// The WASI module name every import in the shim lives under.
@@ -3203,7 +3203,7 @@ impl HostState {
             // overwriting a good first one.
             return;
         }
-        self.answer = Some(match from_line::<GuestFrame>(line) {
+        self.answer = Some(match from_guest_line(line) {
             Ok(GuestFrame::Call(call)) => {
                 // Queued, not serviced: the fixed charge is the shim's to take
                 // first. See `pending_calls`.

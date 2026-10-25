@@ -1528,7 +1528,11 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
                     // a Windows CI run caught (issue #2590).
                     let body = if rel.ends_with(".autumn/generated.toml") {
                         body.lines()
-                            .filter(|line| !line.starts_with("invocation = "))
+                            // The run id hashes the command. The edits listed
+                            // under it are compared (issue #2560).
+                            .filter(|line| {
+                                !line.starts_with("invocation = ") && !line.starts_with("[[runs.")
+                            })
                             .map(normalize_migration_stamp)
                             .collect::<Vec<_>>()
                             .join("\n")

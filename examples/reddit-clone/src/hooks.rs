@@ -29,6 +29,9 @@ fn reject_content_free(subject: &str, value: &str) -> AutumnResult<()> {
 
 /// Mutation hooks for posts — auto-generate slug from title on
 /// create and re-slug on title change during update.
+///
+/// The hooks have no connection, so they cannot check that a slug is free.
+/// The `posts_resolve_slug` trigger does that (#2573).
 #[derive(Clone, Default)]
 pub struct PostHooks;
 

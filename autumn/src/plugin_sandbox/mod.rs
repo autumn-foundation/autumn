@@ -127,7 +127,7 @@ pub fn __fuzz_read_artifact(bytes: &[u8]) -> bool {
 #[doc(hidden)]
 #[must_use]
 pub fn __fuzz_parse_guest_frame(line: &str) -> bool {
-    wire::from_line::<wire::GuestFrame>(line).is_ok()
+    wire::from_guest_line(line).is_ok()
 }
 
 /// Parse a manifest. Fuzzing seam; not a public API.

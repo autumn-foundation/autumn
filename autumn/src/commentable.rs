@@ -2468,7 +2468,11 @@ impl Default for CommentsConfig {
 /// ```rust,ignore
 /// AppBuilder::new()
 ///     .nest("/comments", autumn_web::commentable::router(Default::default()))
+///     .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
 /// ```
+///
+/// [`route_infos`] lists these routes for `autumn routes audit`, which cannot
+/// see inside a nested router.
 ///
 /// # Panics
 ///
@@ -2525,6 +2529,92 @@ where
             axum::routing::get(show_thread).post(post_comment),
         )
         .layer(axum::Extension(std::sync::Arc::new(config)))
+}
+
+/// The routes [`router()`] serves under `prefix`, for
+/// [`AppBuilder::declare_plugin_routes`](crate::app::AppBuilder::declare_plugin_routes).
+///
+/// A `nest`ed router is opaque to `autumn routes audit`, which fails closed on
+/// it. Declaring these alongside the nest makes the mount enumerable:
+///
+/// ```rust,ignore
+/// app.nest("/comments", autumn_web::commentable::router(config))
+///    .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
+/// ```
+///
+/// The classifications state what the handlers do:
+///
+/// - `GET` is `public`. Anyone may read a thread unless the app sets
+///   [`CommentsConfig::authorize`].
+/// - `POST` is `gated` with `provenance: "declared"`. The handler answers
+///   `401` when the session has no
+///   [`session_author_key`](CommentsConfig::session_author_key). That check
+///   lives in the handler body, not in a `#[secured]` attribute, so the audit
+///   records the claim and does not prove it.
+#[cfg(all(feature = "db", feature = "maud"))]
+#[must_use]
+pub fn route_infos(prefix: &str) -> Vec<crate::route_listing::RouteInfo> {
+    use crate::route_listing::{RouteClassification, RouteInfo};
+    let path = format!(
+        "{}/{{commentable_type}}/{{parent_id}}",
+        prefix.trim_end_matches('/')
+    );
+    vec![
+        RouteInfo {
+            method: "GET".to_owned(),
+            path: path.clone(),
+            handler: "autumn_web::commentable::show_thread".to_owned(),
+            classification: RouteClassification::Public,
+            ..Default::default()
+        },
+        RouteInfo {
+            method: "POST".to_owned(),
+            path,
+            handler: "autumn_web::commentable::post_comment".to_owned(),
+            classification: RouteClassification::Gated,
+            layer_guarded: true,
+            ..Default::default()
+        },
+    ]
+}
+
+#[cfg(all(test, feature = "db", feature = "maud"))]
+mod route_infos_tests {
+    use super::route_infos;
+    use crate::route_listing::RouteClassification;
+
+    #[test]
+    fn declares_a_public_read_and_a_declared_gated_post_under_the_prefix() {
+        let infos = route_infos("/comments/");
+        let shape: Vec<_> = infos
+            .iter()
+            .map(|r| {
+                (
+                    r.method.as_str(),
+                    r.path.as_str(),
+                    r.classification,
+                    r.layer_guarded,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (
+                    "GET",
+                    "/comments/{commentable_type}/{parent_id}",
+                    RouteClassification::Public,
+                    false,
+                ),
+                (
+                    "POST",
+                    "/comments/{commentable_type}/{parent_id}",
+                    RouteClassification::Gated,
+                    true,
+                ),
+            ]
+        );
+    }
 }
 
 /// The body of a comment/reply submission.

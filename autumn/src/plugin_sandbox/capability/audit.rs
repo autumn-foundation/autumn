@@ -124,7 +124,7 @@ struct LogState {
     /// Keyed by time, so the oldest record is the first key whatever order the
     /// records arrived in. The sequence number keeps equal times apart. Windowed
     /// by the same cutoff as `entries`.
-    dropped: BTreeMap<(Instant, u64), (String, u64)>,
+    dropped: BTreeMap<(Instant, u64), DroppedRecord>,
     /// The next sequence number for `dropped`.
     seq: u64,
     /// Counts the full `dropped` ledger folded away, by plugin and hour, with
@@ -134,6 +134,24 @@ struct LogState {
     folded: BTreeMap<(String, u64), (Instant, u64)>,
     /// The time the hour buckets count from. Set by the first fold.
     origin: Option<Instant>,
+    /// The newest time of a drop count the full `folded` ledger shed. Its
+    /// owner is unknown, so a summary can only say that counts were lost.
+    shed: Option<Instant>,
+}
+
+/// The gap between two instants, whichever is later.
+fn apart(a: Instant, b: Instant) -> Duration {
+    a.max(b).saturating_duration_since(a.min(b))
+}
+
+/// Calls the log knows happened but cannot show, for one plugin.
+#[derive(Debug)]
+struct DroppedRecord {
+    plugin: String,
+    count: u64,
+    /// The time of the first drop. A record spans at most [`DROPPED_BUCKET`]
+    /// from here.
+    first: Instant,
 }
 
 /// How long one `folded` bucket spans.
@@ -143,9 +161,9 @@ const FOLD_BUCKET_SECS: u64 = 3600;
 ///
 /// One eviction is one dropped call, and evictions arrive at the plugin's whole
 /// call rate — so recording each separately would cost as much memory as
-/// keeping the events did. Consecutive drops for one plugin inside this span
-/// become one record. It is three orders of magnitude below the "last hour" the
-/// acceptance criterion asks about, so the windowing stays honest.
+/// keeping the events did. Drops for one plugin become one record while they
+/// stay inside this span of the record's first drop. The span is far below the
+/// "last hour" window, so the windowing stays honest.
 const DROPPED_BUCKET: Duration = Duration::from_secs(1);
 
 impl PluginActivityLog {
@@ -219,14 +237,15 @@ impl PluginActivityLog {
         summary.dropped = state
             .dropped
             .iter()
-            .filter(|((at, _), (who, _))| who == plugin && in_window(*at))
-            .fold(0_u64, |sum, (_, (_, count))| sum.saturating_add(*count));
+            .filter(|((at, _), record)| record.plugin == plugin && in_window(*at))
+            .fold(0_u64, |sum, (_, record)| sum.saturating_add(record.count));
         let folded: u64 = state
             .folded
             .range((plugin.to_owned(), 0)..=(plugin.to_owned(), u64::MAX))
             .filter(|(_, (at, _))| in_window(*at))
             .fold(0_u64, |sum, (_, (_, count))| sum.saturating_add(*count));
         summary.dropped = summary.dropped.saturating_add(folded);
+        summary.truncated = state.shed.is_some_and(in_window);
         drop(state);
         summary
     }
@@ -248,7 +267,7 @@ impl PluginActivityLog {
                 .entries
                 .values()
                 .map(|(who, _)| who.clone())
-                .chain(state.dropped.values().map(|(who, _)| who.clone()))
+                .chain(state.dropped.values().map(|record| record.plugin.clone()))
                 .chain(state.folded.keys().map(|(who, _)| who.clone()))
                 .collect()
         };
@@ -261,27 +280,42 @@ impl PluginActivityLog {
 impl LogState {
     /// Add `count` dropped calls for `plugin` at `at`.
     ///
-    /// Coalesces into the newest record when it is the same plugin within one
-    /// [`DROPPED_BUCKET`]. Bounded by [`MAX_LOG_EVENTS`]: the oldest record, by
+    /// Coalesces into the newest record when it is the same plugin and within
+    /// one [`DROPPED_BUCKET`] of that record's first drop. Bounded by [`MAX_LOG_EVENTS`]: the oldest record, by
     /// time, folds into `folded` rather than vanishing.
     fn note_dropped(&mut self, at: Instant, plugin: &str, count: u64) {
-        if let Some((&(last, seq), (who, _))) = self.dropped.last_key_value()
-            && who == plugin
-            && at.max(last).saturating_duration_since(at.min(last)) < DROPPED_BUCKET
+        // Measured from the first drop, not the newest. A steady dropper would
+        // otherwise keep one record open for hours.
+        if let Some((&(last, seq), record)) = self.dropped.last_key_value()
+            && record.plugin == plugin
+            && apart(at, record.first) < DROPPED_BUCKET
+            && apart(at, last) < DROPPED_BUCKET
         {
-            // The newer of the two times, so a bucket is reported for as long
-            // as any call in it belongs to the window.
-            if let Some((who, total)) = self.dropped.remove(&(last, seq)) {
-                self.dropped
-                    .insert((last.max(at), seq), (who, total.saturating_add(count)));
+            // Keyed by the newer time: the record counts while any drop in it
+            // is inside the window.
+            if let Some(mut record) = self.dropped.remove(&(last, seq)) {
+                record.count = record.count.saturating_add(count);
+                self.dropped.insert((last.max(at), seq), record);
             }
             return;
         }
         self.seq = self.seq.wrapping_add(1);
-        self.dropped
-            .insert((at, self.seq), (plugin.to_owned(), count));
+        self.dropped.insert(
+            (at, self.seq),
+            DroppedRecord {
+                plugin: plugin.to_owned(),
+                count,
+                first: at,
+            },
+        );
         while self.dropped.len() > MAX_LOG_EVENTS {
-            let Some(((oldest, _), (who, count))) = self.dropped.pop_first() else {
+            let Some((
+                (oldest, _),
+                DroppedRecord {
+                    plugin: who, count, ..
+                },
+            )) = self.dropped.pop_first()
+            else {
                 break;
             };
             let origin = *self.origin.get_or_insert(oldest);
@@ -291,12 +325,15 @@ impl LogState {
             folded.1 = folded.1.saturating_add(count);
         }
         // Bounded like the other ledgers. Past this the oldest hour goes, which
-        // takes thousands of plugin-hours of overflow to reach.
+        // takes thousands of plugin-hours of overflow to reach. Keep the newest
+        // shed time. A summary then says its counts are incomplete.
         while self.folded.len() > MAX_LOG_EVENTS {
             let Some(oldest) = self.folded.keys().min_by_key(|(_, hour)| *hour).cloned() else {
                 break;
             };
-            self.folded.remove(&oldest);
+            if let Some((at, _)) = self.folded.remove(&oldest) {
+                self.shed = Some(self.shed.map_or(at, |seen| seen.max(at)));
+            }
         }
     }
 }
@@ -337,6 +374,10 @@ pub struct ActivitySummary {
     /// means every count above is a **floor**, and an operator must not have to
     /// infer that from a suspiciously round number.
     pub dropped: u64,
+    /// True if the log shed drop counts in this window.
+    ///
+    /// The shed counts belong to any plugin. Then every number here is a floor.
+    pub truncated: bool,
 }
 
 impl ActivitySummary {
@@ -429,9 +470,14 @@ impl ActivitySummary {
             plugin = self.plugin,
             secs = self.window.as_secs()
         );
-        if self.is_empty() && self.dropped == 0 {
+        if self.is_empty() && self.dropped == 0 && !self.truncated {
             out.push_str("  no capability calls\n");
             return;
+        }
+        if self.truncated {
+            out.push_str(
+                "  \u{26A0} the log shed older drop counts. Every number here is a floor\n",
+            );
         }
         if self.dropped > 0 {
             let _ = writeln!(
@@ -845,6 +891,33 @@ mod tests {
     }
 
     #[test]
+    fn a_steady_dropper_does_not_stretch_one_record_across_hours() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        // One drop every 300 ms for five hours. Each lands inside the bucket
+        // of the previous one, so coalescing never opens a new record. The
+        // record must still age: its time may not follow the newest drop.
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+        for _ in 0..60_000 {
+            log.ingest_dropped("shop", 1);
+            clock.advance(Duration::from_millis(300));
+        }
+        let hour = log.summary("shop", Duration::from_secs(3600)).dropped;
+        // 12,000 drops fit in the hour; one bucket of slack, never hours.
+        assert!(hour <= 12_000 + 4, "the last hour reported {hour} drops");
+        assert!(hour >= 12_000, "the last hour lost drops: {hour}");
+        let all = log.summary("shop", Duration::from_secs(6 * 3600)).dropped;
+        assert_eq!(all, 60_000);
+    }
+
+    #[test]
     fn a_summary_never_sees_a_call_in_neither_ledger() {
         use std::sync::Arc;
 
@@ -970,5 +1043,84 @@ mod tests {
             "{}",
             recent.dropped
         );
+    }
+
+    #[test]
+    fn a_summary_says_so_when_the_log_lost_drop_counts() {
+        let log = PluginActivityLog::new();
+        let hour = Duration::from_secs(3600);
+        // This many plugins overflow the dropped ledger. Then the folded
+        // ledger overflows and sheds a count.
+        for n in 0..(MAX_LOG_EVENTS * 2 + 10) {
+            log.ingest_dropped(&format!("p{n}"), 1);
+        }
+        assert!(
+            log.summary("p0", hour).truncated,
+            "counts were lost, and the summary must say so"
+        );
+        assert!(
+            !PluginActivityLog::new().summary("p0", hour).truncated,
+            "a log that lost nothing is not truncated"
+        );
+    }
+
+    #[test]
+    fn a_truncation_leaves_the_window_with_its_time() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+        for n in 0..(MAX_LOG_EVENTS * 2 + 10) {
+            log.ingest_dropped(&format!("p{n}"), 1);
+        }
+        clock.advance(10 * hour);
+        assert!(!log.summary("p0", hour).truncated, "the loss is old");
+        assert!(log.summary("p0", 11 * hour).truncated);
+    }
+
+    #[test]
+    fn truncation_is_exact_at_the_window_edge_and_reaches_every_plugin() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+        for n in 0..(MAX_LOG_EVENTS * 2 + 10) {
+            log.ingest_dropped(&format!("p{n}"), 1);
+        }
+        let shed = log.lock().shed.expect("a count was shed");
+        clock.advance(hour);
+        let age = crate::time::ambient_instant().saturating_duration_since(shed);
+        assert!(log.summary("other", age).truncated, "at the edge");
+        assert!(
+            !log.summary("other", age.saturating_sub(Duration::from_millis(1)))
+                .truncated,
+            "just outside"
+        );
+    }
+
+    #[test]
+    fn a_truncated_summary_is_not_reported_as_empty() {
+        let summary = ActivitySummary {
+            plugin: "shop".to_owned(),
+            truncated: true,
+            ..ActivitySummary::default()
+        };
+        let text = summary.to_string();
+        assert!(text.contains("shed older drop counts"), "{text}");
+        assert!(!text.contains("no capability calls"), "{text}");
     }
 }

@@ -30,7 +30,8 @@
 //! - `#[default]` — a column default. Convention defaults the generator emits are
 //!   recovered by [`convention_default`]: the reserved `created_at` column *marked
 //!   `#[default]`* gets a `NOW()` default (→ [`ColumnDefault::Now`]) and a UUID
-//!   primary key on Postgres gets `gen_random_uuid()` (→ [`ColumnDefault::Sql`]).
+//!   primary key gets `gen_random_uuid()` on Postgres or the `randomblob` v4
+//!   expression on `SQLite` (→ [`ColumnDefault::Sql`]).
 //!   The `created_at` `NOW()` convention requires the generator's `#[default]`
 //!   marker — a hand-written `created_at` without `#[default]` gets no inferred
 //!   default. Every other `#[default]` field carries no inferred DB default (their
@@ -1547,8 +1548,8 @@ fn build_table(
 ///   soft-delete `deleted_at`.
 /// - a UUID `PRIMARY KEY` on Postgres -> `gen_random_uuid()` (the only primary
 ///   key that carries an explicit column `DEFAULT`; a `BIGSERIAL`/serial PK is
-///   type-encoded with no `DEFAULT` clause, and on sqlite a UUID PK is `TEXT
-///   PRIMARY KEY` with no default — indeed `uuid::Uuid` is a rejected type there).
+///   type-encoded with no `DEFAULT` clause) or, on sqlite, the `randomblob` v4
+///   expression `TEXT PRIMARY KEY NOT NULL DEFAULT (…)` carries (issue #2555).
 ///   A `#[id]` PK is not `#[default]`-marked, so this arm is NOT gated on
 ///   `is_default`.
 ///
@@ -1568,8 +1569,11 @@ fn convention_default(
     {
         return Some(ColumnDefault::Now);
     }
-    if is_primary_key && *ty == ColumnType::Uuid && backend == Backend::Postgres {
-        return Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
+    if is_primary_key && *ty == ColumnType::Uuid {
+        return Some(ColumnDefault::Sql(match backend {
+            Backend::Postgres => "gen_random_uuid()".to_owned(),
+            Backend::Sqlite => autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        }));
     }
     None
 }
@@ -2158,6 +2162,32 @@ mod tests {
         assert_eq!(
             id.default,
             Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()))
+        );
+    }
+
+    #[test]
+    fn uuid_primary_key_recovers_the_v4_expression_default_on_sqlite() {
+        // `generate model --id uuid` on `SQLite` emits `#[id] pub id: SqliteUuid`
+        // and `TEXT PRIMARY KEY NOT NULL DEFAULT (<v4 expression>)` (issue #2555).
+        // The parser must record that default, or a diff reads it as drift.
+        let src = r#"
+            #[autumn_web::model]
+            pub struct Session {
+                #[id]
+                pub id: autumn_web::db::sqlite_types::SqliteUuid,
+                pub token: String,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Sqlite).expect("parse");
+        let table = parsed.tables.into_iter().next().unwrap();
+        let id = col(&table, "id");
+        assert_eq!(id.ty, ColumnType::Uuid);
+        assert!(id.primary_key);
+        assert_eq!(
+            id.default,
+            Some(ColumnDefault::Sql(
+                autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned()
+            ))
         );
     }
 

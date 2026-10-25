@@ -577,6 +577,12 @@ pub fn row_weight(row: &PluginRow) -> usize {
     })
 }
 
+/// Bytes of JSON syntax around a row: quotes, colons and commas per column,
+/// and the braces and `row_id` key.
+pub(super) fn row_framing(row: &PluginRow) -> usize {
+    row.len().saturating_mul(8).saturating_add(16)
+}
+
 /// Keep rows while they fit [`MAX_RESULT_BYTES`], reporting whether any were
 /// left behind.
 ///
@@ -600,7 +606,8 @@ pub fn bounded_rows(rows: Vec<PluginRow>) -> (Vec<PluginRow>, bool) {
     let mut total = 0_usize;
     let mut truncated = false;
     for row in rows {
-        let weight = row_weight(&row);
+        // JSON syntax counts too. Else many narrow rows exceed the reply room.
+        let weight = row_weight(&row).saturating_add(row_framing(&row));
         // No "but keep the first one" exemption. Letting an empty `kept` skip
         // the ceiling meant one corrupt or oversized row from an embedder's
         // store was serialized in full — and a single row can be arbitrarily
@@ -3455,6 +3462,37 @@ path = "/shop/panel"
             )
             .is_ok(),
             "the budget must be restored after each parse"
+        );
+    }
+
+    #[test]
+    fn a_page_of_rows_encodes_within_the_result_ceiling() {
+        // `row_weight` counts names and values, not the quotes, colons and
+        // commas around them. Many narrow rows then encoded well past
+        // `MAX_RESULT_BYTES`, and a reply the reserve had promised to fit was
+        // refused after the read.
+        let row: PluginRow = (0..MAX_ROW_COLUMNS)
+            .map(|i| (format!("c{i:02}"), PluginValue::Text("v".to_owned())))
+            .collect();
+        let rows = vec![row; 20_000];
+        let (kept, truncated) = bounded_rows(rows);
+        assert!(truncated);
+        let encoded = serde_json::to_vec(&kept).expect("encodes").len();
+        assert!(
+            encoded <= MAX_RESULT_BYTES,
+            "{} rows encode to {encoded} bytes",
+            kept.len()
+        );
+
+        // Text that grows when escaped: a control character takes six bytes.
+        let row: PluginRow = (0..MAX_ROW_COLUMNS)
+            .map(|i| (format!("c{i:02}"), PluginValue::Text("\u{1}\"".to_owned())))
+            .collect();
+        let (kept, _) = bounded_rows(vec![row; 20_000]);
+        let encoded = serde_json::to_vec(&kept).expect("encodes").len();
+        assert!(
+            encoded <= MAX_RESULT_BYTES,
+            "escaped rows encode to {encoded}"
         );
     }
 

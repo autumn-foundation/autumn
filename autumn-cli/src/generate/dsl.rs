@@ -4,6 +4,7 @@
 //! `published:Option<bool>` into a structured [`Field`] that knows both its
 //! Rust type (for the `#[model]` struct) and its SQL type (for the migration).
 
+use autumn_schema_core::{Backend, IdKind};
 use autumn_web::config::DatabaseBackend;
 
 use super::GenerateError;
@@ -1014,6 +1015,19 @@ impl IdType {
         }
     }
 
+    /// Rust type for the `#[id]` struct field on the target `backend`.
+    /// `SQLite` renders a UUID key as the `TEXT`-backed `SqliteUuid` newtype.
+    #[must_use]
+    pub const fn rust_type_for(self, backend: DatabaseBackend) -> &'static str {
+        match backend {
+            DatabaseBackend::Postgres => self.rust_type(),
+            DatabaseBackend::Sqlite => match self {
+                Self::BigSerial => IdKind::BigSerial.rust_type_for(Backend::Sqlite),
+                Self::Uuid => IdKind::Uuid.rust_type_for(Backend::Sqlite),
+            },
+        }
+    }
+
     /// Diesel `table!` schema type token.
     #[must_use]
     pub const fn schema_type(self) -> &'static str {
@@ -1037,15 +1051,17 @@ impl IdType {
     ///
     /// - `BigSerial` -> `INTEGER PRIMARY KEY AUTOINCREMENT` — an alias of the
     ///   `rowid` that never reuses a freed value (`SQLite` has no `BIGSERIAL`).
-    /// - `Uuid` -> `TEXT PRIMARY KEY` — `SQLite` has no `uuid` type nor a
-    ///   `gen_random_uuid()` default, so the application supplies the id.
+    /// - `Uuid` -> `TEXT PRIMARY KEY NOT NULL DEFAULT (<v4 expression>)` —
+    ///   `SQLite` has no `uuid` type nor `gen_random_uuid()`, so the default is a
+    ///   `randomblob` expression. The database generates the id, as on Postgres,
+    ///   and the column rejects `NULL`.
     #[must_use]
     pub const fn pk_sql_for(self, backend: DatabaseBackend) -> &'static str {
         match backend {
             DatabaseBackend::Postgres => self.pk_sql(),
             DatabaseBackend::Sqlite => match self {
                 Self::BigSerial => "INTEGER PRIMARY KEY AUTOINCREMENT",
-                Self::Uuid => "TEXT PRIMARY KEY",
+                Self::Uuid => IdKind::Uuid.pk_sql(Backend::Sqlite),
             },
         }
     }
@@ -1126,9 +1142,10 @@ pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool
     enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
     position{scope:col}), commentable, Option<…>, :unique";
 
-/// The Rust type a `Uuid` field renders as on `SQLite` — `autumn-web`'s
-/// `TEXT`-backed newtype (issue #1924). See [`FieldKind::rust_type_for`].
-pub const SQLITE_UUID_RUST_TYPE: &str = "autumn_web::db::sqlite_types::SqliteUuid";
+/// The Rust type a `Uuid` field renders as on `SQLite` (`autumn-web`'s
+/// `TEXT`-backed newtype, issue #1924), and the SQL that builds a v4 UUID there
+/// (issue #2555). See [`FieldKind::rust_type_for`] and [`IdType::pk_sql_for`].
+pub use autumn_schema_core::{SQLITE_UUID_RUST_TYPE, SQLITE_UUID_V4_SQL};
 
 /// The Rust type a `decimal{p,s}` field renders as on `SQLite` — `autumn-web`'s
 /// `TEXT`-backed newtype (issue #1924). See [`FieldKind::rust_type_for`].
@@ -3056,7 +3073,19 @@ mod tests {
         );
         assert_eq!(
             IdType::Uuid.pk_sql_for(DatabaseBackend::Sqlite),
-            "TEXT PRIMARY KEY"
+            format!("TEXT PRIMARY KEY NOT NULL DEFAULT ({SQLITE_UUID_V4_SQL})")
+        );
+        assert_eq!(
+            IdType::Uuid.rust_type_for(DatabaseBackend::Sqlite),
+            SQLITE_UUID_RUST_TYPE
+        );
+        assert_eq!(
+            IdType::Uuid.rust_type_for(DatabaseBackend::Postgres),
+            "uuid::Uuid"
+        );
+        assert_eq!(
+            IdType::BigSerial.rust_type_for(DatabaseBackend::Sqlite),
+            "i64"
         );
         // Postgres primary keys stay byte-for-byte identical.
         assert_eq!(

@@ -154,7 +154,7 @@ fn scaffolds_without_bulk_delete_keep_plain_index_signatures() {
 /// its own it turns that into query amplification: the default 32 MiB body cap
 /// leaves room for over a million ids, i.e. a long run of sequential `SELECT`s
 /// holding a pooled connection for a batch that may match no rows. The count
-/// must be capped before the pre-flight runs, and the parser must stop early
+/// must be capped before the pre-flight runs, and the count must stop early
 /// rather than collect a body's worth of ids it will never use.
 #[test]
 fn bulk_delete_caps_the_selection_size() {
@@ -163,14 +163,21 @@ fn bulk_delete_caps_the_selection_size() {
         routes.contains("const MAX_BULK_IDS: usize = 5000;"),
         "a selection cap must be emitted:\n{routes}"
     );
-    // The parser stops one past the cap instead of draining the whole body.
-    assert!(
-        routes.contains("if ids.len() > MAX_BULK_IDS {") && routes.contains("break;"),
-        "the parser must stop collecting once past the cap:\n{routes}"
-    );
     let bulk = handler_slice(&routes, "bulk_delete");
+    // The count stops one past the cap, and runs before the decode, instead of
+    // draining the whole body into a `Vec`.
+    let count_at = bulk
+        .find(".take(MAX_BULK_IDS + 1)")
+        .unwrap_or_else(|| panic!("the count must stop once past the cap:\n{bulk}"));
+    let decode_at = bulk
+        .find("from_urlencoded::<BulkSelection>")
+        .unwrap_or_else(|| panic!("the handler must decode a BulkSelection:\n{bulk}"));
+    assert!(
+        count_at < decode_at,
+        "the cap must be checked before the ids are decoded:\n{bulk}"
+    );
     let guard_at = bulk
-        .find("if ids.len() > MAX_BULK_IDS {")
+        .find("if submitted > MAX_BULK_IDS {")
         .unwrap_or_else(|| panic!("the handler must reject an oversized selection:\n{bulk}"));
     let query_at = bulk
         .find("for chunk in ids.chunks(1000)")
@@ -405,7 +412,7 @@ fn assert_project_cargo_checks(project: &Path) {
     );
 }
 
-/// The emitted bulk-delete handler, parser helper, and index/search views must
+/// The emitted bulk-delete handler, `BulkSelection` form, and index/search views must
 /// actually compile — both on the physical-delete and soft-delete paths.
 ///
 /// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.

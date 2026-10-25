@@ -29,6 +29,7 @@ autumn-web = { version = "0.8.0", features = ["edge"] }
 | `host` (feature) | a reference wasmi host with a hand-written WASI shim, for tests |
 | `gateway` (feature `host`) | a reference gateway: the capsule in front of an origin service, fallthrough forwarded |
 | `node` (feature `node`) | the edge node behind `autumn edge serve`: the gateway over HTTP, a remote origin, and a TTFB probe |
+| `js` / `js/autumn-edge-host.mjs` | the web-standard JS host and gateway (Cloudflare Workers, Deno, Bun, Node) that `autumn edge bundle` ships — held to the reference host by the conformance suite |
 
 See `docs/guide/edge.md` in the Autumn repository for the protocol specification, the
 header contract, and the determinism rules.

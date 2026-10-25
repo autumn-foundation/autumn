@@ -490,3 +490,31 @@ fn every_error_says_what_went_wrong() {
     assert!(message.contains("2499"), "{message}");
     assert!(message.contains("USD"), "{message}");
 }
+
+// ── Characterization: hex rendering (Echo clone class, `hex_lower`) ────────
+//
+// `request_hash` and `IdempotencyKey::derive` both render a SHA-256 digest as
+// lowercase hex through this file's own `hex_lower`, one of six byte-identical
+// copies across the crate (autumn/src/{idempotency,repository_commit_hooks,
+// derivation,money/ledger}.rs, autumn/src/security/submit_token.rs,
+// autumn/src/etag.rs). These two values are pinned here before `hex_lower` is
+// replaced by the `hex` crate (already a dependency, already used this way in
+// ~20 other places in this crate) at its call sites.
+
+#[test]
+fn request_hash_is_pinned_hex() {
+    let checked = Transaction::new(key("k1"), balanced()).validate().unwrap();
+    assert_eq!(
+        checked.request_hash(),
+        "669e73bbe4962768af2f08ff85a6bf43329b6e24f075e478f3d55a228deb5afd",
+    );
+}
+
+#[test]
+fn idempotency_key_derive_is_pinned_hex() {
+    let derived = IdempotencyKey::derive("orders", &balanced());
+    assert_eq!(
+        derived.as_str(),
+        "f683f5c367fb84a014f99a1efc2e3f429b2e47bef3aea2158602c81bd7eeb1a6"
+    );
+}

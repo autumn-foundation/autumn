@@ -530,6 +530,44 @@ mod collision {
         pub raw: i64,
     }
 
+    /// Last segment `Decimal`, serializes as an object, derives nothing.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct Decimal {
+        pub raw: ::std::string::String,
+    }
+
+    /// Same, for the `SQLite` wrapper names.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct SqliteUuid {
+        pub raw: ::std::string::String,
+    }
+
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct SqliteDecimal {
+        pub raw: ::std::string::String,
+    }
+
+    #[derive(autumn_web::openapi::OpenApiSchema)]
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct HoldsNumericCollisions {
+        pub price: Decimal,
+        pub wrapped_id: SqliteUuid,
+        pub wrapped_price: SqliteDecimal,
+        pub real: ::rust_decimal::Decimal,
+    }
+
     // `uuid::Uuid` carries no serde impls in this crate's feature set, so the
     // fixture derives the schema alone — which is all these tests exercise.
     // Every field below is written as the BARE name, exactly as a colliding
@@ -552,6 +590,26 @@ mod collision {
         /// The genuine `String`, for contrast.
         pub real_label: ::std::string::String,
     }
+}
+
+/// Same guard for the `Decimal` family (issue #2582): an application type that
+/// shares the name stays a `$ref`; the genuine `Decimal` stays a scalar.
+#[test]
+fn colliding_decimal_family_names_are_not_inlined_as_scalars() {
+    let schema =
+        <collision::HoldsNumericCollisions as autumn_web::openapi::OpenApiSchema>::schema();
+    for field in ["price", "wrapped_id", "wrapped_price"] {
+        let prop = &schema["properties"][field];
+        assert!(
+            prop.get("type").is_none(),
+            "{field} is not a scalar: {prop}"
+        );
+        assert!(prop.get("$ref").is_some(), "{field} keeps its $ref: {prop}");
+    }
+    assert!(
+        schema["properties"]["real"].get("$ref").is_none(),
+        "the genuine Decimal stays a scalar: {schema}"
+    );
 }
 
 /// `Option` and `Vec` are matched on the LAST PATH SEGMENT too, so an

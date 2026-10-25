@@ -253,6 +253,13 @@ fn existing_schema_columns(schema: &str, table: &str) -> Vec<String> {
 /// honouring the caller-supplied `id_type`.
 /// For `Uuid`, prepends a comment documenting the index-locality trade-off and
 /// the `UUIDv7` upgrade path.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "kept as the Postgres entry point; only tests call it"
+    )
+)]
 #[must_use]
 pub fn create_table_sql_with_metadata_and_id(
     table: &str,
@@ -1707,7 +1714,8 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
 /// re-creates each one that named a removed column, after the columns are back:
 /// an index cannot reference a column that does not exist yet. Without it a
 /// `migrate down` would leave the table missing indexes it had before. Ignored
-/// on Postgres, whose output stays byte-for-byte identical.
+/// on Postgres, whose output stays byte-for-byte identical. A prior index with
+/// the same name as a regenerated index replaces it and keeps its own `UNIQUE`.
 pub fn remove_columns_down_sql_for(
     backend: DatabaseBackend,
     table: &str,
@@ -1721,6 +1729,17 @@ pub fn remove_columns_down_sql_for(
     // repeats one must not be re-created twice: SQLite fails the whole rollback
     // with "index <name> already exists".
     let mut own_indexes: Vec<String> = Vec::new();
+    // A prior index on a removed column keeps its own definition (it can be
+    // UNIQUE). It replaces a regenerated index of the same name.
+    let scanned: Vec<String> = if backend == DatabaseBackend::Sqlite {
+        prior_indexes
+            .iter()
+            .filter(|i| fields.iter().any(|f| i.covers(&f.name)))
+            .map(|i| index_name_key(&i.name))
+            .collect()
+    } else {
+        Vec::new()
+    };
     for f in fields.iter().rev() {
         // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a DEFAULT
         // (#1614 AC #4). The rollback re-adds the dropped column with the same `ADD
@@ -1758,20 +1777,22 @@ pub fn remove_columns_down_sql_for(
         // `references` field that is also `unique` must not get the plain
         // auto-index restored too.
         if f.kind.is_reference() && !f.unique {
-            let _ = writeln!(
-                out,
-                "CREATE INDEX idx_{table}_{} ON {table} ({});",
-                f.name, f.name
-            );
-            own_indexes.push(index_name_key(&format!("idx_{table}_{}", f.name)));
+            let key = index_name_key(&format!("idx_{table}_{}", f.name));
+            if !scanned.contains(&key) {
+                let _ = writeln!(
+                    out,
+                    "CREATE INDEX idx_{table}_{} ON {table} ({});",
+                    f.name, f.name
+                );
+                own_indexes.push(key);
+            }
         }
         if f.unique {
-            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
-            own_indexes.push(index_name_key(&unique_index_name(
-                table,
-                &f.name,
-                &collision_fields,
-            )));
+            let key = index_name_key(&unique_index_name(table, &f.name, &collision_fields));
+            if !scanned.contains(&key) {
+                out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
+                own_indexes.push(key);
+            }
         }
     }
     // Re-create the prior indexes the up path dropped, after every column is
@@ -6445,8 +6466,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("2026_01_01_000000_a");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("up.sql"), create).unwrap();
-        crate::generate::prior_index::scan_prior_indexes(tmp.path(), table)
+        std::fs::write(
+            dir.join("up.sql"),
+            format!(
+                "CREATE TABLE {table} (id INTEGER PRIMARY KEY, author_id INTEGER, \
+                 title TEXT, body TEXT, slug TEXT);\n{create}"
+            ),
+        )
+        .unwrap();
+        crate::generate::prior_index::scan_prior_indexes(
+            tmp.path(),
+            table,
+            &["author_id", "title", "body", "slug"],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -6600,6 +6633,124 @@ mod tests {
             down.matches("idx_posts_author_id ON posts (author_id);")
                 .count(),
             1,
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_keeps_a_prior_unique_index_on_a_conventional_name() {
+        // The scanned UNIQUE index wins over the regenerated plain one (#2580).
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_author_id ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(
+            down.contains("CREATE UNIQUE INDEX idx_posts_author_id ON posts (author_id);"),
+            "got:\n{down}"
+        );
+        assert_eq!(
+            down.matches("idx_posts_author_id ON").count(),
+            1,
+            "got:\n{down}"
+        );
+        let add = down.find("ADD COLUMN author_id").expect("column re-added");
+        assert!(
+            add < down.find("CREATE UNIQUE INDEX").unwrap(),
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_prior_index_name_match_ignores_case_and_quotes() {
+        let indexes = prior(
+            "CREATE UNIQUE INDEX \"IDX_posts_author_id\" ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(down.contains("CREATE UNIQUE INDEX"), "got:\n{down}");
+        assert!(
+            !down.contains("CREATE INDEX idx_posts_author_id"),
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_keeps_both_indexes_when_names_differ() {
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_author ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(
+            down.contains("CREATE INDEX idx_posts_author_id ON"),
+            "got:\n{down}"
+        );
+        assert!(
+            down.contains("CREATE UNIQUE INDEX idx_posts_author ON"),
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_prior_index_replaces_a_unique_field_index() {
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_slug_unique ON posts (slug) WHERE slug IS NOT NULL;",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["slug:Option<String>:unique"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert_eq!(
+            down.matches("idx_posts_slug_unique ON").count(),
+            1,
+            "got:\n{down}"
+        );
+        assert!(down.contains("WHERE slug IS NOT NULL"), "got:\n{down}");
+    }
+
+    #[test]
+    fn postgres_rollback_still_regenerates_the_plain_index() {
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_author_id ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Postgres,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(
+            down.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
             "got:\n{down}"
         );
     }

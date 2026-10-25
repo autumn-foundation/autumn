@@ -204,6 +204,7 @@ jobs:
   #   generated_project_compiles_runs_and_serves  (e2e.rs)
   #   generated_scaffold_cargo_checks             (generate.rs)
   #   generated_sqlite_scaffold_cargo_checks      (generate.rs, #1924)
+  #   generated_sqlite_scaffold_smoke_tests_pass  (generate.rs, #2555)
   #   generated_policy_scaffold_cargo_checks      (generate.rs)
   #   generated_nested_scaffold_cargo_checks      (generate.rs)
   #   generated_counter_cache_scaffold_cargo_checks (generate.rs, #2431)
@@ -296,8 +297,8 @@ jobs:
           assert_ran "$RUNNER_TEMP/conformance-generated_scaffold_cargo_checks.log" generated_scaffold_cargo_checks
       # Issue #1924: the only machine proof that a SQLite-configured scaffold —
       # Uuid, decimal, enum, DateTime, Attachment and json fields — compiles.
-      # `cargo check` (not --all-targets): the smoke test is still Postgres-only
-      # until the SQLite smoke harness is done (#2555).
+      # `cargo check` only. The smoke tests run in
+      # generated_sqlite_scaffold_smoke_tests_pass (#2555).
       - name: generated_sqlite_scaffold_cargo_checks
         run: |
           set -euo pipefail
@@ -310,6 +311,19 @@ jobs:
             | tee "$RUNNER_TEMP/conformance-generated_sqlite_scaffold_cargo_checks.log"
 
           assert_ran "$RUNNER_TEMP/conformance-generated_sqlite_scaffold_cargo_checks.log" generated_sqlite_scaffold_cargo_checks
+      # Issue #2555: a SQLite scaffold runs its own smoke tests with `cargo test`.
+      - name: generated_sqlite_scaffold_smoke_tests_pass
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
+          cargo test -p autumn-cli --test generate \
+            generated_sqlite_scaffold_smoke_tests_pass -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_sqlite_scaffold_smoke_tests_pass.log"
+
+          assert_ran "$RUNNER_TEMP/conformance-generated_sqlite_scaffold_smoke_tests_pass.log" generated_sqlite_scaffold_smoke_tests_pass
       - name: generated_policy_scaffold_cargo_checks
         run: |
           set -euo pipefail

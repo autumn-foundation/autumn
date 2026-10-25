@@ -49,11 +49,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::job_tracking::PendingSettle;
 use crate::{AppState, AutumnError, AutumnResult};
 
 pub use crate::job_tracking::{
-    JobContext, JobTrackingStore, JobTrackingStoreEntry, TrackedJobHandle, TrackedJobOwner,
-    TrackedJobRecord, TrackedJobStatus, enqueue_tracked, enqueue_tracked_for,
+    JobContext, JobTrackingStore, JobTrackingStoreEntry, RetryToken, TrackedJobHandle,
+    TrackedJobOwner, TrackedJobRecord, TrackedJobStatus, enqueue_tracked, enqueue_tracked_for,
 };
 
 /// The asynchronous function signature for a background job.
@@ -3036,8 +3037,10 @@ fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
     tracing::info_span!("job.execute", "otel.kind" = "consumer", job.name = %name, job.attempt = attempt)
 }
 
-/// Run one job attempt, metered as one job run (issue #1720). All job
-/// backends run their handlers through here.
+/// Run one job attempt. Settle its tracked record at once.
+///
+/// Use this for a queue with no claim, such as the in-process queue.
+/// A claimed queue uses [`run_claimed_job_handler`] and settles after its ack.
 async fn run_job_handler(
     name: &str,
     handler: JobHandler,
@@ -3047,6 +3050,27 @@ async fn run_job_handler(
     bounds: ExecutionBounds,
     run: crate::cost::WorkRun,
 ) -> JobExecutionOutcome {
+    let (outcome, pending) =
+        run_claimed_job_handler(name, handler, state, payload, final_attempt, bounds, run).await;
+    pending.apply(name).await;
+    outcome
+}
+
+/// Run one job attempt, metered as one job run (issue #1720). All job
+/// backends run their handlers through here.
+///
+/// This function does not settle the tracked record. The caller applies the
+/// returned [`PendingSettle`] after the queue ack succeeds (issue #2583).
+/// A rejected ack means another attempt owns the job.
+async fn run_claimed_job_handler(
+    name: &str,
+    handler: JobHandler,
+    state: AppState,
+    payload: Value,
+    final_attempt: bool,
+    bounds: ExecutionBounds,
+    run: crate::cost::WorkRun,
+) -> (JobExecutionOutcome, PendingSettle) {
     use crate::cost::WrapMetered as _;
     crate::cost::WorkMeter::start(&state, crate::cost::WorkKind::Job, name, run)
         .wrap(run_job_handler_unmetered(
@@ -3111,7 +3135,7 @@ async fn run_job_handler_unmetered(
     payload: Value,
     final_attempt: bool,
     bounds: ExecutionBounds,
-) -> JobExecutionOutcome {
+) -> (JobExecutionOutcome, PendingSettle) {
     // A job is a second entry point into the application, so a failure in one
     // gets the same capsule a failing request does (#1634). The scope wraps
     // the *whole* execution, so the clock, entropy, database and effect seams
@@ -3157,7 +3181,7 @@ async fn run_job_handler_unmetered(
                 }
                 run.await
             },
-            |outcome| job_capsule_outcome(outcome, final_attempt),
+            |(outcome, _)| job_capsule_outcome(outcome, final_attempt),
         )
         .await;
     }
@@ -3220,7 +3244,7 @@ async fn run_job_handler_inner(
     payload: Value,
     final_attempt: bool,
     bounds: ExecutionBounds,
-) -> JobExecutionOutcome {
+) -> (JobExecutionOutcome, PendingSettle) {
     // A job run is work a sim drain must see (issue #2967).
     crate::sim::note_drain_progress();
     // Tracked jobs carry their args wrapped in an envelope keyed by a hash of
@@ -3313,37 +3337,23 @@ async fn run_job_handler_inner(
         Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
-    if tracked_key.is_some() {
-        let settle = async {
-            match &outcome {
-                JobExecutionOutcome::Succeeded => ctx.settle_success().await,
-                // Panics always dead-letter regardless of remaining attempts
-                // (matching every backend's worker loop), so they are always
-                // terminal for tracking purposes too.
-                JobExecutionOutcome::Panicked(_) => {
-                    ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
-                        .await;
-                }
-                JobExecutionOutcome::Failed(_) if final_attempt => {
-                    ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
-                        .await;
-                }
-                // A retry is pending, or another worker owns the job now. Leave
-                // the record running so progress persists across attempts.
-                JobExecutionOutcome::Failed(_) | JobExecutionOutcome::LeaseLost => {}
-            }
-        };
-        // A stalled store must not hold the worker. The record expires by TTL.
-        if tokio::time::timeout(crate::job_tracking::TRACKING_SETTLE_CAP, settle)
-            .await
-            .is_err()
-        {
-            let cap_ms = crate::job_tracking::TRACKING_SETTLE_CAP.as_millis();
-            tracing::warn!(job = name, cap_ms, "tracking settle timed out");
+    let pending = if tracked_key.is_none() {
+        PendingSettle::None
+    } else {
+        match &outcome {
+            JobExecutionOutcome::Succeeded => PendingSettle::Success(ctx),
+            // Panics always dead-letter regardless of remaining attempts
+            // (matching every backend's worker loop), so they are always
+            // terminal for tracking purposes too.
+            JobExecutionOutcome::Panicked(_) => PendingSettle::Failure(ctx),
+            JobExecutionOutcome::Failed(_) if final_attempt => PendingSettle::Failure(ctx),
+            // A retry is pending, or another worker owns the job now. Leave
+            // the record running so progress persists across attempts.
+            JobExecutionOutcome::Failed(_) | JobExecutionOutcome::LeaseLost => PendingSettle::None,
         }
-    }
+    };
 
-    outcome
+    (outcome, pending)
 }
 
 fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
@@ -10017,6 +10027,7 @@ fn spawn_redis_worker(
 
 #[cfg(feature = "redis")]
 #[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_arguments)]
 async fn settle_failed_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
@@ -10025,6 +10036,7 @@ async fn settle_failed_redis_job(
     error: String,
     outcome: &str,
     job_admin: &JobAdminMemoryBackend,
+    pending: PendingSettle,
 ) {
     let action = prepare_redis_failure_action(
         record.clone(),
@@ -10098,6 +10110,7 @@ async fn settle_failed_redis_job(
                         .record_failure(&dead.name, error.clone(), true);
                     crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
+                    pending.apply(&record.name).await;
                 }
                 Ok(false) => {
                     settle_redis_record(state, job_admin, record, false);
@@ -10128,6 +10141,7 @@ async fn dead_letter_panicked_redis_job(
     record: &RedisJobRecord,
     error: String,
     job_admin: &JobAdminMemoryBackend,
+    pending: PendingSettle,
 ) {
     let dead = prepare_redis_panic_dead_letter(
         record.clone(),
@@ -10150,6 +10164,7 @@ async fn dead_letter_panicked_redis_job(
                 .record_failure(&dead.name, error.clone(), true);
             crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
             job_admin.record_failure(&dead.id, error);
+            pending.apply(&record.name).await;
         }
         Ok(false) => {
             settle_redis_record(state, job_admin, record, false);
@@ -10200,15 +10215,15 @@ async fn dead_letter_invalid_redis_job(
             .record_failure(&record.name, error.to_owned(), true);
         crate::alerts::notify_dead_lettered_job(state, &record.name, &record.id, error);
         job_admin.record_failure(&record.id, error.to_owned());
+        crate::job_tracking::settle_tracked_payload_as_failed(
+            state,
+            &record.payload,
+            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+        )
+        .await;
     } else if moved == Ok(false) {
         settle_redis_record(state, job_admin, record, false);
     }
-    crate::job_tracking::settle_tracked_payload_as_failed(
-        state,
-        &record.payload,
-        crate::job_tracking::GENERIC_FAILURE_MESSAGE,
-    )
-    .await;
 }
 
 #[cfg(feature = "redis")]
@@ -10227,13 +10242,16 @@ async fn process_redis_job_record(
     {
         state.job_registry.record_cancel(&record.name);
         job_admin.record_cancelled(&record.id);
-        let _ = ack_redis_success(connection, worker_config, &record).await;
-        crate::job_tracking::settle_tracked_payload_as_failed(
-            state,
-            &record.payload,
-            "This job was canceled.",
-        )
-        .await;
+        let acked = ack_redis_success(connection, worker_config, &record).await;
+        // A rejected ack means another attempt owns the job (issue #2583).
+        if matches!(acked, Ok(true)) {
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &record.payload,
+                "This job was canceled.",
+            )
+            .await;
+        }
         return;
     }
     state.job_registry.record_start(&record.name);
@@ -10309,7 +10327,7 @@ async fn process_redis_job_record(
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
     };
-    let f = run_job_handler(
+    let f = run_claimed_job_handler(
         &record.name,
         handler,
         state.clone(),
@@ -10321,7 +10339,7 @@ async fn process_redis_job_record(
             record.enqueued_at_ms.and_then(|ms| i64::try_from(ms).ok()),
         ),
     );
-    let outcome = tracing::Instrument::instrument(f, job_span).await;
+    let (outcome, pending) = tracing::Instrument::instrument(f, job_span).await;
     heartbeat
         .stop_after(async {
         match outcome {
@@ -10334,6 +10352,7 @@ async fn process_redis_job_record(
                         settle_redis_record(state, job_admin, &record, true);
                         state.job_registry.record_success(&record.name);
                         job_admin.record_success(&record.id);
+                        pending.apply(&record.name).await;
                     }
                     Ok(false) => {
                         settle_redis_record(state, job_admin, &record, false);
@@ -10360,6 +10379,7 @@ async fn process_redis_job_record(
                     error,
                     "failed",
                     job_admin,
+                    pending,
                 )
                 .await;
             }
@@ -10372,6 +10392,7 @@ async fn process_redis_job_record(
                     &record,
                     error,
                     job_admin,
+                    pending,
                 )
                 .await;
             }
@@ -12259,12 +12280,13 @@ async fn pg_execute_job(
             delay_ms,
         )
         .await;
-        record_pg_row_cancel_after_ack(ack, &row, state);
+        let applied = record_pg_row_cancel_after_ack(ack, &row, state);
         // `pg_nack_failure` reuses the ordinary retry-vs-dead-letter decision
         // even for a cancellation, so only settle the tracked record here
         // when this really was the terminal attempt; otherwise the job is
-        // about to be retried and `run_job_handler` will settle it later.
-        if is_final_attempt(&attempt, &max_attempts) {
+        // about to be retried and the retry will settle it later.
+        // A rejected ack means another attempt owns the job (issue #2583).
+        if applied && is_final_attempt(&attempt, &max_attempts) {
             let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
             crate::job_tracking::settle_tracked_payload_as_failed(
                 state,
@@ -12298,13 +12320,22 @@ async fn pg_execute_job(
         let error = format!("unknown job '{}'", row.name);
         let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
         let lifecycle = PgLifecycleRecord::Failure { error: &error };
-        record_pg_row_lifecycle_ack_result(ack, &row, "unknown-type", lifecycle, state, job_admin);
-        crate::job_tracking::settle_tracked_payload_as_failed(
+        let applied = record_pg_row_lifecycle_ack_result(
+            ack,
+            &row,
+            "unknown-type",
+            lifecycle,
             state,
-            &payload,
-            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
-        )
-        .await;
+            job_admin,
+        );
+        if applied {
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &payload,
+                crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+            )
+            .await;
+        }
         return;
     };
 
@@ -12323,7 +12354,7 @@ async fn pg_execute_job(
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
     };
-    let f = run_job_handler(
+    let f = run_claimed_job_handler(
         &row.name,
         handler,
         state.clone(),
@@ -12332,10 +12363,11 @@ async fn pg_execute_job(
         bounds,
         durable_work_run(state, row.run_at.map(|at| at.timestamp_millis())),
     );
-    let outcome = tracing::Instrument::instrument(f, job_span).await;
+    let (outcome, pending) = tracing::Instrument::instrument(f, job_span).await;
     heartbeat
         .stop_after(pg_settle_outcome(
             outcome,
+            pending,
             &row,
             pool,
             worker_id,
@@ -12347,9 +12379,13 @@ async fn pg_execute_job(
 }
 
 /// Write a finished attempt back to `autumn_jobs` and record it.
+///
+/// The tracked record settles only when the ack applies (issue #2583).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn pg_settle_outcome(
     outcome: JobExecutionOutcome,
+    pending: PendingSettle,
     row: &PgJobRow,
     pool: &PgPool,
     worker_id: &str,
@@ -12365,7 +12401,7 @@ async fn pg_settle_outcome(
         }
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
-            record_pg_row_lifecycle_ack_result(
+            let applied = record_pg_row_lifecycle_ack_result(
                 ack,
                 row,
                 "success",
@@ -12373,6 +12409,9 @@ async fn pg_settle_outcome(
                 state,
                 job_admin,
             );
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
         JobExecutionOutcome::Failed(error) => {
             // One draw for the gauge and the nack UPDATE, so both agree.
@@ -12403,7 +12442,12 @@ async fn pg_settle_outcome(
                 delay_ms,
             )
             .await;
-            record_pg_row_lifecycle_ack_result(ack, row, "failure", lifecycle, state, job_admin);
+            let applied = record_pg_row_lifecycle_ack_result(
+                ack, row, "failure", lifecycle, state, job_admin,
+            );
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
         // Panics dead-letter immediately regardless of remaining attempts,
         // matching the local and redis backend behaviour.
@@ -12411,7 +12455,11 @@ async fn pg_settle_outcome(
             tracing::error!(job = %row.name, error = %error, "postgres job handler panicked");
             let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
             let lifecycle = PgLifecycleRecord::Failure { error: &error };
-            record_pg_row_lifecycle_ack_result(ack, row, "panic", lifecycle, state, job_admin);
+            let applied =
+                record_pg_row_lifecycle_ack_result(ack, row, "panic", lifecycle, state, job_admin);
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
     }
 }
@@ -12786,11 +12834,27 @@ impl PgJobAdminBackend {
             }
             None => None,
         };
+        // The UPDATE also restores a `pending`-window dedup key: a claim moved
+        // it to `pending_unique_key`. The `NOT EXISTS` guard leaves it alone
+        // when a live twin holds the key. Same rule as `pg_nack_failure`.
         let updated = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
                  started_at = NULL, finished_at = NULL, \
-                 claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+                 claimed_by = NULL, claimed_at = NULL, last_error = NULL, \
+                 unique_key = CASE \
+                   WHEN pending_unique_key IS NOT NULL \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM autumn_jobs dup \
+                            WHERE dup.name = autumn_jobs.name \
+                              AND dup.unique_key = autumn_jobs.pending_unique_key \
+                              AND dup.id != autumn_jobs.id \
+                              AND dup.status IN ('enqueued', 'running') \
+                        ) \
+                   THEN pending_unique_key \
+                   ELSE unique_key \
+                   END, \
+                 pending_unique_key = NULL \
              WHERE id = $1 AND status = 'failed' \
              RETURNING payload::TEXT AS payload",
         )
@@ -19168,8 +19232,9 @@ mod tests {
 
     // ── Tracked-job choke-point behavior (#1373) ──────────────────────────────
     //
-    // run_job_handler is the single point all three backends run handlers
-    // through; these tests drive it via the real local backend + the free
+    // run_job_handler (local) and run_claimed_job_handler (sqlite, postgres,
+    // redis) share one handler path; these tests drive the local path via
+    // the real local backend + the free
     // enqueue_tracked function rather than calling it directly, so they also
     // exercise enqueue_tracked's envelope-wrapping and the local backend's
     // retry/dead-letter decisions end to end.
@@ -20793,9 +20858,17 @@ mod tests {
             let sql1 = include_str!("../migrations/20260513000000_create_job_queue/up.sql");
             conn.batch_execute(sql1).await.unwrap();
 
+            let sql_trace =
+                include_str!("../migrations/20260519000000_add_trace_context_to_jobs/up.sql");
+            conn.batch_execute(sql_trace).await.unwrap();
+
             let sql2 =
                 include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
             conn.batch_execute(sql2).await.unwrap();
+
+            let sql_pending =
+                include_str!("../migrations/20260611000000_add_pending_unique_key_to_jobs/up.sql");
+            conn.batch_execute(sql_pending).await.unwrap();
 
             let sql3 = include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql");
             conn.batch_execute(sql3).await.unwrap();
@@ -21990,7 +22063,9 @@ mod tests {
             let mut conn = pool.get().await.unwrap();
             let tracking_sql =
                 include_str!("../migrations/20260702000000_create_job_tracking/up.sql");
-            for stmt in tracking_sql.split(';') {
+            let version_sql =
+                include_str!("../migrations/20261022120000_add_version_to_job_tracking/up.sql");
+            for stmt in tracking_sql.split(';').chain(version_sql.split(';')) {
                 let stmt = stmt.trim();
                 if !stmt.is_empty() {
                     diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
@@ -22581,6 +22656,142 @@ mod tests {
                 .unwrap(),
                 EnqueueOutcome::Deduplicated
             );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_restores_pending_window_unique_key() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
+            };
+
+            let constraints = unique_constraints("acct-9", JobUniquenessWindow::Pending);
+            let enqueue = |id: &'static str| {
+                let pool = pool.clone();
+                let constraints = constraints.clone();
+                async move {
+                    pg_enqueue_job(
+                        &pool,
+                        id.to_string(),
+                        "sync_account",
+                        "default",
+                        serde_json::json!({}),
+                        1,
+                        10,
+                        &constraints,
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(enqueue("pend-fail").await, EnqueueOutcome::Queued);
+            // Claim moves the key to `pending_unique_key`; a final nack fails the row.
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
+            assert!(
+                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, Some("acct-9"), 0)
+                    .await
+                    .unwrap()
+            );
+
+            backend.pg_retry_failed("pend-fail").await.unwrap();
+
+            // The retried row holds its key again, so a twin is deduplicated.
+            assert_eq!(enqueue("pend-twin").await, EnqueueOutcome::Deduplicated);
+            // The claim moves the key back, so the key is not lost.
+            let claimed = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim retried");
+            assert_eq!(claimed.id, "pend-fail");
+            assert_eq!(enqueue("pend-after-claim").await, EnqueueOutcome::Queued);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
+            };
+
+            let constraints = unique_constraints("acct-10", JobUniquenessWindow::Pending);
+            let enqueue = |id: &'static str| {
+                let pool = pool.clone();
+                let constraints = constraints.clone();
+                async move {
+                    pg_enqueue_job(
+                        &pool,
+                        id.to_string(),
+                        "sync_account",
+                        "default",
+                        serde_json::json!({}),
+                        1,
+                        10,
+                        &constraints,
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(enqueue("held-fail").await, EnqueueOutcome::Queued);
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
+            assert!(
+                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, Some("acct-10"), 0)
+                    .await
+                    .unwrap()
+            );
+            // The claim freed the key, so a twin takes it while the row is failed.
+            assert_eq!(enqueue("held-twin").await, EnqueueOutcome::Queued);
+
+            // The retry succeeds. The twin keeps the key; the retried row has none.
+            backend.pg_retry_failed("held-fail").await.unwrap();
+            let retried = pg_fetch_by_id(&pool, "held-fail").await.unwrap();
+            assert_eq!(retried.status, "enqueued");
+            assert!(pg_unique_keys(&pool, "held-fail").await.0.is_none());
+            assert!(pg_unique_keys(&pool, "held-fail").await.1.is_none());
+        }
+
+        async fn pg_unique_keys(pool: &PgPool, id: &str) -> (Option<String>, Option<String>) {
+            use diesel_async::RunQueryDsl as _;
+
+            #[derive(diesel::QueryableByName)]
+            struct Keys {
+                #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+                unique_key: Option<String>,
+                #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+                pending_unique_key: Option<String>,
+            }
+            let mut conn = pool.get().await.unwrap();
+            let keys = diesel::sql_query(
+                "SELECT unique_key, pending_unique_key FROM autumn_jobs WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(id)
+            .get_result::<Keys>(&mut *conn)
+            .await
+            .unwrap();
+            (keys.unique_key, keys.pending_unique_key)
         }
 
         async fn pg_fetch_by_id(pool: &PgPool, id: &str) -> Option<PgJobRow> {
@@ -27735,9 +27946,28 @@ mod lease_tests {
             &'a self,
             _key: &'a str,
             _owner: crate::job_tracking::TrackedJobOwner,
-            _expected_updated_at: chrono::DateTime<chrono::Utc>,
+            _expected: crate::job_tracking::RetryToken,
         ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn get_with_token<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = AutumnResult<
+                            Option<(
+                                crate::job_tracking::TrackedJobRecord,
+                                crate::job_tracking::RetryToken,
+                            )>,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
         }
     }
 
@@ -27754,8 +27984,13 @@ mod lease_tests {
         store.complete("k", Value::Null).await.unwrap();
         store.fail("k", "e".to_owned()).await.unwrap();
         assert!(store.get("k").await.unwrap().is_none());
+        assert!(store.get_with_token("k").await.unwrap().is_none());
         store
-            .reset_for_retry("k", TrackedJobOwner::Anonymous, chrono::Utc::now())
+            .reset_for_retry(
+                "k",
+                TrackedJobOwner::Anonymous,
+                crate::job_tracking::RetryToken::new(0),
+            )
             .await
             .unwrap();
     }

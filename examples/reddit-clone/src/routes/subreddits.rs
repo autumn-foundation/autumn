@@ -25,6 +25,7 @@ use super::layout::{field_errors, form_error_summary, layout, layout_with_seo, t
 ///
 /// Every meta value is fixed text, so the `seo(...)` argument carries all of
 /// them and the handler only adds the canonical URL. See `docs/guide/seo.md`.
+#[public]
 #[get(
     "/r",
     seo(
@@ -312,6 +313,7 @@ pub async fn create(
 /// front page's live feed. `PageRequest` clamps `?page=` and `?size=` rather
 /// than rejecting them, so a hand-edited or stale URL renders the list instead
 /// of a 400.
+#[public]
 #[get("/r/{slug}", seo(og_type = "website"))]
 // Every argument is a distinct extractor: path, SEO defaults, session, CSRF
 // token, CSRF field name, page request, repository, connection, flash.

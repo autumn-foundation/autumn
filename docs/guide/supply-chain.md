@@ -365,6 +365,11 @@ Run it locally. CI derives its check list from the sections `deny.toml`
 declares, so the exact command depends on your policy — `autumn doctor` does
 that derivation for you and reports the same verdict:
 
+In a workspace, `autumn doctor` and `autumn dev` read the outermost
+`deny.toml`, up to the `.git` folder. This is the file CI reads. A `deny.toml`
+in a member crate is ignored. A nested workspace (its own `[workspace]` table)
+keeps its own policy.
+
 ```bash
 cargo install --locked cargo-deny   # once
 autumn doctor                       # derives the checks, as CI does
@@ -535,8 +540,8 @@ job uses. Nothing here is a second implementation, and there is no second
 waiver format: a waiver is an `[advisories] ignore` entry, read by doctor, dev
 and CI alike.
 
-Two differences remain, and doctor reports both on its own line so you can
-judge them:
+Three differences remain. Doctor reports the first two on its own line so you
+can judge them:
 
 - **The auditor version.** The generated workflow pins `cargo-deny@0.20.2`; a
   local run uses whatever `cargo deny` is on your PATH. Doctor names the
@@ -547,6 +552,16 @@ judge them:
   (see *Offline and air-gapped* below) and names its data age. An advisory
   published since your last fetch is red in CI and silent locally — run
   `cargo deny fetch db` to close the gap.
+
+A third difference has no line, because doctor cannot see it. Only cargo-deny
+knows the `deny.toml` schema. Doctor checks that the file is valid TOML. If
+cargo-deny is not installed, doctor does not check the schema: `yanked =
+"bogus"` is valid TOML, so doctor passes and CI rejects it. Without cargo-deny,
+the doctor line says `not evaluated` and that doctor cannot check `deny.toml`. Install cargo-deny to close the gap.
+
+When a doctor or dev audit reaches its deadline (30 seconds), Autumn kills the
+`cargo-deny` process and the processes it started, so they cannot hold Cargo's
+package-cache lock. A finished audit is never killed.
 
 Uncommenting a section widens both sides at once. The generated workflow
 derives its check list from the file:
@@ -569,6 +584,12 @@ the same table. The two are held together by a test —
 `autumn doctor` over every one of those spellings and requires the same answer —
 so a rule that drifts fails the build rather than silently un-enforcing your
 policy.
+
+The two agree on every hand-written policy. They can split in two cases: an
+escaped key, which only doctor sees, and header-like text inside a string, which
+only the grep sees. Then doctor reports no verdict and names the sections. Write
+each section as a plain `[bans]` header, and keep header-like text out of
+strings.
 
 ### `autumn doctor` — the dependency check
 
@@ -696,7 +717,8 @@ On an air-gapped machine, set `[advisories] db-path` in `deny.toml` to a
 directory *holding* database checkouts — the same shape as
 `~/.cargo/advisory-dbs`, not a checkout itself — and mirror the RustSec
 repository into it. `~` and `$CARGO_HOME` are expanded, as cargo-deny expands
-them. Doctor reads that path and ages it the same way.
+them. A relative path is relative to the directory that holds `deny.toml`.
+Doctor reads that path and ages it the same way.
 
 ---
 

@@ -470,6 +470,63 @@ fn datetime_and_uuid_fields_are_inline_scalars_not_dangling_refs() {
     }
 }
 
+// ── `Decimal` is a scalar that matches its serde output (issue #2582) ──
+
+#[derive(OpenApiSchema)]
+#[allow(dead_code)]
+struct Priced {
+    amount: rust_decimal::Decimal,
+    discount: Option<rust_decimal::Decimal>,
+}
+
+/// The JSON Schema type of the value serde writes for a `Decimal`.
+fn decimal_wire_type() -> &'static str {
+    let wire = serde_json::to_value(rust_decimal::Decimal::new(12345, 2)).unwrap();
+    if wire.is_string() { "string" } else { "number" }
+}
+
+#[test]
+fn decimal_field_is_an_inline_scalar_matching_its_serde_output() {
+    let schema = <Priced as OpenApiSchema>::schema();
+    let amount = &schema["properties"]["amount"];
+
+    assert!(amount.get("$ref").is_none(), "dangling ref: {schema}");
+    assert_eq!(amount["type"], decimal_wire_type(), "{schema}");
+    if decimal_wire_type() == "string" {
+        assert_eq!(amount["format"], "decimal", "{schema}");
+    }
+}
+
+/// A real round trip: the value serde writes decodes back, and its JSON kind is
+/// the kind the schema names. The expected shape for this workspace is pinned,
+/// so a feature change that flips it fails here, not in a client.
+#[test]
+fn decimal_wire_value_round_trips_and_matches_the_schema_kind() {
+    let amount = rust_decimal::Decimal::new(12345, 2);
+    let wire = serde_json::to_value(amount).unwrap();
+    let back: rust_decimal::Decimal = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(back, amount);
+
+    let schema = <Priced as OpenApiSchema>::schema();
+    let kind = schema["properties"]["amount"]["type"].as_str().unwrap();
+    let wire_kind = if wire.is_string() { "string" } else { "number" };
+    assert_eq!(kind, wire_kind);
+    assert_eq!(
+        wire_kind, "string",
+        "this workspace enables rust_decimal `serde` only: {wire}"
+    );
+}
+
+#[test]
+fn optional_decimal_field_stays_nullable_scalar() {
+    let schema = <Priced as OpenApiSchema>::schema();
+    let branches = schema["properties"]["discount"]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("nullable oneOf expected: {schema}"));
+    assert_eq!(branches[0]["type"], decimal_wire_type(), "{schema}");
+    assert_eq!(branches[1]["type"], "null", "{schema}");
+}
+
 // ── `deny_unknown_fields` is a closed object (issue #802) ──────────────
 
 /// A struct whose deserialization rejects unknown keys.

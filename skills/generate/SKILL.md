@@ -130,9 +130,10 @@ bundled `libsqlite3-sys`, `autumn-web/sqlite`, no `pq-sys`), a generated
 newtypes that are `Copy`, deref to the wrapped type, and are
 `#[serde(transparent)]` (`uuid::Uuid` and `rust_decimal::Decimal` are foreign
 types no crate but their own can convert for SQLite). `--searchable` works via
-FTS5 (#1910); UUID primary keys and `--sharded` remain Postgres-only. A
-scaffolded SQLite app's `tests/<model>.rs` still uses the Postgres-only
-`TestDb`, so `cargo test` on it does not compile yet (#2555).
+FTS5 (#1910); `--id uuid` works too (#2555): the database fills the id with a
+`randomblob` default. `--sharded` remains Postgres-only. A scaffolded SQLite
+app's `tests/<model>.rs` uses the SQLite `TestDb` (a temp-file database), so it
+runs in a plain `cargo test` with no Docker.
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and
@@ -262,8 +263,12 @@ index list ships a no-JavaScript bulk-delete flow — a leading
 `bulk_select_checkbox` column, the list (and, with `--searchable`, the whole
 htmx-swapped results container) wrapped in a `bulk_actions_form`, and a
 `#[secured] POST /<plural>/bulk_delete` handler mounted right after `destroy`.
-The handler drops malformed ids and redirects on an empty selection (a
-list-write endpoint never 400s), per-row authorizes with the same `"delete"`
+The handler decodes the repeated `ids` checkboxes into a
+`BulkSelection { ids: Vec<i64> }` (the `ids[]` spelling works too) through
+`autumn_web::form::from_urlencoded`. A malformed selection flashes an error and
+deletes nothing, and an empty selection redirects (a list-write endpoint never
+400s). There is no generated `parse_bulk_ids` any more (issue #3394). It
+per-row authorizes with the same `"delete"`
 action `destroy` uses when policy wiring is on (an unauthorized row is dropped
 from the batch, not 403'd), and deletes through `repo.delete_many` so
 soft-delete, hooks and `dependent(...)` cascades all apply. Not emitted for

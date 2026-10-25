@@ -66,6 +66,7 @@ use super::layout::{
 /// URL, which needs `[seo] base_url` from `autumn.toml` at run time.
 ///
 /// See `docs/guide/seo.md`.
+#[public]
 #[get(
     "/",
     seo(
@@ -923,6 +924,7 @@ pub async fn submit(
 
 /// Redirects `/posts/{post_id}` to the canonical `/r/{sub_slug}/posts/{post_slug}`.
 /// Used by live OOB fragments that only have a post id in scope.
+#[public]
 #[get("/posts/{post_id}")]
 pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Redirect> {
     let (post_slug, subreddit_id): (String, i64) = posts::table
@@ -955,6 +957,7 @@ pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Re
 ///
 /// See `docs/guide/seo.md`.
 #[allow(clippy::too_many_lines)] // Template-heavy function
+#[public]
 #[get(
     "/r/{sub_slug}/posts/{post_slug}",
     // `og_type = "article"` is the right Open Graph type for a post. The card
@@ -1395,7 +1398,7 @@ pub async fn update(
     let mut new_slug =
         unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
     let mut attempt = 0u32;
-    loop {
+    let updated = loop {
         let changes = crate::models::UpdatePost {
             title: Patch::Set(title.clone()),
             slug: Patch::Set(new_slug.clone()),
@@ -1415,7 +1418,7 @@ pub async fn update(
             .await;
 
         match attempt_result {
-            Ok(_) => break,
+            Ok(updated) => break updated,
             Err(err) if is_post_slug_conflict(&err) && attempt < MAX_SLUG_CONFLICT_RETRIES => {
                 attempt += 1;
                 new_slug =
@@ -1423,10 +1426,12 @@ pub async fn update(
             }
             Err(err) => return Err(err),
         }
-    }
+    };
 
     flash.success("Post updated.").await;
-    Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)).into_response())
+    // The `posts_resolve_slug` trigger can change the slug (#2573). Link to the
+    // stored one, not the one proposed above.
+    Ok(Redirect::to(&paths::show(&sub_slug, &updated.slug)).into_response())
 }
 
 // ── Manage tags (#1324 many-to-many demo) ───────────────────────
@@ -1730,6 +1735,8 @@ fn is_post_slug_conflict(err: &AutumnError) -> bool {
 /// obvious slug in one query, not to enforce uniqueness by itself — that is
 /// [`POSTS_SLUG_UNIQUE_CONSTRAINT`]'s job, with the caller retrying this
 /// function (via [`is_post_slug_conflict`]) when the database disagrees.
+/// The `posts_resolve_slug` trigger (#2573) also suffixes a taken slug. A route
+/// must use the slug that the database stored.
 async fn unique_slug(
     base: &str,
     subreddit_id: i64,

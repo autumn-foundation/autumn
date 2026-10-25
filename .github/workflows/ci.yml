@@ -883,7 +883,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.87.28
+      - uses: taiki-e/install-action@v2.87.29
         with:
           tool: cargo-deny@0.20.2
       # The shared gate (issue #1600) makes PR CI, the publish gate and a local
@@ -970,6 +970,12 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
+      - uses: actions/setup-node@v4
+        # `autumn-edge`'s JS host suite (`tests/js_host.rs`) runs the
+        # web-standard host under Node and fails under CI without one (ADR-0024).
+        # Installed after the cleanup above, which removes /opt/hostedtoolcache.
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -1711,6 +1717,19 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
             || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
+          # Issue #2576: the Postgres admin-retry unique-key tests are `--lib`
+          # (they drive the crate-private `PgJobAdminBackend`). Named by full
+          # path, with a pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::pg::pg_admin_retry_restores_pending_window_unique_key \
+              job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
+              | tee "${RUNNER_TEMP}/pg-admin-retry-key.log"
+          )
+          grep -qE 'test result: ok\. 2 passed' "${RUNNER_TEMP}/pg-admin-retry-key.log" \
+            || { echo "::error::the pg admin-retry key tests did not all run — the ci.yml filters no longer match"; exit 1; }
           # The migration lock_timeout + retry suite (#3057) is `--lib`: it
           # drives the migrator's private retry policy. Named by full path,
           # with a pass count, for the same reason as the suites above.
@@ -1985,14 +2004,7 @@ jobs:
             --skip per_request_overhead_is_under_50_microseconds_p99 \
             --skip capture_overhead_on_a_successful_query_request \
             --skip outbox_claim_profile
-          # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
-          # deploy up`/`rollback` over ssh/scp against a privileged systemd
-          # container (first deploy, zero-downtime redeploy, on-demand rollback,
-          # forced-failure auto-rollback). Isolated `--test deploy_e2e` binary; it
-          # builds its own fixture image (extracting kamal-proxy from the
-          # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
-          # installed above.
-          cargo test -p autumn-cli --test deploy_e2e -- --ignored
+          # `deploy_e2e` runs in `test-docker-deploy`, on a fresh disk (#2547).
           # Example apps are NOT auto-swept the way autumn-web's consolidated
           # `integration_tests` binary is (Codex review finding on #2530):
           # `saas` and `teams` each have their own Docker-gated
@@ -2060,6 +2072,47 @@ jobs:
           cargo test -p cms --test integration_test -- --ignored --test-threads=1
 
 
+  # AC-7 deploy end-to-end (#1607). It builds its own fixture image on top of
+  # the sweep's disk, which ran the runner out of space (#2547). It has its own
+  # job, so it starts on a clean disk. It runs `autumn deploy up`/`rollback`
+  # over ssh/scp against a privileged systemd container.
+  test-docker-deploy:
+    name: Test (Docker deploy)
+    needs: [lint, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+      - name: Install the ssh client
+        # The test drives the real `ssh`/`scp`. The runner may lack them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client
+          ssh -V
+      - name: Pull Docker Hub images through a mirror
+        # The unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
+      - name: Run deploy end-to-end test
+        timeout-minutes: 45
+        run: cargo test -p autumn-cli --test deploy_e2e -- --ignored
+      - name: Report disk
+        if: always()
+        run: df -h
+
   test-gate:
     name: Test suite
     # The stable, shard-count-independent name for BRANCH PROTECTION. It fails
@@ -2073,7 +2126,7 @@ jobs:
     # skipped required check can never be satisfied, so the PR stops being
     # mergeable even once the real failure is understood. `coverage` and `loom`
     # were briefly wired here and hit exactly that; they depend on `test`.
-    needs: [test, trybuild, test-features, test-docker]
+    needs: [test, trybuild, test-features, test-docker, test-docker-deploy]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -2155,7 +2208,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.28
+        uses: taiki-e/install-action@v2.87.29
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)
@@ -2265,9 +2318,11 @@ jobs:
           # and per-database replication (`db::fleet`, `db::fleet_replication`)
           # and the boot wiring are measured by the same leg, so no second
           # lib-test build.
+          # `db::sqlite_types::` (#2582) measures the `SQLite` wrappers' schema
+          # impls and their unit tests.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
-            fleet_layout:: app::fleet_boot_tests
+            fleet_layout:: app::fleet_boot_tests db::sqlite_types::
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
@@ -2293,6 +2348,12 @@ jobs:
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #2555: the SQLite `TestDb` and the generated UUID key default.
+          # Both are sqlite-only code. Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_test_db
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_uuid_primary_key
           # Issue #3234: the fleet sweeper end to end. Same features, so no
           # rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
@@ -2352,11 +2413,21 @@ jobs:
             --test scoped_tokens_db -- --ignored
           # Issue #3072: the shard-local job runtime and the tenant DB
           # bulkhead run only in these Docker tests of the consolidated
-          # binary; so does the ledger's Postgres fork (#2319). A filter that matches nothing exits 0, so check the count.
+          # binary; so does the ledger's Postgres fork (#2319). The Postgres
+          # data-capsule round trip (`data_capsule_pg`, the only test of
+          # `gdpr/portability/pg.rs` import) joins them: the `Test (Docker)`
+          # sweep runs it without coverage, so the patch gate saw none of that
+          # file. A filter that matches nothing exits 0, so check the count.
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
-            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: \
+            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: data_capsule_pg:: \
             | tee "$RUNNER_TEMP/isolation-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
+          # Issue #2555: the Postgres `TestDb::reset_table` runs only in this
+          # Docker test of the consolidated binary. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored test_db_reset_table:: \
+            | tee "$RUNNER_TEMP/test-db-reset-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/test-db-reset-cov.log"
           # Issue #3061: the Postgres side of the database idempotency store
           # runs only in these Docker tests, the `--lib` pg_tests and the
           # consolidated binary's idempotency suites. Both filters are checked
@@ -2376,6 +2447,13 @@ jobs:
             --test integration_tests -- --ignored experiments_pg_integration:: \
             | tee "$RUNNER_TEMP/experiments-pg-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/experiments-pg-cov.log"
+          # Issue #2583: the tracked-status settle after the queue ack on the
+          # Postgres and Redis backends runs only in these Docker tests. Check
+          # the count: a filter that matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored job_tracking_settle_ack:: \
+            | tee "$RUNNER_TEMP/settle-ack-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/settle-ack-cov.log"
           # Issue #2875: the Postgres tracking store's database-clock expiry
           # runs only in these Docker tests. Check the count: a filter that
           # matches nothing exits 0.
@@ -2383,10 +2461,25 @@ jobs:
             --test integration_tests -- --ignored pg_clock_skew:: \
             | tee "$RUNNER_TEMP/tracking-clock-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-clock-cov.log"
+          # Issue #2581: the Redis tracking store's write counter and
+          # compare-and-swap run only in this Docker test. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored redis_retry_reset_ \
+            | tee "$RUNNER_TEMP/tracking-redis-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-redis-cov.log"
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --lib -- --ignored pg_tracking_cleanup_deletes_expired_rows \
             | tee "$RUNNER_TEMP/tracking-cleanup-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-cleanup-cov.log"
+          # Issue #2576: the Postgres admin-retry key restore runs only in
+          # these `--lib` Docker tests. Check the count: a filter that matches
+          # nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored --test-threads=1 \
+            job::tests::pg::pg_admin_retry_restores_pending_window_unique_key \
+            job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
+            | tee "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
+          grep -Eq "test result: ok\. 2 passed" "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
@@ -2444,6 +2537,10 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- routes::tests:: \
             | tee "$RUNNER_TEMP/cli-routes-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-routes-cov.log"
+          # Issue #2572: same gap for `deps::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deps:: \
+            | tee "$RUNNER_TEMP/cli-deps-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deps-cov.log"
           # Issue #2374: same gap for `built_artifact::`. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- built_artifact:: \
             | tee "$RUNNER_TEMP/cli-built-artifact-cov.log"
@@ -2466,6 +2563,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: routes_audit:: \
             | tee "$RUNNER_TEMP/cli-posture-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-posture-cov.log"
+          # Issue #2570: same gap for `deps::` (the policy search). Check the
+          # count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deps:: \
+            | tee "$RUNNER_TEMP/cli-deps-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deps-cov.log"
           # Issue #3232: same gap for `autumn fleet` (its clap shape and the
           # Postgres-build stub) and the `db::replica` config loader it shares.
           # Check the count.
@@ -2473,10 +2575,11 @@ jobs:
             tests::fleet_subcommands db::replica:: \
             | tee "$RUNNER_TEMP/cli-fleet-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
-          # Issue #2555: same gap for the SQLite scaffold-warning test. Check the
-          # count.
-          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- \
-            generate::scaffold::tests::scaffold_on_sqlite_app_warning \
+          # Issue #2555: same gap for the generators. The SQLite uuid key and the
+          # SQLite scaffold smoke test change `generate::model`, `generate::dsl`,
+          # `generate::scaffold` and `generate::admin`, and their unit tests are
+          # instrumented by no other lane. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate:: \
             | tee "$RUNNER_TEMP/cli-scaffold-sqlite-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scaffold-sqlite-cov.log"
           # Issue #2396: same gap for `db::retention::` (the force env and the
@@ -2484,16 +2587,45 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::retention:: \
             | tee "$RUNNER_TEMP/cli-retention-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-retention-cov.log"
-          # Issue #2531: same gap for `generate::auth::` (the generated auth
-          # routes and their tests). Check the count.
+          # Issue #2531 (independently, also #2753/PR #3358: three
+          # near-identical Cargo-feature-injector functions were merged into
+          # one shared `ensure_autumn_web_feature` here): same gap for
+          # `generate::auth::` (the generated auth routes, and the
+          # Cargo-feature-injector unit tests, backed by unit tests on the
+          # `autumn` bin target that no other lane instruments). Check the
+          # count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::auth:: \
             | tee "$RUNNER_TEMP/cli-generate-auth-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-auth-cov.log"
+          # Issue #2557: same gap for the `destroy` orphan sweep and the
+          # provenance manifest it reads and writes. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::sweep:: \
+            generate::provenance:: generate::emit:: \
+            | tee "$RUNNER_TEMP/cli-generate-sweep-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-sweep-cov.log"
+          # Issue #2580: same gap for the migration safety classifier
+          # (`migrate::safety::`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- migrate::safety:: \
+            | tee "$RUNNER_TEMP/cli-migrate-safety-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-migrate-safety-cov.log"
           # Issue #2553: the SQLite scrub runs through the `cli_tests` binary,
           # which no other lane instruments. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- db_scrub_sqlite:: \
             | tee "$RUNNER_TEMP/cli-scrub-sqlite-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scrub-sqlite-cov.log"
+          # PR #3407: same gap for `generate::tests::` (the Echo linked-copies
+          # drift guard comparing tauri's and tauri_mobile's placeholder icon
+          # assets, plus the module's other unit tests). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::tests:: \
+            | tee "$RUNNER_TEMP/cli-generate-tests-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-tests-cov.log"
+          # ADR-0024: same gap for `autumn edge bundle` (`edge_bundle::`), the
+          # header parser it shares with `edge serve` (`edge::tests`), and the
+          # `edge` subcommand shapes (`tests::parse_edge`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- edge_bundle:: edge::tests \
+            tests::parse_edge \
+            | tee "$RUNNER_TEMP/cli-edge-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-edge-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2699,6 +2831,8 @@ jobs:
             --test sqlite_ledger_out_of_band \
             --test sqlite_searchable_repository \
             --test sqlite_immediate_transaction \
+            --test sqlite_test_db \
+            --test sqlite_uuid_primary_key \
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
             --test sqlite_unique_violation_field \
@@ -2869,8 +3003,11 @@ jobs:
   # capsule in front of the origin, and a generated tier sends 10,000
   # requests through every lane. Tier E runs the edge node over real HTTP
   # against an origin with a simulated distance, and needs a >= 50% lower
-  # median TTFB (the success metric). The last steps run the real
-  # `autumn build`, then `autumn edge serve` and `autumn edge ttfb`.
+  # median TTFB (the success metric). Tier J runs the web-standard JS host
+  # (ADR-0024) over the corpus and the generated requests and requires the
+  # reference host's outcome for each. The last steps run the real
+  # `autumn build`, then `autumn edge serve`, `autumn edge ttfb` and
+  # `autumn edge bundle`.
   #
   # Its own job because it is the only lane that installs a second target, and
   # NOT path-filtered on purpose: byte-identity between the origin and the edge
@@ -2888,6 +3025,11 @@ jobs:
         with:
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2.7.8
+      - uses: actions/setup-node@v4
+        # Tier J runs the web-standard JS host (`autumn-edge/js`, ADR-0024)
+        # over the same corpus as the reference host.
+        with:
+          node-version: 22
       - name: Build the edge capsule
         # Ahead of the suite (which builds it too) so a wasm-only compile break
         # reports as a build failure rather than as a conformance failure.
@@ -2963,6 +3105,50 @@ jobs:
               exit 1
             fi
           done
+      - name: autumn edge bundle runs in Cloudflare's runtime (workerd)
+        # ADR-0024: the bundle needs no vendor SDK and no glue. `wrangler dev`
+        # runs it in workerd, the open-source Workers runtime, against the
+        # real origin binary, with a seeded local KV namespace. An edge answer
+        # carries no `x-request-id` (only the origin's middleware mints one);
+        # a decline, a write and a trap reach the origin unchanged.
+        working-directory: examples/edge-greeting
+        run: |
+          wait_for() {
+            for _ in $(seq 1 120); do curl -sf -o /dev/null "$1" && return 0; sleep 1; done
+            echo "::error::$1 did not answer"; return 1
+          }
+          curl -sf -o /dev/null http://127.0.0.1:3000/greet/ci || {
+            ../../target/debug/edge-greeting &
+            wait_for http://127.0.0.1:3000/greet/ci
+          }
+          out="$RUNNER_TEMP/edge-bundle"
+          ../../target/debug/autumn edge bundle \
+            --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+            --origin http://127.0.0.1:3000 --out "$out" \
+            --response-header 'access-control-allow-origin: *'
+          cd "$out"
+          printf '\n[[kv_namespaces]]\nbinding = "EDGE_KV"\nid = "ci"\n' >> wrangler.toml
+          npx --yes wrangler@4.152.0 kv key put --local --binding EDGE_KV greeting "from workers kv"
+          npx --yes wrangler@4.152.0 dev --port 8788 --ip 127.0.0.1 > wrangler.log 2>&1 &
+          wait_for http://127.0.0.1:8788/greet/ci
+          check() { # path, expected status, expected body substring, edge|origin
+            headers=$(curl -s -D - -o body.txt "${@:5}" "http://127.0.0.1:8788$1")
+            status=$(printf '%s' "$headers" | head -1 | cut -d' ' -f2)
+            lane=edge; printf '%s' "$headers" | grep -qi '^x-request-id:' && lane=origin
+            if [ "$status" != "$2" ] || ! grep -q "$3" body.txt || [ "$lane" != "$4" ]; then
+              cat wrangler.log; printf '%s\n' "$headers"; cat body.txt
+              echo "::error::$1: wanted $2 from the $4 lane containing '$3', got $status from $lane"
+              exit 1
+            fi
+          }
+          check /greet/ada 200 'Hello, ada!' edge
+          check '/stats?tag=one&tag=two' 200 'tags=\[tag=one tag=two\]' edge
+          check /note/greeting 200 'from workers kv' edge
+          check /nope 404 '' origin
+          check /boom 500 '' origin
+          check /feedback 200 '' origin -X POST -d msg=hi
+          curl -s -D - -o /dev/null http://127.0.0.1:8788/greet/ada | grep -qi '^x-frame-options: DENY' \
+            || { echo "::error::the probed security headers are missing at the edge"; exit 1; }
 
   sqlite-fleet-windows:
     name: SQLite fleet (windows-latest)

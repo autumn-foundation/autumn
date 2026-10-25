@@ -132,7 +132,7 @@ copy of the publish order.
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
-| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802) |
+| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802). Scalar fields (`Uuid`, `DateTime`, `NaiveDate`, `NaiveDateTime`, `Decimal`, `SqliteUuid`, `SqliteDecimal`) document as inline scalars, never `$ref`. `Decimal` is `string`/`decimal`, or `number` if serde writes a number (#2582) |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
 | `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
@@ -519,7 +519,11 @@ extractor across one. `autumn_web::commentable::router(cfg)` serves
 single mount; it authorizes the **tenant**, never the record, so an app with
 private records must set `CommentsConfig::authorize(...)`. Build a host page's
 own thread with `commentable::thread_dom_id`/`thread_action` so the router's
-re-render lands on the same element. See `docs/guide/commentable.md`.
+re-render lands on the same element. Pair the `nest` with
+`.declare_plugin_routes(commentable::route_infos("/comments"))` (trunk-dev):
+the nested router is opaque to `autumn routes audit`, which fails without it.
+`GET` is `public`; `POST` is `gated` with `provenance: "declared"`. See
+`docs/guide/commentable.md`.
 
 **(0.7.0)** — `#[votable]` reaction helpers (#1362): declaring
 `#[votable(by = User, aggregate = sum|count)]` on a `#[model]` emits a
@@ -602,7 +606,10 @@ So prefer a real nested type over the comma-separated-string and
 JSON-in-a-string workarounds. This is the same bracket syntax `ListQuery`'s
 `?filter[<col>]=<val>` already used, generalized to arbitrary objects,
 sequences and depths — and it applies to the **query string only**: `Form<T>`
-still decodes bodies through `serde_urlencoded`.
+still decodes bodies through `serde_urlencoded`. `ChangesetForm` and
+`NestedChangesetForm` bodies decode through `form::from_urlencoded` (issue
+#3394): a repeated key fills a `Vec`/`HashSet`/`Option<Vec>`, a repeat on a
+single-value field is a 422, and brackets stay part of the key.
 
 Behaviour worth knowing when writing handlers:
 
@@ -764,6 +771,21 @@ Free functions rendering changeset-aware, accessible inputs:
   `form.text_input(...)`).
 - **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
+- **(Unreleased, #3395)**: `FieldOptions` + a `*_with` variant of each helper
+  (`text_input_with`, `text_input_htmx_with(.., url, token_field, &opts)`,
+  `password_input_with`, `textarea_input_with`, `checkbox_input_with`,
+  `number_input_with`, `date_input_with`, `datetime_input_with`,
+  `select_input_with`, `rich_text_area_with`, `rich_text_area_htmx_with`,
+  `RowScope::{text,number,textarea}_input_with`). `FieldOptions::new()
+  .hint(..).required().placeholder(..).autocomplete(..).inputmode(..)
+  .pattern(..).min(..).max(..).disabled().readonly().data(name, v).hx(name, v)`.
+  The hint is `{field}-hint`, named in `aria-describedby` before the error.
+  No setter for `id`/`name`/`class`/`aria-*`; the label stays positional.
+  Every control has a `required_*` helper (`required_password_input`,
+  `required_textarea_input`, `required_checkbox_input` added); a required
+  label shows an `aria-hidden` `*` marker. `FormFor::field_options(field,
+  FieldOptions)` sets options per field (a checkbox and a password take
+  `required` only from options).
 - **(0.6.0)**: `form_for(&changeset,
   action, method) -> FormFor` whole-form builder. Renders the opening
   `<form>` (audited CSRF injection + hidden `_method` override, as
@@ -985,7 +1007,10 @@ Per-primitive setters (in addition to the shared set):
   &AvatarConfig)` with `AvatarSize::{Small,Medium,Large}` (image or
   colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
   &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
-  `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+  `error_summary(&Changeset) -> Option<Markup>` (each entry links to
+  `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
+  focus moves to it on a failed submit — one per page). All prelude
+  re-exported.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
   `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
@@ -1746,6 +1771,8 @@ An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
 | `node::ttfb::measure(&Probe)` | TTFB edge vs origin and a byte compare of each pair; `Report::passes(min_percent)` |
 | `autumn edge serve --origin URL` | CLI edge node; `--capsule`, `--listen`, `--kv FILE`, `--probe-path`, `--no-probe`, `--response-header`, `--trusted-proxy`, `--quiet`; stops on Ctrl-C or SIGTERM |
 | `autumn edge ttfb --edge URL --origin URL --path P` | CLI probe; exit 0 pass, 1 divergence or reduction < `--min-reduction` (50), 2 error; `--divergence-only` |
+| `autumn edge bundle --target cloudflare --origin URL` | Writes `edge/cloudflare/`: capsule, JS host, `worker.mjs` (rewritten each run) and `wrangler.toml` (written once); `--response-header`, `--probe-path`, `--no-probe`, `--name`, `--out`, `--capsule`. Deploy with `wrangler deploy` |
+| `js::HOST` / `js/autumn-edge-host.mjs` | Web-standard JS host: `Capsule` (same WASI surface as `host`), `createEdgeGateway({ capsule, origin, kv, identity, responseHeaders, probeOrigin, clientIp, onLane })`; async KV by replay-on-miss (ADR-0024) |
 | `paths![…]` / `paths::PathExt::with_query` | Typed path helpers of `#[edge]` routes; compile for wasm; same bytes as `autumn_web::paths` |
 | `autumn build --embed` | Embedded native binary, then the capsule (with `embed-assets`) |
 | `conformance::compare_capsule(origin, capsule)` | Raw capsule vs origin; excuses `VOLATILE_HEADERS`, `SECURITY_HEADERS` and `CORS_HEADERS` only |

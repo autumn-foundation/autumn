@@ -132,6 +132,7 @@ fn register_page(username: &str, email: &str, messages: &[String], csrf_token: &
     )
 }
 
+#[public]
 #[get("/register")]
 pub async fn register_form(csrf: CsrfToken) -> Markup {
     register_page("", "", &[], csrf.token())
@@ -145,6 +146,7 @@ pub struct RegisterForm {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[public]
 #[post("/register")]
 pub async fn register(
     State(state): State<AppState>,
@@ -540,6 +542,7 @@ fn login_page(username: &str, csrf_token: &str, error: Option<&str>) -> Markup {
     )
 }
 
+#[public]
 #[get("/login")]
 pub async fn login_form(csrf: CsrfToken) -> Markup {
     login_page("", csrf.token(), None)
@@ -551,6 +554,7 @@ pub struct LoginForm {
     pub password: String,
 }
 
+#[public]
 #[post("/login")]
 pub async fn login(
     mut db: Db,
@@ -610,6 +614,7 @@ pub async fn login(
 
 // ── Logout ─────────────────────────────────────────────────────
 
+#[public]
 #[post("/logout")]
 pub async fn logout(
     session: Session,
@@ -645,6 +650,7 @@ pub async fn logout(
 ///
 /// See `docs/guide/seo.md`, "Keep a page out of the index".
 #[allow(clippy::too_many_arguments)]
+#[public]
 #[get("/u/{username}", seo(og_type = "profile", robots = "noindex, follow"))]
 pub async fn profile(
     seo: SeoMeta,

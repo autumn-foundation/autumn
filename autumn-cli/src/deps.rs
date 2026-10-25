@@ -7,6 +7,10 @@
 //! issue #1600. Two differences remain and are reported, not hidden: CI pins
 //! its auditor version, and CI fetches the advisory database before it audits.
 //! See `docs/guide/supply-chain.md`, "Part 3b — the dev loop".
+//!
+//! One limit follows from that. Only `cargo deny` knows its config schema. A
+//! `deny.toml` that is valid TOML but breaks the schema (`yanked = "bogus"`)
+//! is accepted here when `cargo deny` is absent, and CI rejects it (issue #2575).
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -138,22 +142,23 @@ pub fn policy_checks(policy: &str) -> Vec<String> {
     checks
 }
 
-/// Optional checks the policy declares that the scaffolded workflow's grep
-/// cannot see.
+/// Optional checks that doctor and the scaffolded workflow list differently.
 ///
-/// Doctor parses TOML; the workflow greps, because a shell cannot parse TOML.
-/// The two agree on every spelling a person writes by hand, but a basic key
-/// carrying an escape (`["ban\u0073"]`) decodes to `bans` for one and not the
-/// other. Rather than let that diverge silently, it is reported.
-pub fn checks_invisible_to_ci(policy: &str) -> Vec<String> {
+/// Doctor parses TOML. The workflow greps, because a shell cannot parse TOML.
+/// They agree on every hand-written policy. They differ in two cases:
+///
+/// - Only TOML sees the check: an escaped key (`["ban\u0073"]`).
+/// - Only the grep sees the check: header-like text inside a string.
+pub fn derivations_disagree(policy: &str) -> Vec<String> {
     let parsed = declared_sections(policy);
     OPTIONAL_CHECKS
         .iter()
         .filter(|section| {
-            parsed.iter().any(|key| key == *section)
-                && !policy
-                    .lines()
-                    .any(|line| line_declares(code_of(line), section))
+            let by_parse = parsed.iter().any(|key| key == *section);
+            let by_scan = policy
+                .lines()
+                .any(|line| line_declares(code_of(line), section));
+            by_parse != by_scan
         })
         .map(|section| (*section).to_owned())
         .collect()
@@ -192,21 +197,12 @@ fn line_declares(code: &str, section: &str) -> bool {
         .strip_prefix("[[")
         .or_else(|| code.strip_prefix('['))
         .map_or(code, ascii_trim_start);
-    // Quoted keys: ["bans"] and ['bans'].
-    let (body, quote) = match body.chars().next() {
-        Some(q @ ('"' | '\'')) => (&body[q.len_utf8()..], Some(q)),
-        _ => (body, None),
-    };
+    // Each quote is optional on its own, as in the workflow's grep.
+    let body = body.strip_prefix(['"', '\'']).unwrap_or(body);
     let Some(rest) = body.strip_prefix(section) else {
         return false;
     };
-    let rest = match quote {
-        Some(quote) => match rest.strip_prefix(quote) {
-            Some(rest) => rest,
-            None => return false,
-        },
-        None => rest,
-    };
+    let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
     matches!(ascii_trim_start(rest).chars().next(), Some(']' | '.' | '='))
 }
 
@@ -773,18 +769,55 @@ pub fn name_some(ids: &[&str], limit: usize) -> String {
 /// Doctor reports a verdict or reports that it got none. It never hangs.
 pub const DOCTOR_BUDGET: Duration = Duration::from_secs(30);
 
+/// A running evaluation: the verdict channel and the means to stop it.
+pub struct Running {
+    /// Delivers the verdict. Closed without one if the audit was stopped.
+    pub receiver: mpsc::Receiver<Evaluation>,
+    /// Ends the auditor process. Call it when you give up on the verdict.
+    pub stop: StopHandle,
+}
+
 /// Run the evaluation on its own thread.
 ///
-/// The caller decides how long to wait. A caller that gives up leaves the
-/// thread to finish and drop its result.
-pub fn spawn_evaluation(root: &Path) -> mpsc::Receiver<Evaluation> {
+/// The caller decides how long to wait. A caller that gives up must call
+/// [`StopHandle::stop`], or the auditor keeps running.
+pub fn spawn_evaluation(root: &Path) -> Running {
+    spawn(root, None)
+}
+
+/// Run the evaluation on its own thread, and stop it after `deadline`.
+///
+/// A watchdog thread enforces the deadline. It does not depend on the caller
+/// polling, so it holds while the caller is busy (for example in a rebuild).
+pub fn spawn_evaluation_with_deadline(root: &Path, deadline: Duration) -> Running {
+    spawn(root, Some(deadline))
+}
+
+fn spawn(root: &Path, deadline: Option<Duration>) -> Running {
     let (sender, receiver) = mpsc::channel();
     let root = root.to_path_buf();
+    let stop = StopHandle::default();
+    ACTIVE.register(&stop);
+    let finished = deadline.map(|deadline| watchdog(stop.clone(), deadline));
+    let worker_stop = stop.clone();
     std::thread::spawn(move || {
         // A closed receiver means the caller moved on. Nothing to report.
-        let _ = sender.send(evaluate(&root));
+        let _ = sender.send(evaluate_with(&root, &worker_stop));
+        // Dropping this ends the watchdog without a stop.
+        drop(finished);
     });
-    receiver
+    Running { receiver, stop }
+}
+
+/// Stop `stop` after `deadline`, unless the returned sender is dropped first.
+fn watchdog(stop: StopHandle, deadline: Duration) -> mpsc::Sender<()> {
+    let (finished, wait) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if wait.recv_timeout(deadline) == Err(mpsc::RecvTimeoutError::Timeout) {
+            stop.stop();
+        }
+    });
+    finished
 }
 
 /// Wait up to `budget` for a spawned evaluation. `None` means it did not
@@ -799,37 +832,221 @@ pub fn await_evaluation(
 /// Evaluate the policy, giving up after `budget`.
 ///
 /// A budget that expires is reported as no verdict, never as a clean tree.
+/// The auditor process is stopped at that point, not before.
 pub fn evaluate_within(root: &Path, budget: Duration) -> Evaluation {
-    let receiver = spawn_evaluation(root);
-    await_evaluation(&receiver, budget).unwrap_or_else(|| Evaluation::Unavailable {
-        reason: format!("the audit did not finish within {}s", budget.as_secs()),
-        checks: Vec::new(),
+    await_or_stop(&spawn_evaluation(root), budget)
+}
+
+/// Wait up to `budget` for `running`. On expiry, stop it and report no verdict.
+fn await_or_stop(running: &Running, budget: Duration) -> Evaluation {
+    await_evaluation(&running.receiver, budget).unwrap_or_else(|| {
+        running.stop.stop();
+        Evaluation::Unavailable {
+            reason: format!("the audit did not finish within {}s", budget.as_secs()),
+            checks: Vec::new(),
+        }
+    })
+}
+
+/// The audits that may still be running.
+static ACTIVE: Registry = Registry(std::sync::Mutex::new(Vec::new()));
+
+/// Stop every audit this process started.
+///
+/// A process that dies on Ctrl+C runs no destructors, and each auditor leads
+/// its own process group, so the terminal does not reach it. The interrupt
+/// handler calls this first.
+pub fn stop_all() {
+    ACTIVE.stop_all();
+}
+
+/// A list of audits to stop together.
+struct Registry(std::sync::Mutex<Vec<StopHandle>>);
+
+impl Registry {
+    fn register(&self, stop: &StopHandle) {
+        let mut handles = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.push(stop.clone());
+    }
+
+    fn stop_all(&self) {
+        let handles = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stop in handles.iter() {
+            stop.stop();
+        }
+    }
+}
+
+/// State shared by an audit thread and the caller that may stop it.
+#[derive(Default)]
+struct Slot {
+    child: Option<std::process::Child>,
+    stopped: bool,
+}
+
+/// Ends an audit's auditor process.
+///
+/// Call it after the deadline, or when the caller ends. On the normal path the
+/// verdict arrives and the process has already exited. Killing a live `cargo metadata` is safe for
+/// Cargo's package-cache lock: the OS releases the lock when its holder dies.
+#[derive(Clone, Default)]
+pub struct StopHandle(std::sync::Arc<std::sync::Mutex<Slot>>);
+
+impl StopHandle {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Kill the auditor and its children. Safe to call at any time, and more
+    /// than once. A call before the process starts prevents it from running.
+    pub fn stop(&self) {
+        let mut slot = self.slot();
+        slot.stopped = true;
+        if let Some(child) = slot.child.as_mut() {
+            kill_tree(child);
+        }
+    }
+
+    /// True after [`stop`](Self::stop).
+    #[cfg(test)]
+    pub fn is_stopped(&self) -> bool {
+        self.slot().stopped
+    }
+}
+
+/// Kill a child and every process it started.
+///
+/// The auditor runs `cargo metadata` as its own child. Killing only the
+/// auditor leaves that process holding the package-cache lock. On Unix the
+/// child leads its own process group (see `run_stoppable`). On Windows the
+/// sweep walks the process tree.
+fn kill_tree(child: &mut std::process::Child) {
+    crate::process::force_kill_group(child.id());
+    let _ = child.kill();
+}
+
+/// How long to wait for output after the auditor exits. A descendant that
+/// outlives it can hold the pipe open.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How often a running auditor is checked for exit.
+const POLL: Duration = Duration::from_millis(10);
+
+/// Run `command` to completion, unless `stop` ends it first.
+///
+/// A stopped run returns an `Interrupted` error.
+fn run_stoppable(
+    command: &mut Command,
+    stop: &StopHandle,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Own process group, so `stop` reaches the auditor's children too.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+    let mut child = command.spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = sender.send(bytes);
+        });
+        receiver
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+
+    {
+        let mut slot = stop.slot();
+        if slot.stopped {
+            kill_tree(&mut child);
+        }
+        slot.child = Some(child);
+    }
+    let status = loop {
+        let mut slot = stop.slot();
+        let waited = slot.child.as_mut().map(std::process::Child::try_wait);
+        match waited {
+            Some(Ok(Some(status))) => {
+                slot.child = None;
+                if slot.stopped {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                break status;
+            }
+            Some(Ok(None)) => {}
+            Some(Err(error)) => return Err(error),
+            None => return Err(std::io::ErrorKind::Interrupted.into()),
+        }
+        drop(slot);
+        std::thread::sleep(POLL);
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.recv_timeout(DRAIN_GRACE).unwrap_or_default(),
+        stderr: stderr.recv_timeout(DRAIN_GRACE).unwrap_or_default(),
     })
 }
 
 /// The directory holding the app's policy file, searching upward from `start`.
 ///
-/// The CI gate runs at the repository root. A developer inside a workspace
-/// member must get that same graph, not "no policy".
+/// The CI gate runs at the repository root, so the outermost policy wins over
+/// a workspace member's own. The search stops at the `.git` folder or at a
+/// `[workspace]` root, whose graph an outer policy does not cover. With
+/// neither boundary, the nearest policy wins: a stray file higher up is not
+/// part of the app.
 pub fn find_policy_root(start: &Path) -> Option<PathBuf> {
     let start = start.canonicalize().ok()?;
+    let mut nearest = None;
+    let mut outermost = None;
+    let mut bounded = false;
     for dir in start.ancestors() {
         if dir.join(POLICY_FILE).is_file() {
-            return Some(dir.to_path_buf());
+            nearest.get_or_insert_with(|| dir.to_path_buf());
+            outermost = Some(dir.to_path_buf());
         }
-        // The repository root bounds the search.
-        if dir.join(".git").exists() {
+        if dir.join(".git").exists() || is_workspace_root(dir) {
+            bounded = true;
             break;
         }
     }
-    None
+    if bounded { outermost } else { nearest }
+}
+
+/// Whether `dir` holds a `Cargo.toml` with a `[workspace]` table.
+fn is_workspace_root(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|manifest| manifest.parse::<toml::Table>().ok())
+        .is_some_and(|manifest| manifest.contains_key("workspace"))
 }
 
 /// Evaluate the dependency policy for the app rooted at `root`.
 ///
 /// Always offline: the advisory database is never fetched here, so this cannot
 /// depend on the network. `cargo deny fetch db` refreshes it.
+#[cfg(test)]
 pub fn evaluate(root: &Path) -> Evaluation {
+    evaluate_with(root, &StopHandle::default())
+}
+
+fn evaluate_with(root: &Path, stop: &StopHandle) -> Evaluation {
     let Some(root) = find_policy_root(root) else {
         return Evaluation::NoPolicy;
     };
@@ -850,15 +1067,15 @@ pub fn evaluate(root: &Path) -> Evaluation {
             checks,
         };
     }
-    // A section only one of the two derivations can see means the local check
-    // list and the CI check list differ, so no verdict here predicts that gate.
-    let invisible = checks_invisible_to_ci(&policy);
-    if !invisible.is_empty() {
+    // One derivation sees a section that the other does not. The local and CI
+    // check lists differ, so doctor gives no verdict.
+    let split = derivations_disagree(&policy);
+    if !split.is_empty() {
         return Evaluation::Unavailable {
             reason: format!(
-                "{POLICY_FILE} declares {} in a spelling the CI workflow's check-list derivation cannot detect; write it as [{}]",
-                invisible.join(", "),
-                invisible.join("], [")
+                "{POLICY_FILE} gives doctor and the CI workflow different check lists for {}. Write each as a plain [{}] header. Do not put header-like text in strings.",
+                split.join(", "),
+                split.join("], [")
             ),
             checks,
         };
@@ -879,7 +1096,7 @@ pub fn evaluate(root: &Path) -> Evaluation {
     // pre-check only guards the default location, so an unreadable custom path
     // reports whatever the auditor says rather than a database that is missing.
     let custom_db = policy_db_path(&policy);
-    let mtime = newest_db_mtime(&custom_db.map_or_else(default_db_dir, PathBuf::from));
+    let mtime = newest_db_mtime(&resolve_db_dir(custom_db, &root));
     if mtime.is_none() && !policy_declares_db_path(&policy) {
         return Evaluation::DatabaseMissing { checks };
     }
@@ -897,8 +1114,7 @@ pub fn evaluate(root: &Path) -> Evaluation {
         .args(&checks)
         .current_dir(&root);
     no_toolchain_installs(&mut command);
-    let output = command.output();
-    let output = match output {
+    let output = match run_stoppable(&mut command, stop) {
         Ok(output) => output,
         Err(error) => {
             return Evaluation::Unavailable {
@@ -930,6 +1146,14 @@ pub fn evaluate(root: &Path) -> Evaluation {
         db_age_days: mtime.map(|mtime| age_days(mtime, SystemTime::now())),
         auditor,
     }
+}
+
+/// The advisory database directory to age.
+///
+/// cargo-deny runs in the policy root. A relative `db-path` is therefore
+/// relative to that root, not to the process directory.
+fn resolve_db_dir(custom: Option<String>, root: &Path) -> PathBuf {
+    custom.map_or_else(default_db_dir, |path| root.join(path))
 }
 
 /// True when the policy names its own advisory database location.
@@ -1395,7 +1619,7 @@ mod tests {
             policy_checks(escaped).contains(&"bans".to_owned()),
             "the TOML parse must decode the key"
         );
-        assert_eq!(checks_invisible_to_ci(escaped), vec!["bans".to_owned()]);
+        assert_eq!(derivations_disagree(escaped), vec!["bans".to_owned()]);
 
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::write(root.path().join(POLICY_FILE), escaped).expect("policy");
@@ -1406,6 +1630,71 @@ mod tests {
             }
             other => panic!("a divergent spelling must not read as evaluable: {other:?}"),
         }
+    }
+
+    #[test]
+    fn section_text_inside_a_string_is_reported_as_a_phantom() {
+        // Issue #2572: the workflow greps, so a header quoted in prose counts
+        // for CI. The TOML parse sees one string, so doctor never checks it.
+        let phantom = "[advisories]\nignore = [\n    { id = \"RUSTSEC-2020-0071\", reason = \"\"\"\nno fix; this is prose:\n[bans]\nreview-by 2026-12-01\"\"\" },\n]\n";
+        assert_eq!(policy_checks(phantom), vec!["advisories".to_owned()]);
+        assert_eq!(derivations_disagree(phantom), vec!["bans".to_owned()]);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(POLICY_FILE), phantom).expect("policy");
+        match evaluate(root.path()) {
+            Evaluation::Unavailable { reason, .. } => {
+                assert!(reason.contains("bans"), "{reason}");
+                assert!(reason.contains("strings"), "{reason}");
+            }
+            other => panic!("a phantom section must not read as evaluable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_header_quoted_in_any_string_is_a_phantom_for_every_optional_check() {
+        for section in OPTIONAL_CHECKS {
+            for quote in ["\"\"\"", "'''"] {
+                let policy = format!(
+                    "[advisories]\nignore = [{{ id = \"X\", reason = {quote}\n[{section}]\n{quote} }}]\n"
+                );
+                assert_eq!(derivations_disagree(&policy), vec![(*section).to_owned()]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_real_header_plus_quoted_text_is_not_a_split() {
+        let policy =
+            "[bans]\n[advisories]\nignore = [{ id = \"X\", reason = \"\"\"\n[bans]\n\"\"\" }]\n";
+        assert!(derivations_disagree(policy).is_empty());
+        assert!(derivations_disagree("[advisories]\n# [bans]\n").is_empty());
+    }
+
+    #[test]
+    fn unpaired_quotes_in_a_string_match_the_grep() {
+        // The grep makes each quote optional, so `["bans']` matches it.
+        let policy = "[advisories]\nnote = \"\"\"\n[\"bans']\n\"\"\"\n";
+        assert_eq!(derivations_disagree(policy), vec!["bans".to_owned()]);
+    }
+
+    #[test]
+    fn invalid_toml_falls_back_to_the_scan_and_agrees() {
+        assert!(derivations_disagree("[bans\n[sources]\n").is_empty());
+    }
+
+    #[test]
+    fn a_relative_db_path_is_resolved_against_the_policy_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let abs = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_db_dir(Some("advisory-dbs".to_owned()), root.path()),
+            root.path().join("advisory-dbs")
+        );
+        // An absolute path stays as written.
+        let abs_path = abs.path().to_string_lossy().into_owned();
+        assert_eq!(resolve_db_dir(Some(abs_path), root.path()), abs.path());
+        assert_eq!(resolve_db_dir(None, root.path()), default_db_dir());
     }
 
     #[test]
@@ -1421,9 +1710,157 @@ mod tests {
             "['bans']\n",
         ] {
             assert!(
-                checks_invisible_to_ci(policy).is_empty(),
-                "wrongly reported as invisible: {policy:?}"
+                derivations_disagree(policy).is_empty(),
+                "wrongly reported as a disagreement: {policy:?}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    mod stoppable {
+        use super::*;
+
+        fn alive(pid: i32) -> bool {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+        }
+
+        fn sh(script: &str) -> Command {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            command
+        }
+
+        #[test]
+        fn a_finished_audit_returns_its_output_and_is_not_killed() {
+            let stop = StopHandle::default();
+            let output = run_stoppable(&mut sh("echo out; echo err >&2"), &stop).expect("run");
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+            assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+            assert!(!stop.is_stopped(), "the normal path never stops");
+        }
+
+        #[test]
+        fn stopping_kills_the_auditor_and_its_children() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pid_file = dir.path().join("grandchild.pid");
+            let tmp_file = dir.path().join("grandchild.tmp");
+            // Write, then rename: the reader never sees a partial pid.
+            let script = format!(
+                "sleep 60 & echo $! > {tmp}; mv {tmp} {pid}; wait",
+                tmp = tmp_file.display(),
+                pid = pid_file.display()
+            );
+            let stop = StopHandle::default();
+            let stopper = stop.clone();
+            let runner = std::thread::spawn(move || run_stoppable(&mut sh(&script), &stopper));
+            let mut grandchild = None;
+            for _ in 0..500 {
+                if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                    grandchild = text.trim().parse::<i32>().ok();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let Some(grandchild) = grandchild else {
+                stop.stop();
+                panic!("the auditor never started its child");
+            };
+            // Kill the child on any failure below.
+            let _cleanup = Cleanup(grandchild);
+            assert!(alive(grandchild));
+            stop.stop();
+            let result = runner.join().expect("join");
+            assert_eq!(
+                result.expect_err("stopped").kind(),
+                std::io::ErrorKind::Interrupted
+            );
+            // Reaping is up to init; allow it a moment.
+            for _ in 0..1000 {
+                if !alive(grandchild) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the auditor's child outlived the stop");
+        }
+
+        /// Kills a leftover process when a test fails early.
+        struct Cleanup(i32);
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(self.0),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+
+        #[test]
+        fn stop_all_stops_every_registered_audit() {
+            let registry = Registry(std::sync::Mutex::new(Vec::new()));
+            let (first, second) = (StopHandle::default(), StopHandle::default());
+            registry.register(&first);
+            registry.register(&second);
+            registry.stop_all();
+            assert!(first.is_stopped() && second.is_stopped());
+        }
+
+        #[test]
+        fn the_watchdog_stops_an_audit_that_outlives_its_deadline() {
+            let stop = StopHandle::default();
+            let _finished = watchdog(stop.clone(), Duration::from_millis(20));
+            for _ in 0..500 {
+                if stop.is_stopped() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the deadline did not stop the audit");
+        }
+
+        #[test]
+        fn the_watchdog_leaves_a_finished_audit_alone() {
+            let stop = StopHandle::default();
+            drop(watchdog(stop.clone(), Duration::from_millis(50)));
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!stop.is_stopped());
+        }
+
+        #[test]
+        fn a_stop_twice_is_harmless() {
+            let stop = StopHandle::default();
+            stop.stop();
+            stop.stop();
+            assert!(stop.is_stopped());
+        }
+
+        #[test]
+        fn output_larger_than_a_pipe_buffer_is_drained() {
+            let stop = StopHandle::default();
+            let output = run_stoppable(&mut sh("head -c 300000 /dev/zero"), &stop).expect("run");
+            assert_eq!(output.stdout.len(), 300_000);
+        }
+
+        #[test]
+        fn a_budget_that_expires_stops_the_audit() {
+            let (_sender, receiver) = mpsc::channel();
+            let stop = StopHandle::default();
+            let running = Running {
+                receiver,
+                stop: stop.clone(),
+            };
+            let eval = await_or_stop(&running, Duration::from_millis(10));
+            assert!(matches!(eval, Evaluation::Unavailable { .. }));
+            assert!(stop.is_stopped(), "expiry must stop the auditor");
+        }
+
+        #[test]
+        fn a_stop_before_the_start_prevents_the_run() {
+            let stop = StopHandle::default();
+            stop.stop();
+            let error = run_stoppable(&mut sh("sleep 60"), &stop).expect_err("stopped");
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         }
     }
 
@@ -1678,6 +2115,81 @@ mod tests {
         assert_eq!(
             find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
             Some(root.path().canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn the_outermost_policy_wins_over_a_workspace_members() {
+        // CI reads the root policy. A member policy must not replace it.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git");
+        std::fs::write(root.path().join(POLICY_FILE), "[advisories]\n").expect("policy");
+        let member = root.path().join("crates").join("app");
+        std::fs::create_dir_all(&member).expect("member");
+        std::fs::write(member.join(POLICY_FILE), "[bans]\n").expect("member policy");
+        assert_eq!(
+            find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
+            Some(root.path().canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn the_outermost_policy_search_still_stops_at_the_repository_root() {
+        // A policy above the `.git` boundary is not part of this repository.
+        let outer = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outer.path().join(POLICY_FILE), "[bans]\n").expect("outer policy");
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git");
+        std::fs::write(repo.join(POLICY_FILE), "[advisories]\n").expect("policy");
+        assert_eq!(
+            find_policy_root(&repo).map(|found| found.canonicalize().expect("canonical")),
+            Some(repo.canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn without_a_repository_root_the_nearest_policy_wins() {
+        // No `.git` bounds the walk, so an outer policy may be a stray file.
+        let outer = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outer.path().join(POLICY_FILE), "[bans]\n").expect("outer policy");
+        let app = outer.path().join("app");
+        std::fs::create_dir_all(&app).expect("app");
+        std::fs::write(app.join(POLICY_FILE), "[advisories]\n").expect("policy");
+        assert_eq!(
+            find_policy_root(&app).map(|found| found.canonicalize().expect("canonical")),
+            Some(app.canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn the_outermost_of_three_policies_wins() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git");
+        let member = root.path().join("crates").join("app");
+        std::fs::create_dir_all(&member).expect("member");
+        for dir in [root.path(), &root.path().join("crates"), &member] {
+            std::fs::write(dir.join(POLICY_FILE), "[advisories]\n").expect("policy");
+        }
+        assert_eq!(
+            find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
+            Some(root.path().canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn a_nested_workspace_keeps_its_own_policy() {
+        // A nested workspace has its own lockfile and graph. The outer policy
+        // does not cover it.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git");
+        std::fs::write(root.path().join(POLICY_FILE), "[bans]\n").expect("policy");
+        let nested = root.path().join("examples").join("flock");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::write(nested.join(POLICY_FILE), "[advisories]\n").expect("nested policy");
+        std::fs::write(nested.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("manifest");
+        assert_eq!(
+            find_policy_root(&nested).map(|found| found.canonicalize().expect("canonical")),
+            Some(nested.canonicalize().expect("canonical"))
         );
     }
 

@@ -106,7 +106,7 @@ the framework almost certainly already generates or ships it:
 | Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` (0.6.0) |
 | Hand-rolled auth, session, or token checks in handler bodies | `#[secured]` / `#[secured("role")]`, `#[authorize]`, repository `policy =`/`scope =`; `#[secured(scopes = [...])]` for service tokens (0.6.0) |
 | A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (0.6.0, issue #1350, see `docs/guide/rate-limiting.md`) |
-| Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (0.6.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (0.6.0) |
+| Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (0.6.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (0.6.0). For a hint, `required`, `placeholder`/`autocomplete`/`data-*`/`hx-*`, use the `*_with` helper + `FieldOptions` (or `FormFor::field_options`) — never hand-write the input to add one attribute |
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
@@ -824,6 +824,8 @@ segment, so a third commentable model needs no route:
 
 ```rust
 .nest("/comments", autumn_web::commentable::router(Default::default()))
+// A nest is opaque to `autumn routes audit`; declare its two routes, or the audit fails:
+.declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
 // GET/POST /comments/{commentable_type}/{parent_id}
 ```
 
@@ -2244,7 +2246,7 @@ for the common cases:
 | `modal(id, title, &body, &ModalConfig)` / `confirm_action(...)` | Native `<dialog>` confirm for destructive actions — replaces `hx-confirm`/`window.confirm()` |
 | `badge(label, BadgeVariant::for_label(status))` / `status_tag(label)` | Semantic status pill; `BadgeVariant` = `Neutral`/`Info`/`Success`/`Warning`/`Danger`, `for_label` picks a deterministic color; `badge_with`/`BadgeConfig` set `title`/`aria-label`. Composes inside a `data_table` cell |
 | `avatar(name, &AvatarConfig::new().image(url).size(AvatarSize::Small))` | Person chip: `<img>` (lazy, square, name `alt`) or a deterministic colored-initials fallback — never a broken image, no JS, no external call |
-| `alert(AlertVariant::Info, body)` / `alert_with(..., &AlertConfig::new().title("...").icon(true).dismissible(true))` | Inline callout / empty-state / error box; `role` per variant, optional title + inline-SVG icon + no-JS dismiss. `error_summary(&changeset)` renders an `Error` alert of all field errors (or `None` when valid) |
+| `alert(AlertVariant::Info, body)` / `alert_with(..., &AlertConfig::new().title("...").icon(true).dismissible(true))` | Inline callout / empty-state / error box; `role` per variant, optional title + inline-SVG icon + no-JS dismiss. `error_summary(&changeset)` renders an `Error` alert of all field errors (or `None` when valid); each entry links to `#field` and the summary takes focus |
 | `flash_messages(&flash.consume().await)` (`autumn_web::flash`) | Accessible flash banners: per-severity `role`/`aria-live`, `autumn-flash--<level>` classes, empty slice renders nothing; `flash_messages_with` adds a no-JS dismiss |
 | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` | Accessible, filter-preserving, htmx-opt-in pager from a `Page`/`CursorPage` (prelude re-export) |
 | `toast(message, variant)` / `toast_region(DEFAULT_TOAST_REGION_ID)` / `toast_in(region_id, ...)` | Transient htmx action feedback: drop `toast_region` once in the layout, then return `toast(...)` next to your swapped fragment — it appends into the region OOB (`hx-swap-oob="beforeend:#toast-region"`). CSS-only auto-dismiss (no `<script>`); `variant` reuses `AlertVariant`. `toast_region` is a persistent `aria-live="polite"` region — non-error toasts inherit its politeness (no own `role`/`aria-live`); `Error` announces assertively via its own `role="alert"` |
@@ -2311,6 +2313,22 @@ line items in one submit — use `autumn_web::nested_form` (0.6.0, #1915) instea
 decode the flat submission back into parent + children with
 `decode_nested_urlencoded`, so the parent and its children validate and persist
 as one transaction.
+
+**Multi-value fields and file parts (issue #3394).** Don't hand-parse repeated
+keys (a `parse_bulk_ids`-style helper over the raw body). A repeated key fills a
+`Vec<T>`, `HashSet<T>` or `Option<Vec<T>>` field of a `ChangesetForm` /
+`NestedChangesetForm` target, so checkbox groups, `<select multiple>` and tag
+inputs decode directly. Give the field `#[serde(default)]` so "none checked"
+decodes as empty, and `#[serde(alias = "ids[]")]` to accept the bracketed
+spelling (brackets are part of the key). A repeated key on a single-value field
+is a 422 naming the field, never "last value wins". A blank element of a typed
+list (`ids=`) is dropped. For a raw `Bytes` body, `form::from_urlencoded::<T>`
+applies the same rules and returns a `FormDecodeError` (`status()` is 422 or
+400). `Changeset::field_values(field)` re-renders every element of a sequence
+field; in a nested row, `row.values(sub)` does the same. On a `multipart/form-data` body, file parts reach the handler through
+`form.file(name)`, `form.files(name)` and `form.take_files()` (`FormFile`), under
+the `security.upload` policy. In a test, build one with `FormFile::new` and
+`ChangesetForm::with_files`. See `docs/guide/forms.md`.
 
 ## Service-to-service wire contracts (0.8.0, issue #1755)
 
@@ -4150,11 +4168,13 @@ ON, and the migration connection leaves it OFF, so the statement applies.
 `DROP COLUMN` also fails on SQLite when the column is a primary key, is `UNIQUE`,
 is named by any index (including a partial index's `WHERE`), or appears in a
 `CHECK`, generated column, view or trigger. `autumn generate migration
-Remove…From…` handles the index case: it reads the project's earlier
-`migrations/*/up.sql`, emits `DROP INDEX IF EXISTS` for every live index that
-names the removed column — composite, partial, expression and hand-named
-included — before the `DROP COLUMN`, and re-creates them in `down.sql`. An index
-created outside `migrations/` stays invisible; drop it in the same migration.
+Remove…From…` handles the index case. It replays the project's earlier
+`migrations/*/up.sql` in an in-memory SQLite database and tests which indexes
+block the `DROP COLUMN`. It emits `DROP INDEX IF EXISTS` for each one before the
+drop, and re-creates them in `down.sql`. It stops with an error for a
+`UNIQUE` or `PRIMARY KEY` column, for a column that a CHECK, view or trigger uses,
+and for an earlier migration that does not replay. An index created outside
+`migrations/` stays invisible; drop it in the same migration.
 
 Postgres classification and generated Postgres DDL are unchanged.
 

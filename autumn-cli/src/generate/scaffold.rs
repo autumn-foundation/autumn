@@ -25,7 +25,7 @@ use super::model::{
 use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::scaffold_i18n;
 use super::schema_edit::{
-    add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
+    add_mod_declaration, create_table_sql_with_metadata_and_id_for, ensure_autumn_web_feature,
     ensure_dependency_feature, ensure_dev_dependency_test_support,
     ensure_dev_dependency_tokio_test_features, unique_index_name, update_main_rs,
 };
@@ -873,7 +873,8 @@ fn plan_scaffold_with_options_impl(
                     "Added the shared `{table}` table. Every `#[commentable]` model \
                      attaches to it, so later models need no migration of their own. \
                      Mount the framework's comment routes once, e.g. \
-                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))`, \
+                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))\
+                     .declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))`, \
                      and render a thread with \
                      `autumn_web::widgets::comment_thread`.",
                     table = super::commentable::COMMENTS_TABLE,
@@ -1891,6 +1892,7 @@ fn plan_scaffold_with_options_impl(
     let smoke_test_fields =
         augment_fields_for_soft_delete(&fields, options_with_key.model.soft_delete)?;
     let mut smoke_test = render_smoke_test(
+        backend,
         &pascal_name,
         &plural,
         options_with_key.api,
@@ -2272,18 +2274,6 @@ fn plan_scaffold_with_options_impl(
             feature: "sqlite".to_owned(),
             owner_dir: Some(project_root.join("src/models")),
         });
-        // The one file this scaffold writes that is known not to compile here.
-        // Say so at generate time rather than let `cargo test` be the messenger.
-        if !for_revert {
-            plan.warn(format!(
-                "tests/{snake_name}.rs uses `autumn_web::test::TestDb`. `TestDb` works only \
-                 with Postgres, so `cargo test` does not compile on this SQLite app. The app \
-                 is not affected: `cargo run`, `cargo build` and `autumn migrate` work. The \
-                 issue for a SQLite smoke harness is \
-                 https://github.com/autumn-foundation/autumn/issues/2555. Until it is done, \
-                 delete that file or put it behind a Postgres-only cargo feature."
-            ));
-        }
     }
 
     // The generated HTML routes render through `autumn_web::form::*` helpers
@@ -4261,11 +4251,15 @@ fn render_routes_file(
     } else {
         String::new()
     };
-    let (flash_none_selected, flash_bulk_deleted) = if bulk_delete_enabled {
+    let (flash_none_selected, flash_bad_selection, flash_bulk_deleted) = if bulk_delete_enabled {
         (
             labels.lit(
                 &format!("{snake_name}.flash.none_selected"),
                 &format!("No {plural} selected"),
+            ),
+            labels.lit(
+                &format!("{snake_name}.flash.bad_selection"),
+                &format!("That is not a valid selection of {plural}"),
             ),
             labels.expr(
                 &format!("{snake_name}.flash.bulk_deleted"),
@@ -4275,7 +4269,7 @@ fn render_routes_file(
             ),
         )
     } else {
-        (String::new(), String::new())
+        (String::new(), String::new(), String::new())
     };
     let (flash_restored, flash_purged) = if trash_enabled {
         (
@@ -6060,9 +6054,9 @@ mod attachment_read_back_tests {{
 
     // ── issue #1312: bulk-select + delete-selected ─────────────────────────
     //
-    // The repeated-checkbox body parser. Emitted next to `csrf_input` /
-    // `submit_token_input` (the routes module's other private form helpers) and
-    // only when the bulk gate is on, so the `--live`/`--sharded` output is
+    // The bulk-select form struct (issue #3394 retired the hand-written
+    // `parse_bulk_ids`). Emitted next to `csrf_input` / `submit_token_input`
+    // and only when the bulk gate is on, so the `--live`/`--sharded` output is
     // byte-identical.
     let bulk_ids_parser = if bulk_delete_enabled {
         "\n/// Most rows one bulk submit may touch.\n\
@@ -6076,40 +6070,14 @@ mod attachment_read_back_tests {{
          /// no rows at all.\n\
          const MAX_BULK_IDS: usize = 5000;\n\
          \n\
-         /// Parse the bulk-select checkboxes out of a URL-encoded form body.\n\
+         /// The bulk-select checkboxes of the index list.\n\
          ///\n\
-         /// Accepts both the plain `ids=1&ids=2` spelling the generated checkboxes\n\
-         /// submit and the `ids[]=1&ids[]=2` spelling some clients send. A value\n\
-         /// that isn't an integer is dropped rather than rejected — a list-write\n\
-         /// endpoint never 400s on a hand-edited form — and repeats are collapsed\n\
-         /// so the same row is never queued for deletion twice.\n\
-         ///\n\
-         /// Dedup goes through a `HashSet` rather than a linear `Vec::contains`\n\
-         /// scan: this parses the raw body, not a page-sized selection, so a\n\
-         /// hand-crafted POST can carry as many distinct `ids` as the request body\n\
-         /// limit allows. A linear scan per value would make that Θ(n²) — a cheap\n\
-         /// request burning real CPU before the handler ever reaches the database.\n\
-         /// The `Vec` still carries insertion order; the set only answers \"seen?\".\n\
-         fn parse_bulk_ids(body: &Bytes) -> Vec<i64> {\n    \
-         let mut ids: Vec<i64> = Vec::new();\n    \
-         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();\n    \
-         for (key, value) in url::form_urlencoded::parse(body.as_ref()) {\n        \
-         if key == \"ids\" || key == \"ids[]\" {\n            \
-         if let Ok(id) = value.parse::<i64>() {\n                \
-         if seen.insert(id) {\n                    \
-         ids.push(id);\n                    \
-         // Stop one past the cap. The handler refuses anything longer, so\n                    \
-         // parsing the rest would burn CPU on a body already destined for\n                    \
-         // rejection — and collecting it would let the request size alone\n                    \
-         // decide how much memory this allocates.\n                    \
-         if ids.len() > MAX_BULK_IDS {\n                        \
-         break;\n                    \
-         }\n                \
-         }\n            \
-         }\n        \
-         }\n    \
-         }\n    \
-         ids\n\
+         /// The checkboxes submit `ids=1&ids=2`. Some clients send `ids[]=1`.\n\
+         /// The framework form decoder puts each repeated key into the `Vec`.\n\
+         #[derive(serde::Deserialize)]\n\
+         struct BulkSelection {\n    \
+         #[serde(default, alias = \"ids[]\")]\n    \
+         ids: Vec<i64>,\n\
          }\n"
     } else {
         ""
@@ -6155,10 +6123,10 @@ mod attachment_read_back_tests {{
         format!(
             "\n\n/// `POST /{plural}/bulk_delete` — delete every selected row in one submit.\n\
              ///\n\
-             /// Reads the index list's repeated `ids` checkboxes (see `parse_bulk_ids`,\n\
-             /// which also accepts the `ids[]` spelling). Malformed ids are dropped and an\n\
-             /// empty selection just redirects back with an informational flash — a\n\
-             /// list-write endpoint never 400s on bad params. The delete itself routes\n\
+             /// Reads the index list's repeated `ids` checkboxes into `BulkSelection`\n\
+             /// (the `ids[]` spelling works too). A malformed body and an empty\n\
+             /// selection each redirect back with a flash — a list-write endpoint\n\
+             /// never 400s on bad params. The delete itself routes\n\
              /// through the repository's `delete_many`, so soft-delete, model hooks, and\n\
              /// `dependent(...)` cascades all apply exactly as they do for the single-row\n\
              /// `destroy`; a `dependent(restrict)` violation aborts the whole batch with a\n\
@@ -6171,18 +6139,36 @@ mod attachment_read_back_tests {{
              mut db: {db_ty},\n    \
              body: Bytes,\n\
              ) -> AutumnResult<autumn_web::Redirect> {{\n    \
-             let ids = parse_bulk_ids(&body);\n    \
-             if ids.is_empty() {{\n        \
-             flash.info({flash_none_selected}).await;\n        \
-             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
-             }}\n    \
              // Refuse an oversized selection outright rather than truncating it: a\n    \
              // silently partial destructive batch is worse than a refused one. Like\n    \
-             // the empty case this redirects with a flash instead of 400ing.\n    \
-             if ids.len() > MAX_BULK_IDS {{\n        \
+             // the empty case this redirects with a flash instead of 400ing. The\n    \
+             // count runs before the decode and stops one past the cap, so a\n    \
+             // crafted body never allocates a body's worth of ids.\n    \
+             let submitted = url::form_urlencoded::parse(&body)\n        \
+             .filter(|(key, _)| key == \"ids\" || key == \"ids[]\")\n        \
+             .take(MAX_BULK_IDS + 1)\n        \
+             .count();\n    \
+             if submitted > MAX_BULK_IDS {{\n        \
              flash\n            \
              .error({flash_bulk_cap})\n            \
              .await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }}\n    \
+             // A body that does not decode (a non-integer id, a mixed `ids` and\n    \
+             // `ids[]` spelling) gets a flash, not a 400: a list-write endpoint\n    \
+             // never 400s on bad params.\n    \
+             let Ok(BulkSelection {{ mut ids }}) =\n        \
+             autumn_web::form::from_urlencoded::<BulkSelection>(&body)\n    \
+             else {{\n        \
+             flash.error({flash_bad_selection}).await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }};\n    \
+             // Collapse repeats so the same row is never queued twice. A\n    \
+             // `HashSet` keeps this O(n); the `Vec` keeps the submitted order.\n    \
+             let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();\n    \
+             ids.retain(|id| seen.insert(*id));\n    \
+             if ids.is_empty() {{\n        \
+             flash.info({flash_none_selected}).await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
              // Chunk the pre-flight the way the repository chunks its own id\n    \
@@ -12453,6 +12439,76 @@ fn escape_sql_for_rust_literal(sql: &str) -> String {
     sql.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// The database name the generated smoke test names in its doc comments.
+const fn smoke_db_label(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => "Postgres",
+        DatabaseBackend::Sqlite => "SQLite",
+    }
+}
+
+/// The `#[ignore]` line (with its newline) for a database-backed smoke test.
+///
+/// Postgres needs Docker, so those tests are opt-in. `SQLite` needs only a
+/// temp file, so its tests run in a plain `cargo test`.
+const fn smoke_ignore_attr(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => {
+            "#[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n"
+        }
+        DatabaseBackend::Sqlite => "",
+    }
+}
+
+/// The doc lines that tell the reader how to run the smoke test.
+const fn smoke_run_note(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => {
+            "//! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
+             //! be available in every environment); run it for real with:\n\
+             //!\n\
+             //!     cargo test -- --ignored\n"
+        }
+        DatabaseBackend::Sqlite => {
+            "//! The test uses a temp-file `SQLite` database, so a plain run covers it:\n\
+             //!\n\
+             //!     cargo test\n"
+        }
+    }
+}
+
+/// The `TestDb` constructor a generated smoke test calls.
+///
+/// Postgres shares one container per binary, because a container is slow to
+/// start. `SQLite` makes a new temp-file database per test, because that is
+/// cheap and it keeps parallel tests apart.
+const fn smoke_db_ctor(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => "shared",
+        DatabaseBackend::Sqlite => "new",
+    }
+}
+
+/// The statement that empties the table under test.
+///
+/// Postgres keeps its `TRUNCATE`. `SQLite` has none, so it calls `reset_table`.
+fn smoke_reset_call(backend: DatabaseBackend, plural: &str) -> String {
+    match backend {
+        DatabaseBackend::Postgres => {
+            format!("db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;")
+        }
+        DatabaseBackend::Sqlite => format!("db.reset_table(\"{plural}\").await;"),
+    }
+}
+
+/// The SQL expression that casts the `id` column to text.
+const fn smoke_id_to_text(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => "id::text",
+        DatabaseBackend::Sqlite => "CAST(id AS TEXT)",
+    }
+}
+
 /// Render the `tests/<snake>.rs` smoke test's HTML (non-`--api`) shape: an
 /// in-process, real-database read of the scaffolded index route.
 ///
@@ -12463,17 +12519,23 @@ fn escape_sql_for_rust_literal(sql: &str) -> String {
 /// `docs/guide/tutorial/11-testing.md`, which documents this exact
 /// constraint and the same "redeclare the handler under test" workaround.
 fn render_index_smoke_test(
+    backend: DatabaseBackend,
     pascal_name: &str,
     plural: &str,
     id_schema_type: &str,
     setup_calls: &str,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
+    let db_ctor = smoke_db_ctor(backend);
+    let db_label = smoke_db_label(backend);
+    let ignore_attr = smoke_ignore_attr(backend);
+    let run_note = smoke_run_note(backend);
     format!(
         "//! Smoke test generated by `autumn generate scaffold`.\n\
          //!\n\
          //! Boots a stand-in for the scaffolded `GET /{plural}` route in-process\n\
          //! via `autumn_web::test::{{TestApp, TestClient, TestDb}}` and asserts a\n\
-         //! real response against a real (throwaway) Postgres database -- no\n\
+         //! real response against a real (throwaway) {db_label} database -- no\n\
          //! running server, no hard-coded server base URL env var, no silent skip.\n\
          //!\n\
          //! The handler below is NOT the generated `routes::{plural}::index`\n\
@@ -12487,10 +12549,7 @@ fn render_index_smoke_test(
          //! coverage of that, add unit tests inside `src/routes/{plural}.rs`\n\
          //! itself (it's part of the binary crate, so it can call the real code).\n\
          //!\n\
-         //! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
-         //! be available in every environment); run it for real with:\n\
-         //!\n\
-         //!     cargo test -- --ignored\n\
+         {run_note}\
          \n\
          use autumn_web::prelude::*;\n\
          use autumn_web::test::{{TestApp, TestClient, TestDb}};\n\
@@ -12513,11 +12572,11 @@ fn render_index_smoke_test(
          }}\n\
          \n\
          #[tokio::test]\n\
-         #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+         {ignore_attr}\
          async fn {plural}_index_renders_scaffolded_rows() {{\n\
-         let db = TestDb::shared().await;\n\
+         let db = TestDb::{db_ctor}().await;\n\
          {setup_calls}\
-         db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+         {reset_call}\n\
          \n\
          let client: TestClient = TestApp::new().routes(routes![index]).with_db(db.pool()).build();\n\
          \n\
@@ -12535,25 +12594,33 @@ fn render_index_smoke_test(
 /// stand-in rather than a literal re-export of the generated
 /// `{snake}_api_list` repository handler.
 fn render_api_smoke_test(
+    backend: DatabaseBackend,
     plural: &str,
     id_schema_type: &str,
     setup_calls: &str,
     fields: &[Field],
     defaults: &BTreeMap<String, String>,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
+    let db_ctor = smoke_db_ctor(backend);
+    let db_label = smoke_db_label(backend);
+    let ignore_attr = smoke_ignore_attr(backend);
+    let run_note = smoke_run_note(backend);
+    let id_to_text = smoke_id_to_text(backend);
     // Route the seed through `render_execute_sql_calls` so a multi-statement
     // seed (the no-required-column branch emits one `INSERT ... DEFAULT VALUES`
     // per row) becomes one `db.execute_sql(...)` call apiece -- diesel-async's
     // `execute` uses the extended protocol, which rejects several `;`-separated
     // statements in a single call. The single-statement required-column branch
     // is unaffected (it renders exactly one call).
-    let seed_calls = render_execute_sql_calls(&render_api_seed_sql(plural, fields, defaults));
+    let seed_calls =
+        render_execute_sql_calls(&render_api_seed_sql(backend, plural, fields, defaults));
     format!(
         "//! Smoke test generated by `autumn generate scaffold --api`.\n\
          //!\n\
          //! Boots a stand-in for the scaffolded `GET /api/{plural}` route\n\
          //! in-process via `autumn_web::test::{{TestApp, TestClient, TestDb}}`\n\
-         //! and asserts a real response against a real (throwaway) Postgres\n\
+         //! and asserts a real response against a real (throwaway) {db_label}\n\
          //! database -- no running server, no hard-coded server base URL env\n\
          //! var, no silent skip.\n\
          //!\n\
@@ -12566,10 +12633,7 @@ fn render_api_smoke_test(
          //! self-describing envelope shape and that pages advance -- but it does\n\
          //! NOT exercise the real repository handler's serialization or filtering.\n\
          //!\n\
-         //! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
-         //! be available in every environment); run it for real with:\n\
-         //!\n\
-         //!     cargo test -- --ignored\n\
+         {run_note}\
          \n\
          use autumn_web::prelude::*;\n\
          use autumn_web::test::{{TestApp, TestClient, TestDb}};\n\
@@ -12591,7 +12655,7 @@ fn render_api_smoke_test(
          async fn api_list(page: PageRequest, mut db: Db) -> AutumnResult<Page<String>> {{\n\
          let total: i64 = {plural}::table.count().get_result(&mut db).await?;\n\
          let ids: Vec<String> = {plural}::table\n\
-         .select(sql::<Text>(\"id::text\"))\n\
+         .select(sql::<Text>(\"{id_to_text}\"))\n\
          .order({plural}::id.asc())\n\
          .limit(page.limit())\n\
          .offset(page.offset())\n\
@@ -12601,11 +12665,11 @@ fn render_api_smoke_test(
          }}\n\
          \n\
          #[tokio::test]\n\
-         #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+         {ignore_attr}\
          async fn {plural}_api_list_paginates_against_a_real_database() {{\n\
-         let db = TestDb::shared().await;\n\
+         let db = TestDb::{db_ctor}().await;\n\
          {setup_calls}\
-         db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+         {reset_call}\n\
          // Seed 25 rows -- more than one page at size = 2, and more than the\n\
          // default page size (20). Every required (NOT NULL, no DEFAULT) column\n\
          // gets a valid, per-row-varying sample value, so this works for an\n\
@@ -12660,7 +12724,11 @@ fn render_api_smoke_test(
 /// statement. Postgres allows a self-referential FK within the same
 /// `CREATE TABLE`, so no stub is needed there; emitting one anyway would
 /// collide with the real (non-`IF NOT EXISTS`) `CREATE TABLE` that follows.
-fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String {
+fn render_reference_stub_tables_sql(
+    backend: DatabaseBackend,
+    fields: &[Field],
+    own_table: &str,
+) -> String {
     let mut out = String::new();
     let mut seen = BTreeSet::new();
     for f in fields {
@@ -12670,7 +12738,8 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
         {
             let _ = writeln!(
                 out,
-                "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
+                "CREATE TABLE IF NOT EXISTS {target} (id {});",
+                IdType::BigSerial.pk_sql_for(backend)
             );
             // Seed two rows — ids 1 and 2, since BIGSERIAL starts there — so a NOT
             // NULL `references` column pointing at this stub has a real id to
@@ -12699,7 +12768,7 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
 /// Delegates to [`render_index_smoke_test`] or [`render_api_smoke_test`]
 /// depending on `api`, after computing the exact `CREATE TABLE`/`CREATE
 /// INDEX` SQL the generated migration also emits (see
-/// [`create_table_sql_with_metadata_and_id`]), so the throwaway table the
+/// [`create_table_sql_with_metadata_and_id_for`]), so the throwaway table the
 /// test creates in `TestDb` matches the real schema. Any `references` field
 /// also gets a stub target table created first — see
 /// [`render_reference_stub_tables_sql`].
@@ -12710,6 +12779,7 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
 // decision.
 #[allow(clippy::fn_params_excessive_bools)]
 fn render_smoke_test(
+    backend: DatabaseBackend,
     pascal_name: &str,
     plural: &str,
     api: bool,
@@ -12721,21 +12791,36 @@ fn render_smoke_test(
     authorize: bool,
     bulk_delete: bool,
 ) -> String {
-    let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
-    let create_table_sql =
-        create_table_sql_with_metadata_and_id(plural, fields, indexes, defaults, id_type);
+    let stub_tables_sql = render_reference_stub_tables_sql(backend, fields, plural);
+    let create_table_sql = create_table_sql_with_metadata_and_id_for(
+        backend, plural, fields, indexes, defaults, id_type,
+    );
     let mut setup_calls = render_execute_sql_calls(&stub_tables_sql);
     setup_calls.push_str(&render_execute_sql_calls(&create_table_sql));
-    let id_schema_type = id_type.schema_type();
+    let id_schema_type = id_type.schema_type_for(backend);
 
     let base = if api {
-        render_api_smoke_test(plural, id_schema_type, &setup_calls, fields, defaults)
+        render_api_smoke_test(
+            backend,
+            plural,
+            id_schema_type,
+            &setup_calls,
+            fields,
+            defaults,
+        )
     } else {
-        render_index_smoke_test(pascal_name, plural, id_schema_type, &setup_calls)
+        render_index_smoke_test(backend, pascal_name, plural, id_schema_type, &setup_calls)
     };
 
     let base = if fields.iter().any(Field::is_enum) {
-        base + &render_enum_rejection_smoke_test(plural, fields, defaults, &setup_calls, api)
+        base + &render_enum_rejection_smoke_test(
+            backend,
+            plural,
+            fields,
+            defaults,
+            &setup_calls,
+            api,
+        )
     } else {
         base
     };
@@ -12745,6 +12830,7 @@ fn render_smoke_test(
         base
     } else {
         base + &render_unique_violation_smoke_test(
+            backend,
             plural,
             fields,
             &unique_fields,
@@ -13895,22 +13981,22 @@ async fn __PLURAL___write_path_crud() {
     const BULK_HANDLER: &str = r#"
 
     // Issue #1312: the index list's bulk form posts the checked rows here as
-    // repeated `ids` pairs. Malformed values are dropped and an empty selection
-    // is a no-op — a list-write endpoint never 400s on bad params.
+    // repeated `ids` pairs. They decode into a `Vec<i64>` (issue #3394). A
+    // malformed body and an empty selection are each a no-op — a list-write
+    // endpoint never 400s on bad params.
+    #[derive(serde::Deserialize)]
+    struct BulkSelection {
+        #[serde(default, alias = "ids[]")]
+        ids: Vec<i64>,
+    }
+
     #[post("/__PLURAL__/bulk_delete")]
     async fn bulk_delete(
         body: autumn_web::reexports::axum::body::Bytes,
     ) -> impl IntoResponse {
-        let mut ids: Vec<i64> = Vec::new();
-        for (key, value) in url::form_urlencoded::parse(body.as_ref()) {
-            if (key == "ids" || key == "ids[]")
-                && let Ok(id) = value.parse::<i64>()
-                && !ids.contains(&id)
-            {
-                ids.push(id);
-            }
+        if let Ok(BulkSelection { ids }) = autumn_web::form::from_urlencoded(&body) {
+            STORE.lock().unwrap().retain(|(i, _)| !ids.contains(i));
         }
-        STORE.lock().unwrap().retain(|(i, _)| !ids.contains(i));
         Redirect::to("/__PLURAL__")
     }"#;
     const BULK_STEPS: &str = r#"
@@ -14650,7 +14736,8 @@ async fn __PLURAL___cross_user_mutations_are_forbidden() {
 /// test needs *some* valid value so the `INSERT`'s failure is attributable to
 /// the target enum column's `CHECK` constraint rather than some other
 /// required column being left out.
-fn sql_sample_literal(kind: FieldKind) -> String {
+fn sql_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
+    let sqlite = backend == DatabaseBackend::Sqlite;
     match kind {
         // `Enum`'s "'sample'" here is never actually used: `enum_rejection_insert_sql`
         // special-cases every enum column (the field under test gets the
@@ -14680,12 +14767,16 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // like `decimal{1,1}` (valid range `(-1,1)`) would reject a literal
         // "1.0" with a numeric field overflow — see `decimal_literal_at_scale`.
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 1),
+        FieldKind::Uuid if sqlite => format!("({})", super::dsl::SQLITE_UUID_V4_SQL),
         FieldKind::Uuid => "gen_random_uuid()".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => "CURRENT_TIMESTAMP".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()".to_owned(),
+        FieldKind::Bytea if sqlite => "X'00'".to_owned(),
         FieldKind::Bytea => "'\\x00'::bytea".to_owned(),
         // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
         // never needs a sample literal to satisfy a `NOT NULL` constraint.
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json if sqlite => "'{}'".to_owned(),
         FieldKind::Json => "'{}'::jsonb".to_owned(),
     }
 }
@@ -14711,7 +14802,8 @@ const API_SMOKE_TEST_SEED_ROWS: usize = 25;
 /// seeding strategy could satisfy the constraint. `uuid` needs no special
 /// case: its `sql_sample_literal` is `gen_random_uuid()`, already distinct
 /// per row.
-fn sql_seed_value_expr(f: &Field) -> String {
+fn sql_seed_value_expr(backend: DatabaseBackend, f: &Field) -> String {
+    let sqlite = backend == DatabaseBackend::Sqlite;
     match f.kind {
         // A slug field is always `unique` (issue #1260) -- it MUST vary per
         // row here, or the seeded rows collide on the very first re-insert.
@@ -14719,7 +14811,11 @@ fn sql_seed_value_expr(f: &Field) -> String {
             "'sample-' || g".to_owned()
         }
         FieldKind::I32 | FieldKind::I64 => "g".to_owned(),
+        FieldKind::F32 | FieldKind::F64 if sqlite => "CAST(g AS REAL)".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "g::double precision".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => {
+            "datetime('now', '+' || g || ' seconds')".to_owned()
+        }
         FieldKind::NaiveDateTime | FieldKind::DateTime => {
             "NOW() + (g || ' seconds')::interval".to_owned()
         }
@@ -14730,8 +14826,9 @@ fn sql_seed_value_expr(f: &Field) -> String {
         // A constant `'{}'::jsonb` for every row (issue #1341 review) would
         // collide on the very first re-insert for a `unique` json column —
         // vary it with `g`, same as the text/numeric arms above.
+        FieldKind::Json if sqlite => "'{\"seed\": ' || g || '}'".to_owned(),
         FieldKind::Json => "('{\"seed\": ' || g || '}')::jsonb".to_owned(),
-        _ => sql_sample_literal(f.kind),
+        _ => sql_sample_literal(backend, f.kind),
     }
 }
 
@@ -14756,6 +14853,7 @@ fn sql_seed_value_expr(f: &Field) -> String {
 /// and fails at runtime with a column-count mismatch rather than inserting N
 /// default rows.
 fn render_api_seed_sql(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     defaults: &BTreeMap<String, String>,
@@ -14765,7 +14863,7 @@ fn render_api_seed_sql(
     for f in fields {
         if !f.nullable && !defaults.contains_key(&f.name) {
             columns.push(f.name.clone());
-            values.push(sql_seed_value_expr(f));
+            values.push(sql_seed_value_expr(backend, f));
         }
     }
     let n = API_SMOKE_TEST_SEED_ROWS;
@@ -14775,8 +14873,18 @@ fn render_api_seed_sql(
         // into one `db.execute_sql(...)` call per statement.
         vec![format!("INSERT INTO {plural} DEFAULT VALUES"); n].join(";\n")
     } else {
+        let (with, source) = match backend {
+            DatabaseBackend::Postgres => (String::new(), format!("generate_series(1, {n}) AS g")),
+            // `SQLite` has no `generate_series`; a recursive CTE gives the same index.
+            DatabaseBackend::Sqlite => (
+                format!(
+                    "WITH RECURSIVE g(g) AS (SELECT 1 UNION ALL SELECT g + 1 FROM g WHERE g < {n}) "
+                ),
+                "g".to_owned(),
+            ),
+        };
         format!(
-            "INSERT INTO {plural} ({}) SELECT {} FROM generate_series(1, {n}) AS g",
+            "{with}INSERT INTO {plural} ({}) SELECT {} FROM {source}",
             columns.join(", "),
             values.join(", ")
         )
@@ -14788,6 +14896,7 @@ fn render_api_seed_sql(
 /// and every other required (`NOT NULL`, no `DEFAULT`) column to a valid
 /// sample value — see [`sql_sample_literal`].
 fn enum_rejection_insert_sql(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     target: &Field,
@@ -14809,7 +14918,7 @@ fn enum_rejection_insert_sql(
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                sql_sample_literal(f.kind)
+                sql_sample_literal(backend, f.kind)
             };
             values.push(value);
         }
@@ -14835,12 +14944,16 @@ fn enum_rejection_insert_sql(
 ///    `tests/*.rs` binary cannot import the project's own handler code).
 /// 3. Either way, the table ends up with zero rows.
 fn render_enum_rejection_smoke_test(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     defaults: &BTreeMap<String, String>,
     setup_calls: &str,
     api: bool,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
+    let db_ctor = smoke_db_ctor(backend);
+    let ignore_attr = smoke_ignore_attr(backend);
     // `setup_calls` is shared with, and identical to, the base index/api smoke test's own
     // setup, which issues a plain, non-idempotent `CREATE TABLE {plural} (...)` and, for
     // any `--index`/`references` field, a plain `CREATE INDEX idx_{plural}_{field} ...`
@@ -14861,7 +14974,7 @@ fn render_enum_rejection_smoke_test(
     let mut out = String::new();
     for target in fields.iter().filter(|f| f.is_enum()) {
         let field_name = &target.name;
-        let insert_sql = enum_rejection_insert_sql(plural, fields, target, defaults);
+        let insert_sql = enum_rejection_insert_sql(backend, plural, fields, target, defaults);
         let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
         let allowed_values = target
             .variants
@@ -14902,11 +15015,11 @@ fn render_enum_rejection_smoke_test(
         let _ = write!(
             out,
             "\n#[tokio::test]\n\
-             #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+             {ignore_attr}\
              async fn {plural}_rejects_out_of_set_{field_name}() {{\n\
-             \x20\x20\x20\x20let db = TestDb::shared().await;\n\
+             \x20\x20\x20\x20let db = TestDb::{db_ctor}().await;\n\
              {setup_calls}\
-             \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+             \x20\x20\x20\x20{reset_call}\n\
              \n\
              {request_boundary_check}\
              \n\
@@ -14928,7 +15041,8 @@ fn render_enum_rejection_smoke_test(
 /// this deliberately avoids non-deterministic SQL (`gen_random_uuid()`,
 /// `NOW()`) — two evaluations of either would almost certainly differ and
 /// the duplicate-insert assertion would never trip.
-fn unique_sample_literal(kind: FieldKind) -> String {
+fn unique_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
+    let sqlite = backend == DatabaseBackend::Sqlite;
     match kind {
         FieldKind::String
         | FieldKind::Text
@@ -14954,11 +15068,17 @@ fn unique_sample_literal(kind: FieldKind) -> String {
         // Scale-derived, distinct from `sql_sample_literal`'s digit-1 value
         // for the same field — see `decimal_literal_at_scale`.
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 2),
+        FieldKind::Uuid if sqlite => "'00000000-0000-0000-0000-000000000001'".to_owned(),
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => {
+            "'2024-01-01 00:00:00'".to_owned()
+        }
         FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp".to_owned(),
         FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Bytea if sqlite => "X'DEADBEEF'".to_owned(),
         FieldKind::Bytea => "'\\xDEADBEEF'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json if sqlite => "'{\"seed\": 1}'".to_owned(),
         FieldKind::Json => "'{\"seed\": 1}'::jsonb".to_owned(),
     }
 }
@@ -14971,7 +15091,8 @@ fn unique_sample_literal(kind: FieldKind) -> String {
 /// exact same value for a non-target unique column on both inserts would
 /// trip *that* column's own UNIQUE index too, racing against the target's
 /// to decide which violation Postgres actually reports.
-fn unique_sample_literal_variant(kind: FieldKind) -> String {
+fn unique_sample_literal_variant(backend: DatabaseBackend, kind: FieldKind) -> String {
+    let sqlite = backend == DatabaseBackend::Sqlite;
     match kind {
         FieldKind::String
         | FieldKind::Text
@@ -14994,11 +15115,17 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
         // and `unique_sample_literal`'s digit-2 value — see
         // `decimal_literal_at_scale`.
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 3),
+        FieldKind::Uuid if sqlite => "'00000000-0000-0000-0000-000000000002'".to_owned(),
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => {
+            "'2024-01-02 00:00:00'".to_owned()
+        }
         FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp".to_owned(),
         FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Bytea if sqlite => "X'BEEFDEAD'".to_owned(),
         FieldKind::Bytea => "'\\xBEEFDEAD'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json if sqlite => "'{\"seed\": 2}'".to_owned(),
         FieldKind::Json => "'{\"seed\": 2}'::jsonb".to_owned(),
     }
 }
@@ -15017,6 +15144,7 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
 /// one `unique` field doesn't also duplicate a *different* column's value
 /// and race it against `target`'s for which violation Postgres reports.
 fn unique_violation_insert_sql(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     target: &Field,
@@ -15031,7 +15159,7 @@ fn unique_violation_insert_sql(
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                unique_sample_literal(f.kind)
+                unique_sample_literal(backend, f.kind)
             };
             values.push(value);
         } else if !f.nullable && !defaults.contains_key(&f.name) {
@@ -15040,11 +15168,11 @@ fn unique_violation_insert_sql(
                 let variant = f.variants.get(1).unwrap_or(&f.variants[0]);
                 format!("'{variant}'")
             } else if is_duplicate_insert && f.unique {
-                unique_sample_literal_variant(f.kind)
+                unique_sample_literal_variant(backend, f.kind)
             } else if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                sql_sample_literal(f.kind)
+                sql_sample_literal(backend, f.kind)
             };
             values.push(value);
         }
@@ -15057,7 +15185,7 @@ fn unique_violation_insert_sql(
 }
 
 /// Render one `#[ignore]`d `#[tokio::test]` per `unique` field (issue #1032)
-/// that proves, against a real (throwaway) Postgres database:
+/// that proves, against a real (throwaway) Postgres or `SQLite` database:
 ///
 /// 1. A raw duplicate `INSERT` (bypassing the app entirely) violates the
 ///    migration's `CREATE UNIQUE INDEX` — the constraint is real, not just
@@ -15075,7 +15203,12 @@ fn unique_violation_insert_sql(
 ///    the full request-boundary path (issue #1032's success metric: a
 ///    second POST with the same value gets a field-level error, not a
 ///    `500`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one generated test template; splitting it would scatter one format string"
+)]
 fn render_unique_violation_smoke_test(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     unique_fields: &[&Field],
@@ -15083,6 +15216,10 @@ fn render_unique_violation_smoke_test(
     setup_calls: &str,
     api: bool,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
+    let db_ctor = smoke_db_ctor(backend);
+    let db_label = smoke_db_label(backend);
+    let ignore_attr = smoke_ignore_attr(backend);
     // Same idempotency treatment as `render_enum_rejection_smoke_test` (see
     // its comment) — this test's own setup must tolerate running alongside
     // the base index/api smoke test and/or the enum-rejection smoke test in
@@ -15109,7 +15246,8 @@ fn render_unique_violation_smoke_test(
             continue;
         }
         let field_name = &target.name;
-        let insert_sql = unique_violation_insert_sql(plural, fields, target, defaults, false);
+        let insert_sql =
+            unique_violation_insert_sql(backend, plural, fields, target, defaults, false);
         let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
         // A scaffold with more than one `unique` field needs a *second*,
         // distinct insert for the DB-level duplicate-insert check below: if
@@ -15121,7 +15259,8 @@ fn render_unique_violation_smoke_test(
         // single compiled function invoked via two separate HTTP calls, so
         // it has no way to distinguish "first call" from "second call" and
         // keeps using `escaped_insert` for both, same as before.
-        let insert_sql_dup = unique_violation_insert_sql(plural, fields, target, defaults, true);
+        let insert_sql_dup =
+            unique_violation_insert_sql(backend, plural, fields, target, defaults, true);
         let escaped_insert_dup = escape_sql_for_rust_literal(&insert_sql_dup);
         let constraint_name = unique_index_name(plural, field_name, fields);
 
@@ -15165,7 +15304,7 @@ fn render_unique_violation_smoke_test(
                  \x20\x20\x20\x20Ok(autumn_web::reexports::http::StatusCode::OK.into_response())\n\
                  }}\n\
                  \n\
-                 \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+                 \x20\x20\x20\x20{reset_call}\n\
                  \x20\x20\x20\x20let client: TestClient = TestApp::new().routes(routes![create]).with_db(db.pool()).build();\n\
                  \n\
                  \x20\x20\x20\x20client.post(\"/{plural}\").send().await.assert_status(200);\n\
@@ -15178,11 +15317,11 @@ fn render_unique_violation_smoke_test(
         let _ = write!(
             out,
             "\n#[tokio::test]\n\
-             #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+             {ignore_attr}\
              async fn {plural}_rejects_duplicate_{field_name}() {{\n\
-             \x20\x20\x20\x20let db = TestDb::shared().await;\n\
+             \x20\x20\x20\x20let db = TestDb::{db_ctor}().await;\n\
              {setup_calls}\
-             \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+             \x20\x20\x20\x20{reset_call}\n\
              \n\
              \x20\x20\x20\x20let mut conn = db.pool().get().await.expect(\"failed to get db connection\");\n\
              \x20\x20\x20\x20diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await.expect(\"first insert must succeed\");\n\
@@ -15194,7 +15333,7 @@ fn render_unique_violation_smoke_test(
              \x20\x20\x20\x20let (field, _message) = autumn_web::error::unique_violation_field(\n\
              \x20\x20\x20\x20\x20\x20\x20\x20&mapped_err,\n\
              \x20\x20\x20\x20\x20\x20\x20\x20&[(\"{constraint_name}\", \"{field_name}\", \"has already been taken\")],\n\
-             \x20\x20\x20\x20).expect(\"a real Postgres unique_violation error must be classified by field\");\n\
+             \x20\x20\x20\x20).expect(\"a real {db_label} unique_violation error must be classified by field\");\n\
              \x20\x20\x20\x20assert_eq!(field, \"{field_name}\");\n\
              \n\
              {request_boundary_check}\
@@ -15993,6 +16132,33 @@ async fn main() {
         assert!(
             !routes.contains(".override_field(\"post_id\""),
             "the missing target's column must keep the derived number input: {routes}"
+        );
+    }
+
+    #[test]
+    fn commentable_scaffold_hints_an_audit_clean_comment_router_mount() {
+        // The generic comment router is a `nest`, which `autumn routes audit`
+        // cannot see into. The hint must pair it with the declaration that
+        // makes the mount enumerable, or the app it scaffolds fails its own
+        // CI audit step.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "comments:commentable".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let hint = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("commentable::router"))
+            .unwrap_or_else(|| panic!("no comment-router hint: {:?}", plan.warnings));
+        assert!(
+            hint.contains(
+                ".declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))"
+            ),
+            "{hint}"
         );
     }
 
@@ -18950,9 +19116,9 @@ async fn main() {
         );
     }
 
-    /// The `SQLite` smoke-test warning cites open issue #2555, not closed #1905.
-    #[test]
-    fn scaffold_on_sqlite_app_warning_cites_open_tracker() {
+    /// Plan a scaffold for a `SQLite` app and return the smoke test source.
+    fn sqlite_smoke_test(args: &[&str], api: bool) -> (Vec<String>, String) {
+        let mut out = (Vec::new(), String::new());
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -18966,22 +19132,143 @@ async fn main() {
                     "[database]\nprimary_url = \"sqlite://app.db\"\n",
                 )
                 .unwrap();
-                let plan = plan_scaffold(
+                let fields: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+                let options = ScaffoldOptions {
+                    api,
+                    ..Default::default()
+                };
+                let plan = plan_scaffold_with_options(
                     tmp.path(),
                     "Post",
-                    &["title:String".into()],
+                    &fields,
                     "20260427000000",
+                    &options,
                 )
                 .unwrap();
-                let warning = plan
-                    .warnings
+                let test = plan
+                    .actions
                     .iter()
-                    .find(|w| w.contains("TestDb"))
-                    .unwrap_or_else(|| panic!("no TestDb warning: {:?}", plan.warnings));
-                assert!(warning.contains("issues/2555"), "{warning}");
-                assert!(!warning.contains("1905"), "{warning}");
+                    .find_map(|a| match a {
+                        Action::Create { path, contents } if path.ends_with("tests/post.rs") => {
+                            Some(contents.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("smoke test is planned");
+                out = (plan.warnings, test);
             },
         );
+        out
+    }
+
+    /// A `SQLite` scaffold has a `SQLite`-native smoke test (issue #2555). It
+    /// needs no Docker, so it is not `#[ignore]`d, and the generator no longer
+    /// warns that `cargo test` cannot compile.
+    #[test]
+    fn sqlite_scaffold_smoke_test_is_native() {
+        let (warnings, test) = sqlite_smoke_test(&["title:String"], false);
+        assert!(
+            !warnings.iter().any(|w| w.contains("TestDb")),
+            "no TestDb warning on SQLite: {warnings:?}"
+        );
+        assert!(test.contains("db.reset_table(\"posts\")"), "{test}");
+        assert!(!test.contains("TRUNCATE"), "{test}");
+        assert!(!test.contains("#[ignore"), "{test}");
+        assert!(!test.contains("Docker"), "{test}");
+        assert!(!test.contains("Postgres"), "{test}");
+        assert!(!test.contains("BIGSERIAL"), "{test}");
+        assert!(test.contains("INTEGER PRIMARY KEY AUTOINCREMENT"), "{test}");
+    }
+
+    /// Each `SQLite` smoke test gets its own database. The tests are not
+    /// `#[ignore]`d, so they run in parallel in one binary. A shared database
+    /// would let one test's `CREATE TABLE` or `reset_table` break another's.
+    #[test]
+    fn sqlite_scaffold_smoke_tests_each_get_their_own_database() {
+        let (_, test) = sqlite_smoke_test(
+            &["name:String:unique", "status:enum{draft,published}"],
+            false,
+        );
+        assert!(test.contains("TestDb::new().await"), "{test}");
+        assert!(!test.contains("TestDb::shared()"), "{test}");
+    }
+
+    /// Every Postgres-only construct in the smoke SQL has a `SQLite` form.
+    #[test]
+    fn sqlite_scaffold_smoke_sql_has_no_postgres_syntax() {
+        let (_, test) = sqlite_smoke_test(
+            &[
+                "title:String:unique",
+                "owner:Uuid",
+                "at:DateTime",
+                "blob:Bytea",
+                "payload:json",
+                "ratio:f64",
+                "status:enum{draft,published}",
+            ],
+            false,
+        );
+        for banned in [
+            "::jsonb",
+            "::uuid",
+            "::bytea",
+            "::timestamp",
+            "::double",
+            "::interval",
+            "NOW()",
+            "gen_random_uuid",
+            "generate_series",
+            "BIGSERIAL",
+            "TRUNCATE",
+        ] {
+            assert!(
+                !test.contains(banned),
+                "`{banned}` in SQLite smoke test:\n{test}"
+            );
+        }
+        assert!(test.contains("rejects_duplicate_title"), "{test}");
+        assert!(test.contains("rejects_out_of_set_status"), "{test}");
+        assert!(test.contains("a real SQLite unique_violation"), "{test}");
+    }
+
+    /// The `--api` smoke test seeds rows with a recursive CTE on `SQLite`.
+    #[test]
+    fn sqlite_api_scaffold_smoke_test_seeds_with_a_recursive_cte() {
+        let (_, test) = sqlite_smoke_test(&["title:String"], true);
+        assert!(test.contains("WITH RECURSIVE g(g)"), "{test}");
+        assert!(test.contains("CAST(id AS TEXT)"), "{test}");
+        assert!(!test.contains("id::text"), "{test}");
+        assert!(!test.contains("#[ignore"), "{test}");
+    }
+
+    /// Postgres keeps its Docker-gated smoke test.
+    #[test]
+    fn postgres_scaffold_smoke_test_stays_ignored() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let test = plan
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Create { path, contents } if path.ends_with("tests/post.rs") => {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .expect("smoke test is planned");
+        assert!(test.contains("#[ignore = \"requires Docker"), "{test}");
+        assert!(test.contains("TestDb::shared().await"), "{test}");
+        assert!(
+            test.contains("db.execute_sql(\"TRUNCATE posts RESTART IDENTITY\")"),
+            "{test}"
+        );
+        assert!(test.contains("BIGSERIAL PRIMARY KEY"), "{test}");
     }
 
     #[test]
@@ -21496,7 +21783,8 @@ async fn main() {
             fields[1].reference_table(),
             "test setup: both fields must target the same table"
         );
-        let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
+        let sql =
+            render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "unrelated_table");
         assert_eq!(
             sql.matches("CREATE TABLE IF NOT EXISTS").count(),
             1,
@@ -21516,7 +21804,7 @@ async fn main() {
         // non-target `unique references` column in the duplicate insert)
         // distinction; see that function's doc comment.
         let fields = super::super::dsl::parse_fields(&["author:references".into()]).unwrap();
-        let sql = render_reference_stub_tables_sql(&fields, "posts");
+        let sql = render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "posts");
         assert_eq!(
             sql,
             "CREATE TABLE IF NOT EXISTS authors (id BIGSERIAL PRIMARY KEY);\n\
@@ -21548,7 +21836,8 @@ async fn main() {
                 state_machine: None,
             },
         ];
-        let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
+        let sql =
+            render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "unrelated_table");
         assert_eq!(
             sql.matches("CREATE TABLE IF NOT EXISTS authors").count(),
             1,
@@ -21570,7 +21859,8 @@ async fn main() {
         // stubbing it first would collide with that statement.
         let fields = super::super::dsl::parse_fields(&["category:references".into()]).unwrap();
         assert_eq!(fields[0].reference_table().as_deref(), Some("categories"));
-        let sql = render_reference_stub_tables_sql(&fields, "categories");
+        let sql =
+            render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "categories");
         assert!(sql.is_empty(), "must not stub the model's own table: {sql}");
     }
 
@@ -21617,27 +21907,36 @@ async fn main() {
     #[test]
     fn decimal_sample_literals_are_pairwise_distinct_at_every_scale() {
         for scale in 0..=6 {
-            let a = sql_sample_literal(FieldKind::Decimal {
-                precision: scale.max(1) + 1,
-                scale,
-            });
-            let b = unique_sample_literal(FieldKind::Decimal {
-                precision: scale.max(1) + 1,
-                scale,
-            });
-            let c = unique_sample_literal_variant(FieldKind::Decimal {
-                precision: scale.max(1) + 1,
-                scale,
-            });
+            let a = sql_sample_literal(
+                DatabaseBackend::Postgres,
+                FieldKind::Decimal {
+                    precision: scale.max(1) + 1,
+                    scale,
+                },
+            );
+            let b = unique_sample_literal(
+                DatabaseBackend::Postgres,
+                FieldKind::Decimal {
+                    precision: scale.max(1) + 1,
+                    scale,
+                },
+            );
+            let c = unique_sample_literal_variant(
+                DatabaseBackend::Postgres,
+                FieldKind::Decimal {
+                    precision: scale.max(1) + 1,
+                    scale,
+                },
+            );
             assert!(a != b && b != c && a != c, "scale {scale}: {a}, {b}, {c}");
         }
     }
 
     #[test]
     fn json_sample_literals_are_pairwise_distinct_and_valid_jsonb() {
-        let a = sql_sample_literal(FieldKind::Json);
-        let b = unique_sample_literal(FieldKind::Json);
-        let c = unique_sample_literal_variant(FieldKind::Json);
+        let a = sql_sample_literal(DatabaseBackend::Postgres, FieldKind::Json);
+        let b = unique_sample_literal(DatabaseBackend::Postgres, FieldKind::Json);
+        let c = unique_sample_literal_variant(DatabaseBackend::Postgres, FieldKind::Json);
         assert!(a != b && b != c && a != c, "{a}, {b}, {c}");
         for literal in [&a, &b, &c] {
             assert!(
@@ -21662,7 +21961,7 @@ async fn main() {
         // 25-row (`API_SMOKE_TEST_SEED_ROWS`) seed — must vary with `g`, same
         // as the text/numeric/timestamp arms.
         let f = csv_test_field("config", FieldKind::Json, false);
-        let expr = sql_seed_value_expr(&f);
+        let expr = sql_seed_value_expr(DatabaseBackend::Postgres, &f);
         assert!(
             expr.contains(" g "),
             "must vary per row via the generate_series index: {expr}"
@@ -21707,7 +22006,13 @@ async fn main() {
             state_machine: None,
         };
         let fields = vec![status.clone(), weight];
-        let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());
+        let sql = enum_rejection_insert_sql(
+            DatabaseBackend::Postgres,
+            "items",
+            &fields,
+            &status,
+            &BTreeMap::new(),
+        );
         assert!(
             sql.contains("weight) VALUES ('__not_a_real_variant__', 0.1)"),
             "expected a scale-fitting 0.1 literal for NUMERIC(1,1), got: {sql}"
@@ -22972,42 +23277,61 @@ exempt_paths = [
         );
     }
 
+    /// Issue #3394: the ids decode into a `Vec<i64>` field through the
+    /// framework form decoder. No generated parser remains.
     #[test]
-    fn bulk_ids_parser_accepts_bracket_form() {
+    fn bulk_selection_is_a_vec_field_that_accepts_bracket_form() {
         let routes = bulk_routes_default();
-        assert!(routes.contains("fn parse_bulk_ids("), "{routes}");
-        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
-            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
+        assert!(!routes.contains("parse_bulk_ids"), "{routes}");
+        let Some((_, rest)) = routes.split_once("struct BulkSelection") else {
+            panic!("routes must emit a BulkSelection form struct:\n{routes}");
         };
-        let parser = rest.split("\npub ").next().unwrap_or(rest);
-        assert!(parser.contains("url::form_urlencoded::parse"), "{parser}");
-        assert!(parser.contains("\"ids\""), "{parser}");
-        assert!(parser.contains("\"ids[]\""), "{parser}");
+        let selection = rest.split("\n}").next().unwrap_or(rest);
+        assert!(selection.contains("ids: Vec<i64>"), "{selection}");
+        assert!(selection.contains("alias = \"ids[]\""), "{selection}");
+        assert!(selection.contains("default"), "{selection}");
+        let bulk = handler_slice(&routes, "bulk_delete");
         assert!(
-            parser.contains("seen.insert("),
-            "the parser must dedupe selected ids: {parser}"
+            bulk.contains("autumn_web::form::from_urlencoded::<BulkSelection>(&body)"),
+            "{bulk}"
         );
     }
 
-    /// The parser reads the raw body, not a page-sized selection, so a crafted
-    /// POST can carry as many distinct ids as the body limit allows. Dedup must
-    /// stay O(1) per value — a `Vec::contains` scan would make it Θ(n²) and let
-    /// a small request burn real CPU before the handler reaches the database.
+    /// A crafted POST can carry as many distinct ids as the body limit
+    /// allows. Dedup must stay O(1) per value — a `Vec::contains` scan would
+    /// make it Θ(n²) and let a small request burn real CPU before the handler
+    /// reaches the database.
     #[test]
-    fn bulk_ids_parser_dedupes_in_linear_time() {
+    fn bulk_selection_dedupes_in_linear_time() {
         let routes = bulk_routes_default();
-        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
-            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
-        };
-        let parser = rest.split("\npub ").next().unwrap_or(rest);
+        let bulk = handler_slice(&routes, "bulk_delete");
         assert!(
-            parser.contains("HashSet"),
-            "dedup must go through a hash set, not a linear scan: {parser}"
+            bulk.contains("HashSet") && bulk.contains("seen.insert("),
+            "dedup must go through a hash set, not a linear scan: {bulk}"
         );
         assert!(
-            !parser.contains("ids.contains(&"),
-            "a per-value Vec::contains scan makes parsing quadratic: {parser}"
+            !bulk.contains("ids.contains(&"),
+            "a per-value Vec::contains scan makes dedup quadratic: {bulk}"
         );
+    }
+
+    /// A malformed or repeated-scalar body flashes and redirects. It never
+    /// 400s (see `bulk_delete_never_returns_bad_request`).
+    #[test]
+    fn bulk_delete_malformed_selection_flashes_and_redirects() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        let decode_at = bulk
+            .find("from_urlencoded::<BulkSelection>")
+            .unwrap_or_else(|| panic!("bulk delete must decode a BulkSelection:\n{bulk}"));
+        let after = &bulk[decode_at..];
+        let else_at = after
+            .find("else {")
+            .unwrap_or_else(|| panic!("a decode failure must take an else branch:\n{bulk}"));
+        let branch = &after[else_at..];
+        assert!(branch.contains("flash"), "{branch}");
+        assert!(branch.contains("Redirect::to(&paths::index())"), "{branch}");
+        assert!(bulk.contains("not a valid selection"), "{bulk}");
     }
 
     #[test]

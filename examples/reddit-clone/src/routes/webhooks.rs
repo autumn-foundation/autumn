@@ -19,6 +19,10 @@ use autumn_web::webhook::SignedWebhook;
 /// 2. Look up the user by `customer.id` in your database.
 /// 3. Grant/revoke the Reddit Gold subscription in a transaction.
 /// 4. Enqueue a confirmation email via `Mailer::deliver_later`.
+///
+/// `#[public]`: Stripe calls this route, not a signed-in user, so no session
+/// guard fits. The `SignedWebhook` signature check is the guard.
+#[public]
 #[post("/webhooks/stripe")]
 pub async fn stripe_webhook(webhook: SignedWebhook) -> AutumnResult<Json<serde_json::Value>> {
     // Deserialise the full event payload — in production, use a typed Stripe SDK

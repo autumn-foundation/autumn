@@ -31,6 +31,7 @@ mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
 mod edge;
+mod edge_bundle;
 mod edge_scan;
 mod experiments;
 mod export;
@@ -1109,6 +1110,56 @@ pub enum EdgeCommands {
         /// Do not write a line for each request.
         #[arg(long)]
         quiet: bool,
+    },
+    /// Write a deployable edge bundle for a web-standard runtime (ADR-0024).
+    ///
+    /// The bundle is the capsule, Autumn's JavaScript edge host and an entry
+    /// module for the platform. It needs no vendor SDK. The platform's own
+    /// CLI deploys it. The capsule serves each GET/HEAD it can; every other
+    /// request goes to the origin unchanged.
+    ///
+    /// Every bundle rewrites the capsule, the host and the entry. The
+    /// platform config (`wrangler.toml`) is written once and then kept, so
+    /// a KV namespace id or a route added to it survives.
+    ///
+    /// # Examples
+    ///
+    ///   autumn build
+    ///   autumn edge bundle --target cloudflare --origin https://origin.example.com
+    ///   cd edge/cloudflare && npx wrangler deploy
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Bundle {
+        /// The platform to bundle for.
+        #[arg(long, value_enum, default_value = "cloudflare")]
+        target: edge_bundle::BundleTarget,
+        /// The capsule that `autumn build` wrote.
+        #[arg(
+            long,
+            value_name = "WASM",
+            default_value = "target/wasm32-wasip1/release/edge-capsule.wasm"
+        )]
+        capsule: String,
+        /// The origin base URL. Required for a new bundle; it goes into the
+        /// platform config, which later bundles keep.
+        #[arg(long, value_name = "URL")]
+        origin: Option<String>,
+        /// The directory to write.
+        #[arg(long, value_name = "DIR", default_value = "edge/cloudflare")]
+        out: String,
+        /// The Worker name for a new config. Defaults to `<package>-edge`.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Also set this header on each edge response. Repeat it.
+        #[arg(long = "response-header", value_name = "NAME: VALUE")]
+        response_headers: Vec<String>,
+        /// The origin path the Worker reads the static security headers
+        /// from, once per isolate.
+        #[arg(long, value_name = "PATH", default_value = "/")]
+        probe_path: String,
+        /// Do not read the origin's static headers.
+        #[arg(long)]
+        no_probe: bool,
     },
     /// Measure time to first byte at the edge node and at the origin.
     ///
@@ -5607,6 +5658,25 @@ fn run_command(command: Commands) {
                 trusted_proxies: &trusted_proxies,
                 quiet,
             }),
+            EdgeCommands::Bundle {
+                target,
+                capsule,
+                origin,
+                out,
+                name,
+                response_headers,
+                probe_path,
+                no_probe,
+            } => edge_bundle::run(&edge_bundle::BundleOptions {
+                target,
+                capsule: &capsule,
+                origin: origin.as_deref(),
+                out: &out,
+                name: name.as_deref(),
+                response_headers: &response_headers,
+                probe_path: &probe_path,
+                no_probe,
+            }),
             EdgeCommands::Ttfb {
                 edge: edge_url,
                 origin,
@@ -6821,13 +6891,27 @@ fn apply_plan(
     flags: generate::Flags,
     mode: ApplyMode,
 ) {
-    let result = plan.and_then(|p| match mode {
-        ApplyMode::Generate => p.execute(flags),
-        ApplyMode::Destroy => p.revert(flags),
-    });
+    let result = plan.and_then(|p| run_plan(p, flags, mode));
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Execute or revert `plan`, as the sole resource of this invocation.
+///
+/// Each `generate`/`destroy` process applies one plan, so the claim is true
+/// here. It lets `destroy` sweep files the templates no longer name (issue
+/// #2557).
+fn run_plan(
+    mut plan: generate::emit::Plan,
+    flags: generate::Flags,
+    mode: ApplyMode,
+) -> Result<(), generate::GenerateError> {
+    plan.claim_sole_resource();
+    match mode {
+        ApplyMode::Generate => plan.execute(flags),
+        ApplyMode::Destroy => plan.revert(flags),
     }
 }
 
@@ -7122,10 +7206,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                     |url| generate::tauri::plan_tauri_thin_client(&project_root, url),
                 )
             });
-            let result = plan.and_then(|p| match mode {
-                ApplyMode::Generate => p.execute(flags),
-                ApplyMode::Destroy => p.revert(flags),
-            });
+            let result = plan.and_then(|p| run_plan(p, flags, mode));
             match result {
                 Ok(()) => {
                     if mode == ApplyMode::Generate && !dry_run {
@@ -7166,10 +7247,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             };
             let plan =
                 guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root, opts));
-            let result = plan.and_then(|p| match mode {
-                ApplyMode::Generate => p.execute(flags),
-                ApplyMode::Destroy => p.revert(flags),
-            });
+            let result = plan.and_then(|p| run_plan(p, flags, mode));
             match result {
                 Ok(()) => {
                     if mode == ApplyMode::Generate && !dry_run {
@@ -7435,10 +7513,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 plan_flags,
             ) {
                 Ok(plugin_plan) => {
-                    let result = match mode {
-                        ApplyMode::Generate => plugin_plan.plan.execute(flags),
-                        ApplyMode::Destroy => plugin_plan.plan.revert(flags),
-                    };
+                    let result = run_plan(plugin_plan.plan, flags, mode);
                     match result {
                         Ok(()) => {
                             if mode == ApplyMode::Generate && !dry_run {
@@ -8083,6 +8158,42 @@ mod tests {
     #[test]
     fn parse_edge_serve_needs_an_origin() {
         assert!(Cli::try_parse_from(["autumn", "edge", "serve"]).is_err());
+    }
+
+    #[test]
+    fn parse_edge_bundle_defaults() {
+        let cli =
+            Cli::try_parse_from(["autumn", "edge", "bundle", "--origin", "https://o.example"])
+                .unwrap();
+        match cli.command {
+            Commands::Edge {
+                command:
+                    EdgeCommands::Bundle {
+                        target,
+                        capsule,
+                        origin,
+                        out,
+                        name,
+                        response_headers,
+                        probe_path,
+                        no_probe,
+                    },
+            } => {
+                assert_eq!(target, edge_bundle::BundleTarget::Cloudflare);
+                assert_eq!(capsule, "target/wasm32-wasip1/release/edge-capsule.wasm");
+                assert_eq!(origin.as_deref(), Some("https://o.example"));
+                assert_eq!(out, "edge/cloudflare");
+                assert_eq!(name, None);
+                assert!(response_headers.is_empty());
+                assert_eq!(probe_path, "/");
+                assert!(!no_probe);
+            }
+            _ => panic!("expected edge bundle"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "edge", "bundle", "--target", "lambda"]).is_err(),
+            "an unknown target is a usage error"
+        );
     }
 
     #[test]

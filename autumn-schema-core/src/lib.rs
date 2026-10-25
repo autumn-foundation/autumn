@@ -631,6 +631,39 @@ impl ColumnType {
     }
 }
 
+/// The `SQLite` expression that builds a random version-4 UUID (see
+/// [`SQLITE_UUID_V4_SQL`]). A macro, so `concat!` can embed it in a literal.
+macro_rules! sqlite_uuid_v4_sql {
+    () => {
+        "lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || \
+         substr(lower(hex(randomblob(2))), 2) || '-' || \
+         substr('89ab', 1 + (random() & 3), 1) || substr(lower(hex(randomblob(2))), 2) || \
+         '-' || lower(hex(randomblob(6)))"
+    };
+}
+
+macro_rules! sqlite_uuid_pk_sql {
+    () => {
+        concat!(
+            "TEXT PRIMARY KEY NOT NULL DEFAULT (",
+            sqlite_uuid_v4_sql!(),
+            ")"
+        )
+    };
+}
+
+/// A `SQLite` expression that yields a random version-4 UUID as canonical
+/// lowercase hyphenated text.
+///
+/// `SQLite` has no `gen_random_uuid()`. This builds the same value from
+/// `randomblob`. It sets the version nibble to `4` and the variant nibble to one
+/// of `8`, `9`, `a`, `b`. Put it in parentheses to use it as a column `DEFAULT`.
+/// It uses `random() & 3`. `abs(random())` can overflow for the smallest `i64`.
+pub const SQLITE_UUID_V4_SQL: &str = sqlite_uuid_v4_sql!();
+
+/// The Rust type of a `SQLite` UUID key: `autumn-web`'s `TEXT`-backed newtype.
+pub const SQLITE_UUID_RUST_TYPE: &str = "autumn_web::db::sqlite_types::SqliteUuid";
+
 /// The primary-key strategy for a generated table.
 ///
 /// Mirrors `dsl::IdType`. Defaults conceptually to [`BigSerial`](Self::BigSerial)
@@ -648,8 +681,9 @@ pub enum IdKind {
     /// by `schema pull` recreates as `SERIAL` (auto-increment) rather than a plain
     /// `INTEGER PRIMARY KEY` that silently loses the sequence.
     Serial,
-    /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` (PG) / `TEXT PRIMARY KEY`
-    /// (`SQLite`) — a non-enumerable UUID.
+    /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` (PG) / `TEXT PRIMARY KEY NOT
+    /// NULL DEFAULT (<v4 expression>)` (`SQLite`) — a non-enumerable UUID that
+    /// the database generates on both backends.
     Uuid,
 }
 
@@ -687,7 +721,19 @@ impl IdKind {
                 "INTEGER PRIMARY KEY AUTOINCREMENT"
             }
             (Self::Uuid, Backend::Postgres) => "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
-            (Self::Uuid, Backend::Sqlite) => "TEXT PRIMARY KEY",
+            (Self::Uuid, Backend::Sqlite) => sqlite_uuid_pk_sql!(),
+        }
+    }
+
+    /// The Rust type for the `#[id]` struct field on `backend`.
+    ///
+    /// `SQLite` has no `uuid` column type. Its UUID key is the `TEXT`-backed
+    /// `SqliteUuid` newtype. Every other key has the same type on both backends.
+    #[must_use]
+    pub const fn rust_type_for(self, backend: Backend) -> &'static str {
+        match (self, backend) {
+            (Self::Uuid, Backend::Sqlite) => SQLITE_UUID_RUST_TYPE,
+            _ => self.rust_type(),
         }
     }
 }
@@ -1697,7 +1743,30 @@ mod tests {
             IdKind::Uuid.pk_sql(Backend::Postgres),
             "UUID PRIMARY KEY DEFAULT gen_random_uuid()"
         );
-        assert_eq!(IdKind::Uuid.pk_sql(Backend::Sqlite), "TEXT PRIMARY KEY");
+        assert_eq!(
+            IdKind::Uuid.pk_sql(Backend::Sqlite),
+            format!("TEXT PRIMARY KEY NOT NULL DEFAULT ({SQLITE_UUID_V4_SQL})")
+        );
+    }
+
+    #[test]
+    fn id_kind_uuid_rust_type_follows_the_backend() {
+        assert_eq!(IdKind::Uuid.rust_type_for(Backend::Postgres), "uuid::Uuid");
+        assert_eq!(
+            IdKind::Uuid.rust_type_for(Backend::Sqlite),
+            "autumn_web::db::sqlite_types::SqliteUuid"
+        );
+        assert_eq!(IdKind::BigSerial.rust_type_for(Backend::Sqlite), "i64");
+    }
+
+    #[test]
+    fn sqlite_uuid_default_names_no_postgres_function() {
+        assert!(!SQLITE_UUID_V4_SQL.contains("gen_random_uuid"));
+        assert!(SQLITE_UUID_V4_SQL.contains("randomblob"));
+        assert!(
+            !SQLITE_UUID_V4_SQL.contains("abs("),
+            "abs(i64::MIN) overflows"
+        );
     }
 
     #[test]

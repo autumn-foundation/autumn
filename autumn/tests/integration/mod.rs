@@ -106,6 +106,8 @@ mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
 mod edge_conformance_ci_coverage;
+#[cfg(all(feature = "ledger-profile", not(feature = "sqlite")))]
+mod ledger_capsule_profile;
 // The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
 // concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
 // of the parity claim lives in the example crate's conformance suite, which
@@ -161,6 +163,8 @@ mod fake_generators;
 mod fault_injection;
 mod feature_flags_integration;
 mod feed;
+#[cfg(feature = "maud")]
+mod form_field_options;
 mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
@@ -201,6 +205,7 @@ mod job_retry_jitter_pg;
 mod job_retry_jitter_redis;
 mod job_tenant_scope;
 mod job_tracking_route;
+mod job_tracking_settle_ack;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod lease_lock;
@@ -525,6 +530,7 @@ mod tenant_cell_unit;
 mod tenant_db_bulkhead;
 mod test_app_integration;
 mod test_db_integration;
+mod test_db_reset_table;
 mod throttle_route;
 mod time_zone_integration;
 #[cfg(feature = "tls")]

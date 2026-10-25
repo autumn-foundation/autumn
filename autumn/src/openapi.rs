@@ -528,6 +528,61 @@ impl_primitive_schema!(f32, "number", "number");
 impl_primitive_schema!(f64, "number", "number");
 impl_primitive_schema!(serde_json::Value, "object", "object");
 
+macro_rules! impl_scalar_schema {
+    ($ty:ty, $name:literal, $schema:expr) => {
+        impl OpenApiSchema for $ty {
+            fn schema_name() -> &'static str {
+                $name
+            }
+            fn schema() -> serde_json::Value {
+                $schema
+            }
+        }
+    };
+}
+
+impl_scalar_schema!(
+    uuid::Uuid,
+    "uuid",
+    serde_json::json!({ "type": "string", "format": "uuid" })
+);
+impl_scalar_schema!(
+    chrono::DateTime<chrono::Utc>,
+    "date-time",
+    serde_json::json!({ "type": "string", "format": "date-time" })
+);
+impl_scalar_schema!(
+    chrono::NaiveDate,
+    "date",
+    serde_json::json!({ "type": "string", "format": "date" })
+);
+// No `format`. A naive value has no UTC offset, so `date-time` is wrong.
+impl_scalar_schema!(
+    chrono::NaiveDateTime,
+    "naive-date-time",
+    serde_json::json!({
+        "type": "string",
+        "description": "ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00",
+    })
+);
+impl_scalar_schema!(rust_decimal::Decimal, "decimal", decimal_scalar_schema());
+
+/// The schema of a [`rust_decimal::Decimal`], as serde writes it.
+///
+/// By default, `rust_decimal` writes a JSON string. With the `serde-float` or
+/// `serde-arbitrary-precision` feature, it writes a number. Cargo merges the
+/// features of all crates in a build, so this function reads the type from
+/// serde at run time. The schema always matches the wire.
+#[must_use]
+pub fn decimal_scalar_schema() -> serde_json::Value {
+    match serde_json::to_value(rust_decimal::Decimal::new(12345, 2)) {
+        Ok(serde_json::Value::String(_)) => {
+            serde_json::json!({ "type": "string", "format": "decimal" })
+        }
+        _ => serde_json::json!({ "type": "number" }),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Compile-time inventory of `#[derive(OpenApiSchema)]` component schemas.
 // ──────────────────────────────────────────────────────────────────
@@ -2695,5 +2750,53 @@ mod tests {
             assign_display_keys(&reversed),
             "display-key assignment must not depend on input order"
         );
+    }
+}
+
+/// The scalar impls compile without the `openapi` feature, so their tests do too.
+#[cfg(test)]
+mod scalar_schema_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_impls_document_strings_with_a_format() {
+        use serde_json::json;
+        let cases = [
+            (
+                <uuid::Uuid as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "uuid"}),
+            ),
+            (
+                <chrono::DateTime<chrono::Utc> as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "date-time"}),
+            ),
+            (
+                <chrono::NaiveDate as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "date"}),
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, want);
+        }
+        let naive = <chrono::NaiveDateTime as OpenApiSchema>::schema();
+        assert_eq!(naive["type"], "string");
+        assert!(
+            naive.get("format").is_none(),
+            "naive has no offset: {naive}"
+        );
+    }
+
+    #[test]
+    fn decimal_schema_matches_its_serde_output() {
+        let wire = serde_json::to_value(rust_decimal::Decimal::new(12345, 2)).unwrap();
+        let schema = <rust_decimal::Decimal as OpenApiSchema>::schema();
+        if wire.is_string() {
+            assert_eq!(
+                schema,
+                serde_json::json!({"type": "string", "format": "decimal"})
+            );
+        } else {
+            assert_eq!(schema, serde_json::json!({"type": "number"}));
+        }
     }
 }

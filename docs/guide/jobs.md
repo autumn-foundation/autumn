@@ -851,7 +851,9 @@ Semantics:
 - Operator actions respect uniqueness: canceling an enqueued job (including
   one parked behind a concurrency slot) releases its key immediately, and
   retrying a failed unique job re-takes the key — or fails with a clear
-  conflict error when an equivalent job is already pending or running.
+  conflict error when an equivalent job is already pending or running. A
+  retried `pending`-window job gets its key back at once, so an equal enqueue
+  stays deduplicated while the retry waits.
 - On Redis, pending/running unique locks carry a 24-hour crash backstop TTL
   that is refreshed every time the job is claimed, retried, or recovered, so
   only a job left completely untouched for a full day can lose its lock.
@@ -1047,20 +1049,33 @@ The browser gets a progress bar within milliseconds and a download link the
 moment the job finishes — no hand-written status table, token, or polling
 endpoint anywhere in app code.
 
-### Known limitation: tracked status vs. the durable queue record
+### Tracked status follows the queue ack
 
-On the Redis and Postgres backends, a job's tracked status (`succeeded`/
-`failed`) is settled *before* that backend's own success/dead-letter
-acknowledgement is written. In the rare case where that ack later fails or
-is skipped (e.g. the claim changed because another worker recovered it as
-stale in between), the tracked status can briefly report a terminal state
-the durable queue record hasn't actually reached — a poller may stop
-watching a moment before the durable backend finishes catching up, which it
-does automatically on its own retry/recovery path. This window only opens
-on an ack failure, not on ordinary success/failure/retry. Treat the tracked
-status as a progress/UX signal for the caller, not as the source of truth
-for whether a job will run again — use the admin dashboard
-([Observability](#observability)) or `JobAdminBackend` for that.
+On the `sqlite`, `postgres` and `redis` backends, a worker writes the
+terminal tracked status (`succeeded` or `failed`) only after the queue
+accepts its acknowledgement. The queue checks that the worker still owns the
+claim.
+
+Delivery is at-least-once. An attempt can run past its visibility timeout
+while a second worker claims the same job. The queue rejects the ack of the
+first attempt, so Autumn does not write its status. The second attempt
+settles the record.
+
+If the ack fails with an error, the record stays `running`. Autumn recovers
+the job and runs it again. The next attempt settles the record. If the worker
+crashes after the ack and before the status write, the record stays
+`running` until its TTL ends. If a failed ack was for the last attempt, the
+queue dead-letters the job and the record ends `failed`, even when the handler
+succeeded. The `local` backend has no claim, so it writes
+the status at once.
+
+The queue row can be retried as soon as the ack lands. An operator retry in
+the short time before the status write can reset the record first. The late
+write then overwrites that reset. This needs a compare-and-swap token on the
+tracking write, which Autumn does not have yet.
+
+To see the durable queue state, use the admin dashboard
+([Observability](#observability)) or `JobAdminBackend`.
 
 ### Known limitation: stale progress writes on the Redis/Postgres stores
 
@@ -1163,6 +1178,8 @@ The migration is bundled with the framework and is applied automatically by
 works the same way regardless of `jobs.backend` — the framework migration
 also creates `autumn_job_tracking`, the table the Postgres-backed tracking
 store uses (see [Tracked jobs and progress polling](#tracked-jobs-and-progress-polling)).
+A later migration adds its `version` column. Run `autumn migrate` before you
+deploy a new binary.
 
 ---
 

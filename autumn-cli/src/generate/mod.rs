@@ -36,6 +36,7 @@ pub mod pwa;
 pub mod scaffold;
 mod scaffold_i18n;
 pub mod schema_edit;
+mod sweep;
 pub mod system_test;
 pub mod task;
 pub mod tauri;
@@ -44,6 +45,7 @@ pub mod teams;
 pub mod webhook;
 pub mod wizard;
 
+use provenance::RevertAnchor;
 use std::path::{Path, PathBuf};
 
 /// Errors that can occur during code generation.
@@ -101,6 +103,27 @@ pub enum GenerateError {
         format_collisions(.0)
     )]
     Diverged(Vec<PathBuf>),
+
+    /// `autumn destroy` would leave a shared-file edit behind (issue #2560).
+    /// `generate` recorded a revert for a file that still exists. The new plan
+    /// holds a revert of the same kind with different values. A project setting
+    /// that the arguments do not show (for example `[i18n]`) has changed.
+    #[error(
+        "refusing to destroy — it would leave edits behind. `generate` made the edit(s) \
+         below. A project setting has changed since, so this destroy does not revert \
+         them. Undo the setting change and run destroy again, or check the files by \
+         hand and pass --force:\n{}",
+        format_anchors(.0)
+    )]
+    RevertsDropped(Vec<RevertAnchor>),
+}
+
+fn format_anchors(anchors: &[RevertAnchor]) -> String {
+    anchors
+        .iter()
+        .map(|a| format!("  {a}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// ⚡ Bolt optimization: Formats collision paths directly into a pre-allocated
@@ -118,19 +141,6 @@ fn format_collisions(paths: &[PathBuf]) -> String {
     out
 }
 
-/// The generate-time rejection for a UUID primary key (`--id uuid`) on a
-/// `SQLite`-backed app (`SQLite` foundation, issue #1614 AC #4).
-///
-/// Postgres emits `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, so ids are
-/// server-generated. `SQLite` has no `uuid` type nor a `gen_random_uuid()`
-/// default, and the `#[model]` macro's generated `New*` insert type omits
-/// `#[id]` fields — so on `SQLite` an inserted row would get a NULL/omitted id
-/// (a non-integer `PRIMARY KEY` is not implicitly `NOT NULL` in `SQLite`).
-/// Making it work needs app-side UUID generation in the repository insert
-/// codegen, which the `SQLite` runtime slice deferred and #2555 now carries.
-/// Rather than emit a `TEXT PRIMARY KEY` column
-/// that silently accepts NULL ids, generation fails here with an actionable
-/// message (AC #4).
 #[must_use]
 /// `--id uuid` cannot be combined with `comments:commentable`.
 ///
@@ -145,19 +155,6 @@ pub fn uuid_pk_commentable_unsupported_error() -> GenerateError {
  )
 }
 
-pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
-    GenerateError::Config(
-        "UUID primary keys (--id uuid) are not yet supported on SQLite apps; Postgres uses \
-         `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, but SQLite has no uuid type nor a \
-         gen_random_uuid() default, and the generated `New*` insert type omits `#[id]` \
-         fields — so inserted rows would get NULL/omitted ids. App-side UUID generation is \
-         tracked in \
-         https://github.com/autumn-foundation/autumn/issues/2555 — re-run without `--id uuid` to use \
-         the default INTEGER PRIMARY KEY AUTOINCREMENT, or target a Postgres database."
-            .to_owned(),
-    )
-}
-
 /// The generate-time rejection for a sharded model (`--sharded`) on a
 /// `SQLite`-backed app (`SQLite` foundation, issue #1614 AC #4).
 ///
@@ -166,8 +163,8 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
 /// `[[database.shards]]` topology. But `DatabaseConfig::validate_backend_consistency`
 /// rejects *any* `database.shards` against a `SQLite` primary, so no valid
 /// `SQLite` config can ever use a generated sharded resource. Unlike UUID ids
-/// (#2555) — and unlike FTS, now supported on `SQLite` via FTS5 (#1910), and
-/// every field kind, now converted (#1924) — this is **not** a deferred slice:
+/// (#2555), FTS (#1910) and every field kind (#1924), which now generate on
+/// `SQLite`, this is **not** a deferred slice:
 /// `SQLite` is single-host / single-writer, so
 /// horizontal sharding is Postgres-only and permanently out of scope for
 /// `SQLite` (see `docs/guide/sqlite-in-production.md`). Rather than emit a
@@ -1121,6 +1118,35 @@ mod tests {
         assert_eq!(
             detect_backend_with(tmp.path(), Some("prod"), no_env),
             DatabaseBackend::Postgres
+        );
+    }
+
+    /// Drift guard for the Echo linked-copies record on `tauri`'s and
+    /// `tauri_mobile`'s placeholder icon assets (below Echo's rule of three
+    /// at 2 instances, see issue #2509): both generators hand-copied the same
+    /// PNG/ICO/ICNS bytes and the same placeholder SVG. If either generator's
+    /// copy changes without the other, this fails — change both or neither.
+    #[test]
+    fn placeholder_icon_assets_match_between_desktop_and_mobile_tauri_generators() {
+        assert_eq!(
+            tauri::PLACEHOLDER_PNG,
+            tauri_mobile::PLACEHOLDER_PNG,
+            "tauri's and tauri_mobile's placeholder PNG bytes have drifted"
+        );
+        assert_eq!(
+            tauri::PLACEHOLDER_ICO,
+            tauri_mobile::PLACEHOLDER_ICO,
+            "tauri's and tauri_mobile's placeholder ICO bytes have drifted"
+        );
+        assert_eq!(
+            tauri::PLACEHOLDER_ICNS,
+            tauri_mobile::PLACEHOLDER_ICNS,
+            "tauri's and tauri_mobile's placeholder ICNS bytes have drifted"
+        );
+        assert_eq!(
+            tauri::render_placeholder_icon_svg(),
+            tauri_mobile::render_placeholder_icon_svg(),
+            "tauri's and tauri_mobile's placeholder SVG have drifted"
         );
     }
 }

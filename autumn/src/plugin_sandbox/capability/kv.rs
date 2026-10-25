@@ -574,6 +574,40 @@ mod tests {
         }
     }
 
+    /// Answers every read with bytes that are not JSON.
+    #[derive(Debug, Default)]
+    struct CorruptCache;
+
+    impl crate::cache::Cache for CorruptCache {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            None
+        }
+
+        fn insert_value(&self, _key: &str, _value: Arc<dyn std::any::Any + Send + Sync>) {}
+
+        fn invalidate(&self, _key: &str) {}
+
+        fn clear(&self) {}
+
+        fn try_get_value(
+            &self,
+            _key: &str,
+        ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, crate::cache::CacheBackendError>
+        {
+            Ok(Some(Arc::new(crate::cache::RawCacheBytes(b"{".to_vec()))))
+        }
+    }
+
+    #[test]
+    fn a_corrupt_stored_value_is_a_failure_not_an_absent_key() {
+        let store = CacheKvStore(Arc::new(CorruptCache) as Arc<dyn crate::cache::Cache>);
+        let get = store.get("k");
+        assert!(
+            get.as_ref().is_err_and(|e| e.contains("cannot be decoded")),
+            "{get:?}"
+        );
+    }
+
     #[test]
     fn a_cache_failure_reaches_the_guest_as_a_failure() {
         let store = CacheKvStore(Arc::new(DownCache) as Arc<dyn crate::cache::Cache>);

@@ -1144,10 +1144,11 @@ Everything `model` produces, plus:
   `autumn_web::test::{TestApp, TestClient, TestDb}`: it boots a throwaway
   Postgres database, fires a request at a stand-in for the scaffolded index
   route, and asserts a real response — no running server, no env var, no
-  silent skip. `cargo test` reports it as `ignored` with an explicit reason
-  (Docker isn't assumed to be available); run `cargo test -- --ignored` to
-  execute it for real. `--api` scaffolds get the JSON equivalent, asserting
-  against `GET /api/<plural>`.
+  silent skip. On Postgres, `cargo test` reports it as `ignored` with an
+  explicit reason (Docker isn't assumed to be available); run
+  `cargo test -- --ignored` to execute it for real. On a SQLite app it uses a
+  temp-file database, so a plain `cargo test` runs it. `--api` scaffolds get the
+  JSON equivalent, asserting against `GET /api/<plural>`.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op. By default, the scaffold registers only
@@ -1219,10 +1220,11 @@ Contract of the generated handler:
 | Situation | Behaviour |
 | --------- | --------- |
 | Checked rows | Deleted through the repository's `delete_many`, then a `Deleted N <plural>` flash and a 303 back to the index. |
-| Field name | `name="ids"` (matching `autumn-admin-plugin`); the parser also accepts the `ids[]` spelling some clients send. |
+| Field name | `name="ids"` (matching `autumn-admin-plugin`). The ids decode into `BulkSelection { ids: Vec<i64> }` through `autumn_web::form::from_urlencoded`. The `ids[]` spelling also works. |
 | Empty selection | Info flash + 303 redirect. **Never** a 400 — a list-write endpoint doesn't fail on missing params. |
-| Malformed id (`ids=abc`) | Silently dropped, same as above. Duplicates are collapsed through a `HashSet`, so parsing a crafted body full of distinct ids stays linear rather than quadratic. |
-| Oversized selection | Capped at `MAX_BULK_IDS` (5000). A real selection is page-sized, so this only bites on a hand-crafted body — the default 32 MiB request limit otherwise leaves room for over a million ids. The parser stops one past the cap, and the handler refuses the batch with an error flash rather than truncating it: a silently partial destructive batch is worse than a refused one. |
+| Malformed body (`ids=abc`, or `ids` mixed with `ids[]`) | Error flash + 303 redirect. Never a 400. Nothing is deleted. |
+| Duplicate ids | Collapsed through a `HashSet`. A crafted body full of distinct ids stays linear, not quadratic. |
+| Oversized selection | Capped at `MAX_BULK_IDS` (5000). A real selection is page-sized, so this only bites on a hand-crafted body — the default 32 MiB request limit otherwise leaves room for over a million ids. The handler counts the submitted ids before it decodes them and stops one past the cap. It refuses the batch with an error flash rather than truncating it: a silently partial destructive batch is worse than a refused one. |
 | Large selection | The pre-flight `SELECT` is chunked at 1000 ids. `eq_any` binds one parameter per id, and `autumn_web::repository::MAX_BIND_PARAMS` is 32766 on SQLite, so one unbounded `eq_any` would fail with "too many SQL variables" before reaching the already-chunked `delete_many`. |
 | `--soft-delete` | The pre-flight `SELECT` filters `deleted_at IS NULL`, and `delete_many` applies the soft-delete update — no hand-rolled `deleted_at` write. |
 | Record policy wiring on (an owner column, the default) | Each selected row is authorized with the same `"delete"` action `destroy` uses. A row the actor may not delete is dropped from the batch rather than 403'ing the request, so the endpoint is not an existence oracle. |
@@ -1411,6 +1413,7 @@ autumn generate scaffold Post title:String comments:commentable
 
   ```rust
   .nest("/comments", autumn_web::commentable::router(Default::default()))
+  .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
   ```
 
   and render a thread with `autumn_web::widgets::comment_thread`. Adding a
@@ -2210,6 +2213,19 @@ quietly do nothing. It also keeps one command from claiming another's files:
 `autumn new --starter` writes through the same machinery, and no generator
 owns what it wrote.
 
+`generate` records each edit it makes to a shared file (`Cargo.toml`,
+`src/main.rs`, `i18n/en.ftl`) under `[[runs.<id>]]`. `destroy` refuses when
+a recorded edit is in a file that still exists, and the new plan reverts that
+kind of edit at a different place. This happens when a project setting that
+the arguments do not show (for example `[i18n] dir`) changes after `generate`.
+Without the check, `destroy` deletes the owned files and leaves the edit in
+the shared file. The message names each edit. Undo the setting change and run
+`destroy` again. Or check the files by hand and pass `--force`. `--dry-run`
+lists the edits and changes nothing. A plan that reverts more than `generate`
+edited is fine. An edit in a file that no longer exists is also fine. A
+manifest from an older CLI has no record, so `destroy` keeps the old behaviour.
+`destroy` checks only edits that have a revert.
+
 Commit `.autumn/generated.toml`. It is the baseline a later checkout compares
 against. Without it, `destroy` can only compare against the current templates —
 so a CLI upgrade that changed a template makes every untouched file that
@@ -2232,6 +2248,26 @@ A file that several resources share (a mailer's `_layout.html`, say) is
 never a hard error and is never force-deleted. `destroy` removes it only
 when it is provably this generator's own output and no sibling resource is
 left in its directory; otherwise it warns and leaves it in place.
+
+A newer CLI can rename or drop a file that an older template made. The current
+plan does not name the old file, but the manifest does. `destroy` sweeps it:
+
+- It deletes the file when the digest still matches and the current templates
+  create a file in the same directory. It prints
+  `Removed <path> (no longer generated)`.
+- It keeps the file and names it in a warning when you edited the file, when
+  other resources can share it, when other Rust code still names it, when the
+  templates create nothing in its directory, or when the manifest entry is from
+  Autumn 0.8.0 (that entry does not say which resource owns the file).
+  `--force` does not change this.
+- It never sweeps a migration, a project file such as `Cargo.toml` or
+  `src/main.rs`, a path with a dot segment (`.env`, `.git/`), a file under
+  `target/`, or a path through a symlink.
+
+The manifest decides what the sweep can delete, so review changes to
+`.autumn/generated.toml` as you review code.
+
+`--dry-run` lists the files the sweep would delete.
 
 `destroy` also removes each entry it acted on from the manifest, and deletes
 the manifest once it holds nothing. Deleting or hand-editing the manifest

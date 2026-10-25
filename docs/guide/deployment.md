@@ -1694,7 +1694,7 @@ binary, then deploy again.
 Two layers exercise the real `autumn deploy` lifecycle over real ssh/scp +
 systemd + kamal-proxy — nothing is mocked:
 
-- **Container e2e (every CI run):** `autumn-cli/tests/deploy_e2e.rs` drives first
+- **Container e2e (`Test (Docker deploy)` CI job):** `autumn-cli/tests/deploy_e2e.rs` drives first
   deploy, zero-downtime redeploy, on-demand rollback, and forced-failure
   auto-rollback against a privileged systemd+sshd container. The same binary also
   drives a **two-host fleet lifecycle** across two containers — rolling both
@@ -1732,9 +1732,9 @@ systemd + kamal-proxy — nothing is mocked:
   harness's curl/ssh assertions while driving the real `autumn` binary; the
   Hetzner-specific provisioning is isolated in the workflow so another provider
   can be swapped in without touching the script. The in-container half of the
-  pam_systemd socket check runs as part of the standard
-  `cargo test -p autumn-cli --test deploy_e2e -- --ignored` Docker sweep (no
-  separate feature needed).
+  pam_systemd socket check runs in the `Test (Docker deploy)` CI job. The job
+  runs `cargo test -p autumn-cli --test deploy_e2e -- --ignored`. No separate
+  feature is needed.
 
 ---
 
