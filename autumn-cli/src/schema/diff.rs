@@ -2664,7 +2664,8 @@ enum RebuildLeg {
 /// shape (`baseline` + this table's diff deltas — the same value the up leg builds
 /// as its target), **not** the parser's partial `ctx.desired`, so a
 /// retained-but-parser-invisible column is copied back on rollback rather than
-/// dropped.
+/// dropped. Both legs take the decimal shapes from `ctx.desired`
+/// ([`with_desired_decimal_shapes`]), so the decimal `CHECK` stays.
 fn emit_sqlite_rebuild(
     table: &str,
     ctx: &SchemaContext,
@@ -2698,10 +2699,9 @@ fn emit_sqlite_rebuild(
             ),
         });
     }
-    // Fetched as a validated precondition (a missing desired shape is a directed
-    // error, exercised by the up leg's missing-context path); neither leg copies
-    // from the parser's partial desired table any more.
-    let _desired = ctx
+    // A missing desired shape is a directed error. Neither leg copies columns
+    // from the parser's partial desired table; it gives the decimal shapes only.
+    let desired = ctx
         .desired
         .get(table)
         .ok_or_else(|| missing_rebuild_shape(table, "desired"))?;
@@ -2715,7 +2715,10 @@ fn emit_sqlite_rebuild(
         // could not observe; the source (INSERT..SELECT) columns are the baseline's,
         // i.e. the actual existing table.
         RebuildLeg::Up => {
-            let new_shape = baseline_with_changes_applied(baseline, changes, table);
+            let new_shape = with_desired_decimal_shapes(
+                baseline_with_changes_applied(baseline, changes, table),
+                desired,
+            );
             let fk_cols = fk_type_change_columns(changes, table);
             Ok(render_sqlite_rebuild(
                 table, &new_shape, baseline, leg, &fk_cols,
@@ -2734,7 +2737,7 @@ fn emit_sqlite_rebuild(
             let fk_cols = fk_type_change_columns(changes, table);
             Ok(render_sqlite_rebuild(
                 table,
-                baseline,
+                &with_desired_decimal_shapes(baseline.clone(), desired),
                 &post_migration,
                 leg,
                 &fk_cols,
@@ -2844,6 +2847,26 @@ fn baseline_with_changes_applied(
                 shape.indexes.retain(|i| i.name != index.name);
             }
             _ => {}
+        }
+    }
+    shape
+}
+
+/// Give a `SQLite` rebuild shape the desired decimal shape of each column that
+/// keeps its storage class (issue #2598).
+///
+/// The renderer builds the decimal `CHECK` from that shape. The baseline can
+/// lose it: `--dev-url` and `schema pull` read the column as `TEXT`, and an old
+/// snapshot holds the `{12, 2}` default. Without this, a rebuild removes the
+/// `CHECK` or makes it wrong. A column of a different storage class keeps its
+/// type, because that is a real type change.
+fn with_desired_decimal_shapes(mut shape: Table, desired: &Table) -> Table {
+    for column in &mut shape.columns {
+        if let Some(want) = desired.columns.iter().find(|c| c.name == column.name)
+            && matches!(want.ty, ColumnType::Decimal { .. })
+            && column_types_equivalent(&column.ty, &want.ty, Backend::Sqlite)
+        {
+            column.ty = want.ty.clone();
         }
     }
     shape
@@ -3609,8 +3632,9 @@ fn emit_add_column(table: &str, column: &Column, backend: Backend) -> Result<Str
 }
 
 /// Render a column definition body: `{name} {type} {NOT NULL|NULL} [REFERENCES
-/// t(c) [ON DELETE a] [ON UPDATE a]] [DEFAULT d]`. Shared by `CREATE TABLE` (non-PK columns) and `ADD
-/// COLUMN`.
+/// t(c) [ON DELETE a] [ON UPDATE a]] [DEFAULT d] [CHECK (…)]`. Shared by `CREATE
+/// TABLE` (non-PK columns) and `ADD COLUMN`. The `CHECK` is the `SQLite` decimal
+/// `CHECK` only.
 fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> String {
     let mut def = format!(
         "{} {} {}",
@@ -3639,6 +3663,18 @@ fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> 
     }
     if let Some(default) = &column.default {
         let _ = write!(def, " DEFAULT {}", default_sql(default, backend));
+    }
+    // #2598: a `SQLite` decimal is `TEXT`, so a `CHECK` holds its shape. The
+    // generator builds the same `CHECK`, so the two lanes cannot drift.
+    if backend == Backend::Sqlite
+        && let ColumnType::Decimal { precision, scale } = column.ty
+    {
+        let check = crate::generate::schema_edit::sqlite_decimal_check(
+            &column.name,
+            u32::from(precision),
+            u32::from(scale),
+        );
+        let _ = write!(def, " {check}");
     }
     def
 }
@@ -8008,17 +8044,21 @@ PRAGMA foreign_keys=ON;
             precision: 12,
             scale: 2,
         };
+        // `DROP NOT NULL` on `views` is the unrelated change: SQLite can only
+        // apply it with a rebuild.
+        let mut views = col("views", ColumnType::Int64);
+        views.nullable = true;
         for baseline_ty in [PRICE, ColumnType::Text, stale] {
             let baseline = sqlite_table(
                 "products",
-                vec![col("views", ColumnType::Int32), col("price", baseline_ty.clone())],
+                vec![
+                    col("views", ColumnType::Int64),
+                    col("price", baseline_ty.clone()),
+                ],
                 vec![],
             );
-            let desired = sqlite_table(
-                "products",
-                vec![col("views", ColumnType::Int64), col("price", PRICE)],
-                vec![],
-            );
+            let desired =
+                sqlite_table("products", vec![views.clone(), col("price", PRICE)], vec![]);
             let plan = diff_schema(
                 std::slice::from_ref(&baseline),
                 &parsed(vec![desired.clone()], vec![]),
@@ -8036,8 +8076,14 @@ PRAGMA foreign_keys=ON;
             );
             let stale_check = crate::generate::schema_edit::sqlite_decimal_check("price", 12, 2);
             for (leg, sql) in [
-                ("up", emit_up_sql_with_context(&plan, &ctx).expect("emit up")),
-                ("down", emit_down_sql_with_context(&plan, &ctx).expect("emit down")),
+                (
+                    "up",
+                    emit_up_sql_with_context(&plan, &ctx).expect("emit up"),
+                ),
+                (
+                    "down",
+                    emit_down_sql_with_context(&plan, &ctx).expect("emit down"),
+                ),
             ] {
                 assert!(
                     sql.contains(&format!("    price TEXT NOT NULL {}", price_check())),
@@ -8068,10 +8114,16 @@ PRAGMA foreign_keys=ON;
             std::slice::from_ref(&baseline),
         );
         let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
-        assert!(up.contains(&price_check()), "the up leg adds the CHECK: {up}");
+        assert!(
+            up.contains(&price_check()),
+            "the up leg adds the CHECK: {up}"
+        );
         let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
         assert!(down.contains("    price INTEGER NOT NULL"), "{down}");
-        assert!(!down.contains("CHECK"), "the down leg restores INTEGER: {down}");
+        assert!(
+            !down.contains("CHECK"),
+            "the down leg restores INTEGER: {down}"
+        );
     }
 
     #[test]

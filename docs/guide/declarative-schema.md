@@ -396,6 +396,16 @@ closed on: instead of refusing, the emitted migration carries an
 hand-written triggers or dependent views you must re-create the triggers and
 repair the views in a manual migration after applying the rebuild.
 
+**A decimal column keeps its `CHECK` (#2598).** SQLite stores `decimal{p,s}`
+as `TEXT`, and a `CHECK` enforces the precision and scale. `schema diff` writes
+the same `CHECK` as `autumn generate`, in `CREATE TABLE`, `ADD COLUMN` and the
+table-recreate. The parser reads the shape from the
+`#[decimal_shape(precision = p, scale = s)]` attribute that `autumn generate`
+writes on the field. A decimal field without the attribute is `{12, 2}`. The
+recreate uses the model shape, also when the baseline reads the column as plain
+`TEXT` (`--dev-url`, `schema pull`). If a row does not agree with the `CHECK`,
+the copy into the new table fails and the migration stops.
+
 ---
 
 ## `autumn schema migrate`

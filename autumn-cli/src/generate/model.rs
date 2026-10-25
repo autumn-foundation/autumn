@@ -4420,17 +4420,36 @@ mod tests {
             conn.batch_execute(&fs::read_to_string(generated_up).expect("read up.sql"))
                 .expect("apply the generated migration");
             let check = sqlite_decimal_check("price", 10, 2);
-            assert!(table_sql(&mut conn).contains(&check), "the generator wrote the CHECK");
+            assert!(
+                table_sql(&mut conn).contains(&check),
+                "the generator wrote the CHECK"
+            );
 
-            // The baseline `autumn schema snapshot` writes from these models.
+            // Opt the model in to the declarative lane, then take the
+            // baseline that `autumn schema snapshot` writes.
             let models = tmp.path().join("src/models");
+            let model_path = models.join("product.rs");
+            let model = fs::read_to_string(&model_path).expect("read model");
+            assert!(model.contains("#[autumn_web::model]\n"), "{model}");
+            fs::write(
+                &model_path,
+                model.replace("#[autumn_web::model]\n", "#[autumn_web::model(managed)]\n"),
+            )
+            .expect("mark the model managed");
             let snapshot = parse_models_path(&models, Backend::Sqlite).expect("parse models");
-            assert!(snapshot.diagnostics.is_empty(), "{:?}", snapshot.diagnostics);
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{:?}",
+                snapshot.diagnostics
+            );
             let clean = diff_schema(&snapshot.tables, &snapshot, DiffOptions::default());
-            assert!(clean.changes.is_empty(), "spurious diff: {:?}", clean.changes);
+            assert!(
+                clean.changes.is_empty(),
+                "spurious diff: {:?}",
+                clean.changes
+            );
 
             // An unrelated change that SQLite can only apply with a rebuild.
-            let model_path = models.join("product.rs");
             let model = fs::read_to_string(&model_path).expect("read model");
             assert!(model.contains("pub title: String,"), "{model}");
             fs::write(

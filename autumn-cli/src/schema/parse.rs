@@ -1180,6 +1180,9 @@ struct FieldAttrs {
     /// An unknown action value. The parser skips the column and records a
     /// diagnostic.
     reference_error: Option<String>,
+    /// `#[decimal_shape(precision = p, scale = s)]` (issue #2598): the declared
+    /// `decimal{p,s}`, or the problem with a bad attribute.
+    decimal_shape: Option<Result<(u8, u8), String>>,
 }
 
 /// The SQL default a `#[translatable]` column's storage requires — the empty
@@ -1205,6 +1208,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         on_delete: None,
         on_update: None,
         reference_error: None,
+        decimal_shape: None,
     };
     for attr in &field.attrs {
         let Some(ident) = attr.path().get_ident() else {
@@ -1229,6 +1233,10 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             // #1806: same storage contract as `#[translatable]` — `TEXT NOT
             // NULL` with an empty-container default the type cannot carry.
             "collaborative" => out.is_collaborative = true,
+            // #2598: the first attribute wins, as in the `#[model]` macro.
+            "decimal_shape" if out.decimal_shape.is_none() => {
+                out.decimal_shape = Some(parse_decimal_shape(attr));
+            }
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
@@ -1267,6 +1275,38 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         }
     }
     out
+}
+
+/// Read `#[decimal_shape(precision = p, scale = s)]` (issue #2598).
+///
+/// `autumn generate` writes it on each `decimal{p,s}` field. The Rust type does
+/// not carry the shape. The bounds are the bounds of the generator DSL.
+fn parse_decimal_shape(attr: &syn::Attribute) -> Result<(u8, u8), String> {
+    let mut precision = None;
+    let mut scale = None;
+    attr.parse_nested_meta(|meta| {
+        let slot = if meta.path.is_ident("precision") {
+            &mut precision
+        } else if meta.path.is_ident("scale") {
+            &mut scale
+        } else {
+            return Err(meta.error("expected `precision` or `scale`"));
+        };
+        *slot = Some(meta.value()?.parse::<syn::LitInt>()?.base10_parse::<u8>()?);
+        Ok(())
+    })
+    .map_err(|e| format!("bad `#[decimal_shape]`: {e}"))?;
+    let (Some(precision), Some(scale)) = (precision, scale) else {
+        return Err("`#[decimal_shape]` needs `precision` and `scale`".to_owned());
+    };
+    let max = crate::generate::dsl::MAX_DECIMAL_PRECISION;
+    if precision == 0 || u32::from(precision) > max || scale > precision {
+        return Err(format!(
+            "`#[decimal_shape(precision = {precision}, scale = {scale})]` is out of range \
+             (precision 1 to {max}, scale 0 to precision)"
+        ));
+    }
+    Ok((precision, scale))
 }
 
 /// Return the problem with the `#[references]` actions of `raw`, or `None`. A
@@ -1394,6 +1434,28 @@ fn build_table(
             Some(ColumnType::Text)
         } else {
             ColumnType::from_rust_type(&raw.rust_type)
+        };
+        // #2598: the declared shape replaces the `{12, 2}` default. A bad
+        // attribute skips the column: a guessed shape gives a wrong `SQLite`
+        // `CHECK`.
+        let column_ty = match (column_ty, &raw.attrs.decimal_shape) {
+            (Some(ColumnType::Decimal { .. }), Some(Ok((precision, scale)))) => {
+                Some(ColumnType::Decimal {
+                    precision: *precision,
+                    scale: *scale,
+                })
+            }
+            (Some(ColumnType::Decimal { .. }), Some(Err(problem))) => {
+                diagnostics.push(SchemaDiagnostic {
+                    model: model_name.clone(),
+                    table: table_name.clone(),
+                    field: raw.name.clone(),
+                    rust_type: raw.rust_type.clone(),
+                    message: format!("{problem} on `{model_name}.{}`; column skipped", raw.name),
+                });
+                continue;
+            }
+            (ty, _) => ty,
         };
         let Some(ty) = column_ty else {
             // Unknown/unsupported type (a generated enum, an association type):
@@ -2400,7 +2462,11 @@ mod tests {
                 parsed.tables[0].columns.iter().all(|c| c.name != "price"),
                 "`{attr}` must skip the column"
             );
-            assert_eq!(parsed.diagnostics.len(), 1, "`{attr}` must add a diagnostic");
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "`{attr}` must add a diagnostic"
+            );
             assert_eq!(parsed.diagnostics[0].field, "price");
             assert!(
                 parsed.diagnostics[0].message.contains("decimal_shape"),
