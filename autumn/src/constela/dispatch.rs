@@ -988,4 +988,150 @@ mod tests {
         assert_eq!(path_segments(&json!(["a", "b", "c"]), 2), None);
         assert!(path_segments(&json!("a.b"), 2).is_some());
     }
+
+    /// Dispatch `action` of a document with the given steps, state and
+    /// payload.
+    fn dispatch_steps(
+        state: &str,
+        steps: &str,
+        initial: &[(&str, Value)],
+        payload: &[(&str, Value)],
+    ) -> (Result<Dispatched, ConstelaError>, Map<String, Value>) {
+        let source = format!(
+            r#"{{"version":"1.0","state":{{{state}}},
+                "actions":[{{"name":"go","steps":[{steps}]}}],
+                "view":{{"kind":"element","tag":"div"}}}}"#
+        );
+        let document =
+            crate::constela::Document::parse(&source, &crate::constela::Limits::default())
+                .unwrap_or_else(|err| panic!("valid document: {err}"));
+        let mut values = document.initial_state();
+        for (key, value) in initial {
+            values.insert((*key).to_string(), value.clone());
+        }
+        let payload: Map<String, Value> = payload
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect();
+        let outcome = document.dispatch("go", &mut values, &payload);
+        (outcome, values)
+    }
+
+    #[test]
+    fn effects_keep_their_evaluated_operands() {
+        let cases = [
+            (
+                r#"{"do":"fetch","url":{"expr":"var","name":"u"},"method":"POST",
+                    "body":{"expr":"lit","value":{"a":1}},"result":"r"}"#,
+                Effect::Fetch {
+                    url: "/api".into(),
+                    method: HttpMethod::Post,
+                    body: Some(json!({"a": 1})),
+                    result: Some("r".into()),
+                },
+            ),
+            (
+                r#"{"do":"storage","operation":"set","key":{"expr":"lit","value":7},
+                    "value":{"expr":"var","name":"u"},"storage":"local"}"#,
+                Effect::Storage {
+                    operation: StorageOperation::Set,
+                    area: StorageArea::Local,
+                    key: "7".into(),
+                    value: Some(json!("/api")),
+                    result: None,
+                },
+            ),
+            (
+                r#"{"do":"navigate","url":{"expr":"var","name":"u"},"replace":true}"#,
+                Effect::Navigate {
+                    url: "/api".into(),
+                    replace: true,
+                },
+            ),
+            (
+                r#"{"do":"delay","ms":{"expr":"lit","value":250},"then":[]}"#,
+                Effect::Delay { ms: 250.0 },
+            ),
+            (
+                r#"{"do":"interval","ms":{"expr":"lit","value":"x"},"action":"go"}"#,
+                Effect::Interval {
+                    ms: 0.0,
+                    action: "go".into(),
+                },
+            ),
+            (
+                r#"{"do":"focus","target":{"expr":"lit","value":"field"},"operation":"focus"}"#,
+                Effect::Focus {
+                    target: "field".into(),
+                    operation: "focus".into(),
+                },
+            ),
+        ];
+        for (step, expected) in cases {
+            let (outcome, _) = dispatch_steps("", step, &[], &[("u", json!("/api"))]);
+            let outcome = outcome.unwrap_or_else(|err| panic!("{step}: {err}"));
+            assert_eq!(outcome.effects, vec![expected], "{step}");
+            assert!(outcome.is_suspended());
+        }
+    }
+
+    #[test]
+    fn a_kept_effect_operand_charges_the_budget() {
+        let (outcome, _) = dispatch_steps(
+            "",
+            r#"{"do":"navigate","url":{"expr":"var","name":"u"}}"#,
+            &[],
+            &[("u", Value::String("/".repeat(5 * 1024 * 1024)))],
+        );
+        let err = outcome.expect_err("a 5 MiB URL copy is over the budget");
+        assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    }
+
+    #[test]
+    fn a_computed_url_with_a_bad_scheme_is_refused() {
+        let (outcome, _) = dispatch_steps(
+            "",
+            r#"{"do":"fetch","url":{"expr":"var","name":"u"}}"#,
+            &[],
+            &[("u", json!("javascript:alert(1)"))],
+        );
+        let err = outcome.expect_err("scheme refused");
+        assert_eq!(err.diagnostics()[0].code, codes::URL_SCHEME);
+    }
+
+    #[test]
+    fn pure_steps_write_moved_values_into_state() {
+        let (outcome, state) = dispatch_steps(
+            r#""items":{"type":"list","initial":[1,2,3]},
+               "form":{"type":"object","initial":{}},
+               "on":{"type":"boolean","initial":false}"#,
+            r#"{"do":"update","target":"items","operation":"splice",
+                "index":{"expr":"lit","value":1},"deleteCount":{"expr":"lit","value":1},
+                "value":{"expr":"var","name":"extra"}},
+               {"do":"setPath","target":"form","path":{"expr":"lit","value":"a.b"},
+                "value":{"expr":"var","name":"extra"}},
+               {"do":"if","condition":{"expr":"state","name":"on"},
+                "then":[{"do":"set","target":"on","value":{"expr":"lit","value":"then"}}],
+                "else":[{"do":"update","target":"on","operation":"toggle"}]}"#,
+            &[],
+            &[("extra", json!(["x", "y"]))],
+        );
+        assert!(outcome.expect("pure").is_pure());
+        assert_eq!(state["items"], json!([1, "x", "y", 3]));
+        assert_eq!(state["form"], json!({"a": {"b": ["x", "y"]}}));
+        assert_eq!(state["on"], json!(true));
+    }
+
+    #[test]
+    fn a_set_path_over_the_depth_limit_is_refused() {
+        let (outcome, _) = dispatch_steps(
+            r#""form":{"type":"object","initial":{}}"#,
+            r#"{"do":"setPath","target":"form","path":{"expr":"var","name":"p"},
+                "value":{"expr":"lit","value":1}}"#,
+            &[],
+            &[("p", Value::Array(vec![json!("a"); 500]))],
+        );
+        let err = outcome.expect_err("path too deep");
+        assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    }
 }

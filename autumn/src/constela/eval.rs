@@ -1008,4 +1008,246 @@ mod tests {
         let err = eval(&expr, &ctx, "expr").expect_err("over budget");
         assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
     }
+
+    /// Evaluate with route values and style presets in scope, and a budget.
+    fn eval_full(
+        source: &str,
+        route: &RouteValues,
+        styles: &BTreeMap<String, StylePreset>,
+        budget: &Budget,
+    ) -> Result<Value, ConstelaError> {
+        let expr: Expr = serde_json::from_str(source).expect("expression parses");
+        let state = Map::new();
+        let env = Env::default();
+        let ctx = EvalCtx {
+            state: &state,
+            env: &env,
+            route,
+            styles,
+            depth: 64,
+            budget,
+        };
+        eval(&expr, &ctx, "expr")
+    }
+
+    #[test]
+    fn get_and_index_move_out_of_a_built_value() {
+        let built = r#"{"expr":"obj","props":{"a":{"expr":"array","elements":[
+            {"expr":"lit","value":"x"},{"expr":"lit","value":{"k":"v"}}]}}}"#;
+        assert_eq!(
+            eval_str(&format!(
+                r#"{{"expr":"get","base":{built},"path":"a.1.k"}}"#
+            )),
+            json!("v")
+        );
+        assert_eq!(
+            eval_str(&format!(r#"{{"expr":"get","base":{built},"path":"a.9"}}"#)),
+            json!(null)
+        );
+        assert_eq!(
+            eval_str(&format!(
+                r#"{{"expr":"index","base":{built},"key":{{"expr":"lit","value":"a"}}}}"#
+            )),
+            json!(["x", {"k": "v"}])
+        );
+        let list =
+            r#"{"expr":"array","elements":[{"expr":"lit","value":1},{"expr":"lit","value":2}]}"#;
+        assert_eq!(
+            eval_str(&format!(
+                r#"{{"expr":"index","base":{list},"key":{{"expr":"lit","value":1}}}}"#
+            )),
+            json!(2)
+        );
+        assert_eq!(
+            eval_str(&format!(
+                r#"{{"expr":"index","base":{list},"key":{{"expr":"lit","value":5}}}}"#
+            )),
+            json!(null)
+        );
+    }
+
+    #[test]
+    fn index_reads_objects_strings_and_nothing_else() {
+        let read = |base: &str, key: &str| {
+            eval_str(&format!(
+                r#"{{"expr":"index","base":{{"expr":"lit","value":{base}}},"key":{{"expr":"lit","value":{key}}}}}"#
+            ))
+        };
+        assert_eq!(read(r#"{"1":"one"}"#, "1"), json!("one"));
+        assert_eq!(read(r#"{"a":1}"#, r#""b""#), json!(null));
+        assert_eq!(read(r#""héllo""#, "1"), json!("é"));
+        assert_eq!(read(r#""abc""#, "9"), json!(null));
+        assert_eq!(read(r#""abc""#, r#""x""#), json!(null));
+        assert_eq!(read("7", "0"), json!(null));
+        // A built string indexes the same way.
+        assert_eq!(
+            eval_str(
+                r#"{"expr":"index","base":{"expr":"concat","items":[{"expr":"lit","value":"ab"}]},
+                    "key":{"expr":"lit","value":1}}"#
+            ),
+            json!("b")
+        );
+    }
+
+    #[test]
+    fn route_values_are_read_by_source() {
+        let mut route = RouteValues::default();
+        route.params.insert("id".into(), "7".into());
+        route.query.insert("q".into(), "tea".into());
+        route.path = "/posts/7".into();
+        let styles = BTreeMap::new();
+        let budget = Budget::new(usize::MAX);
+        let read = |source: &str| {
+            eval_full(
+                &format!(
+                    r#"{{"expr":"route","name":"{}","source":"{source}"}}"#,
+                    if source == "query" { "q" } else { "id" }
+                ),
+                &route,
+                &styles,
+                &budget,
+            )
+            .expect("evaluates")
+        };
+        assert_eq!(read("param"), json!("7"));
+        assert_eq!(read("query"), json!("tea"));
+        assert_eq!(read("path"), json!("/posts/7"));
+        assert_eq!(
+            eval_full(
+                r#"{"expr":"route","name":"missing","source":"param"}"#,
+                &route,
+                &styles,
+                &budget
+            )
+            .expect("evaluates"),
+            json!(null)
+        );
+    }
+
+    #[test]
+    fn a_style_expression_resolves_its_preset() {
+        let mut styles = BTreeMap::new();
+        styles.insert(
+            "btn".to_string(),
+            serde_json::from_str::<StylePreset>(
+                r#"{"base":"btn","variants":{"size":{"lg":"btn-lg"}}}"#,
+            )
+            .expect("preset parses"),
+        );
+        let route = RouteValues::default();
+        let budget = Budget::new(usize::MAX);
+        assert_eq!(
+            eval_full(
+                r#"{"expr":"style","name":"btn","variants":{"size":{"expr":"lit","value":"lg"}}}"#,
+                &route,
+                &styles,
+                &budget
+            )
+            .expect("evaluates"),
+            json!("btn btn-lg")
+        );
+        assert_eq!(
+            eval_full(
+                r#"{"expr":"style","name":"none"}"#,
+                &route,
+                &styles,
+                &budget
+            )
+            .expect("evaluates"),
+            json!("")
+        );
+    }
+
+    #[test]
+    fn coercions_follow_javascript() {
+        let bin = |op: &str, left: &str, right: &str| {
+            eval_str(&format!(
+                r#"{{"expr":"bin","op":"{op}","left":{{"expr":"lit","value":{left}}},"right":{{"expr":"lit","value":{right}}}}}"#
+            ))
+        };
+        assert_eq!(bin("+", "true", r#""x""#), json!("truex"));
+        assert_eq!(bin("+", "null", r#""x""#), json!("nullx"));
+        assert_eq!(bin("+", "[1,2]", "3"), json!("1,23"));
+        assert_eq!(bin("<", "[1]", r#""2""#), json!(true));
+        assert_eq!(bin(">=", r#""b""#, r#""a""#), json!(true));
+        assert_eq!(bin("<=", "1", "1"), json!(true));
+        assert_eq!(bin("!=", "1", "2"), json!(true));
+        assert_eq!(bin("*", "3", "4"), json!(12));
+        assert_eq!(bin("%", "7", "4"), json!(3));
+        assert_eq!(bin("/", "7", "2"), json!(3.5));
+        assert_eq!(
+            eval_str(
+                r#"{"expr":"concat","items":[{"expr":"lit","value":1},{"expr":"lit","value":null},{"expr":"lit","value":true}]}"#
+            ),
+            json!("1true")
+        );
+        assert_eq!(
+            eval_str(
+                r#"{"expr":"cond","if":{"expr":"lit","value":0},"then":{"expr":"lit","value":"a"},"else":{"expr":"lit","value":"b"}}"#
+            ),
+            json!("b")
+        );
+        assert_eq!(
+            eval_str(r#"{"expr":"not","operand":{"expr":"lit","value":[]}}"#),
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn a_read_borrows_and_a_kept_copy_charges() {
+        let mut state = Map::new();
+        state.insert("big".into(), json!("x".repeat(100)));
+        let expr: Expr = serde_json::from_str(r#"{"expr":"state","name":"big"}"#).expect("parses");
+        let styles = BTreeMap::new();
+        let route = RouteValues::default();
+        let env = Env::default();
+        let budget = Budget::new(10);
+        let ctx = EvalCtx {
+            state: &state,
+            env: &env,
+            route: &route,
+            styles: &styles,
+            depth: 64,
+            budget: &budget,
+        };
+        // Borrowed: no charge, so a 10-byte budget is enough.
+        let read = eval_ref(&expr, &ctx, "expr").expect("borrows");
+        assert!(matches!(read, Cow::Borrowed(_)));
+        // Owned: the copy is charged, and 100 bytes is over the budget.
+        let err = eval(&expr, &ctx, "expr").expect_err("copy over budget");
+        assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    }
+
+    #[test]
+    fn coercing_a_non_string_charges_the_budget() {
+        let budget = Budget::new(4);
+        let value = json!([1, 2, 3]);
+        coerce(&value, &budget, "p").expect_err("over a 4-byte budget");
+        let text = json!("plain");
+        assert!(matches!(
+            coerce(&text, &Budget::new(0), "p").expect("strings borrow"),
+            Cow::Borrowed("plain")
+        ));
+        assert_eq!(
+            text_coerce(&json!(null), &Budget::new(0), "p").expect("null is empty"),
+            ""
+        );
+    }
+
+    #[test]
+    fn env_bindings_resolve_innermost_first() {
+        let outer = json!("outer");
+        let env = Env::default()
+            .with_var("v", Bound::Borrowed(&outer))
+            .with_var("v", Bound::Shared(Rc::new(json!("inner"))));
+        assert_eq!(env.var("v"), Some(&json!("inner")));
+        assert_eq!(env.var("missing"), None);
+        let mut params = BTreeMap::new();
+        params.insert("p", Bound::from(Cow::Owned(json!(1))));
+        let env = Env {
+            params: Rc::new(params),
+            vars: Vec::new(),
+        };
+        assert_eq!(env.param("p"), Some(&json!(1)));
+    }
 }
