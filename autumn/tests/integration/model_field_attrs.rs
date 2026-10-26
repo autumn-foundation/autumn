@@ -215,7 +215,7 @@ fn insert_probe_borrows_when_normalize_is_a_noop() {
         "save must not clone a no-op New*"
     );
 
-    let many = vec![one.clone(), one.clone()];
+    let many = vec![one.clone(), one];
     let got: &[NewPlainNote] = (&&SpezNormalize(many.as_slice())).spez_normalize_insert_many();
     assert!(
         std::ptr::eq(got, many.as_slice()),
@@ -247,7 +247,7 @@ fn insert_probe_normalizes_when_columns_are_declared() {
     assert_eq!(got.email, "foo@x.com", "save must normalize");
     assert_eq!(one.email, "  Foo@X.COM ", "input must not change");
 
-    let many = vec![one.clone()];
+    let many = vec![one];
     let probed = (&&SpezNormalize(many.as_slice())).spez_normalize_insert_many();
     let got: &[NewAccount] = probed.borrow();
     assert_eq!(got[0].email, "foo@x.com", "save_many must normalize");
