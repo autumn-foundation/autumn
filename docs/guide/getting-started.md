@@ -27,7 +27,7 @@ around Rust web frameworks and just want CRUD on screen, jump straight to
 
 - **Rust 1.88.0+** (edition 2024) — install via [rustup](https://rustup.rs/)
 - **The PostgreSQL client library (`libpq`)** — required to *build*, not just
-  to run. The `db` feature is on by default, so a fresh project links `libpq`
+  to run. The `postgres` feature is on by default, so a fresh project links `libpq`
   even before you configure a database. Install `libpq-dev` (Debian/Ubuntu),
   `libpq` (Homebrew), or `postgresql-devel` (Fedora/RHEL).
 - **A reachable PostgreSQL server** — needed from

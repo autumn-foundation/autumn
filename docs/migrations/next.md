@@ -190,6 +190,67 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Features: `db` has no Postgres client; enable `postgres`
+
+**Why:** `db` compiled `pq-sys`, `tokio-postgres` and diesel's Postgres backend
+into every build. This included a SQLite build (issue #2605). Now `db` is the
+shared database layer only. The new `postgres` feature adds the Postgres
+client. It is a default feature.
+
+**Who must change:** only a build that turns default features off. With
+default features on, nothing changes. Such a build must add `postgres` when:
+
+- it enables `db`, `seed`, `repl`, `offline-sync` or `ledger-profile` without
+  `sqlite`. The build stops with this error:
+
+  ```text
+  autumn-web: the `db` feature needs a database backend. Enable `postgres` (a default feature) or `sqlite`.
+  ```
+
+- it enables `sqlite` and also uses a Postgres-only item (see the list below).
+
+This also applies to `autumn console` on a project with default features off
+and no backend: its `playground` feature enables `seed`.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["db", "maud"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["db", "postgres", "maud"] }
+```
+
+**SQLite apps:** to build with no Postgres client, turn default features off
+and enable `sqlite` without `postgres`:
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = [
+    "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
+] }
+```
+
+A build without `postgres` does not have the items that need a Postgres
+connection:
+
+- `DbApiTokenStore`, `PgSyncBackend`, `PgSuppressionStore`,
+  `PostgresIsrCoordinator`, `PgJobTrackingStore`;
+- `PostgresTickSchedulerCoordinator` and its deprecated alias
+  `PostgresAdvisorySchedulerCoordinator`;
+- the `feature_flags::pg`, `experiments::pg` and `runtime_config::pg`
+  modules;
+- most `migrate` items, for example `run_pending`, `pending_migrations`, the
+  checksum functions and `MigrationLockGuard`;
+- `job::enqueue_on_conn` and its siblings;
+- the `transition_<field>_to_on_conn` method that `#[model]` makes for a state
+  machine with effects. It takes an `AsyncPgConnection`.
+
+**Automation:** `manual` — this is a Cargo feature change; `autumn upgrade`
+rewrites Rust source, not `Cargo.toml` feature lists.
+
 ### Jobs: `JobTrackingStore::reset_for_retry` takes a `RetryToken`
 
 **Why:** The old check compared `updated_at`. That value can repeat: two

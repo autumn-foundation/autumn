@@ -1081,9 +1081,9 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
 /// Same shape, different backend: diesel on its `sqlite` feature with the
 /// bundled `libsqlite3-sys` amalgamation, `diesel-async` on the sync-connection
 /// wrapper that `autumn-web`'s `sqlite` feature runs the pool through, and no
-/// `pq-sys` — a `SQLite` app has no reason to name libpq itself. (`autumn-web`'s
-/// `db` feature still pulls it in transitively, so this trims the app's direct
-/// dependency list, not its link line.) `returning_clauses_for_sqlite_3_35`
+/// `pq-sys` — a `SQLite` app has no reason to name libpq itself. (With default
+/// features on, `autumn-web`'s `postgres` feature still pulls it in, so this
+/// trims the app's direct dependency list, not its link line; see #2605.) `returning_clauses_for_sqlite_3_35`
 /// matches `autumn-web`, so the two never disagree about `RETURNING` support.
 pub(super) const MODEL_DEPS_SQLITE: &[(&str, &str)] = &[
     ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),

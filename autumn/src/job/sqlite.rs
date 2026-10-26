@@ -1596,7 +1596,7 @@ fn install_enqueue_client(
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             sqlite: Some(queue_handle.clone()),
             registry: state.job_registry.clone(),
@@ -1612,7 +1612,7 @@ fn install_enqueue_client(
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         },
     );

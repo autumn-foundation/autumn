@@ -720,7 +720,7 @@ pub struct JobClient {
     local_coordination: Option<Arc<LocalJobCoordination>>,
     #[cfg(feature = "redis")]
     redis: Option<RedisClient>,
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pg_pool: Option<PgPool>,
     /// The durable `SQLite` queue's pool, when `jobs.backend = "sqlite"` is the
     /// running backend (issue #1907).
@@ -736,7 +736,7 @@ pub struct JobClient {
     /// `jobs.postgres.shard_local` (#3072). When `true`, an in-transaction
     /// enqueue does not use the fleet-wide `job_queue` breaker. A
     /// control-database outage must not stop shard enqueues.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     shard_local: bool,
     /// Injected entropy source for minting job ids. Defaults to
     /// [`crate::entropy::OsEntropy`]; a simulation seeds it via the app's
@@ -823,7 +823,7 @@ pub(crate) enum EnqueueOutcome {
 /// One item on its way into [`JobClient::enqueue_many_pg`]'s batched
 /// `INSERT`. Every in-memory step already ran for it: capsule replay, id,
 /// constraints, registry and admin bookkeeping.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 struct BatchEnqueueRow {
     /// Index into the caller's `items`. Used to send the batch's outcome
     /// back to the right slot, no matter what order rows insert in.
@@ -4088,7 +4088,7 @@ pub async fn enqueue_at(
 ///     Ok(())
 /// }.scope_boxed()).await?;
 /// ```
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn enqueue_on_conn<A: serde::Serialize>(
     name: &str,
     args: A,
@@ -4121,7 +4121,7 @@ pub async fn enqueue_on_conn<A: serde::Serialize>(
 ///
 /// Returns an error if the job runtime is not initialized, if `args` cannot be
 /// serialized to JSON, or if the database INSERT fails.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn enqueue_in_on_conn<A: serde::Serialize>(
     name: &str,
     args: A,
@@ -4151,7 +4151,7 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
 ///
 /// Returns an error if the job runtime is not initialized, if `args` cannot be
 /// serialized to JSON, or if the database INSERT fails.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn enqueue_at_on_conn<A: serde::Serialize>(
     name: &str,
     args: A,
@@ -4317,7 +4317,7 @@ pub async fn enqueue_at_after_commit<A: serde::Serialize>(
 ///     })
 /// }).await?;
 /// ```
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn enqueue_in_tx<A: serde::Serialize>(
     name: &str,
     args: A,
@@ -4337,7 +4337,7 @@ impl JobClient {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -4350,7 +4350,7 @@ impl JobClient {
             entropy: Arc::new(crate::entropy::OsEntropy),
             clock,
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         }
     }
@@ -4463,11 +4463,11 @@ impl JobClient {
         if self.redis.is_some() {
             return false;
         }
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         {
             self.pg_pool.is_some()
         }
-        #[cfg(not(feature = "db"))]
+        #[cfg(not(feature = "postgres"))]
         {
             false
         }
@@ -4958,7 +4958,7 @@ impl JobClient {
         name: &str,
         items: Vec<(Value, Option<chrono::DateTime<chrono::Utc>>)>,
     ) -> Vec<AutumnResult<EnqueueOutcome>> {
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         if self.can_batch_enqueue(name) {
             return self.enqueue_many_pg(name, items).await;
         }
@@ -4982,7 +4982,7 @@ impl JobClient {
     ///
     /// `false` means the sequential fallback runs instead. That path stays
     /// exactly as it works today; nothing changes for it.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     fn can_batch_enqueue(&self, name: &str) -> bool {
         if self.interceptor.is_some() || !self.durable_is_pg() {
             return false;
@@ -5008,7 +5008,7 @@ impl JobClient {
     /// sorted by that index before return. This avoids writing into a
     /// pre-sized slot by index, which this module's panic-free gate does
     /// not allow.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[allow(clippy::too_many_lines)]
     async fn enqueue_many_pg(
         &self,
@@ -5573,7 +5573,7 @@ impl JobClient {
     ) -> AutumnResult<EnqueueOutcome> {
         // Only the Postgres arm below consumes this; keep the compiler quiet
         // on redis/sqlite-only builds where that arm does not compile in.
-        #[cfg(not(feature = "db"))]
+        #[cfg(not(feature = "postgres"))]
         let _ = &relative_delay;
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
@@ -5607,7 +5607,7 @@ impl JobClient {
             )
             .await;
         }
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         if let Some(pool) = &self.pg_pool {
             // `due_at`/`relative_delay` are resolved inside `pg_insert_job`,
             // after this call's own pool checkout — see its comment.
@@ -5652,7 +5652,7 @@ impl JobClient {
     ///
     /// Returns an error if `name` is not a registered job, or if the
     /// database INSERT fails.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pub async fn enqueue_on_conn(
         &self,
         name: &str,
@@ -5672,7 +5672,7 @@ impl JobClient {
     ///
     /// Returns an error if `name` is not a registered job, or if the database
     /// INSERT fails.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pub async fn enqueue_on_conn_due(
         &self,
         name: &str,
@@ -5692,7 +5692,7 @@ impl JobClient {
     /// transactional counterpart of [`Self::enqueue_relative`]. Keeps the
     /// delay distinct from an absolute instant so the Postgres arm can
     /// compute `run_at` on the database's own clock. Backs `enqueue_in_on_conn`.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pub(crate) async fn enqueue_on_conn_relative_due(
         &self,
         name: &str,
@@ -5718,7 +5718,7 @@ impl JobClient {
     /// Shared body of [`Self::enqueue_on_conn_due`] and
     /// [`Self::enqueue_on_conn_relative_due`] — only `due_at`/`relative_delay`
     /// resolution differs between the two.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[allow(
         clippy::too_many_arguments,
         reason = "the deadline the caller gave travels beside the resolved one"
@@ -5771,7 +5771,7 @@ impl JobClient {
     /// Carries its wrapper's `db` gate: the body names `AsyncPgConnection`,
     /// `pg_pool` and the postgres enqueue helpers, none of which exist without
     /// it.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[allow(clippy::too_many_lines)]
     async fn enqueue_on_conn_due_inner(
         &self,
@@ -6420,7 +6420,7 @@ pub(crate) fn start_local_runtime_inner(
         local_coordination: Some(Arc::clone(&coordination)),
         #[cfg(feature = "redis")]
         redis: None,
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         pg_pool: None,
         #[cfg(feature = "sqlite")]
         sqlite: None,
@@ -6437,7 +6437,7 @@ pub(crate) fn start_local_runtime_inner(
         resilience_config: state
             .extension::<crate::config::AutumnConfig>()
             .map(|c| Arc::new(c.resilience.clone())),
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         shard_local: false,
     };
     install_job_client(state, client);
@@ -10543,7 +10543,7 @@ fn start_redis_runtime(
                 unique_prefix: unique_prefix.clone(),
                 clock: state.clock_arc(),
             }),
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -10560,7 +10560,7 @@ fn start_redis_runtime(
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         },
     );
@@ -10627,19 +10627,19 @@ fn start_redis_runtime(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Postgres job backend (feature = "db")
+// Postgres job backend (feature = "postgres")
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 type PgPool = diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_STATUS_ENQUEUED: &str = "enqueued";
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_STATUS_RUNNING: &str = "running";
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_STATUS_COMPLETED: &str = "completed";
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_STATUS_FAILED: &str = "failed";
 
 #[cfg(feature = "db")]
@@ -10661,7 +10661,7 @@ enum PgLifecycleRecord<'a> {
     },
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const fn pg_claim_transition_applied(rows_affected: usize) -> bool {
     rows_affected > 0
 }
@@ -10808,7 +10808,7 @@ fn record_pg_lifecycle_ack_result(
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn record_pg_row_lifecycle_ack_result(
     ack_result: AutumnResult<bool>,
     row: &PgJobRow,
@@ -10855,7 +10855,7 @@ fn record_pg_cancel_after_ack(
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn record_pg_row_cancel_after_ack(
     ack_result: AutumnResult<bool>,
     row: &PgJobRow,
@@ -10868,9 +10868,9 @@ fn record_pg_row_cancel_after_ack(
 ///
 /// The Postgres runtime has no `LISTEN`/`NOTIFY` wake-up. A new job waits
 /// for the next poll. `docs/guide/jobs.md` states this value.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// How often to sweep expired rows out of `autumn_job_tracking`. Much
 /// slower than [`PG_MAINTENANCE_INTERVAL`] (which recovers stale claims —
@@ -10878,11 +10878,11 @@ const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// urgency: the row is already invisible to reads/writes the moment it
 /// expires (`PgJobTrackingStore` filters on `expires_at` lazily), so this
 /// sweep exists only to bound table growth over time, not correctness.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_TRACKING_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is disabled.
-#[cfg(all(feature = "db", not(feature = "telemetry-otlp")))]
+#[cfg(all(feature = "postgres", not(feature = "telemetry-otlp")))]
 const PG_JOB_SELECT_COLS: &str = "id, name, queue, payload::TEXT AS payload, status, attempt, \
     max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error";
@@ -10890,13 +10890,13 @@ const PG_JOB_SELECT_COLS: &str = "id, name, queue, payload::TEXT AS payload, sta
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is enabled.
 /// Includes the nullable `traceparent` and `tracestate` columns added by the
 /// `add_trace_context_to_jobs` migration.
-#[cfg(all(feature = "db", feature = "telemetry-otlp"))]
+#[cfg(all(feature = "postgres", feature = "telemetry-otlp"))]
 const PG_JOB_SELECT_COLS: &str = "id, name, queue, payload::TEXT AS payload, status, attempt, \
     max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error, traceparent, tracestate";
 
 /// A job row read from the `autumn_jobs` Postgres table.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName, Debug, Clone)]
 #[allow(dead_code)]
 struct PgJobRow {
@@ -10940,7 +10940,7 @@ struct PgJobRow {
     tracestate: Option<String>,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl PgJobRow {
     fn to_admin_record(&self, status: JobAdminStatus) -> JobAdminRecord {
         let payload = serde_json::from_str::<Value>(&self.payload).unwrap_or(Value::Null);
@@ -10969,14 +10969,14 @@ impl PgJobRow {
 }
 
 /// A simple count row for admin queries.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgCount {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgEnqueuedCounts {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -11018,7 +11018,7 @@ pub(crate) fn sql_row_retry_delay_ms(
     )
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_evict_expired_unique_key(
     conn: &mut diesel_async::AsyncPgConnection,
     name: &str,
@@ -11049,7 +11049,7 @@ async fn pg_evict_expired_unique_key(
 /// app-vs-database clock skew that stamping from `chrono::Utc::now()` and
 /// binding the result would carry. `Absolute` is a real-world deadline the
 /// caller chose (`enqueue_at`); it is inserted unchanged, exactly as before.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PgDueAt {
     /// Run as soon as possible.
@@ -11079,7 +11079,7 @@ const PG_MAX_RELATIVE_DELAY_MS: i64 = i64::MAX / 1_000_000;
 /// (or a transactional/after-commit sibling) was called with, so it is
 /// measured from the database's clock. Otherwise `due_at` is either an
 /// explicit `enqueue_at` instant or `None` (immediate).
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn pg_due_from(
     relative_delay: Option<std::time::Duration>,
     due_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -11116,7 +11116,7 @@ fn pg_due_from(
 /// `idx_autumn_jobs_unique_inflight` closes the race where two app instances
 /// pass the guard simultaneously. Zero rows inserted for a unique job means
 /// the enqueue was coalesced.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_insert_job(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -11289,7 +11289,7 @@ async fn pg_insert_job(
 /// (`pg_evict_expired_unique_key`) needs its own round trip per key, and
 /// this batch does not run it. [`JobClient::can_batch_enqueue`] checks
 /// this before any row reaches here.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_insert_jobs_many(
     pool: &PgPool,
@@ -11431,7 +11431,7 @@ async fn pg_insert_jobs_many(
 ///
 /// Thin wrapper over [`pg_enqueue_job_at`] with no delay; retained for the
 /// Postgres backend's test suite, which exercises the immediate path directly.
-#[cfg(all(feature = "db", test))]
+#[cfg(all(feature = "postgres", test))]
 #[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_job(
     pool: &PgPool,
@@ -11465,7 +11465,7 @@ async fn pg_enqueue_job(
 /// enqueue. `due_at`/`relative_delay` are resolved into a [`PgDueAt`] inside
 /// [`pg_insert_job`], after this function's own `pool.get()` wait — see that
 /// function's comment on why a relative delay must be resolved that late.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_job_at(
     pool: &PgPool,
@@ -11506,7 +11506,7 @@ async fn pg_enqueue_job_at(
 /// When `run_at` is in the future the row is also a crash-safe delayed enqueue:
 /// invisible to workers until **both** the transaction commits **and** the due
 /// time passes.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_on_conn_at(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -11546,10 +11546,10 @@ async fn pg_enqueue_on_conn_at(
 /// cap. The lock is transaction-scoped and only taken when at least one
 /// registered job declares a concurrency limit, so unconstrained deployments
 /// keep fully parallel claims.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_CLAIM_ADVISORY_LOCK_KEY: i64 = 0x6175_7475_6d6e_6a62; // "autumnjb"
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn pg_claim_sql() -> String {
     // `$3` is the deferred job names (issue #1720): empty unless the cost
     // signal is high. Those rows stay enqueued and keep their attempt.
@@ -11619,7 +11619,7 @@ fn pg_claim_sql() -> String {
 /// anyway — but lets the planner recognize `(queue, run_at)` index order and
 /// do an `Index Scan` + `Limit 1`, touching O(1) buffers regardless of
 /// backlog size.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn pg_claim_sql_single_queue() -> String {
     format!(
         "UPDATE autumn_jobs \
@@ -11645,7 +11645,7 @@ fn pg_claim_sql_single_queue() -> String {
     )
 }
 
-#[cfg(all(feature = "db", test))]
+#[cfg(all(feature = "postgres", test))]
 async fn pg_claim_next_job(
     pool: &PgPool,
     worker_id: &str,
@@ -11656,7 +11656,7 @@ async fn pg_claim_next_job(
 }
 
 /// Claim the next ready job, but not a job named in `deferred` (issue #1720).
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_claim_next_job_except(
     pool: &PgPool,
     worker_id: &str,
@@ -11775,7 +11775,7 @@ where
 }
 
 /// Row shape for per-name aggregate count queries.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgNameCount {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -11786,7 +11786,7 @@ struct PgNameCount {
 
 /// Survey enqueued jobs whose concurrency group is saturated and publish the
 /// per-name counts as `blocked_on_concurrency` gauges.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_update_concurrency_blocked_gauges(pool: &PgPool, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
 
@@ -11824,7 +11824,7 @@ async fn pg_update_concurrency_blocked_gauges(pool: &PgPool, state: &AppState) {
 }
 
 /// Row shape for the per-(queue, name) ready-depth survey.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgQueueDepthRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -11859,7 +11859,7 @@ struct PgQueueDepthRow {
 /// `/actuator/jobs` gauges backend-derived and authoritative on every replica —
 /// including enqueue-only web replicas, which previously reported ever-growing
 /// phantom depth from their local enqueue marks.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
 
@@ -11910,7 +11910,7 @@ async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
 }
 
 /// Mark a running job as completed.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
@@ -11934,7 +11934,7 @@ async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnR
 
 /// Handle a job failure: schedule a retry after `retry_delay_ms`, or
 /// dead-letter.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::if_not_else)]
 async fn pg_nack_failure(
     pool: &PgPool,
@@ -12025,7 +12025,7 @@ async fn pg_nack_failure(
 /// Dead-letter a job unconditionally, regardless of remaining attempts.
 ///
 /// Used for panics, which are always terminal regardless of `max_attempts`.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_ack_dead_letter(
     pool: &PgPool,
     job_id: &str,
@@ -12056,7 +12056,7 @@ async fn pg_ack_dead_letter(
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job dead-letter failed: {e}")))
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgStaleRecoveryRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -12076,7 +12076,7 @@ struct PgStaleRecoveryRow {
 /// Uses a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` so
 /// concurrent maintenance tasks from multiple replicas each recover disjoint
 /// sets of stale jobs.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_recover_stale_claims(
     pool: &PgPool,
     visibility_timeout_ms: u64,
@@ -12206,7 +12206,7 @@ async fn pg_recover_stale_claims(
 }
 
 /// Move a running job's claim expiry forward, if this worker still holds it.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_renew_claim(pool: &PgPool, job_id: &str, worker_id: &str) -> LeaseRenewal {
     use diesel_async::RunQueryDsl as _;
 
@@ -12230,7 +12230,7 @@ async fn pg_renew_claim(pool: &PgPool, job_id: &str, worker_id: &str) -> LeaseRe
 }
 
 /// Start renewing `row`'s claim for `worker_id`.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_lease_heartbeat(
     pool: &PgPool,
     row: &PgJobRow,
@@ -12251,7 +12251,7 @@ async fn pg_lease_heartbeat(
 }
 
 /// Execute one claimed job and ack/nack based on the outcome.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_execute_job(
     row: PgJobRow,
@@ -12381,7 +12381,7 @@ async fn pg_execute_job(
 /// Write a finished attempt back to `autumn_jobs` and record it.
 ///
 /// The tracked record settles only when the ack applies (issue #2583).
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_settle_outcome(
     outcome: JobExecutionOutcome,
@@ -12468,7 +12468,7 @@ async fn pg_settle_outcome(
 ///
 /// Spawned once per runtime rather than per-worker so maintenance always runs
 /// even when all workers are occupied with long-running jobs.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_maintenance_loop(
     pool: PgPool,
     visibility_timeout_ms: u64,
@@ -12507,7 +12507,7 @@ async fn pg_maintenance_loop(
 /// local enqueue marks (which only grow, since it never pops). The survey
 /// interval doubles as the gauge cache TTL: the endpoint reads the last surveyed
 /// snapshot and never queries the backend per request.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_queue_depth_survey_loop(
     pool: PgPool,
     state: AppState,
@@ -12539,7 +12539,7 @@ async fn pg_queue_depth_survey_loop(
 /// check a `ModelRegistration::retain("autumn_job_tracking", ...)` would be
 /// honoured by `autumn db retention` and quietly violated here five minutes
 /// later, which is worse than having no hold at all.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_cleanup_expired_tracking_rows(pool: &PgPool, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
 
@@ -12567,7 +12567,7 @@ async fn pg_cleanup_expired_tracking_rows(pool: &PgPool, state: &AppState) {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_worker_loop(
     pool: PgPool,
@@ -12686,7 +12686,7 @@ async fn pg_worker_loop(
 }
 
 /// Postgres-backed job admin dashboard.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 struct PgJobAdminBackend {
     pool: PgPool,
@@ -12725,7 +12725,7 @@ struct PgJobAdminBackend {
 /// this whole change exists to remove. A NULL `run_at` (never happens in
 /// practice — it is stored as `COALESCE($run_at, NOW())`) coalesces
 /// `offset_ms` to a very negative value, treating it as ready for safety.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgCancelRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -12738,14 +12738,14 @@ struct PgCancelRow {
     offset_ms: i64,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgPayloadRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     payload: String,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl PgJobAdminBackend {
     async fn pg_snapshot(&self, query: &JobAdminQuery) -> AutumnResult<JobAdminSnapshot> {
         let mut conn = self.pool.get().await.map_err(|e| {
@@ -12989,7 +12989,7 @@ impl PgJobAdminBackend {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl JobAdminBackend for PgJobAdminBackend {
     fn snapshot(&self, query: JobAdminQuery) -> JobAdminFuture<'_, JobAdminSnapshot> {
         Box::pin(async move { self.pg_snapshot(&query).await })
@@ -13017,7 +13017,7 @@ impl JobAdminBackend for PgJobAdminBackend {
 /// (e.g. `"enqueued_at"`, `"started_at"`, `"finished_at"`). It is a `&'static
 /// str` from our own call sites — never user input — so embedding it via
 /// `format!` is safe.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_admin_page(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
     status: &str,
@@ -13114,7 +13114,7 @@ async fn pg_admin_page(
 /// Ready rows surface as [`JobAdminStatus::Enqueued`] (newest-first); scheduled
 /// rows surface as [`JobAdminStatus::Scheduled`] with their `run_at` due time,
 /// soonest-due first.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_enqueued_and_scheduled_pages(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
     enqueued_page: u64,
@@ -13484,7 +13484,7 @@ fn start_postgres_runtime(
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: config.postgres.shard_local,
         },
     );
@@ -13610,7 +13610,7 @@ fn build_per_job_settings(jobs: &[JobInfo]) -> HashMap<String, JobRuntimeSetting
 }
 
 /// Whether any registered job declares a concurrency limit.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn any_job_has_concurrency(jobs: &[JobInfo]) -> bool {
     jobs.iter().any(|job| job.concurrency.is_some())
 }
@@ -13733,7 +13733,7 @@ mod tests {
             "{JOBS} jobs got only {} distinct delays: {delays:?}",
             delays.len()
         );
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         {
             let sql: std::collections::BTreeSet<u64> = (0..JOBS)
                 .map(|_| sql_row_retry_delay_ms(&state, 1_000, 1))
@@ -13887,7 +13887,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -13900,7 +13900,7 @@ mod tests {
                 entropy,
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 shard_local: false,
             }
         }
@@ -14003,7 +14003,7 @@ mod tests {
     /// needs its own round trip, which the batch does not run). Every
     /// other case must fall back to the sequential per-item path,
     /// unchanged. Regression test for the batching fix in issue #2748.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[test]
     #[allow(clippy::too_many_lines)]
     fn can_batch_enqueue_only_when_postgres_uninterrupted_and_non_ttl() {
@@ -14221,7 +14221,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -14234,7 +14234,7 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch)),
                 resilience_config: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 shard_local: false,
             }
         }
@@ -14292,7 +14292,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -14305,7 +14305,7 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 shard_local: false,
             }
         }
@@ -14337,7 +14337,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -14350,7 +14350,7 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 shard_local: false,
             }
         }
@@ -14400,7 +14400,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -14416,7 +14416,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         });
 
@@ -14488,7 +14488,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -14504,7 +14504,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         });
 
@@ -14548,7 +14548,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -14564,7 +14564,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         });
 
@@ -14611,7 +14611,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -14627,7 +14627,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         });
 
@@ -15038,7 +15038,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -15054,7 +15054,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         };
 
@@ -15104,7 +15104,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -15120,7 +15120,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         };
 
@@ -18892,7 +18892,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -18905,7 +18905,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         });
         assert!(global_job_client().is_some());
@@ -21249,7 +21249,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: Some(pool.clone()),
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -21262,7 +21262,7 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 shard_local: false,
             };
 
@@ -22817,7 +22817,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -22833,7 +22833,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         };
         (client, rx)
@@ -23216,7 +23216,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -23232,7 +23232,7 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 shard_local: false,
             };
             rt.block_on(async {
@@ -23277,7 +23277,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -23290,7 +23290,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         };
 
@@ -23430,7 +23430,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -23443,7 +23443,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: spy.clone(),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         };
 
@@ -24213,7 +24213,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -24229,7 +24229,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         });
 
@@ -24259,7 +24259,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -24275,7 +24275,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         });
 
@@ -24415,7 +24415,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -24431,7 +24431,7 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         });
 
@@ -24636,7 +24636,7 @@ mod uniqueness_concurrency_tests {
         assert_eq!(JobAdminStatus::Deduplicated.label(), "deduplicated");
     }
 
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[test]
     fn aggregate_surveyed_job_gauges_maps_rows_to_both_families() {
         // Empty survey → empty gauges (a fully-drained backend reports nothing,

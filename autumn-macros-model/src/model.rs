@@ -7768,7 +7768,9 @@ fn emit_state_machine_on_conn(
         })
         .collect();
 
+    // The method takes `AsyncPgConnection`, so it needs `postgres` (#2605).
     quote! {
+        ::autumn_web::__if_postgres! {
         impl #model_name {
             /// Validates a `{field}` transition and, for the fired edge, runs
             /// its declared effects on `conn` (issue #1973): first a sync
@@ -7789,6 +7791,7 @@ fn emit_state_machine_on_conn(
                 }
                 ::core::result::Result::Ok(__new_state)
             }
+        }
         }
     }
 }
@@ -9754,7 +9757,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if upsert_columns.is_empty() {
         upsert_columns.push(quote! {
-            #table_ident::id.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::id))
+            #table_ident::id.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::id))
         });
     }
 
@@ -19279,6 +19282,56 @@ mod tests {
             generated.contains("enqueue_on_conn")
                 && generated.contains("< SendShippedEmailJob > :: NAME"),
             "the effect must enqueue the named job on the connection: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_conn_method_needs_the_postgres_feature() {
+        // The method takes `AsyncPgConnection`. A SQLite-only app has no such
+        // type, so the method compiles only with `postgres` (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let gate = generated
+            .find(":: autumn_web :: __if_postgres !")
+            .expect("the `_on_conn` impl must sit in `__if_postgres!`");
+        let method = generated
+            .find("transition_status_to_on_conn")
+            .expect("the `_on_conn` method must be emitted");
+        assert!(gate < method, "{generated}");
+    }
+
+    #[test]
+    fn id_only_model_upsert_uses_the_backend_neutral_excluded() {
+        // `diesel::pg` does not exist in a SQLite-only build (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Tag {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("pg :: upsert :: excluded"),
+            "an id-only model must not name `diesel::pg`: {generated}"
+        );
+        assert!(
+            generated.contains("diesel :: upsert :: excluded"),
+            "{generated}"
         );
     }
 
