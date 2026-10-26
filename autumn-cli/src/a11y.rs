@@ -1262,15 +1262,18 @@ fn skip_gated(trees: &[TokenTree], start: usize) -> usize {
     }
     if let Some(arrow) = arm_arrow(trees, i) {
         let body = arrow + 2;
-        return match trees.get(body) {
-            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
-                let end = body + 1;
-                end + usize::from(
+        // A block body ends the arm, unless a postfix expression goes on
+        // past it (`{ rows }.into_iter()`, `{ x }?`).
+        let block_ends_arm = matches!(trees.get(body), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
+            && !matches!(trees.get(body + 1), Some(TokenTree::Punct(p)) if p.as_char() == '.' || p.as_char() == '?');
+        if block_ends_arm {
+            let end = body + 1;
+            return end
+                + usize::from(
                     matches!(trees.get(end), Some(TokenTree::Punct(p)) if p.as_char() == ','),
-                )
-            }
-            _ => skip_expr(trees, body, false),
-        };
+                );
+        }
+        return skip_expr(trees, body, false);
     }
     // A `<` opens generics after these keywords; elsewhere it can be a `<`
     // comparison.
@@ -5493,6 +5496,7 @@ mod tests {
             "Page::Admin => { clean() }",
             "Page::Admin => foo::<A, B>(clean()),",
             "Page::Admin => rows.map(|a, b| clean()),",
+            "Page::Admin => { rows }.into_iter().map(clean).count(),",
         ] {
             let src = gated_arm(arm);
             assert_eq!(
@@ -5501,6 +5505,23 @@ mod tests {
                 "{arm}"
             );
         }
+    }
+
+    #[test]
+    fn a_method_chain_after_a_gated_arm_block_is_skipped() {
+        let src = r#"
+            #[get("/a")]
+            async fn a(x: Page, rows: Vec<Row>) -> Markup {
+                match x {
+                    #[cfg(feature = "admin")]
+                    Page::Admin => { rows }.into_iter().map(sidebar).count(),
+                    _ => html! { span { "a" } },
+                }
+            }
+
+            fn sidebar(r: Row) -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_with_features(src, &[]).is_empty());
     }
 
     #[test]
