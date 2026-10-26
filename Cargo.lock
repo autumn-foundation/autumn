@@ -913,6 +913,7 @@ dependencies = [
  "pq-sys",
  "printpdf",
  "proptest",
+ "psl",
  "pulldown-cmark",
  "rand 0.10.3",
  "rand_chacha 0.10.0",
@@ -7303,6 +7304,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
+]
+
+[[package]]
+name = "psl"
+version = "2.1.245"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46cce9bc841c0eeb395275a775d11e3cc91b904e6ab370a9a42369e111b3038e"
+dependencies = [
+ "psl-types",
 ]
 
 [[package]]
