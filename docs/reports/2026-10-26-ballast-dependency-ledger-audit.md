@@ -257,9 +257,17 @@ cargo test -p autumn-cli --test cli_tests the_scaffold_policy_covers_the_bundled
 3. **`wasmi` 2.0.0 / `croner` 4.0.1 migrations**: unchanged, real engineering
    work, no forcing fact, not attempted this pass (now third pass noting
    this without scoping further).
-4. **GitHub-native Dependabot alert count**: not re-checked this pass (no
-   tool in this session lists individual alerts — fourth pass flagging
-   this).
+4. **GitHub-native Dependabot alert count moved: 16 → 18 (4 high, 11
+   moderate, 3 low)**, first change in three passes, observed on this pass's
+   own `git push` (no tool in this session lists individual alerts, so
+   still no breakdown by id — fourth pass flagging the tooling gap, but
+   first pass with an actual delta to report). Plausibly includes new GHSA
+   findings opened this week (`css-inline` GHSA-jh54-c7gc-mvcc, tracked as
+   #3353 above, is one candidate per last pass's note that GHSA-only
+   findings never surface in `cargo deny`'s RustSec-backed count) plus
+   whatever newly-dated advisories (RUSTSEC-2026-0386/0387, handled by the
+   2026-10-25 Semaphore pass) GitHub's own scanner counts differently than
+   `cargo-deny` does. Not confirmed against individual ids this pass.
 5. `fuzz/` and `examples/island-flock/` scheduled-batch ownership: still
    unaddressed, unchanged across seven passes now.
 6. Cost attribution (`cargo build --timings`) and a usage/unused-feature
