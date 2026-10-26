@@ -129,14 +129,15 @@ pub fn normalize_hostname(raw: &str) -> Result<String, String> {
     Ok(host)
 }
 
-/// Is `hostname` an apex (registrable) name, which cannot carry a CNAME?
+/// Returns true if `hostname` is the top name of a DNS zone. Such a name
+/// cannot have a CNAME.
 ///
 /// Uses the Public Suffix List (ICANN and private sections), so
 /// `clientco.co.uk` is an apex (#2643, ADR 0026). A public suffix itself is
 /// also an apex. A TLD that is not on the list uses the two-label rule.
 ///
-/// A delegated sub-zone is not found. [`grade_dns_verification`] accepts
-/// A/AAAA records too, so such a tenant can still verify.
+/// This function does not find a delegated sub-zone. [`grade_dns_verification`]
+/// accepts A/AAAA records too, so such a tenant can still verify.
 #[must_use]
 pub fn is_apex(hostname: &str) -> bool {
     let host = hostname.trim_end_matches('.').to_ascii_lowercase();

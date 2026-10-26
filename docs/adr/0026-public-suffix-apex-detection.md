@@ -42,8 +42,8 @@ PSL, or a name that is a public suffix. The lookup uses the ICANN and the
 private sections, because a private suffix such as `eu.org` also delegates
 zones. A TLD that is not on the list keeps the two-label rule.
 
-`autumn doctor` calls the same `is_apex`. It warns when a registered apex has
-no ingress addresses.
+`autumn doctor` calls `RoutingRecord::for_hostname`, as the tenant view does.
+It warns when a registered domain gets no DNS instructions.
 
 - Option 1: the license is MIT or Apache-2.0. It shares `psl-types` with the
   current graph. A PSL change gets a new patch release, and Dependabot
@@ -51,7 +51,8 @@ no ingress addresses.
 - Option 2: the data file is MPL-2.0 inside an MIT/Apache crate. Nothing
   updates it.
 - Option 3: the list becomes old, and nothing tells us.
-- Option 4: each app must know the answer. That is the problem.
+- Option 4: each app must then find the apex itself. This function exists to
+  prevent that.
 - Option 5: more text for each tenant, and an instruction that can still be
   incorrect.
 

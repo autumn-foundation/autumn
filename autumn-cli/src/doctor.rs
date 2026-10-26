@@ -1950,8 +1950,30 @@ pub fn check_custom_domains_config_impl(
             hint: Some("Raise [server.tls.acme.custom_domains] max_domains"),
         });
     }
-    // #2643: build each domain's instructions as the tenant view does, so
-    // doctor and the tenant view use one apex rule.
+    if let Some(warn) = check_custom_domain_instructions(cd, registry) {
+        return Some(warn);
+    }
+    Some(CheckResult {
+        name: "custom_domains",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "custom domains are enabled; {registered} registered, cap {}",
+            cd.max_domains
+        )),
+        hint: None,
+    })
+}
+
+/// Warn when a registered domain gets no DNS instructions (#2643).
+///
+/// Uses [`RoutingRecord::for_hostname`](autumn_web::custom_domain::RoutingRecord::for_hostname),
+/// as the tenant view does, so the two use one apex rule.
+fn check_custom_domain_instructions(
+    cd: &autumn_web::config::CustomDomainsConfig,
+    registry: &CustomDomainRegistryRead,
+) -> Option<CheckResult> {
+    use std::fmt::Write as _;
+    const SHOWN: usize = 5;
     let ingress = cd.ingress();
     let unusable: Vec<(&str, String)> = registry
         .domains
@@ -1962,38 +1984,28 @@ pub fn check_custom_domains_config_impl(
                 .map(|e| (hostname.as_str(), e))
         })
         .collect();
-    if let Some((_, first)) = unusable.first() {
-        const SHOWN: usize = 5;
-        let mut names = unusable
-            .iter()
-            .take(SHOWN)
-            .map(|(hostname, _)| *hostname)
-            .collect::<Vec<_>>()
-            .join(", ");
-        if unusable.len() > SHOWN {
-            names.push_str(&format!(" and {} more", unusable.len() - SHOWN));
-        }
-        return Some(CheckResult {
-            name: "custom_domains",
-            status: CheckStatus::Warn,
-            detail: Some(format!(
-                "{} registered domains get no DNS instructions ({names}): {first}",
-                unusable.len()
-            )),
-            hint: Some(
-                "Set [server.tls.acme.custom_domains] ingress_ipv4 / ingress_ipv6 for apex \
-                 domains, and ingress_hostname for subdomains",
-            ),
-        });
+    let (_, first) = unusable.first()?;
+    let mut names = unusable
+        .iter()
+        .take(SHOWN)
+        .map(|(hostname, _)| *hostname)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unusable.len() > SHOWN {
+        let _ = write!(names, " and {} more", unusable.len() - SHOWN);
     }
+    let count = match unusable.len() {
+        1 => "1 registered domain gets".to_owned(),
+        n => format!("{n} registered domains get"),
+    };
     Some(CheckResult {
         name: "custom_domains",
-        status: CheckStatus::Pass,
-        detail: Some(format!(
-            "custom domains are enabled; {registered} registered, cap {}",
-            cd.max_domains
-        )),
-        hint: None,
+        status: CheckStatus::Warn,
+        detail: Some(format!("{count} no DNS instructions ({names}): {first}")),
+        hint: Some(
+            "Set [server.tls.acme.custom_domains] ingress_ipv4 / ingress_ipv6 for apex \
+             domains, and ingress_hostname for subdomains",
+        ),
     })
 }
 
@@ -14913,6 +14925,7 @@ pub struct Vault {
         .unwrap();
         assert_eq!(warn.status, CheckStatus::Warn);
         let detail = warn.detail.unwrap();
+        assert!(detail.starts_with("1 registered domain gets"), "{detail}");
         assert!(detail.contains("clientco.co.uk"), "{detail}");
         assert!(!detail.contains("app.clientco.com"), "{detail}");
         assert!(warn.hint.unwrap().contains("ingress_ipv4"));
@@ -14947,6 +14960,17 @@ pub struct Vault {
         .unwrap();
         assert_eq!(no_cname.status, CheckStatus::Warn);
         assert!(no_cname.hint.unwrap().contains("ingress_hostname"));
+
+        // Many domains: the detail shows five names and a count.
+        let hosts: Vec<String> = (1..=7).map(|i| format!("c{i}.co.uk")).collect();
+        let hosts: Vec<&str> = hosts.iter().map(String::as_str).collect();
+        let many =
+            check_custom_domains_config_impl(Some(&hostname_only), None, &read_of_hosts(&hosts))
+                .unwrap();
+        let detail = many.detail.unwrap();
+        assert!(detail.starts_with("7 registered domains get"), "{detail}");
+        assert!(detail.contains("c5.co.uk and 2 more"), "{detail}");
+        assert!(!detail.contains("c6.co.uk"), "{detail}");
     }
 
     fn probe(status: &str, dns: CustomDomainDns) -> CustomDomainProbe {

@@ -485,7 +485,7 @@ p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa"
 getrandom = "0.2"
 hex = "0.4"
 # Public Suffix List for custom-domain apex detection (issue #2643, ADR 0026).
-# The list is compiled in. Shares `psl-types` with `publicsuffix`.
+# The crate contains the list as code. It shares `psl-types` with `publicsuffix`.
 psl = "2.1"
 include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
