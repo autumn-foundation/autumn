@@ -297,6 +297,8 @@ mod offline_sync_push_batching_perf;
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
+#[cfg(all(feature = "db", feature = "openapi"))]
+mod openapi_direction;
 #[cfg(feature = "openapi")]
 mod openapi_export;
 #[cfg(feature = "db")]

@@ -298,6 +298,8 @@ fn enum_schema_body(
 /// | `into` / `from` / `try_from` | routes through another type | shape is that type's |
 /// | `tag` / `untagged` | re-tags the container | adds or removes an object level |
 /// | `flatten` (field) | merges the field's keys upward | the field is not a nested property |
+/// | `with` / `serialize_with` / `deserialize_with` (field) | any wire shape | the Rust type does not describe it |
+/// | `alias` (field) | accepts a second name | one schema advertises one |
 /// | `skip_serializing` / `skip_deserializing` (field) | one direction only | one schema serves both |
 /// | split `rename_all` / `rename` | two different names | one schema advertises one |
 ///
@@ -306,11 +308,6 @@ fn enum_schema_body(
 /// output — "not required" is true either way), and a symmetric `rename_all` /
 /// `rename`.
 ///
-/// KNOWN RESIDUAL: `with` / `serialize_with` / `deserialize_with` can put an
-/// arbitrary shape on the wire, and the schema still describes the Rust type.
-/// Not refused, because the attribute is common and usually only reformats a
-/// value of the same JSON type — but a converter that changes the type is
-/// misdescribed. Register such a type's schema by hand.
 /// Refuse `#[serde(skip_serializing_if = "…")]` where omission is not valid in
 /// BOTH directions.
 ///

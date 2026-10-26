@@ -1371,7 +1371,7 @@ double-submits and replays.
 | `jobs(Vec<JobInfo>)` | Background jobs |
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
-| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived). Get the document out with `autumn openapi export` — no boot, no database (#802) |
+| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived, in both request and response positions). Get the document out with `autumn openapi export` — no boot, no database (#802). A type with different request and response shapes gets two components, `Widget` and `WidgetRequest` (#2607). To render a ref yourself, use `openapi::schema_entry_to_value_in(entry, &openapi::schema_component_index_for(&config, &routes), SchemaDirection::Request)` for a request; `schema_entry_to_value` renders a response |
 | `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)`, `mcp_tasks(config)`, `mcp_instructions(text)`, `mcp_catalog(catalog)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()/mcp_task()/mcp_core()` toggle exposure per route (plugin fluent opt-in); `mcp_tasks` sets task-tool limits; `mcp_instructions` sets the server instructions; `mcp_catalog(McpCatalog::Progressive)` lists core tools plus `search_tools` and `call_tool` |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
