@@ -642,6 +642,20 @@ pub enum A11ySubcommands {
         /// fails, consistent with `autumn i18n check --strict`.
         #[arg(long)]
         strict: bool,
+        /// Cargo features to turn on in every crate of the scan, in addition
+        /// to the default features. Repeat the flag or give a comma-separated
+        /// list. An item or a call under a `#[cfg(feature = "…")]` that is off
+        /// does not attribute a route. Features change only the route
+        /// attribution, not the findings or the exit code.
+        #[arg(long, value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Turn on every feature that the manifest declares, and the implicit
+        /// feature of each optional dependency that no `dep:` entry names.
+        #[arg(long)]
+        all_features: bool,
+        /// Do not turn on the `[features] default` set.
+        #[arg(long)]
+        no_default_features: bool,
     },
 }
 
@@ -6139,6 +6153,9 @@ fn run_command(command: Commands) {
                 path,
                 format,
                 strict,
+                features,
+                all_features,
+                no_default_features,
             } => {
                 let format = match format.as_str() {
                     "json" => a11y::OutputFormat::Json,
@@ -6150,9 +6167,14 @@ fn run_command(command: Commands) {
                         std::process::exit(2);
                     }
                 };
-                let code = a11y::run_in(
+                let code = a11y::run_in_with(
                     std::path::Path::new(&path),
                     a11y::A11yVerifyOptions { format, strict },
+                    &routes::CargoFeatures {
+                        features,
+                        all: all_features,
+                        no_default: no_default_features,
+                    },
                 );
                 std::process::exit(code);
             }
@@ -10449,8 +10471,11 @@ mod tests {
                     ref path,
                     ref format,
                     strict: false,
+                    ref features,
+                    all_features: false,
+                    no_default_features: false,
                 }
-            } if path == "." && format == "text"
+            } if path == "." && format == "text" && features.is_empty()
         ));
     }
 
@@ -10473,8 +10498,48 @@ mod tests {
                     ref path,
                     ref format,
                     strict: true,
+                    ref features,
+                    all_features: false,
+                    no_default_features: false,
                 }
-            } if path == "./crates/web" && format == "json"
+            } if path == "./crates/web" && format == "json" && features.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parse_a11y_verify_features() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "a11y",
+            "verify",
+            "--features",
+            "admin,db",
+            "--features",
+            "billing",
+            "--all-features",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::A11y {
+                action: A11ySubcommands::Verify {
+                    ref features,
+                    all_features: true,
+                    no_default_features: false,
+                    ..
+                }
+            } if features == &["admin,db".to_owned(), "billing".to_owned()]
+        ));
+        let cli =
+            Cli::try_parse_from(["autumn", "a11y", "verify", "--no-default-features"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::A11y {
+                action: A11ySubcommands::Verify {
+                    no_default_features: true,
+                    ..
+                }
+            }
         ));
     }
 

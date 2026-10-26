@@ -9553,16 +9553,25 @@ fn render_reference_option_loaders(
             // raw id. A nullable display column coalesces to the id string.
             Some(display) => {
                 let column = &display.column;
+                // A blank label gives an option with no accessible name, and
+                // trips the `SelectOption::new` debug assert (#2666): use the
+                // id instead.
                 let (load_ty, label_expr) = if display.column_nullable {
-                    ("Option<String>", "label.unwrap_or_else(|| id.to_string())")
+                    (
+                        "Option<String>",
+                        "label.filter(|label| !autumn_web::a11y::is_blank(label)).unwrap_or_else(|| id.to_string())",
+                    )
                 } else {
-                    ("String", "label")
+                    (
+                        "String",
+                        "if autumn_web::a11y::is_blank(&label) { id.to_string() } else { label }",
+                    )
                 };
                 let _ = write!(
                     out,
                     "/// Load the `(value, label)` select options for the `{name}` reference —\n\
-                     /// one option per `{table}` row (value = id, label = `{column}`), ordered\n\
-                     /// by id (issues #1135, #1146).\n\
+                     /// one option per `{table}` row (value = id, label = `{column}`, or the\n\
+                     /// id when `{column}` is blank), ordered by id (issues #1135, #1146).\n\
                      async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
                      let rows: Vec<(i64, {load_ty})> = {table}::table\n        \
                      .select(({table}::id, {table}::{column}))\n        \

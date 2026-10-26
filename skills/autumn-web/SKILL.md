@@ -59,7 +59,8 @@ when their details matter:
   `.aria_required()`, `.aria_invalid()`, `.described_by()`, per-type
   min/max/length) plus a `.hx(name, value)` escape hatch for arbitrary `hx-*`
   attributes. Treat `autumn a11y verify` as an advisory/best-effort CI net, not
-  a guarantee — the typed primitives are the compile-time proof (0.6.0,
+  a guarantee (its route attribution reads `#[cfg(feature)]` against the
+  default features; add `--features x` / `--all-features` to match your build) — the typed primitives are the compile-time proof (0.6.0,
   #1706). See `skills/autumn-web/references/api-reference.md` for the full
   setter surface. To check rendered HTML from a test, shell out to `autumn
   check --a11y --html "<markup>"` and assert on the exit code (0 = no

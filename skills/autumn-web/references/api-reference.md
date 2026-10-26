@@ -853,6 +853,11 @@ primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`,
 - `MenuItem::new(name)` (renders `role="menuitem"` on a `<button>`; `.href(..)`
   switches to `<a>`); `.icon(markup)` (name ⇒ `aria-label`) / `.class(..)`.
   WCAG 4.1.2.
+- The types prove that a name is present, not that it holds text. An empty or
+  blank name (`Img::new(src, "")`, `.aria_label("")`, a blank
+  `RadioOption`/`SelectOption` label) trips a `debug_assert!` at the call site
+  (#2666). Give a name from data a fallback (`a11y::is_blank(text)` uses the
+  same rule); use `Img::decorative(src)` for an image with no information.
 
 ### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` / `RadioGroup`)
 
@@ -892,7 +897,10 @@ Per-primitive setters (in addition to the shared set):
 - **`RadioGroup::new(name, first)`** — the first `RadioOption` is a constructor
   argument, so a group always has a choice; `.option(RadioOption)` /
   `.options(iter)`, `.checked_value(s)`, `.id_prefix(s)` (for the same group
-  rendered repeatedly). `RadioOption::new(value, label)`
+  rendered repeatedly). `.option` takes a built `RadioOption`, as `new` does;
+  `Select::option` takes the `(value, label)` pair. Choice ids are valid CSS
+  selectors: a first part that does not start with a letter after any
+  leading `_` gets one more `_` (`1plan` → `_1plan-…`). `RadioOption::new(value, label)`
   requires the choice label; `.checked()` / `.disabled()`. The group renders
   `<fieldset><legend>` (visible name) or `<div>` (ARIA name), both with
   `role="radiogroup"`; `aria-invalid` and `hx-*` land on each `<input>`,
