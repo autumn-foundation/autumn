@@ -2361,6 +2361,14 @@ jobs:
           # rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet_sweeper
+          # Issue #2663: the SQLite split-sum aggregate and bulk decrement in
+          # `counter_cache.rs` are sqlite-only. Same features, so no rebuild.
+          # A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --lib -- counter_cache::tests::sqlite_sum | tee "$RUNNER_TEMP/sqlite-sum-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/sqlite-sum-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_derivation_wide_sum
           # Issue #3233: slot ownership driven by its renew loop in virtual
           # time. Single-threaded, like its CI step. Same features, so no
           # rebuild.
@@ -2872,6 +2880,7 @@ jobs:
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_derivation \
+            --test sqlite_derivation_wide_sum \
             --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
             --test sqlite_commentable \
