@@ -1,6 +1,7 @@
 mod a11y_verify;
 mod admin_generator_bulk_delete_profile;
 mod api_scaffold;
+mod binary_lookup_build_target;
 mod cloud_native_scaffold;
 mod console;
 mod db;
