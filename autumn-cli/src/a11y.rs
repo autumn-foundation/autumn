@@ -961,14 +961,19 @@ fn skip_unindexed_item(
     i: usize,
     features: Option<&BTreeSet<String>>,
 ) -> Option<usize> {
+    // A gated item can be a match arm or a field inside a body, so it ends
+    // where `skip_gated` says, not at the next brace group.
+    if matches!(
+        (trees.get(i), trees.get(i + 1)),
+        (Some(TokenTree::Punct(p)), Some(TokenTree::Group(attr)))
+            if p.as_char() == '#'
+                && attr.delimiter() == Delimiter::Bracket
+                && !is_cfg_test_attr(trees, i)
+                && cfg_is_off(attr, features)
+    ) {
+        return Some(skip_gated(trees, i + 2));
+    }
     let off = is_cfg_test_attr(trees, i)
-        || matches!(
-            (trees.get(i), trees.get(i + 1)),
-            (Some(TokenTree::Punct(p)), Some(TokenTree::Group(attr)))
-                if p.as_char() == '#'
-                    && attr.delimiter() == Delimiter::Bracket
-                    && cfg_is_off(attr, features)
-        )
         || (matches!(&trees[i], TokenTree::Ident(ident) if *ident == "macro_rules")
             && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!'));
     off.then(|| skip_cfg_test_item(trees, i + 2))
@@ -1231,7 +1236,8 @@ fn cfg_is_off(attr: &proc_macro2::Group, features: Option<&BTreeSet<String>>) ->
 ///
 /// It ends after a `;` or `,`, or after a brace group that closes it (a block,
 /// an arm body). A `,` inside the generics of a `let` or a turbofish, or in a
-/// closure argument list, does not end it. A brace group that a pattern or an
+/// closure argument list, does not end it; nor does one in the generics of an
+/// item (`impl<A, B>`). A brace group that a pattern or an
 /// expression goes on past (`V { a } =>`, `{ … } else`, `S { .. } = …`) does
 /// not end it either. An `fn` item ends after its body.
 fn skip_gated(trees: &[TokenTree], start: usize) -> usize {
@@ -1259,7 +1265,10 @@ fn skip_gated(trees: &[TokenTree], start: usize) -> usize {
     if matches!(trees.get(i), Some(TokenTree::Ident(id)) if *id == "fn") {
         return find_fn_body(trees, i + 1).map_or(trees.len(), |body| body + 1);
     }
-    let is_let = matches!(trees.get(i), Some(TokenTree::Ident(id)) if *id == "let");
+    // A `<` opens generics after these keywords; elsewhere it can be a `<`
+    // comparison (`if n < 3 =>`).
+    let has_generics = matches!(trees.get(i), Some(TokenTree::Ident(id))
+        if ["let", "impl", "struct", "enum", "union", "trait", "type"].iter().any(|kw| id == kw));
     let mut angles = 0usize;
     let mut in_closure_args = false;
     while let Some(tree) = trees.get(i) {
@@ -1268,8 +1277,8 @@ fn skip_gated(trees: &[TokenTree], start: usize) -> usize {
             TokenTree::Punct(p) => match p.as_char() {
                 ';' => break,
                 ',' if angles == 0 && !in_closure_args => break,
-                // Generics of a `let` type, or of a turbofish (`::<`).
-                '<' if is_let || (i >= 2 && punct(i - 2) == Some(':')) => angles += 1,
+                // Generics of a `let` type or an item, or of a turbofish (`::<`).
+                '<' if has_generics || (i >= 2 && punct(i - 2) == Some(':')) => angles += 1,
                 '>' if angles > 0 && punct(i - 2) != Some('-') => angles -= 1,
                 '|' if angles == 0 => in_closure_args = !in_closure_args,
                 _ => {}
@@ -5386,6 +5395,37 @@ mod tests {
             }
         "#;
         assert!(routes_with_features(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_gated_arm_does_not_exclude_the_next_arm() {
+        let src = r#"
+            #[get("/a")]
+            async fn a(x: Kind) -> Markup {
+                match x {
+                    #[cfg(feature = "admin")]
+                    Kind::Admin => clean(),
+                    _ => html! { img src="/x.png"; },
+                }
+            }
+
+            fn clean() -> Markup { html! { span { "clean" } } }
+        "#;
+        assert_eq!(routes_with_features(src, &[]), vec!["GET /a".to_owned()]);
+    }
+
+    #[test]
+    fn a_gated_generic_impl_is_skipped_whole() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+
+            #[cfg(feature = "admin")]
+            impl<A, B> Render for Pair<A, B> { fn render(&self) -> Markup { sidebar() } }
+
+            fn sidebar() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(routes_with_features(src, &[]), vec!["GET /a".to_owned()]);
     }
 
     #[test]
