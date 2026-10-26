@@ -2006,7 +2006,8 @@ jobs:
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
-            --skip capture_overhead_on_a_successful_query_request
+            --skip capture_overhead_on_a_successful_query_request \
+            --skip outbox_claim_profile
           # `deploy_e2e` runs in `test-docker-deploy`, on a fresh disk (#2547).
           # Example apps are NOT auto-swept the way autumn-web's consolidated
           # `integration_tests` binary is (Codex review finding on #2530):
@@ -2439,6 +2440,15 @@ jobs:
             --test integration_tests -- --ignored test_db_reset_table:: \
             | tee "$RUNNER_TEMP/test-db-reset-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/test-db-reset-cov.log"
+          # Ledger (outbox claim index): the existing-tables branch of
+          # `outbox::ensure_schema` runs only in this Docker test, so the
+          # `Test (Docker)` sweep alone leaves it out of the patch gate. The
+          # filter stops at `docker::`: `docker_webhook_store` is a different
+          # suite that does not pass in this lane.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored --test-threads=1 outbox_pg::docker:: \
+            | tee "$RUNNER_TEMP/outbox-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/outbox-pg-cov.log"
           # Issue #3061: the Postgres side of the database idempotency store
           # runs only in these Docker tests, the `--lib` pg_tests and the
           # consolidated binary's idempotency suites. Both filters are checked

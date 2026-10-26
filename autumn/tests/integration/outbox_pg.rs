@@ -177,6 +177,70 @@ mod docker {
         assert!(!inbox.seen(&mut conn, &id).await.unwrap());
         assert!(inbox.seen(&mut conn, &id).await.unwrap());
     }
+
+    #[derive(diesel::QueryableByName)]
+    struct IndexValid {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        valid: bool,
+    }
+
+    /// Tables made before `idx_autumn_outbox_claim` existed get the index from
+    /// `ensure_schema`, built in the background (it must not delay boot).
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_outbox_ensure_schema_adds_claim_index_to_existing_tables() {
+        use diesel_async::RunQueryDsl as _;
+
+        let pool = pool().await;
+        let mut conn = pool.get().await.unwrap();
+        diesel::sql_query("DROP INDEX IF EXISTS idx_autumn_outbox_claim")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        outbox::ensure_schema(&pool).await.unwrap();
+
+        // A concurrent build is in the catalog with `indisvalid = false` first.
+        let mut valid = false;
+        for _ in 0..100 {
+            let rows = diesel::sql_query(
+                "SELECT i.indisvalid AS valid FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = 'idx_autumn_outbox_claim'",
+            )
+            .load::<IndexValid>(&mut *conn)
+            .await
+            .unwrap();
+            if rows.len() == 1 && rows[0].valid {
+                valid = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            valid,
+            "ensure_schema builds the claim index in the background"
+        );
+    }
+
+    /// A pool of one has no connection to spare for the background build, so
+    /// `ensure_schema` skips it (and still succeeds).
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_outbox_ensure_schema_skips_the_index_build_on_a_single_connection_pool() {
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+        let db = autumn_web::test::TestDb::shared().await;
+        outbox::ensure_schema(&db.pool()).await.unwrap();
+        let single: PgPool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            db.url(),
+        ))
+        .max_size(1)
+        .build()
+        .unwrap();
+        outbox::ensure_schema(&single).await.unwrap();
+    }
 }
 
 #[cfg(feature = "test-support")]

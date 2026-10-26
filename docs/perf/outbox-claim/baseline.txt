@@ -1,0 +1,192 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.23s
+     Running tests/outbox_claim_profile.rs (target/debug/deps/outbox_claim_profile-e903ab28f5905455)
+
+running 1 test
+test outbox_claim_profile ... 
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): claim, history=100000 ===
+Update on public.autumn_outbox  (cost=89.45..894.04 rows=100 width=82) (actual time=16.075..17.271 rows=100 loops=1)
+  Output: autumn_outbox.seq, autumn_outbox.id, autumn_outbox.aggregate, autumn_outbox.topic, autumn_outbox.payload, autumn_outbox.attempts, autumn_outbox.created_at
+  Buffers: shared hit=6151 dirtied=5 written=5
+  ->  Nested Loop  (cost=89.45..894.04 rows=100 width=82) (actual time=15.929..16.120 rows=100 loops=1)
+        Output: (autumn_outbox.attempts + 1), 'tok'::text, '1792684620560'::bigint, autumn_outbox.ctid, "ANY_subquery".*
+        Inner Unique: true
+        Buffers: shared hit=4837
+        ->  HashAggregate  (cost=89.03..90.03 rows=100 width=40) (actual time=15.918..15.934 rows=100 loops=1)
+              Output: "ANY_subquery".*, "ANY_subquery".seq
+              Group Key: "ANY_subquery".seq
+              Batches: 1  Memory Usage: 24kB
+              Buffers: shared hit=4437
+              ->  Subquery Scan on "ANY_subquery"  (cost=0.71..88.78 rows=100 width=40) (actual time=15.421..15.878 rows=100 loops=1)
+                    Output: "ANY_subquery".*, "ANY_subquery".seq
+                    Buffers: shared hit=4437
+                    ->  Limit  (cost=0.71..87.78 rows=100 width=20) (actual time=15.413..15.847 rows=100 loops=1)
+                          Output: o.seq, o.ctid, p.ctid
+                          Buffers: shared hit=4437
+                          ->  LockRows  (cost=0.71..26723.02 rows=30692 width=20) (actual time=15.412..15.835 rows=100 loops=1)
+                                Output: o.seq, o.ctid, p.ctid
+                                Buffers: shared hit=4437
+                                ->  Nested Loop Anti Join  (cost=0.71..26416.10 rows=30692 width=20) (actual time=15.403..15.784 rows=100 loops=1)
+                                      Output: o.seq, o.ctid, p.ctid
+                                      Buffers: shared hit=4337
+                                      ->  Index Scan using autumn_outbox_pkey on public.autumn_outbox o  (cost=0.42..11179.42 rows=46038 width=22) (actual time=15.384..15.449 rows=103 loops=1)
+                                            Output: o.seq, o.ctid, o.aggregate
+                                            Filter: ((o.dispatched_at IS NULL) AND (o.dead_at IS NULL) AND (o.available_at <= '1792684560560'::bigint) AND ((o.locked_until IS NULL) OR (o.locked_until <= '1792684560560'::bigint)) AND (o.topic = ANY ('{order.placed,mail.deliver,webhook.dispatch,job.enqueue}'::text[])))
+                                            Rows Removed by Filter: 100034
+                                            Buffers: shared hit=4128
+                                      ->  Index Scan using idx_autumn_outbox_pending on public.autumn_outbox p  (cost=0.29..1.22 rows=20 width=22) (actual time=0.003..0.003 rows=0 loops=103)
+                                            Output: p.ctid, p.aggregate, p.seq
+                                            Index Cond: ((p.aggregate = o.aggregate) AND (p.seq < o.seq))
+                                            Filter: ((p.dispatched_at IS NULL) AND (p.dead_at IS NULL))
+                                            Buffers: shared hit=209
+        ->  Index Scan using autumn_outbox_pkey on public.autumn_outbox  (cost=0.42..8.04 rows=1 width=18) (actual time=0.001..0.001 rows=1 loops=100)
+              Output: autumn_outbox.attempts, autumn_outbox.ctid, autumn_outbox.seq
+              Index Cond: (autumn_outbox.seq = "ANY_subquery".seq)
+              Buffers: shared hit=400
+Query Identifier: 1598410629992789692
+Planning:
+  Buffers: shared hit=129 read=1
+Planning Time: 0.577 ms
+Execution Time: 17.400 ms
+
+-- history=100000: handled 300 messages, ordered-id hash 1ab60f9ccd42a100, first ["m100002", "m100003", "m100004"] --
+
+=== pg_stat_statements: history=100000 (ranked by buffers) ===
+buffers=19104    ( 74.5%) calls=3     (  0.5%) temp_w=0 wal=213726 UPDATE autumn_outbox SET claim_token = $1, locked_until = $2, attempts = attempts + $6 WHERE seq IN ( SELECT o.seq FROM autumn_outbox o WHERE o.dispat
+buffers=6059     ( 23.6%) calls=300   ( 45.6%) temp_w=0 wal=102774 UPDATE autumn_outbox SET dispatched_at = $1, claim_token = $4, locked_until = $5, last_error = $6 WHERE seq = $2 AND claim_token = $3
+buffers=491      (  1.9%) calls=50    (  7.6%) temp_w=0 wal=23257 INSERT INTO autumn_outbox (id, aggregate, topic, payload, created_at, available_at) VALUES ($1, $2, $3, $4, $5, $6)
+buffers=0        (  0.0%) calls=303   ( 46.0%) temp_w=0 wal=0 SELECT $1
+buffers=0        (  0.0%) calls=1     (  0.2%) temp_w=0 wal=0 SET CLIENT_ENCODING TO 'UTF8'
+buffers=0        (  0.0%) calls=1     (  0.2%) temp_w=0 wal=0 SET TIME ZONE 'UTC'
+-- total: statements=658 buffers=25654 --
+pg_stat_user_tables autumn_outbox: seq_tup_read=0 idx_scan=206 idx_tup_fetch=100242
+pg_stat_user_indexes autumn_outbox_id_key: idx_scan=0 idx_tup_read=0
+pg_stat_user_indexes autumn_outbox_pkey: idx_scan=103 idx_tup_read=100239
+pg_stat_user_indexes idx_autumn_outbox_dispatched: idx_scan=0 idx_tup_read=0
+pg_stat_user_indexes idx_autumn_outbox_pending: idx_scan=103 idx_tup_read=3
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): claim, history=300000 ===
+Update on public.autumn_outbox  (cost=178.50..1007.33 rows=100 width=82) (actual time=49.663..51.030 rows=100 loops=1)
+  Output: autumn_outbox.seq, autumn_outbox.id, autumn_outbox.aggregate, autumn_outbox.topic, autumn_outbox.payload, autumn_outbox.attempts, autumn_outbox.created_at
+  Buffers: shared hit=13668 read=935 dirtied=2630 written=931
+  ->  Nested Loop  (cost=178.50..1007.33 rows=100 width=82) (actual time=49.574..49.739 rows=100 loops=1)
+        Output: (autumn_outbox.attempts + 1), 'tok'::text, '1792684625174'::bigint, autumn_outbox.ctid, "ANY_subquery".*
+        Inner Unique: true
+        Buffers: shared hit=12349 read=935 dirtied=2624 written=919
+        ->  HashAggregate  (cost=178.08..179.08 rows=100 width=40) (actual time=49.563..49.580 rows=100 loops=1)
+              Output: "ANY_subquery".*, "ANY_subquery".seq
+              Group Key: "ANY_subquery".seq
+              Batches: 1  Memory Usage: 24kB
+              Buffers: shared hit=11949 read=935 dirtied=2624 written=919
+              ->  Subquery Scan on "ANY_subquery"  (cost=0.71..177.83 rows=100 width=40) (actual time=49.051..49.509 rows=100 loops=1)
+                    Output: "ANY_subquery".*, "ANY_subquery".seq
+                    Buffers: shared hit=11949 read=935 dirtied=2624 written=919
+                    ->  Limit  (cost=0.71..176.83 rows=100 width=20) (actual time=49.044..49.470 rows=100 loops=1)
+                          Output: o.seq, o.ctid, p.ctid
+                          Buffers: shared hit=11949 read=935 dirtied=2624 written=919
+                          ->  LockRows  (cost=0.71..39025.90 rows=22159 width=20) (actual time=49.043..49.458 rows=100 loops=1)
+                                Output: o.seq, o.ctid, p.ctid
+                                Buffers: shared hit=11949 read=935 dirtied=2624 written=919
+                                ->  Nested Loop Anti Join  (cost=0.71..38804.31 rows=22159 width=20) (actual time=49.029..49.399 rows=100 loops=1)
+                                      Output: o.seq, o.ctid, p.ctid
+                                      Buffers: shared hit=11849 read=935 dirtied=2624 written=919
+                                      ->  Index Scan using autumn_outbox_pkey on public.autumn_outbox o  (cost=0.42..26271.42 rows=33239 width=22) (actual time=49.005..49.059 rows=103 loops=1)
+                                            Output: o.seq, o.ctid, o.aggregate
+                                            Filter: ((o.dispatched_at IS NULL) AND (o.dead_at IS NULL) AND (o.available_at <= '1792684565174'::bigint) AND ((o.locked_until IS NULL) OR (o.locked_until <= '1792684565174'::bigint)) AND (o.topic = ANY ('{order.placed,mail.deliver,webhook.dispatch,job.enqueue}'::text[])))
+                                            Rows Removed by Filter: 300034
+                                            Buffers: shared hit=11640 read=935 dirtied=2624 written=919
+                                      ->  Index Scan using idx_autumn_outbox_pending on public.autumn_outbox p  (cost=0.29..2.39 rows=21 width=22) (actual time=0.003..0.003 rows=0 loops=103)
+                                            Output: p.ctid, p.aggregate, p.seq
+                                            Index Cond: ((p.aggregate = o.aggregate) AND (p.seq < o.seq))
+                                            Filter: ((p.dispatched_at IS NULL) AND (p.dead_at IS NULL))
+                                            Buffers: shared hit=209
+        ->  Index Scan using autumn_outbox_pkey on public.autumn_outbox  (cost=0.42..8.28 rows=1 width=18) (actual time=0.001..0.001 rows=1 loops=100)
+              Output: autumn_outbox.attempts, autumn_outbox.ctid, autumn_outbox.seq
+              Index Cond: (autumn_outbox.seq = "ANY_subquery".seq)
+              Buffers: shared hit=400
+Query Identifier: 684164119577941518
+Planning:
+  Buffers: shared hit=64 dirtied=1
+Planning Time: 0.547 ms
+Execution Time: 51.110 ms
+
+-- history=300000: handled 300 messages, ordered-id hash 7fac038b795e379f, first ["m300002", "m300003", "m300004"] --
+
+=== pg_stat_statements: history=300000 (ranked by buffers) ===
+buffers=44474    ( 87.7%) calls=3     (  0.5%) temp_w=0 wal=213470 UPDATE autumn_outbox SET claim_token = $1, locked_until = $2, attempts = attempts + $6 WHERE seq IN ( SELECT o.seq FROM autumn_outbox o WHERE o.dispat
+buffers=5746     ( 11.3%) calls=300   ( 45.7%) temp_w=0 wal=104220 UPDATE autumn_outbox SET dispatched_at = $1, claim_token = $4, locked_until = $5, last_error = $6 WHERE seq = $2 AND claim_token = $3
+buffers=502      (  1.0%) calls=50    (  7.6%) temp_w=0 wal=24093 INSERT INTO autumn_outbox (id, aggregate, topic, payload, created_at, available_at) VALUES ($1, $2, $3, $4, $5, $6)
+buffers=0        (  0.0%) calls=304   ( 46.3%) temp_w=0 wal=0 SELECT $1
+-- total: statements=657 buffers=50722 --
+pg_stat_user_tables autumn_outbox: seq_tup_read=0 idx_scan=206 idx_tup_fetch=300242
+pg_stat_user_indexes autumn_outbox_id_key: idx_scan=0 idx_tup_read=0
+pg_stat_user_indexes autumn_outbox_pkey: idx_scan=103 idx_tup_read=300239
+pg_stat_user_indexes idx_autumn_outbox_dispatched: idx_scan=0 idx_tup_read=0
+pg_stat_user_indexes idx_autumn_outbox_pending: idx_scan=103 idx_tup_read=3
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): claim, history=950000 ===
+Update on public.autumn_outbox  (cost=305.41..1146.49 rows=100 width=82) (actual time=579.438..581.467 rows=100 loops=1)
+  Output: autumn_outbox.seq, autumn_outbox.id, autumn_outbox.aggregate, autumn_outbox.topic, autumn_outbox.payload, autumn_outbox.attempts, autumn_outbox.created_at
+  Buffers: shared hit=2020 read=40029 dirtied=37439 written=38016
+  ->  Nested Loop  (cost=305.41..1146.49 rows=100 width=82) (actual time=579.300..579.594 rows=100 loops=1)
+        Output: (autumn_outbox.attempts + 1), 'tok'::text, '1792684635296'::bigint, autumn_outbox.ctid, "ANY_subquery".*
+        Inner Unique: true
+        Buffers: shared hit=709 read=40026 dirtied=37426 written=38003
+        ->  HashAggregate  (cost=304.99..305.99 rows=100 width=40) (actual time=579.286..579.320 rows=100 loops=1)
+              Output: "ANY_subquery".*, "ANY_subquery".seq
+              Group Key: "ANY_subquery".seq
+              Batches: 1  Memory Usage: 24kB
+              Buffers: shared hit=309 read=40026 dirtied=37426 written=38003
+              ->  Subquery Scan on "ANY_subquery"  (cost=0.71..304.74 rows=100 width=40) (actual time=578.533..579.236 rows=100 loops=1)
+                    Output: "ANY_subquery".*, "ANY_subquery".seq
+                    Buffers: shared hit=309 read=40026 dirtied=37426 written=38003
+                    ->  Limit  (cost=0.71..303.74 rows=100 width=20) (actual time=578.524..579.166 rows=100 loops=1)
+                          Output: o.seq, o.ctid, p.ctid
+                          Buffers: shared hit=309 read=40026 dirtied=37426 written=38003
+                          ->  LockRows  (cost=0.71..97200.45 rows=32077 width=20) (actual time=578.522..579.148 rows=100 loops=1)
+                                Output: o.seq, o.ctid, p.ctid
+                                Buffers: shared hit=309 read=40026 dirtied=37426 written=38003
+                                ->  Nested Loop Anti Join  (cost=0.71..96879.68 rows=32077 width=20) (actual time=578.508..579.068 rows=100 loops=1)
+                                      Output: o.seq, o.ctid, p.ctid
+                                      Buffers: shared hit=209 read=40026 dirtied=37426 written=38003
+                                      ->  Index Scan using autumn_outbox_pkey on public.autumn_outbox o  (cost=0.42..75326.82 rows=48115 width=22) (actual time=578.472..578.581 rows=103 loops=1)
+                                            Output: o.seq, o.ctid, o.aggregate
+                                            Filter: ((o.dispatched_at IS NULL) AND (o.dead_at IS NULL) AND (o.available_at <= '1792684575296'::bigint) AND ((o.locked_until IS NULL) OR (o.locked_until <= '1792684575296'::bigint)) AND (o.topic = ANY ('{order.placed,mail.deliver,webhook.dispatch,job.enqueue}'::text[])))
+                                            Rows Removed by Filter: 950034
+                                            Buffers: shared hit=4 read=40022 dirtied=37426 written=37999
+                                      ->  Index Scan using idx_autumn_outbox_pending on public.autumn_outbox p  (cost=0.29..3.99 rows=20 width=22) (actual time=0.004..0.004 rows=0 loops=103)
+                                            Output: p.ctid, p.aggregate, p.seq
+                                            Index Cond: ((p.aggregate = o.aggregate) AND (p.seq < o.seq))
+                                            Filter: ((p.dispatched_at IS NULL) AND (p.dead_at IS NULL))
+                                            Buffers: shared hit=205 read=4 written=4
+        ->  Index Scan using autumn_outbox_pkey on public.autumn_outbox  (cost=0.42..8.40 rows=1 width=18) (actual time=0.002..0.002 rows=1 loops=100)
+              Output: autumn_outbox.attempts, autumn_outbox.ctid, autumn_outbox.seq
+              Index Cond: (autumn_outbox.seq = "ANY_subquery".seq)
+              Buffers: shared hit=400
+Query Identifier: 2767482250046267066
+Planning:
+  Buffers: shared hit=56 read=8 dirtied=1
+Planning Time: 0.945 ms
+Execution Time: 581.594 ms
+
+-- history=950000: handled 300 messages, ordered-id hash 62ad056a4d38c8b5, first ["m950002", "m950003", "m950004"] --
+
+=== pg_stat_statements: history=950000 (ranked by buffers) ===
+buffers=126813   ( 95.4%) calls=3     (  0.5%) temp_w=0 wal=213353 UPDATE autumn_outbox SET claim_token = $1, locked_until = $2, attempts = attempts + $6 WHERE seq IN ( SELECT o.seq FROM autumn_outbox o WHERE o.dispat
+buffers=5681     (  4.3%) calls=300   ( 45.7%) temp_w=0 wal=105015 UPDATE autumn_outbox SET dispatched_at = $1, claim_token = $4, locked_until = $5, last_error = $6 WHERE seq = $2 AND claim_token = $3
+buffers=482      (  0.4%) calls=50    (  7.6%) temp_w=0 wal=19865 INSERT INTO autumn_outbox (id, aggregate, topic, payload, created_at, available_at) VALUES ($1, $2, $3, $4, $5, $6)
+buffers=0        (  0.0%) calls=304   ( 46.3%) temp_w=0 wal=0 SELECT $1
+-- total: statements=657 buffers=132976 --
+pg_stat_user_tables autumn_outbox: seq_tup_read=0 idx_scan=439 idx_tup_fetch=1900511
+pg_stat_user_indexes autumn_outbox_id_key: idx_scan=0 idx_tup_read=0
+pg_stat_user_indexes autumn_outbox_pkey: idx_scan=233 idx_tup_read=1900646
+pg_stat_user_indexes idx_autumn_outbox_dispatched: idx_scan=0 idx_tup_read=0
+pg_stat_user_indexes idx_autumn_outbox_pending: idx_scan=206 idx_tup_read=6
+
+=== summary (workload: 50 writes + drain(300)) ===
+history=100000   statements=658   buffers=25654
+history=300000   statements=657   buffers=50722
+history=950000   statements=657   buffers=132976
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.49s
+

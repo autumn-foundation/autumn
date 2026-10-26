@@ -301,6 +301,8 @@ mod openapi;
 mod openapi_direction;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
+mod outbox_claim_profile;
 #[cfg(feature = "db")]
 mod outbox_pg;
 mod pagination;

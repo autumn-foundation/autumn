@@ -106,6 +106,9 @@ CREATE TABLE IF NOT EXISTS autumn_outbox (
 CREATE INDEX IF NOT EXISTS idx_autumn_outbox_pending
     ON autumn_outbox (aggregate, seq)
     WHERE dispatched_at IS NULL AND dead_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_autumn_outbox_claim
+    ON autumn_outbox (seq)
+    WHERE dispatched_at IS NULL AND dead_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_autumn_outbox_dispatched
     ON autumn_outbox (dispatched_at)
     WHERE dispatched_at IS NOT NULL;
@@ -169,6 +172,23 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
     crate::backend_select! {
         pg => {
             if tables_exist(&mut conn, &["autumn_outbox", "autumn_inbox"]).await? {
+                // Off the startup path: the build waits for every older
+                // transaction on the table, however long that takes.
+                let pool = pool.clone();
+                // The build holds a pooled connection until every older
+                // transaction on the table ends. A pool of one has none to spare.
+                if pool.status().max_size < 2 {
+                    tracing::warn!(
+                        "pool too small to build idx_autumn_outbox_claim in the background; run \
+                         `{CLAIM_INDEX_SQL}` by hand to speed up the outbox claim"
+                    );
+                    return Ok(());
+                }
+                tokio::spawn(async move {
+                    if let Err(error) = build_claim_index(&pool).await {
+                        tracing::warn!(%error, "could not build idx_autumn_outbox_claim; the outbox claim stays slow on a large backlog of sent rows");
+                    }
+                });
                 return Ok(());
             }
             conn.batch_execute(&format!(
@@ -184,6 +204,34 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
         },
     }
 }
+
+/// Add the claim index to tables made before it existed (Postgres).
+///
+/// The claim reads pending rows in `seq` order. Without this index it walks
+/// the primary key past every sent row that the purge has not deleted yet.
+/// The build is `CONCURRENTLY`, so it blocks no writes, and the index covers
+/// only pending rows. [`ensure_schema`] runs it in a background task, because
+/// the build waits for older transactions on the table and must not delay
+/// boot. A role that cannot create indexes keeps working, only slower: the
+/// failure is a warning. After a failed build, drop the invalid
+/// `idx_autumn_outbox_claim` and restart.
+#[cfg(not(feature = "sqlite"))]
+async fn build_claim_index(pool: &Pool<RuntimeConnection>) -> Result<(), String> {
+    let mut conn = pool.get().await.map_err(|error| error.to_string())?;
+    let present = tables_exist(&mut conn, &["idx_autumn_outbox_claim"])
+        .await
+        .map_err(|error| error.to_string())?;
+    if present {
+        return Ok(());
+    }
+    conn.batch_execute(CLAIM_INDEX_SQL)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "sqlite"))]
+const CLAIM_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_autumn_outbox_claim \
+     ON autumn_outbox (seq) WHERE dispatched_at IS NULL AND dead_at IS NULL";
 
 /// `true` when every table in `tables` exists (Postgres).
 #[cfg(not(feature = "sqlite"))]
