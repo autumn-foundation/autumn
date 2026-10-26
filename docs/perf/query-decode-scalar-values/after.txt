@@ -1,0 +1,8 @@
+# After: same harness, same machine/session, change = Node::Scalar holds `Values` (first value inline)
+callgrind Ir  run(0)    = 1,934,384
+callgrind Ir  run(2000) = 63,123,052
+callgrind Ir  marginal  = 61,188,668   (30,594 Ir/iteration)   vs 65,071,806  => -5.97%
+dhat blocks   run(0)    = 2,863 (140,054 bytes)
+dhat blocks   run(500)  = 31,363 (1,513,056 bytes)
+dhat blocks   marginal  = 57.0/iteration  vs 66.0 => -13.6%
+dhat bytes    marginal  = 2,746/iteration vs 3,657 => -24.9%

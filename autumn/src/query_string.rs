@@ -347,6 +347,48 @@ fn classify_segment(inner: &str) -> Segment<'_> {
 // Tree
 // ──────────────────────────────────────────────────────────────────
 
+/// The values submitted under one key, in submission order.
+///
+/// Nearly every key is submitted once, so the first value lives inline instead
+/// of behind a `Vec` allocation. Derefs to `[String]`, so readers see the same
+/// slice either way. An empty `Many` is the empty state.
+#[derive(Debug)]
+enum Values {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Default for Values {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl Values {
+    fn push(&mut self, value: String) {
+        match self {
+            Self::Many(values) if values.is_empty() => *self = Self::One(value),
+            Self::Many(values) => values.push(value),
+            Self::One(_) => {
+                if let Self::One(first) = std::mem::take(self) {
+                    *self = Self::Many(vec![first, value]);
+                }
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for Values {
+    type Target = [String];
+
+    fn deref(&self) -> &[String] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
+}
+
 /// One decoded position in the query tree.
 #[derive(Debug)]
 enum Node {
@@ -355,7 +397,7 @@ enum Node {
     /// Holding all of them (rather than collapsing to one) is what lets the
     /// same node serve a scalar field (first wins) and a sequence field (all
     /// values) without the parser needing to know the target type.
-    Scalar(Vec<String>),
+    Scalar(Values),
     /// Positional children (`k[]`, `k[3]`), ordered by [`SeqKey`]. A `BTreeMap`
     /// keeps sparse and out-of-order indices cheap: `tags[4000000000]` costs
     /// one entry, not four billion.
@@ -474,7 +516,7 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
     if segments.len() >= MAX_DEPTH {
         let node = root
             .entry(base.to_owned())
-            .or_insert_with(|| Node::Scalar(Vec::new()));
+            .or_insert_with(|| Node::Scalar(Values::default()));
         poison(
             node,
             format!(
@@ -604,7 +646,7 @@ fn poison(node: &mut Node, message: String) {
 /// The empty container a segment's *successor* requires.
 const fn empty_for(next: Option<&Segment<'_>>) -> Node {
     match next {
-        None => Node::Scalar(Vec::new()),
+        None => Node::Scalar(Values::Many(Vec::new())),
         Some(Segment::Key(_)) => Node::Map(BTreeMap::new()),
         Some(Segment::Append | Segment::Index { .. }) => Node::Seq(BTreeMap::new()),
     }
