@@ -11114,27 +11114,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #lookup_key => ::core::option::Option::Some(#expr), }
         })
         .collect();
-    // #2634: gate the `New*` `Normalize` impl on the insert struct actually
-    // having `#[normalize]` columns. With no columns the `Yes` arm of the
-    // repository autoref probe (`SpezNormalizeManyYes`) would win and clone
-    // the whole batch to run an empty `normalize()` — a guaranteed no-op.
-    // Omitting the impl lets the probe's `No` arm win, so `save` /
-    // `save_many` / `save_many_skip_invalid` / `find_or_create_by_*` pay no
-    // clone for unnormalized models. The read-model impl stays unconditional:
-    // it is `&mut self` in place (no clone involved) and user code may call
-    // `.normalize()` on it directly, so removing it would be a compile break.
-    // `NormalizedModel` stays unconditional too: derived finders call
-    // `normalize_lookup` for every model and rely on the `None` arm.
-    let normalize_new_impl = if normalize_new_stmts.is_empty() {
-        quote! {}
+    // #2692: emit `impl Normalize` for every `New*`, so a `T: Normalize`
+    // bound accepts it. If the `New*` has no `#[normalize]` columns, the impl
+    // does nothing. Then also emit `NormalizeNoop`, so the repository probe
+    // skips the clone (#2634). The read-model impl and `NormalizedModel` are
+    // unconditional.
+    let normalize_new_noop = if normalize_new_stmts.is_empty() {
+        quote! { impl ::autumn_web::normalize::NormalizeNoop for #new_name {} }
     } else {
-        quote! {
-            impl ::autumn_web::normalize::Normalize for #new_name {
-                fn normalize(&mut self) {
-                    #(#normalize_new_stmts)*
-                }
+        quote! {}
+    };
+    let normalize_new_impl = quote! {
+        impl ::autumn_web::normalize::Normalize for #new_name {
+            fn normalize(&mut self) {
+                #(#normalize_new_stmts)*
             }
         }
+        #normalize_new_noop
     };
     let normalize_impls = quote! {
         #normalize_new_impl
@@ -17836,12 +17832,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_impl_for_new_is_gated_on_normalize_columns() {
-        // #2634: a model with no `#[normalize]` columns must not get
-        // `impl Normalize for New*` — otherwise the repository probe's `Yes`
-        // arm always wins and `save_many` clones a batch whose normalization
-        // is a guaranteed no-op. The read-model impl and `NormalizedModel`
-        // stay unconditional (public API surface and the finder `None` arm).
+    fn normalize_impl_for_new_is_unconditional_and_noop_is_marked() {
+        // #2692: every `New*` implements `Normalize`, so a `T: Normalize`
+        // bound accepts it. With no `#[normalize]` columns the impl is a
+        // no-op, and the `NormalizeNoop` marker tells the repository probe to
+        // skip the clone (#2634).
         let output = model_macro(
             TokenStream::new(),
             quote! {
@@ -17854,8 +17849,12 @@ mod tests {
         );
         let generated = output.to_string();
         assert!(
-            !generated.contains("normalize :: Normalize for NewUser"),
-            "must NOT generate `impl Normalize for NewUser` with no normalize columns: {generated}"
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark the no-op `NewUser` impl with `NormalizeNoop`: {generated}"
         );
         assert!(
             generated.contains("normalize :: Normalize for User"),
@@ -17864,6 +17863,65 @@ mod tests {
         assert!(
             generated.contains("normalize :: NormalizedModel for User"),
             "must keep `impl NormalizedModel for User`: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_noop_marker_is_absent_when_new_has_normalize_columns() {
+        // #2692: the marker skips normalization on insert. A `New*` with a
+        // `#[normalize]` column must not get it.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            !generated.contains("NormalizeNoop"),
+            "must not mark a normalizing `NewUser` as no-op: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_noop_marker_when_normalize_column_is_not_in_new() {
+        // #2692: a `#[default]` column is not in `NewUser`. `NewUser` has
+        // nothing to normalize, so it gets the marker. `User` still
+        // normalizes the column.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[default]
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark `NewUser` as no-op: {generated}"
+        );
+        let user_impl = generated
+            .split("normalize :: Normalize for User")
+            .nth(1)
+            .expect("must generate `impl Normalize for User`");
+        let user_body = user_impl.split("impl").next().unwrap_or_default();
+        assert!(
+            user_body.contains("normalize :: trim"),
+            "`User` must still trim the column: {user_body}"
         );
     }
 

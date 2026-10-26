@@ -159,3 +159,96 @@ fn normalize_is_idempotent() {
     assert_eq!(once.display_name, twice.display_name);
     assert_eq!(twice.email, "foo@x.com");
 }
+
+// ── #2692: every `New*` implements `Normalize` ─────────────────────────────
+
+diesel::table! {
+    plain_notes (id) {
+        id -> BigInt,
+        title -> Text,
+    }
+}
+
+/// A model with no `#[normalize]` columns.
+#[autumn_web::model(table = "plain_notes")]
+pub struct PlainNote {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+fn normalized<T: Normalize>(mut value: T) -> T {
+    value.normalize();
+    value
+}
+
+#[test]
+fn new_struct_without_normalize_columns_implements_normalize() {
+    // A generic `T: Normalize` bound accepts every generated `New*`.
+    let new = normalized(NewPlainNote {
+        title: "  Kept  ".into(),
+    });
+    assert_eq!(new.title, "  Kept  ", "no-op normalize keeps the value");
+}
+
+#[test]
+// The `&&` receiver is the codegen call shape. Keep it for every type.
+#[allow(clippy::needless_borrow)]
+fn insert_probe_borrows_when_normalize_is_a_noop() {
+    // The repository insert path must not clone a `New*` that has nothing to
+    // normalize (#2634). Same call shape as the `#[repository]` codegen.
+    // All arms in scope, as in the codegen. Only the winning arms are used.
+    #[allow(unused_imports)]
+    use autumn_web::normalize::{
+        SpezNormalize, SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _,
+        SpezNormalizeManyYes as _, SpezNormalizeNo as _, SpezNormalizeNoop as _,
+        SpezNormalizeYes as _,
+    };
+
+    // A `&T` result type proves the borrow arm won: the clone arm returns `T`.
+    let one = NewPlainNote {
+        title: "  Kept  ".into(),
+    };
+    let got: &NewPlainNote = (&&SpezNormalize(&one)).spez_normalize_insert();
+    assert!(
+        std::ptr::eq(got, std::ptr::from_ref(&one)),
+        "save must not clone a no-op New*"
+    );
+
+    let many = vec![one.clone(), one];
+    let got: &[NewPlainNote] = (&&SpezNormalize(many.as_slice())).spez_normalize_insert_many();
+    assert!(
+        std::ptr::eq(got, many.as_slice()),
+        "save_many must not clone a no-op batch"
+    );
+}
+
+#[test]
+// The `&&` receiver is the codegen call shape. Keep it for every type.
+#[allow(clippy::needless_borrow)]
+fn insert_probe_normalizes_when_columns_are_declared() {
+    // All arms in scope, as in the codegen. Only the winning arms are used.
+    #[allow(unused_imports)]
+    use autumn_web::normalize::{
+        SpezNormalize, SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _,
+        SpezNormalizeManyYes as _, SpezNormalizeNo as _, SpezNormalizeNoop as _,
+        SpezNormalizeYes as _,
+    };
+    use std::borrow::Borrow as _;
+
+    let one = NewAccount {
+        email: "  Foo@X.COM ".into(),
+        password_hash: "h".into(),
+        display_name: "a".into(),
+        bio: "b".into(),
+    };
+    let probed = (&&SpezNormalize(&one)).spez_normalize_insert();
+    let got: &NewAccount = probed.borrow();
+    assert_eq!(got.email, "foo@x.com", "save must normalize");
+    assert_eq!(one.email, "  Foo@X.COM ", "input must not change");
+
+    let many = vec![one];
+    let probed = (&&SpezNormalize(many.as_slice())).spez_normalize_insert_many();
+    let got: &[NewAccount] = probed.borrow();
+    assert_eq!(got[0].email, "foo@x.com", "save_many must normalize");
+}
