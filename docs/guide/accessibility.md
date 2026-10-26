@@ -708,7 +708,8 @@ predicate is true for the enabled features. Thus a gated handler is not a
 route, a gated helper is not a target, and a gated call is not followed. The
 scan reads `[features] default` from the nearest `Cargo.toml`. `--features a,b`
 adds features in every crate of the scan, `--all-features` turns on every
-feature and optional dependency, and `--no-default-features` turns the default
+feature (as Cargo does, an optional dependency that a `dep:` entry names is
+not a feature), and `--no-default-features` turns the default
 set off. A predicate the scan cannot decide (`target_os = "linux"`), or a file
 with no package manifest, keeps the item. A finding inside a gated item or
 statement that is off has no route. The features change only the route

@@ -504,7 +504,9 @@ fn enabled_features(manifest: &str, selection: &CargoFeatures) -> Option<BTreeSe
         if let Some(features) = table.get("features").and_then(toml::Value::as_table) {
             requested.extend(features.keys().cloned());
         }
-        // An optional dependency is also a feature of the same name.
+        // An optional dependency is also a feature of the same name, unless
+        // a `dep:name` entry suppresses that implicit feature.
+        let features = table.get("features").and_then(toml::Value::as_table);
         let targets = table
             .get("target")
             .and_then(toml::Value::as_table)
@@ -515,6 +517,7 @@ fn enabled_features(manifest: &str, selection: &CargoFeatures) -> Option<BTreeSe
             .filter_map(|deps| deps.and_then(toml::Value::as_table))
             .flat_map(|deps| deps.iter())
             .filter(|(_, dep)| dep.get("optional").and_then(toml::Value::as_bool) == Some(true))
+            .filter(|(name, _)| !crate::edge_scan::implicit_feature_is_suppressed(features, name))
             .map(|(name, _)| name.clone());
         requested.extend(optional);
     }
@@ -5203,6 +5206,21 @@ mod tests {
         };
         let on = enabled_features(MANIFEST, &selection).expect("a package");
         assert!(on.contains("default") && on.contains("db"), "{on:?}");
+    }
+
+    #[test]
+    fn all_features_skips_an_optional_dependency_named_by_dep() {
+        // `dep:redis` suppresses the implicit `redis` feature, so Cargo's
+        // `--all-features` does not turn it on.
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+            [features]\nadmin = [\"dep:redis\"]\n\n\
+            [dependencies]\nredis = { version = \"1\", optional = true }\n";
+        let selection = CargoFeatures {
+            all: true,
+            ..CargoFeatures::default()
+        };
+        let on = enabled_features(manifest, &selection).expect("a package");
+        assert!(on.contains("admin") && !on.contains("redis"), "{on:?}");
     }
 
     #[test]

@@ -1619,7 +1619,7 @@ fn is_optional_dependency(table: &toml::Table, name: &str, resolver_v1: bool) ->
 /// such a manifest's real build compiles it out (Codex review on #2739,
 /// round 13, P2).
 #[must_use]
-fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &str) -> bool {
+pub fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &str) -> bool {
     let needle = format!("dep:{pkg}");
     features_table.is_some_and(|features| {
         features.values().any(|entries| {

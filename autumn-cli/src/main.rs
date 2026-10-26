@@ -649,8 +649,8 @@ pub enum A11ySubcommands {
         /// attribution, not the findings or the exit code.
         #[arg(long, value_name = "FEATURES")]
         features: Vec<String>,
-        /// Turn on every feature and every optional dependency that the
-        /// manifest declares.
+        /// Turn on every feature that the manifest declares, and the implicit
+        /// feature of each optional dependency that no `dep:` entry names.
         #[arg(long)]
         all_features: bool,
         /// Do not turn on the `[features] default` set.
