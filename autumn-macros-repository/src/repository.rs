@@ -26809,9 +26809,20 @@ mod tests {
         // `NormalizeNoop` arm wins first and returns the borrow (#2634).
         let generated =
             repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
-        assert!(
-            !generated.contains("= :: autumn_web :: normalize :: SpezNormalize (new) ."),
+        // One `&` lets the clone arm win for every generated `New*`.
+        assert_eq!(
+            generated.matches("SpezNormalize (new)").count(),
+            generated
+                .matches("(&& :: autumn_web :: normalize :: SpezNormalize (new))")
+                .count(),
             "every insert probe must start at `&&SpezNormalize`: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches("(&& :: autumn_web :: normalize :: SpezNormalize (new))")
+                .count(),
+            3,
+            "save, save_many and save_many_skip_invalid must each probe once: {generated}"
         );
         assert!(
             generated.contains("SpezNormalizeNoop as _"),
@@ -26831,14 +26842,22 @@ mod tests {
             },
         )
         .to_string();
+        let start = generated
+            .find("pub async fn find_or_create_by_slug")
+            .expect("must generate find_or_create_by_slug");
+        assert!(
+            generated[start..].contains("pub async fn preload"),
+            "`preload` must follow, or the section runs to the end: {generated}"
+        );
         let section = section_between(
             &generated,
             "pub async fn find_or_create_by_slug",
             "pub async fn preload",
         );
         assert!(
-            section.contains("SpezNormalize (new)) . spez_normalize_insert ()")
-                && section.contains("SpezNormalizeNoop as _"),
+            section.contains(
+                "(&& :: autumn_web :: normalize :: SpezNormalize (new)) . spez_normalize_insert ()"
+            ) && section.contains("SpezNormalizeNoop as _"),
             "find_or_create_by_* must use the three-arm probe: {section}"
         );
     }

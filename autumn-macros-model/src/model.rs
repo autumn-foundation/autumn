@@ -17771,6 +17771,39 @@ mod tests {
     }
 
     #[test]
+    fn normalize_noop_marker_when_normalize_column_is_not_in_new() {
+        // #2692: a `#[default]` column is not in `NewUser`. `NewUser` has
+        // nothing to normalize, so it gets the marker. `User` still
+        // normalizes the column.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[default]
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark `NewUser` as no-op: {generated}"
+        );
+        let user_impl = generated
+            .split("normalize :: Normalize for User")
+            .nth(1)
+            .expect("must generate `impl Normalize for User`");
+        let user_body = user_impl.split("impl").next().unwrap_or_default();
+        assert!(
+            user_body.contains("normalize :: trim"),
+            "`User` must still trim the column: {user_body}"
+        );
+    }
+
+    #[test]
     fn update_model_drops_non_declarative_validators_but_new_model_keeps_them() {
         // #1719: `Patch<T>` implements validator's per-field declarative traits
         // (length/email/…) but NOT `custom`/`must_match`/`nested`/etc. The

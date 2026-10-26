@@ -195,23 +195,23 @@ fn new_struct_without_normalize_columns_implements_normalize() {
 fn insert_probe_borrows_when_normalize_is_a_noop() {
     // The repository insert path must not clone a `New*` that has nothing to
     // normalize (#2634). Same call shape as the `#[repository]` codegen.
+    // All arms in scope, as in the codegen. Only the winning arms are used.
+    #[allow(unused_imports)]
     use autumn_web::normalize::{
         SpezNormalize, SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _,
         SpezNormalizeManyYes as _, SpezNormalizeNo as _, SpezNormalizeNoop as _,
         SpezNormalizeYes as _,
     };
-    use std::borrow::Borrow as _;
 
+    // A `&T` result type proves the borrow arm won: the clone arm returns `T`.
     let one = NewPlainNote {
         title: "  Kept  ".into(),
     };
-    let probed = (&&SpezNormalize(&one)).spez_normalize_insert();
-    let got: &NewPlainNote = probed.borrow();
+    let got: &NewPlainNote = (&&SpezNormalize(&one)).spez_normalize_insert();
     assert!(std::ptr::eq(got, &one), "save must not clone a no-op New*");
 
     let many = vec![one.clone(), one.clone()];
-    let probed = (&&SpezNormalize(many.as_slice())).spez_normalize_insert_many();
-    let got: &[NewPlainNote] = probed.borrow();
+    let got: &[NewPlainNote] = (&&SpezNormalize(many.as_slice())).spez_normalize_insert_many();
     assert!(
         std::ptr::eq(got, many.as_slice()),
         "save_many must not clone a no-op batch"
@@ -220,6 +220,8 @@ fn insert_probe_borrows_when_normalize_is_a_noop() {
 
 #[test]
 fn insert_probe_normalizes_when_columns_are_declared() {
+    // All arms in scope, as in the codegen. Only the winning arms are used.
+    #[allow(unused_imports)]
     use autumn_web::normalize::{
         SpezNormalize, SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _,
         SpezNormalizeManyYes as _, SpezNormalizeNo as _, SpezNormalizeNoop as _,
