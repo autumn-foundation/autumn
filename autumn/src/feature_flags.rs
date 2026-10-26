@@ -785,6 +785,24 @@ pub mod pg {
     /// loads at once and then on each interval.
     ///
     /// [`AppBuilder::with_flag_store`]: crate::app::AppBuilder::with_flag_store
+    ///
+    /// Clone class (jscpd, `--min-tokens 50 --format rust`): this
+    /// `Shared`/snapshot-and-poll shape also serves `PgExperimentStore`
+    /// (`autumn/src/experiments.rs`, ported in #3262/#3273) and, in a
+    /// deliberately unported form, `PgConfigStore`
+    /// (`autumn/src/runtime_config.rs` — see its own doc for why). `retry_delay`,
+    /// `with_connect_timeout` and `STATEMENT_TIMEOUT_MS` really are shared
+    /// code, not copies: `experiments::pg` imports them from here instead of
+    /// redefining them. The rest stays duplicated per store because each
+    /// closes over a different row/config type; unifying it would need
+    /// generics over that type or a trait for two implementors, and this
+    /// clone class is 2 non-identical instances, not the 3 identical ones
+    /// Echo's bar needs. One deliberate difference, not a missed fix: this
+    /// store applies a local write straight into the snapshot
+    /// (`Shared::apply_local`) and relies on `generation`/`write_lock` to
+    /// keep that race-free against a concurrent background refresh;
+    /// `PgExperimentStore` instead reloads from Postgres after every write
+    /// and carries no matching `generation`/`write_lock` pair.
     #[derive(Debug)]
     pub struct PgFlagStore {
         shared: Arc<Shared>,

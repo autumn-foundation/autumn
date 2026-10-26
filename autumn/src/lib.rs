@@ -2460,4 +2460,21 @@ mod tests {
         // Just verify it compiles and can accept routes
         let _builder = builder.routes(vec![]);
     }
+
+    /// `PgFlagStore`, `PgExperimentStore` and `PgConfigStore` are a
+    /// documented clone class (see each struct's doc) that advertises the
+    /// same 1 s snapshot TTL. Nothing shares this constant, so a change to
+    /// one that forgets its siblings would otherwise drift silently.
+    #[cfg(feature = "db")]
+    #[test]
+    fn pg_store_cache_ttl_matches_across_clone_class_siblings() {
+        assert_eq!(
+            feature_flags::pg::PgFlagStore::DEFAULT_CACHE_TTL,
+            experiments::pg::PgExperimentStore::DEFAULT_CACHE_TTL,
+        );
+        assert_eq!(
+            feature_flags::pg::PgFlagStore::DEFAULT_CACHE_TTL,
+            runtime_config::pg::PgConfigStore::DEFAULT_CACHE_TTL,
+        );
+    }
 }
