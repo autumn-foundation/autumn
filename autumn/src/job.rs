@@ -11653,50 +11653,56 @@ fn pg_claim_sql_single_queue() -> String {
 /// O(parked backlog) buffers, and the backlog grows because nothing claims the
 /// parked names. This variant instead skip-scans the distinct ready names on
 /// `idx_autumn_jobs_queue_name_ready (queue, name, run_at)` (one index-only
-/// probe per name, parked or not), then probes each runnable name for its
-/// earliest eligible row and keeps the earliest of those. The probe applies the
-/// same concurrency-limit predicate before its `LIMIT 1`, so the claimed row is
-/// the one `pg_claim_sql_single_queue` would pick (ties on `run_at` stay
-/// unordered, as before). Cost is O(distinct ready names), independent of the
-/// parked backlog. Row locks are taken per probe and drop with the statement,
-/// as in the multi-queue claim.
+/// probe per name), keeps the runnable ones with the `run_at` of their earliest
+/// due row (`heads`), and walks them in that order. Each probe returns the
+/// name's earliest concurrency-eligible row strictly earlier than the best found
+/// so far, and the walk stops at the first name whose head cannot beat the best,
+/// so a name with a large saturated backlog is never scanned past the point the
+/// plain claim would have stopped at. The claimed row is the one
+/// `pg_claim_sql_single_queue` would pick (ties on `run_at` stay unordered, as
+/// before). Row locks are taken per probe and drop with the statement, as in the
+/// multi-queue claim.
 ///
 /// Used only when `deferred` is non-empty, so the common path is untouched.
 #[cfg(feature = "postgres")]
 fn pg_claim_sql_single_queue_deferred() -> String {
     format!(
-        "UPDATE autumn_jobs \
-         SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
-             pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
-             unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
+        "UPDATE autumn_jobs SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
+         pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
+         unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
          WHERE id = ( \
-           WITH RECURSIVE names(n, skip) AS ( \
-             (SELECT name, name = ANY($3) FROM autumn_jobs \
-               WHERE status = 'enqueued' AND queue = $2 ORDER BY name LIMIT 1) \
-             UNION ALL \
-             SELECT nx.name, nx.name = ANY($3) FROM names \
-               CROSS JOIN LATERAL (SELECT name FROM autumn_jobs \
-                 WHERE status = 'enqueued' AND queue = $2 AND name > names.n \
-                 ORDER BY name LIMIT 1) nx \
-           ) \
-           SELECT picked.id FROM names \
-           CROSS JOIN LATERAL ( \
-             SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
-             WHERE NOT names.skip AND candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
-               AND candidate.queue = $2 AND candidate.name = names.n \
-               AND (candidate.concurrency_limit IS NULL OR ( \
-                 SELECT COUNT(*) FROM autumn_jobs running \
-                 WHERE running.status = 'running' \
-                   AND running.name = candidate.name \
-                   AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
-               ) < candidate.concurrency_limit) \
-             ORDER BY candidate.run_at ASC \
-             LIMIT 1 \
-             FOR UPDATE SKIP LOCKED \
-           ) picked \
-           ORDER BY picked.run_at \
-           LIMIT 1 \
+         WITH RECURSIVE names(n, skip) AS ( \
+         (SELECT name, name = ANY($3) FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 ORDER BY name LIMIT 1) \
+         UNION ALL \
+         SELECT nx.name, nx.name = ANY($3) FROM names \
+         CROSS JOIN LATERAL (SELECT name FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 AND name > names.n ORDER BY name LIMIT 1) nx \
+         ), \
+         heads AS MATERIALIZED ( \
+         SELECT names.n, h.head, row_number() OVER (ORDER BY h.head, names.n) AS i FROM names \
+         CROSS JOIN LATERAL (SELECT run_at AS head FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 AND name = names.n AND run_at <= NOW() \
+         ORDER BY run_at LIMIT 1) h \
+         WHERE NOT names.skip \
+         ), \
+         walk(i, best_at, best_id) AS ( \
+         SELECT 0::bigint, NULL::timestamptz, NULL::text \
+         UNION ALL \
+         SELECT heads.i, COALESCE(p.run_at, walk.best_at), COALESCE(p.id, walk.best_id) \
+         FROM walk \
+         JOIN heads ON heads.i = walk.i + 1 AND (walk.best_at IS NULL OR heads.head < walk.best_at) \
+         LEFT JOIN LATERAL ( \
+         SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
+         WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+         AND (walk.best_at IS NULL OR candidate.run_at < walk.best_at) \
+         AND candidate.queue = $2 AND candidate.name = heads.n \
+         AND (candidate.concurrency_limit IS NULL OR (SELECT COUNT(*) FROM autumn_jobs running \
+         WHERE running.status = 'running' AND running.name = candidate.name \
+         AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key) < candidate.concurrency_limit) \
+         ORDER BY candidate.run_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) p ON true \
          ) \
+         SELECT best_id FROM walk WHERE best_id IS NOT NULL ORDER BY i DESC LIMIT 1) \
          RETURNING {PG_JOB_SELECT_COLS}"
     )
 }

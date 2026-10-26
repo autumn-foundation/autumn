@@ -27,7 +27,7 @@ The ack (4.6k) and enqueue (3.8k) are flat. `temp_blks_written` is 0 throughout.
 Before: `Index Scan using idx_autumn_jobs_queue_ready` with `Rows Removed by Filter` = the
 parked backlog (50,000 / 200,000 / 800,000); buffers 932 / 3,629 / 14,497 (scales linearly).
 After: recursive skip scan (`Index Only Scan using idx_autumn_jobs_queue_name_ready`, ~10 loops,
-one per distinct ready name) + one `Index Scan` probe per runnable name; ~112 buffers at every size.
+one per distinct ready name), then an early-stopping walk over the runnable names; ~108 buffers per claim at every size.
 
 ## Hypothesis
 
@@ -39,8 +39,11 @@ grows because nothing claims it.
 
 `pg_claim_sql_single_queue_deferred` (used only when `deferred` is non-empty): skip-scan the
 distinct ready names on a new partial index `(queue, name, run_at) WHERE status = 'enqueued'`,
-probe each runnable name for its earliest eligible row (the concurrency-limit predicate is
-applied before the per-name `LIMIT 1`), take the earliest. Migration
+order the runnable names by the `run_at` of their earliest due row, and walk them: each probe
+returns the name's earliest concurrency-eligible row strictly earlier than the best so far, and
+the walk stops at the first name whose head cannot beat the best. The first version of this
+query probed every name to exhaustion; Codex review found (and `saturated.sh` reproduces) that
+a non-deferred name with a large concurrency-saturated backlog made that O(backlog); see below. Migration
 `20261026170000_add_jobs_queue_name_ready_index`: plain `CREATE INDEX IF NOT EXISTS`,
 `SHARE` lock for the build (2.09 s on 1.9M rows / 900k ready; 1.78 s on re-apply),
 `down.sql` `DROP INDEX` 37 ms. The migration system is transactional, so `CONCURRENTLY` was not an option.
@@ -50,20 +53,33 @@ The index is also in `SHARD_JOB_SCHEMA`.
 
 | Parked backlog | Buffers before | Buffers after | Delta | Rows filtered out per claim, before → after |
 | --- | ---: | ---: | ---: | --- |
-| 50k | 277,957 | 32,376 | -88.4% | 50,000 → 0 |
-| 200k | 1,093,270 | 33,954 | -96.9% | 200,000 → 0 |
-| 800k | 4,354,264 | 33,955 | -99.2% | 800,000 → 0 |
+| 50k | 277,957 | 32,423 | -88.3% | 50,000 → 0 |
+| 200k | 1,093,270 | 32,421 | -97.0% | 200,000 → 0 |
+| 800k | 4,354,264 | 32,422 | -99.3% | 800,000 → 0 |
 
 Statements per poll are unchanged (3). `temp_blks_written` 0 before and after.
-`idx_autumn_jobs_queue_name_ready.idx_scan` = 6000 after each 300-poll run (`after/indexes.*.txt`);
+`idx_autumn_jobs_queue_name_ready.idx_scan` = 6300 after each 300-poll run (`after/indexes.*.txt`);
 `idx_autumn_jobs_queue_ready` = 0 in the deferred loop, so the new index is the one in use.
+
+## Saturated-backlog check (regression found in review, fixed)
+
+One claim, a non-deferred name `sat` with N due rows, `concurrency_limit = 1` and one running,
+an earlier eligible `ok` job, and a 1,000-row parked name (`saturated.sh`, `saturated_result.txt`):
+
+| `sat` backlog | shipped claim | first rewrite | final claim |
+| --- | ---: | ---: | ---: |
+| 20k | 23 | 40,430 | 51 |
+| 100k | 25 | 201,976 | 95 |
+| 200k | 26 | 403,898 | 61 |
+
+The first rewrite scanned the whole saturated backlog on every claim; the final claim is flat.
 
 ## Equivalence
 
 `equivalence.sql` drains an edge-case fixture (NULL / non-NULL concurrency keys with limits,
 equal-`run_at` ties, a future row, a row 1 us in the past, a second queue, names sorting
 before/after/around the parked ones, a prefix of a parked name, a running row holding a slot)
-with both queries for five deferred sets, including all names deferred and a nonexistent
+with the shipped and the final query for five deferred sets, including all names deferred and a nonexistent
 name. Result (`equivalence_result.txt`): identical claim counts, identical `run_at`
 sequence, identical claimed ids per `run_at` tie group. Order inside a `run_at` tie was
 unspecified before and remains so. The text extracted from the Rust source was also run

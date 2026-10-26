@@ -1,13 +1,30 @@
             indexrelname             | idx_scan | pg_size_pretty 
 -------------------------------------+----------+----------------
+ autumn_jobs_pkey                    |        0 | 56 kB
+ autumn_jobs_pkey                    |        0 | 56 kB
  autumn_jobs_pkey                    |      600 | 99 MB
  idx_autumn_jobs_concurrency_running |        0 | 16 kB
+ idx_autumn_jobs_concurrency_running |        0 | 16 kB
+ idx_autumn_jobs_concurrency_running |        0 | 16 kB
  idx_autumn_jobs_enqueued_dashboard  |        0 | 35 MB
- idx_autumn_jobs_queue_name_ready    |     6000 | 45 MB
+ idx_autumn_jobs_enqueued_dashboard  |        0 | 32 kB
+ idx_autumn_jobs_enqueued_dashboard  |        0 | 32 kB
+ idx_autumn_jobs_queue_name_ready    |     6300 | 45 MB
+ idx_autumn_jobs_queue_name_ready    |        0 | 56 kB
+ idx_autumn_jobs_queue_ready         |        0 | 40 kB
  idx_autumn_jobs_queue_ready         |        0 | 27 MB
+ idx_autumn_jobs_queue_ready         |        0 | 40 kB
+ idx_autumn_jobs_ready               |        0 | 40 kB
+ idx_autumn_jobs_ready               |        0 | 40 kB
  idx_autumn_jobs_ready               |        0 | 19 MB
  idx_autumn_jobs_stale_recovery      |        0 | 16 kB
+ idx_autumn_jobs_stale_recovery      |        0 | 16 kB
+ idx_autumn_jobs_stale_recovery      |        0 | 16 kB
+ idx_autumn_jobs_status_finished     |        0 | 40 kB
+ idx_autumn_jobs_status_finished     |        0 | 40 kB
  idx_autumn_jobs_status_finished     |        0 | 75 MB
  idx_autumn_jobs_unique_inflight     |        0 | 8192 bytes
-(9 rows)
+ idx_autumn_jobs_unique_inflight     |        0 | 8192 bytes
+ idx_autumn_jobs_unique_inflight     |        0 | 8192 bytes
+(26 rows)
 
