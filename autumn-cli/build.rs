@@ -1,9 +1,4 @@
 fn main() {
-    // The triple the CLI runs on. `built_artifact` prefers it when a build
-    // reports one binary for more than one triple.
-    let target = std::env::var("TARGET").unwrap_or_default();
-    println!("cargo:rustc-env=AUTUMN_CLI_HOST_TRIPLE={target}");
-
     // Windows default main-thread stack is 1 MB. The Clap-derived parser for
     // this CLI now exceeds that limit with 25+ subcommands. Request 8 MB to
     // match the Linux/macOS default and prevent stack overflow at startup.

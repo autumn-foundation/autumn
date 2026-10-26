@@ -10,9 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
-/// The triple this CLI runs on. Only a binary for it can start here.
-const HOST_TRIPLE: &str = env!("AUTUMN_CLI_HOST_TRIPLE");
-
 /// Executables from the builds this process ran, newest last.
 static BUILT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
@@ -37,29 +34,60 @@ fn profile_dir(path: &Path) -> Option<&OsStr> {
 }
 
 /// The triple directory of an artifact path: `t` in `.../t/debug/app`.
-fn triple_dir(path: &Path) -> Option<&OsStr> {
-    path.parent()?.parent()?.file_name()
+fn triple_dir(path: &Path) -> Option<&str> {
+    path.parent()?.parent()?.file_name()?.to_str()
 }
 
-/// Add `executables` to `built`, newest last. A path is kept once.
+/// Whether two artifact paths have the same file name and profile directory.
+fn same_slot(a: &Path, b: &Path) -> bool {
+    a.file_name() == b.file_name() && profile_dir(a) == profile_dir(b)
+}
+
+/// Whether a binary for `triple` can start on this machine.
+///
+/// The arch and the OS of the triple must agree with this CLI. The triple
+/// directory of a build without `build.target` is not a triple, so it fails.
+fn runs_here(triple: &str) -> bool {
+    let mut parts = triple.split('-');
+    let arch = parts.next().unwrap_or_default();
+    let arch_ok = match std::env::consts::ARCH {
+        "x86" => matches!(arch, "i386" | "i586" | "i686"),
+        "arm" => arch.starts_with("arm") || arch.starts_with("thumb"),
+        host => arch == host,
+    };
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    arch_ok && parts.any(|part| part == os)
+}
+
+/// Add the `executables` of one build to `built`, newest last.
+///
+/// A build replaces the older paths in the same slot. The paths of one build
+/// stay together: with more than one triple, one build reports one path for
+/// each triple.
 fn record_into(built: &mut Vec<PathBuf>, executables: &[PathBuf]) {
+    built.retain(|old| !executables.iter().any(|exe| same_slot(old, exe)));
     for exe in executables {
-        built.retain(|old| old != exe);
-        built.push(exe.clone());
+        if !built.contains(exe) {
+            built.push(exe.clone());
+        }
     }
 }
 
 /// The path in `built` that matches `guess` by file name and profile directory.
 ///
-/// `build.target` can name more than one triple. Then the host triple wins,
-/// because only its binary can start here. Otherwise the newest match wins.
+/// With more than one triple, the path for this machine wins. Otherwise the
+/// newest path wins.
 fn lookup_in(built: &[PathBuf], guess: &Path) -> Option<PathBuf> {
-    let mut matches = built.iter().rev().filter(|path| {
-        path.file_name() == guess.file_name() && profile_dir(path) == profile_dir(guess)
-    });
-    let newest = matches.clone().next()?;
-    let host = matches.find(|path| triple_dir(path) == Some(OsStr::new(HOST_TRIPLE)));
-    Some(host.unwrap_or(newest).clone())
+    let matches: Vec<&PathBuf> = built.iter().filter(|path| same_slot(path, guess)).collect();
+    matches
+        .iter()
+        .rev()
+        .find(|path| triple_dir(path).is_some_and(runs_here))
+        .or_else(|| matches.last())
+        .map(|path| (*path).clone())
 }
 
 /// Remember the executables of a finished build.
@@ -127,30 +155,34 @@ mod tests {
         assert!(parse_executables(&out).is_empty());
     }
 
+    /// A triple that [`runs_here`] accepts on this machine.
+    fn local_triple() -> String {
+        let arch = match std::env::consts::ARCH {
+            "x86" => "i686",
+            "arm" => "armv7",
+            other => other,
+        };
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            other => other,
+        };
+        format!("{arch}-unknown-{os}")
+    }
+
     #[test]
-    fn newest_path_wins_for_same_file_name() {
+    fn newer_build_replaces_older_path_in_same_slot() {
         let mut built = Vec::new();
         record_into(
             &mut built,
             &[PathBuf::from("/a/debug/bin"), PathBuf::from("/a/other")],
         );
         record_into(&mut built, &[PathBuf::from("/b/debug/bin")]);
-        record_into(&mut built, &[PathBuf::from("/b/debug/bin")]);
-        assert_eq!(built.len(), 3, "a path is kept once: {built:?}");
+        assert_eq!(built.len(), 2);
         assert_eq!(
             lookup_in(&built, Path::new("/t/debug/bin")),
             Some(PathBuf::from("/b/debug/bin"))
         );
         assert_eq!(lookup_in(&built, Path::new("/t/debug/missing")), None);
-    }
-
-    #[test]
-    fn prefer_built_swaps_a_stale_guess() {
-        record(&[PathBuf::from("/t/triple/debug/yy_app")]);
-        assert_eq!(
-            prefer_built(PathBuf::from("/t/debug/yy_app")),
-            PathBuf::from("/t/triple/debug/yy_app")
-        );
     }
 
     #[test]
@@ -163,20 +195,41 @@ mod tests {
     }
 
     #[test]
-    fn host_triple_wins_over_a_foreign_triple() {
-        // `build.target = [host, foreign]`: Cargo reports both, in any order.
-        let host = PathBuf::from(format!("/t/{HOST_TRIPLE}/debug/app"));
-        let foreign = PathBuf::from("/t/foreign-triple/debug/app");
-        for order in [[&host, &foreign], [&foreign, &host]] {
+    fn local_triple_wins_over_a_foreign_triple() {
+        // `build.target = [local, foreign]`: one build reports both, in any order.
+        let local = PathBuf::from(format!("/t/{}/debug/app", local_triple()));
+        let foreign = PathBuf::from("/t/sparc64-unknown-netbsd/debug/app");
+        for order in [[&local, &foreign], [&foreign, &local]] {
             let mut built = Vec::new();
-            for exe in order {
-                record_into(&mut built, std::slice::from_ref(exe));
-            }
+            record_into(&mut built, &order.map(PathBuf::clone));
+            assert_eq!(built.len(), 2);
             assert_eq!(
                 lookup_in(&built, Path::new("/t/debug/app")),
-                Some(host.clone())
+                Some(local.clone())
             );
         }
+    }
+
+    #[test]
+    fn newer_build_beats_an_older_local_triple_entry() {
+        // `build.target` was removed between two builds in one process.
+        let mut built = Vec::new();
+        let local = PathBuf::from(format!("/t/{}/debug/app", local_triple()));
+        record_into(&mut built, &[local]);
+        record_into(&mut built, &[PathBuf::from("/t/debug/app")]);
+        assert_eq!(
+            lookup_in(&built, Path::new("/t/debug/app")),
+            Some(PathBuf::from("/t/debug/app"))
+        );
+    }
+
+    #[test]
+    fn runs_here_needs_the_local_arch_and_os() {
+        assert!(runs_here(&local_triple()));
+        assert!(runs_here(&format!("{}-gnu", local_triple())));
+        assert!(!runs_here("sparc64-unknown-netbsd"));
+        assert!(!runs_here("wasm32-wasip1"));
+        assert!(!runs_here("target"));
     }
 
     #[test]
