@@ -731,6 +731,35 @@ struct FnDecl {
     top: Option<usize>,
 }
 
+/// `(line, column)` of the first and the last token of a range.
+type Span = ((usize, usize), (usize, usize));
+
+/// The span of `trees[from..to]`.
+fn span_of(trees: &[TokenTree], from: usize, to: usize) -> Span {
+    let start = trees[from].span().start();
+    let end = trees[to.max(from + 1) - 1].span().end();
+    ((start.line, start.column), (end.line, end.column))
+}
+
+impl FnDecl {
+    /// A range that is not in the build: an item or a statement under a `cfg`
+    /// that is off. It holds no calls and no routes, and no call reaches it,
+    /// so markup inside it has no route.
+    fn excluded(file: &str, (start, end): Span) -> Self {
+        Self {
+            name: String::new(),
+            file: file.to_owned(),
+            start,
+            end,
+            calls: BTreeSet::new(),
+            routes: Vec::new(),
+            callable: false,
+            owner: None,
+            top: None,
+        }
+    }
+}
+
 /// Route attribute macros that serve markup. `#[static_get]` is one of them —
 /// it pre-renders a page, so an alt-less image in it is as broken as in any
 /// other. `#[ws]` is not: a WebSocket upgrade serves no document.
@@ -802,6 +831,7 @@ fn collect_fns_in(trees: &[TokenTree], level: &Level<'_>, out: &mut Vec<FnDecl>)
     let mut i = 0;
     while i < trees.len() {
         if let Some(next) = skip_unindexed_item(trees, i, features) {
+            out.push(FnDecl::excluded(file, span_of(trees, i, next)));
             i = next;
             pending.clear();
             continue;
@@ -818,23 +848,7 @@ fn collect_fns_in(trees: &[TokenTree], level: &Level<'_>, out: &mut Vec<FnDecl>)
                 && let TokenTree::Group(body) = &trees[body_at]
             {
                 let inner: Vec<TokenTree> = body.stream().into_iter().collect();
-                let mut calls = BTreeSet::new();
-                collect_calls(&inner, features, &mut calls);
-                // A name bound in this function — a parameter, a local, a
-                // closure argument — shadows any free function that shares it,
-                // so calling it does not reach that function.
-                let mut bound = BTreeSet::new();
-                // The parameter list is the first parenthesized group after the
-                // name; a return type or a `where` clause can sit between it
-                // and the body.
-                if let Some(params) = trees[i + 2..body_at].iter().find_map(|tree| match tree {
-                    TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => Some(g),
-                    _ => None,
-                }) {
-                    collect_idents(&params.stream().into_iter().collect::<Vec<_>>(), &mut bound);
-                }
-                collect_bindings(&inner, &mut bound);
-                calls.retain(|call| !bound.contains(call));
+                let (calls, excluded) = fn_calls(&trees[i + 2..body_at], &inner, features);
                 let start = trees[i].span().start();
                 let end = body.span().end();
                 out.push(FnDecl {
@@ -848,10 +862,16 @@ fn collect_fns_in(trees: &[TokenTree], level: &Level<'_>, out: &mut Vec<FnDecl>)
                     owner,
                     top,
                 });
+                let index = out.len() - 1;
+                out.extend(
+                    excluded
+                        .into_iter()
+                        .map(|span| FnDecl::excluded(file, span)),
+                );
                 let body = Level {
                     callable: false,
-                    owner: Some(out.len() - 1),
-                    top: top.or(Some(out.len() - 1)),
+                    owner: Some(index),
+                    top: top.or(Some(index)),
                     ..*level
                 };
                 collect_fns_in(&inner, &body, out);
@@ -896,6 +916,34 @@ fn collect_fns_in(trees: &[TokenTree], level: &Level<'_>, out: &mut Vec<FnDecl>)
         }
         i += 1;
     }
+}
+
+/// The call edges of a function, and the ranges of its body that a `cfg`
+/// takes out of the build. `head` is the tokens between the name and the
+/// body; `body` is the body.
+fn fn_calls(
+    head: &[TokenTree],
+    body: &[TokenTree],
+    features: Option<&BTreeSet<String>>,
+) -> (BTreeSet<String>, Vec<Span>) {
+    let mut calls = BTreeSet::new();
+    let mut excluded = Vec::new();
+    collect_calls(body, features, &mut calls, &mut excluded);
+    // A name bound in this function — a parameter, a local, a closure
+    // argument — shadows any free function that shares it, so calling it does
+    // not reach that function.
+    let mut bound = BTreeSet::new();
+    // The parameter list is the first parenthesized group after the name; a
+    // return type or a `where` clause can sit between it and the body.
+    if let Some(params) = head.iter().find_map(|tree| match tree {
+        TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => Some(g),
+        _ => None,
+    }) {
+        collect_idents(&params.stream().into_iter().collect::<Vec<_>>(), &mut bound);
+    }
+    collect_bindings(body, &mut bound);
+    calls.retain(|call| !bound.contains(call));
+    (calls, excluded)
 }
 
 /// The index past an item at `trees[i]` that [`collect_fns_in`] does not
@@ -1027,6 +1075,7 @@ fn collect_calls(
     trees: &[TokenTree],
     features: Option<&BTreeSet<String>>,
     out: &mut BTreeSet<String>,
+    excluded: &mut Vec<Span>,
 ) {
     let mut i = 0;
     while i < trees.len() {
@@ -1045,7 +1094,9 @@ fn collect_calls(
             && attr.delimiter() == Delimiter::Bracket
         {
             i = if cfg_is_off(attr, features) {
-                skip_gated(trees, i + 2)
+                let end = skip_gated(trees, i + 2);
+                excluded.push(span_of(trees, i, end));
+                end
             } else {
                 i + 2
             };
@@ -1058,7 +1109,7 @@ fn collect_calls(
                 && is_resolvable_call(trees, i)
                 && !CALL_KEYWORDS.contains(&name.as_str())
             {
-                out.insert(name.clone());
+                out.insert(call_key(trees, i, &name));
             }
             // The arguments of a call or a method call: a function can be
             // passed by name. A macro (`format!(…)`) has a `!` here instead.
@@ -1076,9 +1127,23 @@ fn collect_calls(
         }
         if let TokenTree::Group(group) = &trees[i] {
             let inner: Vec<TokenTree> = group.stream().into_iter().collect();
-            collect_calls(&inner, features, out);
+            collect_calls(&inner, features, out, excluded);
         }
         i += 1;
+    }
+}
+
+/// The key of a call to `name` at `trees[i]`: the bare name, or `::name` for
+/// a path (`views::sidebar`). A path names a free item, so neither a local
+/// helper nor a local binding of the same name can shadow it.
+fn call_key(trees: &[TokenTree], i: usize, name: &str) -> String {
+    let path = i
+        .checked_sub(1)
+        .is_some_and(|prev| matches!(&trees[prev], TokenTree::Punct(p) if p.as_char() == ':'));
+    if path {
+        format!("::{name}")
+    } else {
+        name.to_owned()
     }
 }
 
@@ -1141,7 +1206,7 @@ fn collect_paths_passed(args: &proc_macro2::Group, out: &mut BTreeSet<String>) {
         }
         let last = arg.len() - 1;
         if last == 0 || qualifier_is_module(arg, last) {
-            out.insert(arg[last].to_string());
+            out.insert(call_key(arg, last, &arg[last].to_string()));
         }
     }
 }
@@ -1489,6 +1554,9 @@ impl<'a> RouteGraph<'a> {
         // A bare call reaches the nearest helper of that name: one declared in
         // the caller's body, then in each enclosing body, then a free item.
         let resolve = |from: usize, name: &str| -> Option<usize> {
+            if let Some(path) = name.strip_prefix("::") {
+                return by_name.get(path).copied().flatten();
+            }
             if hidden.contains(&(fns[from].top.unwrap_or(from), name)) {
                 return None;
             }
@@ -5265,6 +5333,74 @@ mod tests {
             fn admin(u: User) -> Markup { html! { img src="/x.png"; } }
         "#;
         assert!(routes_with_features(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn markup_in_a_gated_nested_fn_is_not_the_handler_s() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                #[cfg(feature = "admin")]
+                fn unused() -> Markup { html! { img src="/x.png"; } }
+                html! { span { "a" } }
+            }
+        "#;
+        assert!(routes_with_features(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn markup_in_a_gated_statement_is_not_the_handler_s() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                #[cfg(feature = "admin")]
+                let _x = html! { img src="/x.png"; };
+                html! { span { "a" } }
+            }
+        "#;
+        assert!(routes_with_features(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_module_qualified_call_skips_a_local_helper() {
+        // `views::sidebar()` names the free fn, not the uncalled local one.
+        let local_bad = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                fn sidebar() -> Markup { html! { img src="/x.png"; } }
+                html! { (views::sidebar()) }
+            }
+
+            fn sidebar() -> Markup { html! { span { "clean" } } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", local_bad)]).is_empty());
+        let free_bad = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                fn sidebar() -> Markup { html! { span { "clean" } } }
+                html! { (views::sidebar()) }
+            }
+
+            fn sidebar() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", free_bad)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_local_binding_does_not_shadow_a_module_qualified_call() {
+        let src = r#"
+            #[get("/a")]
+            async fn a(sidebar: bool) -> Markup { html! { (views::sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
     }
 
     #[test]

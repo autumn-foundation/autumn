@@ -687,7 +687,8 @@ resolve to nothing in the whole function.
 
 These call shapes are followed:
 
-- `sidebar()` and `views::sidebar()`.
+- `sidebar()` and `views::sidebar()`. A path always names a free item, so a
+  local helper or a local binding of the same name does not shadow it.
 - A turbofish: `sidebar::<Html>()`.
 - A function passed by name: `rows.map(render_row)`, `.map(views::render_row)`.
 
@@ -707,7 +708,8 @@ scan reads `[features] default` from the nearest `Cargo.toml`. `--features a,b`
 adds features in every crate of the scan, `--all-features` turns on every
 feature and optional dependency, and `--no-default-features` turns the default
 set off. A predicate the scan cannot decide (`target_os = "linux"`), or a file
-with no package manifest, keeps the item. The features change only the route
+with no package manifest, keeps the item. A finding inside a gated item or
+statement that is off has no route. The features change only the route
 attribution. They do not change the findings or the exit code.
 
 Attribution is therefore a lower bound. `status: "pass"` means no finding was
