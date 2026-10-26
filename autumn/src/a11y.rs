@@ -586,6 +586,16 @@ enum LabelSource {
     LabelledBy(String),
 }
 
+/// `visible_label`, `aria_label`, `aria_labelledby`, `aria_invalid`,
+/// `aria_required`, in the order [`label_render_attrs`] returns them.
+type LabelRenderAttrs<'a> = (
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
 /// Resolves a `<Labeled>` primitive's label and validity state into the
 /// markup attributes every one of them renders the same way: WCAG
 /// 1.3.1/3.3.2/4.1.2 requires exactly one accessible-name attribute, and
@@ -594,16 +604,10 @@ enum LabelSource {
 /// `TextArea`, `Select`, `Checkbox`, `FileField` and `RadioGroup` all call
 /// this with their own `label`/`aria_invalid`/`aria_required` fields.
 fn label_render_attrs(
-    label: &Option<LabelSource>,
+    label: Option<&LabelSource>,
     aria_invalid: Option<bool>,
     aria_required: bool,
-) -> (
-    Option<&str>,
-    Option<&str>,
-    Option<&str>,
-    Option<&'static str>,
-    Option<&'static str>,
-) {
+) -> LabelRenderAttrs<'_> {
     let (visible_label, aria_label, aria_labelledby) = match label {
         Some(LabelSource::Visible(text)) => (Some(text.as_str()), None, None),
         Some(LabelSource::Aria(text)) => (None, Some(text.as_str()), None),
@@ -994,7 +998,7 @@ impl Render for TextField<Labeled> {
         // every other attribute is shared, so compute the label bits once and
         // emit a single `<input>`.
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
-            label_render_attrs(&self.label, self.aria_invalid, self.aria_required);
+            label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let input = html! {
             input
                 type=(self.input_type)
@@ -1229,7 +1233,7 @@ impl<State> TextArea<State> {
 impl Render for TextArea<Labeled> {
     fn render(&self) -> Markup {
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
-            label_render_attrs(&self.label, self.aria_invalid, self.aria_required);
+            label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let textarea = html! {
             textarea
                 id=(self.name)
@@ -1476,7 +1480,7 @@ impl<State> Select<State> {
 impl Render for Select<Labeled> {
     fn render(&self) -> Markup {
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
-            label_render_attrs(&self.label, self.aria_invalid, self.aria_required);
+            label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let select = html! {
             select
                 id=(self.name)
@@ -1679,7 +1683,7 @@ impl<State> Checkbox<State> {
 impl Render for Checkbox<Labeled> {
     fn render(&self) -> Markup {
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
-            label_render_attrs(&self.label, self.aria_invalid, self.aria_required);
+            label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let input = html! {
             input
                 type="checkbox"
@@ -1887,7 +1891,7 @@ impl Render for FileField<Labeled> {
         // fix for the `direct_upload_input` derived-aria-label precedence caveat
         // (issue #1933).
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
-            label_render_attrs(&self.label, self.aria_invalid, self.aria_required);
+            label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let input = html! {
             input
                 type="file"
@@ -2254,7 +2258,7 @@ fn selector_safe(part: &str) -> String {
 impl Render for RadioGroup<Labeled> {
     fn render(&self) -> Markup {
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
-            label_render_attrs(&self.label, self.aria_invalid, self.aria_required);
+            label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let ids = radio_option_ids(self.id_prefix.as_deref(), &self.name, &self.options);
         // A group holds one selection: more than one `checked` control is a
         // document-conformance error, and a browser would keep only the last,
