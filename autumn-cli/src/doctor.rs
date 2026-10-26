@@ -1950,6 +1950,42 @@ pub fn check_custom_domains_config_impl(
             hint: Some("Raise [server.tls.acme.custom_domains] max_domains"),
         });
     }
+    // #2643: build each domain's instructions as the tenant view does, so
+    // doctor and the tenant view use one apex rule.
+    let ingress = cd.ingress();
+    let unusable: Vec<(&str, String)> = registry
+        .domains
+        .iter()
+        .filter_map(|(hostname, ..)| {
+            autumn_web::custom_domain::RoutingRecord::for_hostname(hostname, &ingress)
+                .err()
+                .map(|e| (hostname.as_str(), e))
+        })
+        .collect();
+    if let Some((_, first)) = unusable.first() {
+        const SHOWN: usize = 5;
+        let mut names = unusable
+            .iter()
+            .take(SHOWN)
+            .map(|(hostname, _)| *hostname)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if unusable.len() > SHOWN {
+            names.push_str(&format!(" and {} more", unusable.len() - SHOWN));
+        }
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{} registered domains get no DNS instructions ({names}): {first}",
+                unusable.len()
+            )),
+            hint: Some(
+                "Set [server.tls.acme.custom_domains] ingress_ipv4 / ingress_ipv6 for apex \
+                 domains, and ingress_hostname for subdomains",
+            ),
+        });
+    }
     Some(CheckResult {
         name: "custom_domains",
         status: CheckStatus::Pass,

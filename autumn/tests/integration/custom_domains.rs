@@ -169,7 +169,9 @@ async fn multi_label_suffix_apexes_get_address_records() {
         .await
         .unwrap();
     assert!(matches!(
-        DnsInstructions::for_domain(&sub, &ingress()).unwrap().routing,
+        DnsInstructions::for_domain(&sub, &ingress())
+            .unwrap()
+            .routing,
         RoutingRecord::Cname { .. }
     ));
 }
