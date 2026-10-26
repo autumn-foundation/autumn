@@ -14846,6 +14846,73 @@ pub struct Vault {
         );
     }
 
+    /// A read of one healthy record per hostname.
+    fn read_of_hosts(hosts: &[&str]) -> CustomDomainRegistryRead {
+        CustomDomainRegistryRead {
+            domains: hosts
+                .iter()
+                .map(|h| {
+                    (
+                        (*h).to_owned(),
+                        "tenant-a".to_owned(),
+                        "pending_dns".to_owned(),
+                        None,
+                    )
+                })
+                .collect(),
+            ..CustomDomainRegistryRead::default()
+        }
+    }
+
+    /// #2643: doctor warns when a registered domain gets no DNS instructions.
+    /// It uses the same builder as the tenant view.
+    #[test]
+    fn custom_domains_config_check_warns_when_a_domain_gets_no_dns_instructions() {
+        let hostname_only = custom_domains_config(true);
+        let warn = check_custom_domains_config_impl(
+            Some(&hostname_only),
+            None,
+            &read_of_hosts(&["app.clientco.com", "clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(warn.status, CheckStatus::Warn);
+        let detail = warn.detail.unwrap();
+        assert!(detail.contains("clientco.co.uk"), "{detail}");
+        assert!(!detail.contains("app.clientco.com"), "{detail}");
+        assert!(warn.hint.unwrap().contains("ingress_ipv4"));
+
+        // Subdomains only: a CNAME serves them all.
+        let subs = check_custom_domains_config_impl(
+            Some(&hostname_only),
+            None,
+            &read_of_hosts(&["app.clientco.com", "app.clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(subs.status, CheckStatus::Pass);
+
+        // Addresses configured: the apex has its A records.
+        let mut with_addresses = custom_domains_config(true);
+        with_addresses.ingress_ipv4 = vec!["203.0.113.10".to_owned()];
+        let pass = check_custom_domains_config_impl(
+            Some(&with_addresses),
+            None,
+            &read_of_hosts(&["clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(pass.status, CheckStatus::Pass);
+
+        // Addresses only: a subdomain gets no CNAME target.
+        with_addresses.ingress_hostname = None;
+        let no_cname = check_custom_domains_config_impl(
+            Some(&with_addresses),
+            None,
+            &read_of_hosts(&["app.clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(no_cname.status, CheckStatus::Warn);
+        assert!(no_cname.hint.unwrap().contains("ingress_hostname"));
+    }
+
     fn probe(status: &str, dns: CustomDomainDns) -> CustomDomainProbe {
         CustomDomainProbe {
             hostname: "app.clientco.com".to_owned(),

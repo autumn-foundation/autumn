@@ -2937,6 +2937,35 @@ mod tests {
         assert!(!is_apex("a.b.clientco.com"));
     }
 
+    /// #2643: an apex under a multi-label public suffix has three labels.
+    #[test]
+    fn apex_detection_uses_the_public_suffix_list() {
+        for apex in ["clientco.co.uk", "customer.com.au", "tenant.co.jp"] {
+            assert!(is_apex(apex), "{apex} is an apex");
+            let sub = format!("app.{apex}");
+            assert!(!is_apex(&sub), "{sub} is a subdomain");
+        }
+        // Wildcard rule `*.ck` and its exception `!www.ck`.
+        assert!(is_apex("foo.bar.ck"));
+        assert!(is_apex("www.ck"));
+        assert!(!is_apex("app.www.ck"));
+        // A private-section suffix delegates a zone too.
+        assert!(is_apex("clientco.eu.org"));
+        // An unlisted TLD keeps the two-label rule.
+        assert!(is_apex("clientco.internal"));
+        assert!(!is_apex("app.clientco.internal"));
+        // A public suffix is itself the top of a zone.
+        assert!(is_apex("co.uk"));
+    }
+
+    /// The lookup ignores case and a trailing dot.
+    #[test]
+    fn apex_detection_ignores_case_and_a_trailing_dot() {
+        assert!(is_apex("ClientCo.CO.UK"));
+        assert!(is_apex("clientco.co.uk."));
+        assert!(!is_apex("APP.ClientCo.co.uk"));
+    }
+
     #[test]
     fn backoff_doubles_and_caps() {
         assert_eq!(backoff_secs(0, 300, 3600), 0);

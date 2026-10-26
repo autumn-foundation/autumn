@@ -146,6 +146,53 @@ async fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
     assert!(apex.render().contains('A'));
 }
 
+/// #2643: an apex under a multi-label public suffix gets A/AAAA records.
+#[tokio::test]
+async fn multi_label_suffix_apexes_get_address_records() {
+    let registry = registry();
+    for hostname in ["clientco.co.uk", "customer.com.au", "tenant.co.jp"] {
+        let domain = registry.register(hostname, "tenant-a", NOW).await.unwrap();
+        let instructions = DnsInstructions::for_domain(&domain, &ingress()).unwrap();
+        match &instructions.routing {
+            RoutingRecord::Address { name, ipv4, .. } => {
+                assert_eq!(name, hostname);
+                assert_eq!(ipv4, &["203.0.113.10".to_owned()]);
+            }
+            other @ RoutingRecord::Cname { .. } => {
+                panic!("{hostname}: expected address records, got {other:?}")
+            }
+        }
+    }
+
+    let sub = registry
+        .register("app.clientco.co.uk", "tenant-a", NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        DnsInstructions::for_domain(&sub, &ingress()).unwrap().routing,
+        RoutingRecord::Cname { .. }
+    ));
+}
+
+/// #2643: with no ingress addresses, a multi-label apex gets the same error
+/// as a two-label apex, not a CNAME it cannot publish.
+#[tokio::test]
+async fn multi_label_suffix_apex_without_addresses_names_the_missing_keys() {
+    let hostname_only = ExpectedIngress {
+        hostname: Some("ingress.myapp.com".to_owned()),
+        ..ExpectedIngress::default()
+    };
+    let registry = registry();
+    for hostname in ["clientco.com", "clientco.co.uk"] {
+        let domain = registry.register(hostname, "tenant-a", NOW).await.unwrap();
+        let err = DnsInstructions::for_domain(&domain, &hostname_only).unwrap_err();
+        assert!(
+            err.contains("ingress_ipv4") && err.contains("ingress_ipv6"),
+            "{hostname}: {err}"
+        );
+    }
+}
+
 // ── #2642: ownership proof by TXT token ──────────────────────────────────
 
 /// Both shapes render the TXT record that carries the registration's token,
