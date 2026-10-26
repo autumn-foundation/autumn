@@ -1716,7 +1716,7 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
 /// `resolver_v1` (see [`resolver_v1_is_in_effect`]) is forwarded to
 /// [`is_optional_dependency`] for the strong-dependency-feature check below.
 #[must_use]
-fn enabled_features_from_manifest_for_resolver(
+pub fn enabled_features_from_manifest_for_resolver(
     manifest: &str,
     requested: &[&str],
     resolver_v1: bool,
@@ -3309,10 +3309,16 @@ impl CfgPredicate {
 /// not understand. A caller treats `None` the same as `Some(true)` — kept in
 /// the scan — so only `Some(false)` ever excludes a function.
 fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> Option<bool> {
-    if !attr.path().is_ident("cfg") {
+    eval_cfg_meta(&attr.meta, default_features)
+}
+
+/// [`eval_cfg_attr`] on the body of an attribute (`cfg(...)`). `autumn a11y
+/// verify` reads tokens, not a `syn` AST, so it calls this directly.
+pub fn eval_cfg_meta(meta: &syn::Meta, default_features: &BTreeSet<String>) -> Option<bool> {
+    if !meta.path().is_ident("cfg") {
         return None;
     }
-    let syn::Meta::List(list) = &attr.meta else {
+    let syn::Meta::List(list) = meta else {
         return None;
     };
     syn::parse2::<CfgPredicate>(list.tokens.clone())

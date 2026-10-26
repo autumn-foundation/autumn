@@ -68,6 +68,11 @@
 //!   [`RadioGroup`](crate::a11y::RadioGroup)`<Labeled>` implements
 //!   [`maud::Render`].
 //!
+//! The types prove that a name is *present*, not that it holds text:
+//! `Img::new(src, "")` compiles. Every entry point that takes a name has a
+//! `debug_assert!`, so an empty or blank name panics at the call site in a
+//! debug build. A release build renders the name as it is.
+//!
 //! All six form primitives also accept arbitrary `hx-*` attributes through an
 //! `hx(name, value)` escape hatch, so the htmx (`--live-validation`) rendering
 //! path keeps the typed label obligation instead of dropping to raw markup.
@@ -117,10 +122,11 @@ impl Img {
     /// let markup = Img::new("/hero.png", "A field at sunrise").render();
     /// assert!(markup.into_string().contains("alt=\"A field at sunrise\""));
     /// ```
+    #[track_caller]
     pub fn new(src: impl Into<String>, alt: impl Into<String>) -> Self {
         Self {
             src: src.into(),
-            alt: alt.into(),
+            alt: checked_name("Img::new", alt),
             class: None,
             width: None,
             height: None,
@@ -223,9 +229,10 @@ impl Button {
     ///
     /// assert!(Button::new("Save").render().into_string().contains("Save"));
     /// ```
+    #[track_caller]
     pub fn new(accessible_name: impl Into<String>) -> Self {
         Self {
-            accessible_name: accessible_name.into(),
+            accessible_name: checked_name("Button::new", accessible_name),
             icon: None,
             kind: ButtonType::default(),
             class: None,
@@ -244,9 +251,10 @@ impl Button {
     /// let markup = Button::icon(trash, "Delete item").render().into_string();
     /// assert!(markup.contains("aria-label=\"Delete item\""));
     /// ```
+    #[track_caller]
     pub fn icon(icon: Markup, accessible_name: impl Into<String>) -> Self {
         Self {
-            accessible_name: accessible_name.into(),
+            accessible_name: checked_name("Button::icon", accessible_name),
             icon: Some(icon),
             kind: ButtonType::default(),
             class: None,
@@ -334,10 +342,11 @@ impl Link {
     /// assert!(markup.contains("href=\"/about\""));
     /// assert!(markup.contains(">About us<"));
     /// ```
+    #[track_caller]
     pub fn new(href: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             href: href.into(),
-            accessible_name: text.into(),
+            accessible_name: checked_name("Link::new", text),
             icon: None,
             class: None,
             new_tab: false,
@@ -358,10 +367,11 @@ impl Link {
     ///     .into_string();
     /// assert!(markup.contains("aria-label=\"GitHub\""));
     /// ```
+    #[track_caller]
     pub fn icon(href: impl Into<String>, icon: Markup, accessible_name: impl Into<String>) -> Self {
         Self {
             href: href.into(),
-            accessible_name: accessible_name.into(),
+            accessible_name: checked_name("Link::icon", accessible_name),
             icon: Some(icon),
             class: None,
             new_tab: false,
@@ -442,9 +452,10 @@ impl MenuItem {
     /// assert!(markup.contains("role=\"menuitem\""));
     /// assert!(markup.contains(">Settings<"));
     /// ```
+    #[track_caller]
     pub fn new(accessible_name: impl Into<String>) -> Self {
         Self {
-            accessible_name: accessible_name.into(),
+            accessible_name: checked_name("MenuItem::new", accessible_name),
             href: None,
             icon: None,
             class: None,
@@ -518,6 +529,39 @@ pub struct NoLabel;
 /// state implements [`maud::Render`].
 #[derive(Debug, Clone, Copy)]
 pub struct Labeled;
+
+/// Convert the accessible name given to `entry`, and make sure that it is not
+/// blank.
+///
+/// The typestate proves that a name is present. It does not prove that the
+/// name holds text: `""`, `" "` or a zero-width space gives an element with no
+/// name (WCAG 4.1.2). A debug build panics at the caller. A release build keeps
+/// the text as it is.
+#[track_caller]
+fn checked_name(entry: &str, name: impl Into<String>) -> String {
+    let name = name.into();
+    debug_assert!(
+        !is_blank(&name),
+        "{entry}: the text is empty or blank, so the element has no accessible name{}",
+        if entry == "Img::new" {
+            "; use Img::decorative(src) for an image that carries no information"
+        } else {
+            ""
+        }
+    );
+    name
+}
+
+/// Whether `text` shows nothing: only white space and zero-width characters.
+fn is_blank(text: &str) -> bool {
+    text.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+            )
+    })
+}
 
 /// How a [`TextField`]'s accessible name is provided.
 #[derive(Debug, Clone)]
@@ -670,22 +714,31 @@ impl TextField<NoLabel> {
     /// Attach a visible `<label for=…>` and transition to the renderable
     /// [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn label(self, text: impl Into<String>) -> TextField<Labeled> {
-        self.with_label(LabelSource::Visible(text.into()))
+        self.with_label(LabelSource::Visible(checked_name("TextField::label", text)))
     }
 
     /// Attach an `aria-label` (no visible label) and transition to the
     /// renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn aria_label(self, text: impl Into<String>) -> TextField<Labeled> {
-        self.with_label(LabelSource::Aria(text.into()))
+        self.with_label(LabelSource::Aria(checked_name(
+            "TextField::aria_label",
+            text,
+        )))
     }
 
     /// Reference an existing element's `id` via `aria-labelledby` and
     /// transition to the renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn labelled_by(self, id: impl Into<String>) -> TextField<Labeled> {
-        self.with_label(LabelSource::LabelledBy(id.into()))
+        self.with_label(LabelSource::LabelledBy(checked_name(
+            "TextField::labelled_by",
+            id,
+        )))
     }
 
     fn with_label(self, label: LabelSource) -> TextField<Labeled> {
@@ -991,22 +1044,31 @@ impl TextArea<NoLabel> {
     /// Attach a visible `<label for=…>` and transition to the renderable
     /// [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn label(self, text: impl Into<String>) -> TextArea<Labeled> {
-        self.with_label(LabelSource::Visible(text.into()))
+        self.with_label(LabelSource::Visible(checked_name("TextArea::label", text)))
     }
 
     /// Attach an `aria-label` (no visible label) and transition to the
     /// renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn aria_label(self, text: impl Into<String>) -> TextArea<Labeled> {
-        self.with_label(LabelSource::Aria(text.into()))
+        self.with_label(LabelSource::Aria(checked_name(
+            "TextArea::aria_label",
+            text,
+        )))
     }
 
     /// Reference an existing element's `id` via `aria-labelledby` and transition
     /// to the renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn labelled_by(self, id: impl Into<String>) -> TextArea<Labeled> {
-        self.with_label(LabelSource::LabelledBy(id.into()))
+        self.with_label(LabelSource::LabelledBy(checked_name(
+            "TextArea::labelled_by",
+            id,
+        )))
     }
 
     fn with_label(self, label: LabelSource) -> TextArea<Labeled> {
@@ -1179,10 +1241,11 @@ pub struct SelectOption {
 
 impl SelectOption {
     /// Build an option with a submitted `value` and a human-visible `label`.
+    #[track_caller]
     pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             value: value.into(),
-            label: label.into(),
+            label: checked_name("SelectOption::new", label),
             selected: false,
             disabled: false,
         }
@@ -1252,22 +1315,28 @@ impl Select<NoLabel> {
     /// Attach a visible `<label for=…>` and transition to the renderable
     /// [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn label(self, text: impl Into<String>) -> Select<Labeled> {
-        self.with_label(LabelSource::Visible(text.into()))
+        self.with_label(LabelSource::Visible(checked_name("Select::label", text)))
     }
 
     /// Attach an `aria-label` (no visible label) and transition to the
     /// renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn aria_label(self, text: impl Into<String>) -> Select<Labeled> {
-        self.with_label(LabelSource::Aria(text.into()))
+        self.with_label(LabelSource::Aria(checked_name("Select::aria_label", text)))
     }
 
     /// Reference an existing element's `id` via `aria-labelledby` and transition
     /// to the renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn labelled_by(self, id: impl Into<String>) -> Select<Labeled> {
-        self.with_label(LabelSource::LabelledBy(id.into()))
+        self.with_label(LabelSource::LabelledBy(checked_name(
+            "Select::labelled_by",
+            id,
+        )))
     }
 
     fn with_label(self, label: LabelSource) -> Select<Labeled> {
@@ -1290,6 +1359,7 @@ impl Select<NoLabel> {
 impl<State> Select<State> {
     /// Append a single option built from a `value` and visible `label`.
     #[must_use]
+    #[track_caller]
     pub fn option(mut self, value: impl Into<String>, label: impl Into<String>) -> Self {
         self.options.push(SelectOption::new(value, label));
         self
@@ -1467,22 +1537,31 @@ impl Checkbox<NoLabel> {
     /// Attach a visible `<label for=…>` and transition to the renderable
     /// [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn label(self, text: impl Into<String>) -> Checkbox<Labeled> {
-        self.with_label(LabelSource::Visible(text.into()))
+        self.with_label(LabelSource::Visible(checked_name("Checkbox::label", text)))
     }
 
     /// Attach an `aria-label` (no visible label) and transition to the
     /// renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn aria_label(self, text: impl Into<String>) -> Checkbox<Labeled> {
-        self.with_label(LabelSource::Aria(text.into()))
+        self.with_label(LabelSource::Aria(checked_name(
+            "Checkbox::aria_label",
+            text,
+        )))
     }
 
     /// Reference an existing element's `id` via `aria-labelledby` and transition
     /// to the renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn labelled_by(self, id: impl Into<String>) -> Checkbox<Labeled> {
-        self.with_label(LabelSource::LabelledBy(id.into()))
+        self.with_label(LabelSource::LabelledBy(checked_name(
+            "Checkbox::labelled_by",
+            id,
+        )))
     }
 
     fn with_label(self, label: LabelSource) -> Checkbox<Labeled> {
@@ -1669,22 +1748,31 @@ impl FileField<NoLabel> {
     /// [`Labeled`] state. With a visible label the field emits no `aria-label`,
     /// so the visible label is the caller-controlled accessible name.
     #[must_use]
+    #[track_caller]
     pub fn label(self, text: impl Into<String>) -> FileField<Labeled> {
-        self.with_label(LabelSource::Visible(text.into()))
+        self.with_label(LabelSource::Visible(checked_name("FileField::label", text)))
     }
 
     /// Attach an `aria-label` (no visible label) and transition to the
     /// renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn aria_label(self, text: impl Into<String>) -> FileField<Labeled> {
-        self.with_label(LabelSource::Aria(text.into()))
+        self.with_label(LabelSource::Aria(checked_name(
+            "FileField::aria_label",
+            text,
+        )))
     }
 
     /// Reference an existing element's `id` via `aria-labelledby` and transition
     /// to the renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn labelled_by(self, id: impl Into<String>) -> FileField<Labeled> {
-        self.with_label(LabelSource::LabelledBy(id.into()))
+        self.with_label(LabelSource::LabelledBy(checked_name(
+            "FileField::labelled_by",
+            id,
+        )))
     }
 
     fn with_label(self, label: LabelSource) -> FileField<Labeled> {
@@ -1832,10 +1920,11 @@ pub struct RadioOption {
 
 impl RadioOption {
     /// Build a choice with a submitted `value` and a human-visible `label`.
+    #[track_caller]
     pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             value: value.into(),
-            label: label.into(),
+            label: checked_name("RadioOption::new", label),
             checked: false,
             disabled: false,
         }
@@ -1938,22 +2027,34 @@ impl RadioGroup<NoLabel> {
     /// Attach a visible `<legend>` and transition to the renderable
     /// [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn label(self, text: impl Into<String>) -> RadioGroup<Labeled> {
-        self.with_label(LabelSource::Visible(text.into()))
+        self.with_label(LabelSource::Visible(checked_name(
+            "RadioGroup::label",
+            text,
+        )))
     }
 
     /// Attach an `aria-label` (no visible legend) and transition to the
     /// renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn aria_label(self, text: impl Into<String>) -> RadioGroup<Labeled> {
-        self.with_label(LabelSource::Aria(text.into()))
+        self.with_label(LabelSource::Aria(checked_name(
+            "RadioGroup::aria_label",
+            text,
+        )))
     }
 
     /// Reference an existing element's `id` via `aria-labelledby` and
     /// transition to the renderable [`Labeled`] state.
     #[must_use]
+    #[track_caller]
     pub fn labelled_by(self, id: impl Into<String>) -> RadioGroup<Labeled> {
-        self.with_label(LabelSource::LabelledBy(id.into()))
+        self.with_label(LabelSource::LabelledBy(checked_name(
+            "RadioGroup::labelled_by",
+            id,
+        )))
     }
 
     fn with_label(self, label: LabelSource) -> RadioGroup<Labeled> {
@@ -1976,6 +2077,10 @@ impl RadioGroup<NoLabel> {
 
 impl<State> RadioGroup<State> {
     /// Append a choice. Choices render in insertion order.
+    ///
+    /// This takes a built [`RadioOption`], as [`RadioGroup::new`] does, so a
+    /// choice is built the same way in both places. [`Select::option`] takes
+    /// the `(value, label)` pair instead.
     #[must_use]
     pub fn option(mut self, option: RadioOption) -> Self {
         self.options.push(option);
@@ -2072,7 +2177,8 @@ impl<State> RadioGroup<State> {
     }
 }
 
-/// One `id` per choice, unique within the group and unambiguous across groups.
+/// One `id` per choice, unique within the group and, for most names, across
+/// groups. Some names still collide across groups (#3454).
 ///
 /// The id pairs each `<input>` with its `<label for=…>`, so a duplicate would
 /// break the very association the primitive exists to guarantee. Each part is
@@ -2081,11 +2187,12 @@ impl<State> RadioGroup<State> {
 /// without that, group `a-b` choice `c` and group `a` choice `b-c` would both
 /// read `a-b-c`, and no per-group check can see the other group. Two choices
 /// that still reduce to the same text within one group are separated by an
-/// index suffix, so those ids depend on the order they were added.
+/// index suffix, so those ids depend on the order they were added. The lead
+/// part goes through [`selector_safe`], so every id is a valid CSS selector.
 fn radio_option_ids(prefix: Option<&str>, name: &str, options: &[RadioOption]) -> Vec<String> {
     let group = prefix.map_or_else(
-        || id_part(name),
-        |prefix| format!("{}-{}", id_part(prefix), id_part(name)),
+        || selector_safe(&id_part(name)),
+        |prefix| format!("{}-{}", selector_safe(&id_part(prefix)), id_part(name)),
     );
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::with_capacity(options.len());
@@ -2117,6 +2224,24 @@ fn id_part(text: &str) -> String {
         }
     }
     out
+}
+
+/// Make the first part of an id safe as the start of a CSS selector, so
+/// `#id` works in `querySelector` and `hx-target`.
+///
+/// If the part, after any leading `_`, does not start with a letter, the part
+/// gets one more `_` at the start: `1plan` becomes `_1plan`, and `_1plan`
+/// becomes `__1plan`. Thus two different parts never give the same result.
+/// `verification/radio_choice_id.rs` proves both rules.
+fn selector_safe(part: &str) -> String {
+    if part
+        .trim_start_matches('_')
+        .starts_with(|c: char| c.is_ascii_alphabetic())
+    {
+        part.to_owned()
+    } else {
+        format!("_{part}")
+    }
 }
 
 impl Render for RadioGroup<Labeled> {
@@ -2740,5 +2865,283 @@ mod tests {
             .into_string();
         assert_eq!(markup.matches(r#"hx-post="/quote""#).count(), 2, "{markup}");
         assert!(!open_tag_of_group(&markup).contains("hx-post"), "{markup}");
+    }
+
+    /// Builds one primitive, and renders nothing.
+    type Build = Box<dyn Fn() + std::panic::RefUnwindSafe>;
+
+    /// Every entry point that takes an accessible name, called with `name`.
+    /// Each closure renders nothing; it only builds the value.
+    fn name_entry_points(name: &'static str) -> Vec<(&'static str, Build)> {
+        let first = || RadioOption::new("a", "A");
+        vec![
+            ("Img::new", Box::new(move || drop(Img::new("/x.png", name)))),
+            ("Button::new", Box::new(move || drop(Button::new(name)))),
+            (
+                "Button::icon",
+                Box::new(move || drop(Button::icon(html! {}, name))),
+            ),
+            ("Link::new", Box::new(move || drop(Link::new("/", name)))),
+            (
+                "Link::icon",
+                Box::new(move || drop(Link::icon("/", html! {}, name))),
+            ),
+            ("MenuItem::new", Box::new(move || drop(MenuItem::new(name)))),
+            (
+                "SelectOption::new",
+                Box::new(move || drop(SelectOption::new("v", name))),
+            ),
+            (
+                "Select::option",
+                Box::new(move || drop(Select::new("f").option("v", name))),
+            ),
+            (
+                "RadioOption::new",
+                Box::new(move || drop(RadioOption::new("v", name))),
+            ),
+            (
+                "TextField::label",
+                Box::new(move || drop(TextField::new("f").label(name))),
+            ),
+            (
+                "TextField::aria_label",
+                Box::new(move || drop(TextField::new("f").aria_label(name))),
+            ),
+            (
+                "TextField::labelled_by",
+                Box::new(move || drop(TextField::new("f").labelled_by(name))),
+            ),
+            (
+                "TextArea::label",
+                Box::new(move || drop(TextArea::new("f").label(name))),
+            ),
+            (
+                "TextArea::aria_label",
+                Box::new(move || drop(TextArea::new("f").aria_label(name))),
+            ),
+            (
+                "TextArea::labelled_by",
+                Box::new(move || drop(TextArea::new("f").labelled_by(name))),
+            ),
+            (
+                "Select::label",
+                Box::new(move || drop(Select::new("f").label(name))),
+            ),
+            (
+                "Select::aria_label",
+                Box::new(move || drop(Select::new("f").aria_label(name))),
+            ),
+            (
+                "Select::labelled_by",
+                Box::new(move || drop(Select::new("f").labelled_by(name))),
+            ),
+            (
+                "Checkbox::label",
+                Box::new(move || drop(Checkbox::new("f").label(name))),
+            ),
+            (
+                "Checkbox::aria_label",
+                Box::new(move || drop(Checkbox::new("f").aria_label(name))),
+            ),
+            (
+                "Checkbox::labelled_by",
+                Box::new(move || drop(Checkbox::new("f").labelled_by(name))),
+            ),
+            (
+                "FileField::label",
+                Box::new(move || drop(FileField::new("f").label(name))),
+            ),
+            (
+                "FileField::aria_label",
+                Box::new(move || drop(FileField::new("f").aria_label(name))),
+            ),
+            (
+                "FileField::labelled_by",
+                Box::new(move || drop(FileField::new("f").labelled_by(name))),
+            ),
+            (
+                "RadioGroup::label",
+                Box::new(move || drop(RadioGroup::new("g", first()).label(name))),
+            ),
+            (
+                "RadioGroup::aria_label",
+                Box::new(move || drop(RadioGroup::new("g", first()).aria_label(name))),
+            ),
+            (
+                "RadioGroup::labelled_by",
+                Box::new(move || drop(RadioGroup::new("g", first()).labelled_by(name))),
+            ),
+        ]
+    }
+
+    /// Issue #2666: the typestate proves a name is present. An empty or blank
+    /// name is not a name, so a debug build stops at the call site.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn an_empty_or_blank_accessible_name_trips_a_debug_assert() {
+        for name in ["", " ", "\t\n", "\u{200B}", "\u{FEFF} "] {
+            for (entry, build) in name_entry_points(name) {
+                let result = std::panic::catch_unwind(&*build);
+                assert!(
+                    result.is_err(),
+                    "{entry}({name:?}) must not accept an empty name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_real_accessible_name_is_accepted_everywhere() {
+        for (entry, build) in name_entry_points("Name") {
+            let result = std::panic::catch_unwind(&*build);
+            assert!(result.is_ok(), "{entry} rejected a real name");
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn the_empty_name_panic_names_the_primitive() {
+        let err = std::panic::catch_unwind(|| Img::new("/x.png", "")).expect_err("must panic");
+        let message = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("Img::new"), "{message}");
+        assert!(message.contains("Img::decorative"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_value_is_not_a_name_and_stays_allowed() {
+        // The `— Select —` placeholder has an empty value and a real label.
+        let markup = Select::new("s")
+            .options([SelectOption::new("", "— Select —").disabled()])
+            .label("Size")
+            .render()
+            .into_string();
+        assert!(markup.contains(r#"value="""#), "{markup}");
+        let markup = RadioGroup::new("g", RadioOption::new("", "None"))
+            .label("Choice")
+            .render()
+            .into_string();
+        assert!(markup.contains(r#"value="""#), "{markup}");
+        assert!(
+            Img::decorative("/x.png")
+                .render()
+                .into_string()
+                .contains(r#"alt="""#)
+        );
+    }
+
+    /// The first choice `id` in `markup`.
+    fn first_id(markup: &str) -> String {
+        let at = markup.find(r#" id=""#).expect("an id") + 5;
+        markup[at..][..markup[at..].find('"').expect("id closes")].to_owned()
+    }
+
+    /// A CSS identifier over the ASCII alphabet an id here can carry: it
+    /// starts with a letter or `_`, and holds only `[A-Za-z0-9_-]`.
+    fn is_css_ident(id: &str) -> bool {
+        id.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    /// Issue #2666: `#1plan-2x` is not a valid selector, so
+    /// `querySelector` and `hx-target` throw on it.
+    #[test]
+    fn a_digit_led_group_name_gets_a_selector_safe_id() {
+        let markup = RadioGroup::new("1plan", RadioOption::new("2x", "Two"))
+            .label("Plan")
+            .render()
+            .into_string();
+        assert_eq!(first_id(&markup), "_1plan-2x", "{markup}");
+        assert!(markup.contains(r#"for="_1plan-2x""#), "{markup}");
+    }
+
+    #[test]
+    fn an_empty_group_name_and_value_get_a_selector_safe_id() {
+        let markup = RadioGroup::new("", RadioOption::new("", "None"))
+            .label("Plan")
+            .render()
+            .into_string();
+        assert_eq!(first_id(&markup), "_-", "{markup}");
+    }
+
+    #[test]
+    fn a_digit_led_id_prefix_gets_a_selector_safe_id() {
+        let markup = RadioGroup::new("speed", RadioOption::new("fast", "Fast"))
+            .id_prefix("7")
+            .label("Speed")
+            .render()
+            .into_string();
+        assert_eq!(first_id(&markup), "_7-speed-fast", "{markup}");
+    }
+
+    #[test]
+    fn an_underscore_led_name_cannot_collide_with_an_escaped_one() {
+        // `1plan` becomes `_1plan`, so `_1plan` itself must move too.
+        let escaped = RadioGroup::new("1plan", RadioOption::new("a", "A"))
+            .label("One")
+            .render()
+            .into_string();
+        let underscored = RadioGroup::new("_1plan", RadioOption::new("a", "A"))
+            .label("Two")
+            .render()
+            .into_string();
+        assert_eq!(first_id(&underscored), "__1plan-a", "{underscored}");
+        assert_ne!(first_id(&escaped), first_id(&underscored));
+    }
+
+    #[test]
+    fn a_letter_led_or_underscore_letter_name_keeps_its_id() {
+        for (name, id) in [
+            ("speed", "speed-a"),
+            ("_speed", "_speed-a"),
+            ("Speed", "Speed-a"),
+        ] {
+            let markup = RadioGroup::new(name, RadioOption::new("a", "A"))
+                .label("Speed")
+                .render()
+                .into_string();
+            assert_eq!(first_id(&markup), id, "{markup}");
+        }
+    }
+
+    proptest::proptest! {
+        /// Every choice id is a valid CSS identifier, so `#id` is a valid
+        /// selector.
+        #[test]
+        fn every_choice_id_is_a_css_identifier(
+            prefix in proptest::option::of("[a-z0-9_ .-]{0,6}"),
+            name in "[A-Za-z0-9_ .\\[\\]-]{0,8}",
+            values in proptest::collection::vec("[A-Za-z0-9_ .-]{0,6}", 1..4),
+        ) {
+            let options: Vec<RadioOption> =
+                values.iter().map(|v| RadioOption::new(v.as_str(), "Choice")).collect();
+            let ids = radio_option_ids(prefix.as_deref(), &name, &options);
+            for id in &ids {
+                proptest::prop_assert!(is_css_ident(id), "{id:?}");
+            }
+        }
+
+        /// The rule is injective: two different parts never give one result
+        /// (the Verus spec in `verification/radio_choice_id.rs` proves the
+        /// same rule).
+        #[test]
+        fn the_selector_safe_rule_is_injective(a in "[A-Za-z0-9_-]{0,6}", b in "[A-Za-z0-9_-]{0,6}") {
+            proptest::prop_assume!(a != b);
+            proptest::prop_assert_ne!(selector_safe(&a), selector_safe(&b));
+        }
+
+        /// The one case that can collide: a part that gets the `_`, and the
+        /// same part with a `_` already in front.
+        #[test]
+        fn an_escaped_part_never_meets_its_underscored_twin(a in "([0-9_-][A-Za-z0-9_-]{0,5})?") {
+            proptest::prop_assert_ne!(selector_safe(&a), selector_safe(&format!("_{a}")));
+        }
     }
 }

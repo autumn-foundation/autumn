@@ -173,6 +173,23 @@ relay. Its `ceiling_ms` uses the runtime's shift and saturating multiply, and
 Verus proves that it equals `min(cap, base * 2^retry)`. It also proves that
 the ceiling never decreases, and that no jitter overflows.
 
+## Radio choice ids
+
+`radio_choice_id.rs` models `selector_safe` in `autumn/src/a11y.rs`
+(issue #2666). Verify it with:
+
+```sh
+verus verification/radio_choice_id.rs
+```
+
+It proves that the first part of a choice id starts with a letter or `_`, so
+`#id` is a valid CSS selector. It also proves that two different parts never
+give the same result, so the rule adds no collision of its own. It does not
+prove that the joined id is unique (see #3454). The proptests
+`every_choice_id_is_a_css_identifier`, `the_selector_safe_rule_is_injective`
+and `an_escaped_part_never_meets_its_underscored_twin` check the runtime
+against the same rules.
+
 ## Kani proofs
 
 Kani checks the shipped functions, not a model of them. The harnesses are in
