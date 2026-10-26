@@ -1676,6 +1676,44 @@ writes return `Tie`.
 
 **Automation:** `manual` — add the arm, and the check to a custom store.
 
+### `#[model]`: every `NewX` implements `Normalize` again
+
+**Why:** 0.8.0 removed `impl Normalize for NewX` when the model has no
+`#[normalize]` columns. Then `NewX::normalize()` and a `T: Normalize` bound did
+not compile (#2692). The generated impl is back. It does nothing for such a
+model.
+
+This affects you only if you wrote your own `impl Normalize for NewX` for a
+model with no `#[normalize]` columns. That impl now conflicts with the
+generated impl.
+
+**Before (`0.8`):**
+
+```rust
+impl autumn_web::normalize::Normalize for NewNote {
+    fn normalize(&mut self) {
+        self.title = self.title.trim().to_owned();
+    }
+}
+```
+
+**After (next release):** remove the impl. If it changed values, put the
+logic on the field. The insert path does not call a generated no-op
+`normalize`, so logic left elsewhere does not run on `save`.
+
+```rust
+#[model]
+pub struct Note {
+    #[id]
+    pub id: i64,
+    #[normalize(trim)]
+    pub title: String,
+}
+```
+
+**Automation:** `manual` — move the logic to `#[normalize(...)]` or a
+`before_create` hook.
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /
@@ -1708,6 +1746,7 @@ single most valuable section of the guide — keep it factual and short.
 | `error[E0063]: missing field \`timeout\`` | a `JobInfo` literal | add `timeout: None` |
 | `error[E0063]: missing field \`content_type\`` | a `StaticRouteMeta` literal | add `content_type: None` |
 | `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
+| `error[E0119]: conflicting implementations of trait \`Normalize\` for type \`NewX\`` | your own `impl Normalize for NewX` | remove it; see [`#[model]`: every `NewX` implements `Normalize` again](#model-every-newx-implements-normalize-again) |
 
 ## Configuration changes
 

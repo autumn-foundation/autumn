@@ -145,15 +145,17 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 // A `#[repository]` can target a hand-written `New*` or model. Such a type
 // need not implement `Normalize` / `NormalizedModel`. So the generated code
 // calls these probe wrappers. Method resolution picks the first arm whose
-// bound the concrete type satisfies. Each arm has one more `&` of receiver
-// depth than the next arm, so the order is fixed. This works only at a
-// concrete call site, not through a generic boundary. Thus the macro builds
-// the wrappers in the generated code.
+// bound the concrete type satisfies. Each arm takes one more `&` than the
+// next arm. This sets the order. This works only at a concrete call site, not
+// through a generic boundary. Thus the macro builds the wrappers in the
+// generated code. The method names differ from 0.8.0 (two arms). Thus 0.8.0
+// macro output does not compile against this probe and cannot skip
+// normalization silently.
 
 /// Probe wrapper for write-path normalization.
 ///
 /// Holds a borrow of the caller's input. Call it as
-/// `(&&SpezNormalize(x)).spez_normalize()`. The arms, in order:
+/// `(&&SpezNormalize(x)).spez_normalize_insert()`. The arms, in order:
 ///
 /// 1. `Noop` (`T: NormalizeNoop`): returns the borrow. No clone (#2634).
 /// 2. `Yes` (`T: Normalize + Clone`): clones, normalizes, returns the value.
@@ -164,8 +166,8 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 #[doc(hidden)]
 pub struct SpezNormalize<'a, T: ?Sized>(pub &'a T);
 
-// `Copy`, so the `No` arm can take `self` by value after autoderef. A derive
-// would add a `T: Copy` bound.
+// The `No` arm takes `self` by value after autoderef. Thus `SpezNormalize`
+// must be `Copy`. A derive adds a `T: Copy` bound, so the impls are manual.
 impl<T: ?Sized> Clone for SpezNormalize<'_, T> {
     fn clone(&self) -> Self {
         *self
@@ -175,22 +177,22 @@ impl<T: ?Sized> Copy for SpezNormalize<'_, T> {}
 
 #[doc(hidden)]
 pub trait SpezNormalizeNoop<'a, T> {
-    fn spez_normalize(self) -> &'a T;
+    fn spez_normalize_insert(self) -> &'a T;
 }
 impl<'a, T: NormalizeNoop> SpezNormalizeNoop<'a, T> for &&SpezNormalize<'a, T> {
     #[inline]
-    fn spez_normalize(self) -> &'a T {
+    fn spez_normalize_insert(self) -> &'a T {
         self.0
     }
 }
 
 #[doc(hidden)]
 pub trait SpezNormalizeYes<'a, T> {
-    fn spez_normalize(self) -> T;
+    fn spez_normalize_insert(self) -> T;
 }
 impl<'a, T: Normalize + Clone> SpezNormalizeYes<'a, T> for &SpezNormalize<'a, T> {
     #[inline]
-    fn spez_normalize(self) -> T {
+    fn spez_normalize_insert(self) -> T {
         let mut owned = self.0.clone();
         owned.normalize();
         owned
@@ -199,33 +201,33 @@ impl<'a, T: Normalize + Clone> SpezNormalizeYes<'a, T> for &SpezNormalize<'a, T>
 
 #[doc(hidden)]
 pub trait SpezNormalizeNo<'a, T: ?Sized> {
-    fn spez_normalize(self) -> &'a T;
+    fn spez_normalize_insert(self) -> &'a T;
 }
 impl<'a, T: ?Sized> SpezNormalizeNo<'a, T> for SpezNormalize<'a, T> {
     #[inline]
-    fn spez_normalize(self) -> &'a T {
+    fn spez_normalize_insert(self) -> &'a T {
         self.0
     }
 }
 
 #[doc(hidden)]
 pub trait SpezNormalizeManyNoop<'a, T> {
-    fn spez_normalize_many(self) -> &'a [T];
+    fn spez_normalize_insert_many(self) -> &'a [T];
 }
 impl<'a, T: NormalizeNoop> SpezNormalizeManyNoop<'a, T> for &&SpezNormalize<'a, [T]> {
     #[inline]
-    fn spez_normalize_many(self) -> &'a [T] {
+    fn spez_normalize_insert_many(self) -> &'a [T] {
         self.0
     }
 }
 
 #[doc(hidden)]
 pub trait SpezNormalizeManyYes<'a, T> {
-    fn spez_normalize_many(self) -> Vec<T>;
+    fn spez_normalize_insert_many(self) -> Vec<T>;
 }
 impl<'a, T: Normalize + Clone> SpezNormalizeManyYes<'a, T> for &SpezNormalize<'a, [T]> {
     #[inline]
-    fn spez_normalize_many(self) -> Vec<T> {
+    fn spez_normalize_insert_many(self) -> Vec<T> {
         self.0
             .iter()
             .map(|item| {
@@ -239,11 +241,11 @@ impl<'a, T: Normalize + Clone> SpezNormalizeManyYes<'a, T> for &SpezNormalize<'a
 
 #[doc(hidden)]
 pub trait SpezNormalizeManyNo<'a, T> {
-    fn spez_normalize_many(self) -> &'a [T];
+    fn spez_normalize_insert_many(self) -> &'a [T];
 }
 impl<'a, T> SpezNormalizeManyNo<'a, T> for SpezNormalize<'a, [T]> {
     #[inline]
-    fn spez_normalize_many(self) -> &'a [T] {
+    fn spez_normalize_insert_many(self) -> &'a [T] {
         self.0
     }
 }
@@ -374,19 +376,19 @@ mod tests {
 
         // `Normalize + Clone`: cloned and canonicalized; input untouched.
         let n = Norms("  Foo ".into());
-        let normalized = (&&SpezNormalize(&n)).spez_normalize();
+        let normalized = (&&SpezNormalize(&n)).spez_normalize_insert();
         let n_ref: &Norms = normalized.borrow();
         assert_eq!(n_ref.0, "foo", "Normalize type must be canonicalized");
         assert_eq!(n.0, "  Foo ", "input must not be mutated in place");
 
         // `NormalizeNoop`: the caller's borrow comes back. No clone (#2634).
         let z = Noop("  Foo ".into());
-        let z_ref: &Noop = (&&SpezNormalize(&z)).spez_normalize();
+        let z_ref: &Noop = (&&SpezNormalize(&z)).spez_normalize_insert();
         assert!(std::ptr::eq(z_ref, &z), "no-op type must not be cloned");
 
         // No `Normalize` impl: the borrow comes back untouched.
         let p = Plain("  Foo ".into());
-        let p_ref: &Plain = (&&SpezNormalize(&p)).spez_normalize();
+        let p_ref: &Plain = (&&SpezNormalize(&p)).spez_normalize_insert();
         assert!(
             std::ptr::eq(p_ref, &p),
             "non-Normalize type must be untouched"
@@ -394,26 +396,26 @@ mod tests {
     }
 
     #[test]
-    fn spez_normalize_many_picks_noop_then_yes_then_no() {
+    fn spez_normalize_insert_many_picks_noop_then_yes_then_no() {
         use super::{
             SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _, SpezNormalizeManyYes as _,
         };
         use std::borrow::Borrow as _;
 
         let n = vec![Norms("  Foo ".into())];
-        let normalized = (&&SpezNormalize(n.as_slice())).spez_normalize_many();
+        let normalized = (&&SpezNormalize(n.as_slice())).spez_normalize_insert_many();
         let n_ref: &[Norms] = normalized.borrow();
         assert_eq!(n_ref[0].0, "foo", "each row must be canonicalized");
 
         let z = vec![Noop("  Foo ".into())];
-        let z_ref: &[Noop] = (&&SpezNormalize(z.as_slice())).spez_normalize_many();
+        let z_ref: &[Noop] = (&&SpezNormalize(z.as_slice())).spez_normalize_insert_many();
         assert!(
             std::ptr::eq(z_ref, z.as_slice()),
             "no-op batch must not be cloned"
         );
 
         let p = vec![Plain("  Foo ".into())];
-        let p_ref: &[Plain] = (&&SpezNormalize(p.as_slice())).spez_normalize_many();
+        let p_ref: &[Plain] = (&&SpezNormalize(p.as_slice())).spez_normalize_insert_many();
         assert!(
             std::ptr::eq(p_ref, p.as_slice()),
             "non-Normalize batch must be untouched"

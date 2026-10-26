@@ -6337,16 +6337,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // #1379: normalize `#[normalize]` columns before the
                 // `before_create` hook and the DB write. Validators and the
                 // database see the canonical value. The probe arms, in order:
-                // `Noop` returns the borrow (no columns, no clone, #2634);
-                // `Yes` clones and normalizes; `No` returns the borrow (a
-                // hand-written `New*`). `Borrow` unifies them to `&#new_name`.
+                // 1. `Noop`: returns the borrow. No clone (#2634).
+                // 2. `Yes`: clones and normalizes.
+                // 3. `No`: returns the borrow (a hand-written `New*`).
+                // `Borrow` unifies the arms to `&#new_name`.
                 #[allow(unused_imports)]
                 use ::autumn_web::normalize::{
                     SpezNormalizeNo as _, SpezNormalizeNoop as _, SpezNormalizeYes as _,
                 };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert();
                 let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
@@ -6389,7 +6390,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_many();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert_many();
                 let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
@@ -6404,7 +6405,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_many();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert_many();
                 let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_skip_invalid_body
             }
@@ -19654,7 +19655,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                     #[allow(unused_imports)]
                     use ::std::borrow::Borrow as _;
                     let __autumn_normalized =
-                        (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize();
+                        (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert();
                     let new: &#new_name = __autumn_normalized.borrow();
                     #validate_or_found
                     // Step 2: create on the primary with ON CONFLICT DO NOTHING.
@@ -22752,7 +22753,7 @@ mod tests {
         let section = section_between(&generated, "async fn save (", "async fn update (");
 
         let normalize_at = section
-            .find("spez_normalize ()")
+            .find("spez_normalize_insert ()")
             .expect("save must normalize the payload");
         // Pinned to the exact emitted form: `new` is already a `&New*`, so an
         // extra borrow would validate only via `validator`'s blanket
@@ -22848,7 +22849,7 @@ mod tests {
         );
 
         let normalize_at = section
-            .find("spez_normalize_many ()")
+            .find("spez_normalize_insert_many ()")
             .expect("skip-invalid must normalize rows");
         let validate_at = section
             .find("MaybeValidate (__autumn_row)")
@@ -26789,12 +26790,12 @@ mod tests {
         let generated =
             repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
         assert!(
-            generated.contains("SpezNormalize (new)) . spez_normalize ()"),
+            generated.contains("SpezNormalize (new)) . spez_normalize_insert ()"),
             "save must normalize the New input before persisting: {generated}"
         );
         assert_eq!(
             generated
-                .matches("SpezNormalize (new)) . spez_normalize_many ()")
+                .matches("SpezNormalize (new)) . spez_normalize_insert_many ()")
                 .count(),
             2,
             "save_many and save_many_skip_invalid must normalize each New input: {generated}"
@@ -26836,7 +26837,7 @@ mod tests {
             "pub async fn preload",
         );
         assert!(
-            section.contains("SpezNormalize (new)) . spez_normalize ()")
+            section.contains("SpezNormalize (new)) . spez_normalize_insert ()")
                 && section.contains("SpezNormalizeNoop as _"),
             "find_or_create_by_* must use the three-arm probe: {section}"
         );

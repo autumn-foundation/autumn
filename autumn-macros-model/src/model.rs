@@ -10995,9 +10995,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
     // #2692: emit `impl Normalize` for every `New*`, so a `T: Normalize`
-    // bound accepts it. With no `#[normalize]` columns the impl does nothing.
-    // Then also emit `NormalizeNoop`, so the repository probe skips the clone
-    // (#2634). The read-model impl and `NormalizedModel` are unconditional.
+    // bound accepts it. If the `New*` has no `#[normalize]` columns, the impl
+    // does nothing. Then also emit `NormalizeNoop`, so the repository probe
+    // skips the clone (#2634). The read-model impl and `NormalizedModel` are
+    // unconditional.
     let normalize_new_noop = if normalize_new_stmts.is_empty() {
         quote! { impl ::autumn_web::normalize::NormalizeNoop for #new_name {} }
     } else {
