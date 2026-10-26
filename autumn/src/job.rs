@@ -11701,6 +11701,17 @@ fn pg_claim_sql_single_queue_deferred() -> String {
     )
 }
 
+/// The single-queue claim text for this poll: the plain claim, or the
+/// skip-scan variant while any job name is deferred.
+#[cfg(feature = "postgres")]
+fn pg_single_queue_claim_sql(deferred: &[String]) -> String {
+    if deferred.is_empty() {
+        pg_claim_sql_single_queue()
+    } else {
+        pg_claim_sql_single_queue_deferred()
+    }
+}
+
 #[cfg(all(feature = "postgres", test))]
 async fn pg_claim_next_job(
     pool: &PgPool,
@@ -11729,11 +11740,7 @@ async fn pg_claim_next_job_except(
     // `[jobs] queues` priority config — the common case) gets its own query
     // text rather than reusing `pg_claim_sql` with a one-element array.
     let claimed = if let [only_queue] = queue_order {
-        let sql = if deferred.is_empty() {
-            pg_claim_sql_single_queue()
-        } else {
-            pg_claim_sql_single_queue_deferred()
-        };
+        let sql = pg_single_queue_claim_sql(deferred);
         let only_queue = only_queue.clone();
         let deferred = deferred.to_vec();
         if serialize_claims {
@@ -20975,6 +20982,8 @@ mod tests {
             assert!(deferred.contains("WITH RECURSIVE names"));
             assert!(deferred.contains("FOR UPDATE SKIP LOCKED"));
             assert!(deferred.contains("RETURNING id, name, queue"));
+            assert_eq!(pg_single_queue_claim_sql(&[]), plain);
+            assert_eq!(pg_single_queue_claim_sql(&["parked".to_owned()]), deferred);
         }
 
         #[tokio::test]
