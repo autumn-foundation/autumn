@@ -1234,17 +1234,12 @@ fn cfg_is_off(attr: &proc_macro2::Group, features: Option<&BTreeSet<String>>) ->
 /// Skip the statement, match arm, field or item after an attribute, from
 /// `start`.
 ///
-/// It ends after a `;` or `,`, or after a brace group that closes it (a block,
-/// an arm body). A `,` inside the generics of a `let` or a turbofish, or in a
-/// closure argument list, does not end it; nor does one in the generics of an
-/// item (`impl<A, B>`). A brace group that a pattern or an
-/// expression goes on past (`V { a } =>`, `{ … } else`, `S { .. } = …`) does
-/// not end it either. An `fn` item ends after its body.
+/// - An `fn` item ends after its body.
+/// - A match arm (a `=>` comes before any `;`) ends after its body: a block,
+///   or an expression up to its `,`. Its pattern (`A | B`, `V { a } if …`)
+///   does not matter.
+/// - Anything else ends as [`skip_expr`] says.
 fn skip_gated(trees: &[TokenTree], start: usize) -> usize {
-    let punct = |at: usize| match trees.get(at) {
-        Some(TokenTree::Punct(p)) => Some(p.as_char()),
-        _ => None,
-    };
     let mut i = start;
     // Skip the other attributes and qualifiers of the item.
     while let Some(tree) = trees.get(i) {
@@ -1265,27 +1260,82 @@ fn skip_gated(trees: &[TokenTree], start: usize) -> usize {
     if matches!(trees.get(i), Some(TokenTree::Ident(id)) if *id == "fn") {
         return find_fn_body(trees, i + 1).map_or(trees.len(), |body| body + 1);
     }
+    if let Some(arrow) = arm_arrow(trees, i) {
+        let body = arrow + 2;
+        return match trees.get(body) {
+            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
+                let end = body + 1;
+                end + usize::from(
+                    matches!(trees.get(end), Some(TokenTree::Punct(p)) if p.as_char() == ','),
+                )
+            }
+            _ => skip_expr(trees, body, false),
+        };
+    }
     // A `<` opens generics after these keywords; elsewhere it can be a `<`
-    // comparison (`if n < 3 =>`).
+    // comparison.
     let has_generics = matches!(trees.get(i), Some(TokenTree::Ident(id))
         if ["let", "impl", "struct", "enum", "union", "trait", "type"].iter().any(|kw| id == kw));
+    skip_expr(trees, i, has_generics)
+}
+
+/// The index of the `=>` of a match arm that starts at `trees[start]`: the
+/// first `=>` at this level before any `;`. A statement or a field has none.
+fn arm_arrow(trees: &[TokenTree], start: usize) -> Option<usize> {
+    for at in start..trees.len() {
+        let TokenTree::Punct(p) = &trees[at] else {
+            continue;
+        };
+        match p.as_char() {
+            ';' => return None,
+            '=' if p.spacing() == proc_macro2::Spacing::Joint
+                && matches!(trees.get(at + 1), Some(TokenTree::Punct(q)) if q.as_char() == '>') =>
+            {
+                return Some(at);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The index past a statement, a field or an arm body that starts at
+/// `trees[start]`.
+///
+/// It ends after a `;` or `,`, or after a brace group that closes it. A `,`
+/// does not end it inside generics (`has_generics`, or a turbofish `::<`) or
+/// a closure argument list. A brace group that an expression goes on past
+/// (`{ … } else`, `S { .. } = …`, `unsafe { … } + x`) does not end it either.
+fn skip_expr(trees: &[TokenTree], start: usize, has_generics: bool) -> usize {
+    let punct = |at: usize| match trees.get(at) {
+        Some(TokenTree::Punct(p)) => Some(p.as_char()),
+        _ => None,
+    };
+    let mut i = start;
     let mut angles = 0usize;
     let mut in_closure_args = false;
     while let Some(tree) = trees.get(i) {
+        let at = i;
         i += 1;
         match tree {
             TokenTree::Punct(p) => match p.as_char() {
                 ';' => break,
                 ',' if angles == 0 && !in_closure_args => break,
-                // Generics of a `let` type or an item, or of a turbofish (`::<`).
-                '<' if has_generics || (i >= 2 && punct(i - 2) == Some(':')) => angles += 1,
-                '>' if angles > 0 && punct(i - 2) != Some('-') => angles -= 1,
-                '|' if angles == 0 => in_closure_args = !in_closure_args,
+                '<' if has_generics || (at >= 1 && punct(at - 1) == Some(':')) => angles += 1,
+                '>' if angles > 0 && (at == 0 || punct(at - 1) != Some('-')) => angles -= 1,
+                // A closure list opens where an expression starts; a `|` after
+                // an operand is a bitwise or.
+                '|' if angles == 0
+                    && (in_closure_args
+                        || at == start
+                        || matches!(&trees[at - 1], TokenTree::Punct(_))
+                        || matches!(&trees[at - 1], TokenTree::Ident(id) if id == "move")) =>
+                {
+                    in_closure_args = !in_closure_args;
+                }
                 _ => {}
             },
             TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
-                // The statement goes on when an operator, `else`, `in` or
-                // `=>` follows the group.
                 let goes_on = match trees.get(i) {
                     Some(TokenTree::Punct(p)) => ![';', ',', '#'].contains(&p.as_char()),
                     Some(TokenTree::Ident(id)) => ["else", "in", "as"].iter().any(|kw| id == kw),
@@ -5410,6 +5460,77 @@ mod tests {
             }
 
             fn clean() -> Markup { html! { span { "clean" } } }
+        "#;
+        assert_eq!(routes_with_features(src, &[]), vec!["GET /a".to_owned()]);
+    }
+
+    /// A handler whose `match` has one gated arm `arm`, then an active arm
+    /// with a defect.
+    fn gated_arm(arm: &str) -> String {
+        format!(
+            r#"
+            #[get("/a")]
+            async fn a(x: Page) -> Markup {{
+                match x {{
+                    #[cfg(feature = "admin")]
+                    {arm}
+                    _ => html! {{ img src="/x.png"; }},
+                }}
+            }}
+
+            fn clean() -> Markup {{ html! {{ span {{ "clean" }} }} }}
+            "#
+        )
+    }
+
+    #[test]
+    fn a_gated_arm_ends_at_its_own_end_for_every_pattern_shape() {
+        for arm in [
+            "Page::Admin => clean(),",
+            "Page::Admin | Page::Legacy => clean(),",
+            "Page::Admin { user } if user.active => clean(),",
+            "Page::Admin(a, b) if a < b => clean(),",
+            "Page::Admin => { clean() }",
+            "Page::Admin => foo::<A, B>(clean()),",
+            "Page::Admin => rows.map(|a, b| clean()),",
+        ] {
+            let src = gated_arm(arm);
+            assert_eq!(
+                routes_with_features(&src, &[]),
+                vec!["GET /a".to_owned()],
+                "{arm}"
+            );
+        }
+    }
+
+    #[test]
+    fn markup_in_a_gated_guarded_arm_is_not_the_handler_s() {
+        let src = r#"
+            #[get("/a")]
+            async fn a(x: Page) -> Markup {
+                match x {
+                    #[cfg(feature = "admin")]
+                    Page::Admin { user } if user.active => html! { img src="/x.png"; },
+                    _ => html! { span { "a" } },
+                }
+            }
+        "#;
+        assert!(routes_with_features(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_gated_statement_with_a_bitwise_or_still_ends_at_its_comma() {
+        // A `|` after an operand is not a closure; the field ends at its `,`.
+        let src = r#"
+            #[get("/a")]
+            async fn a(a: u8, b: u8) -> Markup {
+                let _f = Flags {
+                    #[cfg(feature = "admin")]
+                    mask: a | b,
+                    page: html! { img src="/x.png"; },
+                };
+                html! { span { "a" } }
+            }
         "#;
         assert_eq!(routes_with_features(src, &[]), vec!["GET /a".to_owned()]);
     }
