@@ -33,7 +33,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.8.0 --locked
+cargo install autumn-cli --version 0.9.0 --locked
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -82,7 +82,7 @@ Prefer a manual download? Grab the tarball plus its `.sha256`:
 - Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-<target>.tar.gz`
 - Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.8.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.9.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
 
 ### Install a prebuilt binary (Windows)
 
@@ -248,6 +248,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [**Guide index — every guide page, grouped by task**](docs/guide/index.md) — the
   full table of contents for `docs/guide/`; the list below is a selection of
   highlights, not the whole guide
+- [**What's new in 0.9.0**](docs/releases/0.9.0.md) — a walkthrough of the release: load shedding, retry budgets and deadlines on by default, adaptive admission control, a transactional outbox and fenced leases, SQLite fleets with one database per tenant, and MCP Tasks
 - [**What's new in 0.8.0**](docs/releases/0.8.0.md) — a walkthrough of the release: simulated networks and build-time query budgets, SQLite as a full backend, `Money` and ledgered data, mTLS and DNS-01 certificates, shadow deploys, and capability-sandboxed plugins
 - [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)

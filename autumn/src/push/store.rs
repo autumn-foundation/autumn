@@ -812,7 +812,7 @@ mod db_store {
         if message.contains("tenant_id") && message.contains("column") {
             return PushError::Store(format!(
                 "query failed: {e}. The `{PUSH_SUBSCRIPTIONS_TABLE}` table has no `tenant_id` \
-                 column — see docs/migrations/next.md"
+                 column — see docs/migrations/0.9.0.md"
             ));
         }
         if message.contains("does not exist") || message.contains("no such table") {

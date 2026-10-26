@@ -1,12 +1,13 @@
-# autumn-web API Reference (0.8.0)
+# autumn-web API Reference (0.9.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.8.0**, the current release line,
+Version identity: this reference tracks **0.9.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
 arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
-earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries predate 0.6.0.
+earlier, **(0.8.0)** is absent from 0.7.x and earlier, and **(0.9.0)** is absent
+from 0.8.x and earlier. Unmarked entries predate 0.6.0.
 
 ## Published crates
 
@@ -28,7 +29,7 @@ earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries pred
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.8.0`. This table lists the same crates, in the same order, as
+together at `0.9.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 
@@ -772,7 +773,7 @@ Free functions rendering changeset-aware, accessible inputs:
   `form.text_input(...)`).
 - **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
-- **(Unreleased, #3395)**: `FieldOptions` + a `*_with` variant of each helper
+- **(0.9.0, #3395)**: `FieldOptions` + a `*_with` variant of each helper
   (`text_input_with`, `text_input_htmx_with(.., url, token_field, &opts)`,
   `password_input_with`, `textarea_input_with`, `checkbox_input_with`,
   `number_input_with`, `date_input_with`, `datetime_input_with`,
@@ -1198,7 +1199,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
-- Unreleased (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
+- 0.9.0 (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
   durable claims renew on a heartbeat; `JobContext::lease_lost()`,
   `is_cancelled()`, `cancelled()`.
 
@@ -1582,7 +1583,7 @@ csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.8"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.9"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 

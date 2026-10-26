@@ -273,7 +273,7 @@ To check another Redis, register `RedisHealthIndicator` yourself. It needs
 the `redis` feature:
 
 ```toml
-autumn-web = { version = "0.8", features = ["redis"] }
+autumn-web = { version = "0.9", features = ["redis"] }
 ```
 
 ```rust

@@ -49,7 +49,7 @@ Enable the runtime by building the application with the `sqlite` cargo feature (
   `postgres`:
 
   ```toml
-  autumn-web = { version = "0.8", default-features = false, features = [
+  autumn-web = { version = "0.9", default-features = false, features = [
       "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
   ] }
   ```

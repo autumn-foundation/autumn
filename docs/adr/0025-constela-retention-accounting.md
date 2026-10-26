@@ -95,7 +95,7 @@ We compared these options:
   not. An action that copies a state value larger than 4 MiB fails. Before,
   the copy was free.
 - A document that rendered duplicate ids now fails. The migration guide
-  (`docs/migrations/next.md`) gives the fix.
+  (`docs/migrations/0.9.0.md`) gives the fix.
 - The budget bounds what is kept, not the work done. Paths are still built
   as strings for each node, so a very long key makes each path long, and
   comparisons are not metered. With the default `Limits` this costs CPU.
