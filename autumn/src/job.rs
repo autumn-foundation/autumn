@@ -11645,6 +11645,62 @@ fn pg_claim_sql_single_queue() -> String {
     )
 }
 
+/// Single-queue claim for the cost-deferral case (issue #1720): `deferred` is
+/// non-empty, so some job names are parked at the head of the queue.
+///
+/// `pg_claim_sql_single_queue` walks `idx_autumn_jobs_queue_ready` in `run_at`
+/// order and drops parked names with a heap-side filter, so a poll costs
+/// O(parked backlog) buffers, and the backlog grows because nothing claims the
+/// parked names. This variant instead skip-scans the distinct ready names on
+/// `idx_autumn_jobs_queue_name_ready (queue, name, run_at)` (one index-only
+/// probe per name, parked or not), then probes each runnable name for its
+/// earliest eligible row and keeps the earliest of those. The probe applies the
+/// same concurrency-limit predicate before its `LIMIT 1`, so the claimed row is
+/// the one `pg_claim_sql_single_queue` would pick (ties on `run_at` stay
+/// unordered, as before). Cost is O(distinct ready names), independent of the
+/// parked backlog. Row locks are taken per probe and drop with the statement,
+/// as in the multi-queue claim.
+///
+/// Used only when `deferred` is non-empty, so the common path is untouched.
+#[cfg(feature = "postgres")]
+fn pg_claim_sql_single_queue_deferred() -> String {
+    format!(
+        "UPDATE autumn_jobs \
+         SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
+             pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
+             unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
+         WHERE id = ( \
+           WITH RECURSIVE names(n, skip) AS ( \
+             (SELECT name, name = ANY($3) FROM autumn_jobs \
+               WHERE status = 'enqueued' AND queue = $2 ORDER BY name LIMIT 1) \
+             UNION ALL \
+             SELECT nx.name, nx.name = ANY($3) FROM names \
+               CROSS JOIN LATERAL (SELECT name FROM autumn_jobs \
+                 WHERE status = 'enqueued' AND queue = $2 AND name > names.n \
+                 ORDER BY name LIMIT 1) nx \
+           ) \
+           SELECT picked.id FROM names \
+           CROSS JOIN LATERAL ( \
+             SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
+             WHERE NOT names.skip AND candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+               AND candidate.queue = $2 AND candidate.name = names.n \
+               AND (candidate.concurrency_limit IS NULL OR ( \
+                 SELECT COUNT(*) FROM autumn_jobs running \
+                 WHERE running.status = 'running' \
+                   AND running.name = candidate.name \
+                   AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
+               ) < candidate.concurrency_limit) \
+             ORDER BY candidate.run_at ASC \
+             LIMIT 1 \
+             FOR UPDATE SKIP LOCKED \
+           ) picked \
+           ORDER BY picked.run_at \
+           LIMIT 1 \
+         ) \
+         RETURNING {PG_JOB_SELECT_COLS}"
+    )
+}
+
 #[cfg(all(feature = "postgres", test))]
 async fn pg_claim_next_job(
     pool: &PgPool,
@@ -11673,7 +11729,11 @@ async fn pg_claim_next_job_except(
     // `[jobs] queues` priority config — the common case) gets its own query
     // text rather than reusing `pg_claim_sql` with a one-element array.
     let claimed = if let [only_queue] = queue_order {
-        let sql = pg_claim_sql_single_queue();
+        let sql = if deferred.is_empty() {
+            pg_claim_sql_single_queue()
+        } else {
+            pg_claim_sql_single_queue_deferred()
+        };
         let only_queue = only_queue.clone();
         let deferred = deferred.to_vec();
         if serialize_claims {
@@ -13225,7 +13285,7 @@ fn start_postgres_runtime(
 /// A shard-local job table is made from these same files, so it cannot drift
 /// from the control table. Each file is idempotent (`IF NOT EXISTS`).
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
-const SHARD_JOB_SCHEMA: [(&str, &str); 5] = [
+const SHARD_JOB_SCHEMA: [(&str, &str); 6] = [
     (
         "20260513000000_create_job_queue",
         include_str!("../migrations/20260513000000_create_job_queue/up.sql"),
@@ -13245,6 +13305,10 @@ const SHARD_JOB_SCHEMA: [(&str, &str); 5] = [
     (
         "20260628000000_add_queue_to_jobs",
         include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql"),
+    ),
+    (
+        "20261026170000_add_jobs_queue_name_ready_index",
+        include_str!("../migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql"),
     ),
 ];
 
