@@ -917,9 +917,16 @@ fn strip_migrations(main_rs: &str) -> String {
 const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "reporting"];
 
 /// Default `autumn-web` features minus the HTML view stack (`maud`/`htmx`/
-/// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` so
-/// migrations and database features still work.
-const API_FEATURES: &[&str] = &["db", "cache-moka", "http-client", "reporting", "flash"];
+/// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` and its
+/// `postgres` backend so migrations and database features still work.
+const API_FEATURES: &[&str] = &[
+    "db",
+    "postgres",
+    "cache-moka",
+    "http-client",
+    "reporting",
+    "flash",
+];
 
 /// Anchor: first line of the DB-specific prerequisites/steps block in
 /// `README.md.tmpl` (the `- **A reachable Postgres**` bullet). Everything from
@@ -2283,6 +2290,10 @@ mod tests {
         assert!(
             !cargo.contains("\"db\""),
             "daemon starter must not enable db"
+        );
+        assert!(
+            !cargo.contains("\"postgres\""),
+            "daemon starter must not enable postgres"
         );
         assert!(
             !cargo.contains("diesel_migrations"),

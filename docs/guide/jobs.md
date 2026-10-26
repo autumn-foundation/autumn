@@ -169,7 +169,7 @@ poll_interval_ms = 250          # default: 250 ms
   for development or single-process demos.
 - `postgres`: Postgres-backed queue that reuses your existing `[database]` pool.
   Jobs survive restarts and are claimed atomically across replicas via
-  `SELECT … FOR UPDATE SKIP LOCKED`. Requires the `db` feature and an
+  `SELECT … FOR UPDATE SKIP LOCKED`. Requires the `postgres` feature (on by default) and an
   `autumn migrate` run before the first worker starts.
 - `redis`: Durable, Redis-backed queue for multi-replica workers. Higher
   throughput ceiling than `postgres` but adds Redis as an infrastructure dependency.

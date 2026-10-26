@@ -1236,11 +1236,15 @@ jobs:
         # `markdown` node kind reachable: without it that node fails validation
         # with `constela.feature_required` and the sanitizing render path is
         # never exercised.
+        #
+        # `constela_memory` is its own binary (a counting global allocator).
+        # It checks that a hostile document uses bounded peak memory (#2626).
         run: |
           cargo test -p autumn-web --features constela --lib constela::
           cargo test -p autumn-web --features constela --doc constela
           cargo test -p autumn-web --features constela --test integration_tests constela
           cargo test -p autumn-web --features "constela,markdown" --test integration_tests constela
+          cargo test -p autumn-web --features constela --test constela_memory
       - name: Run inbound-mail-gated tests (untrusted MIME parsing)
         if: matrix.lane == 'inbound-mail'
         # `inbound-mail` and its provider aliases are not default features, so
@@ -2625,6 +2629,12 @@ jobs:
             tests::parse_edge \
             | tee "$RUNNER_TEMP/cli-edge-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-edge-cov.log"
+          # Issue #2589: same gap for `deploy::` (the SQLite data-file ops and
+          # `deploy plan`) and `db::sqlite_snapshot::` (backup and restore).
+          # Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deploy:: db::sqlite_snapshot:: \
+            | tee "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2702,6 +2712,27 @@ jobs:
         # does, but only at tag-push time. This is also the enforcing lane that
         # retires the panic-gate exemption for `middleware/trace_context.rs`.
         run: cargo clippy -p autumn-web --features "sqlite,telemetry-otlp" --lib -- -D warnings
+      - name: Clippy autumn-web as a SQLite-only app (no Postgres client)
+        # Issue #2605. Default features are off, so `postgres` is off. The list
+        # is the default set without `postgres`, plus each feature that does
+        # not need Postgres, except the test-only features.
+        # `autumn/tests/integration/sqlite_postgres_free.rs` keeps it complete.
+        # `cargo tree` then shows that no Postgres crate is in the graph. The
+        # step writes the tree to a file. Then a failed `cargo tree` fails the
+        # step.
+        env:
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile
+        run: |
+          cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
+          tree="${RUNNER_TEMP}/sqlite-only-tree.txt"
+          cargo tree -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" \
+            -e normal,build --prefix none --format '{p}' > "$tree"
+          grep -q '^libsqlite3-sys ' "$tree" \
+            || { echo "::error::the SQLite-only tree has no libsqlite3-sys; the check is broken"; exit 1; }
+          if grep -E '^(pq-sys|pq-src|tokio-postgres|tokio-postgres-rustls|postgresql_embedded) ' "$tree"; then
+            echo "::error::a SQLite-only build links a Postgres crate (#2605)"
+            exit 1
+          fi
       - name: Clippy (autumn-web lib, sim-testing op-driver)
         # `sim-testing` (W6 PR2, issue #1797) promotes `proptest` to a library
         # dependency for `sim::op` — lint it here (alongside the sqlite lib

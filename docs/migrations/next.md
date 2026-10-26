@@ -190,6 +190,67 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Features: `db` has no Postgres client; enable `postgres`
+
+**Why:** `db` compiled `pq-sys`, `tokio-postgres` and diesel's Postgres backend
+into every build. This included a SQLite build (issue #2605). Now `db` is the
+shared database layer only. The new `postgres` feature adds the Postgres
+client. It is a default feature.
+
+**Who must change:** only a build that turns default features off. With
+default features on, nothing changes. Such a build must add `postgres` when:
+
+- it enables `db`, `seed`, `repl`, `offline-sync` or `ledger-profile` without
+  `sqlite`. The build stops with this error:
+
+  ```text
+  autumn-web: the `db` feature needs a database backend. Enable `postgres` (a default feature) or `sqlite`.
+  ```
+
+- it enables `sqlite` and also uses a Postgres-only item (see the list below).
+
+This also applies to `autumn console` on a project with default features off
+and no backend: its `playground` feature enables `seed`.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["db", "maud"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["db", "postgres", "maud"] }
+```
+
+**SQLite apps:** to build with no Postgres client, turn default features off
+and enable `sqlite` without `postgres`:
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = [
+    "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
+] }
+```
+
+A build without `postgres` does not have the items that need a Postgres
+connection:
+
+- `DbApiTokenStore`, `PgSyncBackend`, `PgSuppressionStore`,
+  `PostgresIsrCoordinator`, `PgJobTrackingStore`;
+- `PostgresTickSchedulerCoordinator` and its deprecated alias
+  `PostgresAdvisorySchedulerCoordinator`;
+- the `feature_flags::pg`, `experiments::pg` and `runtime_config::pg`
+  modules;
+- most `migrate` items, for example `run_pending`, `pending_migrations`, the
+  checksum functions and `MigrationLockGuard`;
+- `job::enqueue_on_conn` and its siblings;
+- the `transition_<field>_to_on_conn` method that `#[model]` makes for a state
+  machine with effects. It takes an `AsyncPgConnection`.
+
+**Automation:** `manual` — this is a Cargo feature change; `autumn upgrade`
+rewrites Rust source, not `Cargo.toml` feature lists.
+
 ### Jobs: `JobTrackingStore::reset_for_retry` takes a `RetryToken`
 
 **Why:** The old check compared `updated_at`. That value can repeat: two
@@ -1713,6 +1774,55 @@ pub struct Note {
 
 **Automation:** `manual` — move the logic to `#[normalize(...)]` or a
 `before_create` hook.
+
+### Constela: tighter bounds on what a document keeps
+
+**Why:** Four paths kept document-controlled bytes without a bound (issue
+#2626). A hostile document could make one request keep gigabytes. See
+[ADR 0025](../adr/0025-constela-retention-accounting.md).
+
+**Before (`{X.Y}`):**
+
+- Two elements could render with the same id. A `<label for>` then found only
+  the first.
+- A portal `target` had no length limit.
+- `ConstelaError::Invalid` held every fault.
+- A copy of a `state`, `var` or `param` value was free.
+
+**After (`{(X+1).0}`):**
+
+- A second element with the same id stops the render with
+  `constela.duplicate`. Validation rejects a literal `id` in an `each` body.
+  Give each use its own id: pass a different param value to each use, or
+  build it from the loop index:
+
+  ```json
+  { "kind": "each", "items": { "expr": "state", "name": "rows" },
+    "as": "r", "index": "i",
+    "body": { "kind": "element", "tag": "input", "props": {
+      "id": { "expr": "concat", "items": [
+        { "expr": "lit", "value": "row-" }, { "expr": "var", "name": "i" } ] } } } }
+  ```
+
+- An id with whitespace stops the render with `constela.eval`: an id is one
+  token. `true` and `""` now omit the attribute. Before, they wrote a bare
+  `id`.
+
+- A portal `target` longer than 256 bytes fails validation with
+  `constela.limit`.
+- `ConstelaError::Invalid` holds at most `MAX_DIAGNOSTICS` (256) faults, then
+  one `constela.limit` diagnostic. Each `path` and `message` from
+  `Diagnostic::new` is cut to `MAX_DIAGNOSTIC_FIELD_BYTES` (4096). The
+  messages for a missing or unknown component prop say "this component", not
+  the component name. Match on `code` and `path`, not on message text.
+- A copy that a render keeps charges `RenderLimits::max_output_bytes`
+  (default 4 MiB). A dispatch always uses 4 MiB, and you cannot change it. A
+  read that only shows a value does not copy it. An action that copies a
+  state value larger than the budget now fails with `constela.render_limit`.
+
+**Automation:** `manual` — it is a runtime behaviour change. Repair the
+document. For a render, you can also raise `RenderLimits::max_output_bytes`.
+For a dispatch, make the state value smaller.
 
 ## Plugin authors
 

@@ -961,7 +961,7 @@ impl ConfigStore for InMemoryConfigStore {
 /// `autumn_runtime_config_changes` tables managed by
 /// [`crate::migrate::FRAMEWORK_MIGRATIONS`]. This is the persistent store that
 /// shares state with the `autumn config` CLI.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub mod pg {
     use super::{ConfigChangeRecord, ConfigStore, ConfigStoreError, ConfigValue};
     use diesel::prelude::*;

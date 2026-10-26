@@ -281,19 +281,21 @@ pub fn plan_pull(
     // none of which a freshly-`autumn new`-ed project carries. The `#[model]`
     // macro itself is exported only behind `autumn-web`'s `db` feature, which a
     // DB-free `autumn new --daemon` project disables; enable it so the pulled
-    // models compile there too.
+    // models compile there too. `db` needs a backend (#2605), and `db pull`
+    // reads Postgres, so enable `postgres` too.
     let cargo_path = project_root.join("Cargo.toml");
     let existing = read_or_empty(&cargo_path);
     let with_deps = super::model::ensure_cargo_dependencies(&existing, super::model::MODEL_DEPS);
-    let (updated, db_enabled) =
+    let (with_db, db_enabled) =
         super::schema_edit::ensure_autumn_web_feature_status(&with_deps, "db");
+    let (updated, _) = super::schema_edit::ensure_autumn_web_feature_status(&with_db, "postgres");
     if !db_enabled {
         // No `autumn-web` dependency could be located to enable `db` on. The
         // generated `#[autumn_web::model]` code needs that feature, so warn
         // rather than emit silently-uncompilable output.
         eprintln!(
             "  \u{26a0} Could not enable autumn-web's `db` feature automatically. \
-             Add `features = [\"db\"]` to the `autumn-web` dependency in Cargo.toml \
+             Add `features = [\"db\", \"postgres\"]` to the `autumn-web` dependency in Cargo.toml \
              so the generated models compile."
         );
     }
@@ -1573,8 +1575,8 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert!(
-            cargo.contains("autumn-web = { version = \"0.5\", features = [\"db\"] }"),
-            "pull must enable autumn-web's db feature: {cargo}"
+            cargo.contains("autumn-web = { version = \"0.5\", features = [\"db\", \"postgres\"] }"),
+            "pull must enable autumn-web's db feature and its postgres backend: {cargo}"
         );
     }
 

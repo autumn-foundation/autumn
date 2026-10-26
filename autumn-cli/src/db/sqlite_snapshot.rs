@@ -119,35 +119,77 @@ impl SnapshotError {
 /// [`SnapshotError::NotAFile`] when the target is in-memory (or not a `SQLite`
 /// URL at all).
 pub fn database_path(target: &str) -> Result<PathBuf, SnapshotError> {
-    replication::database_file(target).ok_or_else(|| SnapshotError::NotAFile {
+    database_target(target).map(replication::DatabaseTarget::into_path)
+}
+
+/// Resolve a `SQLite` target to its file and its open options.
+///
+/// # Errors
+///
+/// [`SnapshotError::NotAFile`] when the target is in-memory (or not a `SQLite`
+/// URL at all).
+pub fn database_target(target: &str) -> Result<replication::DatabaseTarget, SnapshotError> {
+    replication::database_target(target).ok_or_else(|| SnapshotError::NotAFile {
         target: target.to_owned(),
     })
 }
 
-/// Open a private connection to a `SQLite` database file.
+/// Open a private connection to a `SQLite` database file, such as an artifact.
 ///
-/// Never creates the file. `sqlite3_open` creates an empty database, so a typo'd
-/// path would back up zero tables and report success.
+/// Never creates the file. See [`open_target`].
+///
+/// # Errors
+///
+/// [`SnapshotError::Missing`] or [`SnapshotError::Open`].
 pub fn open(path: &Path) -> Result<SqliteConnection, SnapshotError> {
-    if !path.exists() {
-        return Err(SnapshotError::Missing {
-            path: path.display().to_string(),
-        });
+    require_file(path)?;
+    connect(
+        &replication::no_create_uri(path).ok_or_else(|| not_unicode(path))?,
+        path,
+    )
+}
+
+/// Open the database a target names, with the target's own URI options.
+///
+/// Never creates the file. The existence check gives a clear error. The
+/// no-create `mode=rw` closes the race after it: a file removed in between
+/// fails the open, and `SQLite` does not create an empty one (#2589 item 7).
+/// The source `vfs` stays, so the locks match the app's (item 12).
+///
+/// # Errors
+///
+/// [`SnapshotError::Missing`] or [`SnapshotError::Open`].
+pub fn open_target(
+    target: &replication::DatabaseTarget,
+) -> Result<SqliteConnection, SnapshotError> {
+    let path = target.path();
+    require_file(path)?;
+    connect(
+        &target.no_create_uri().ok_or_else(|| not_unicode(path))?,
+        path,
+    )
+}
+
+fn require_file(path: &Path) -> Result<(), SnapshotError> {
+    if path.exists() {
+        return Ok(());
     }
-    // Through the runtime's own `connection_string`, so the CLI opens exactly what
-    // the app opens. It refuses a path no `&str` can carry (`file:app%FF.db`
-    // decodes to such a name), and it keeps a filename that itself begins with
-    // `file:` from being re-read as a URI naming a different database.
-    let Some(target) = replication::connection_string(path) else {
-        return Err(SnapshotError::Open {
-            path: path.display().to_string(),
-            detail: "the path is not valid UTF-8, and SQLite is opened through a UTF-8 \
-                     connection string"
-                .to_owned(),
-        });
-    };
-    let mut conn = SqliteConnection::establish(&target).map_err(|e| SnapshotError::Open {
-        path: target.clone(),
+    Err(SnapshotError::Missing {
+        path: path.display().to_string(),
+    })
+}
+
+fn not_unicode(path: &Path) -> SnapshotError {
+    SnapshotError::Open {
+        path: path.display().to_string(),
+        detail: "the path is not valid Unicode, so no SQLite URI can name it".to_owned(),
+    }
+}
+
+/// Open `uri` (a no-create URI for `path`) and set the busy timeout.
+fn connect(uri: &str, path: &Path) -> Result<SqliteConnection, SnapshotError> {
+    let mut conn = SqliteConnection::establish(uri).map_err(|e| SnapshotError::Open {
+        path: path.display().to_string(),
         detail: e.to_string(),
     })?;
     conn.batch_execute(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};"))
@@ -172,9 +214,11 @@ pub fn open(path: &Path) -> Result<SqliteConnection, SnapshotError> {
 ///
 /// See [`SnapshotError`].
 pub fn snapshot(target: &str, out_path: &Path) -> Result<(), SnapshotError> {
-    let db = database_path(target)?;
-    let mut conn = open(&db)?;
-    let out = out_path.to_string_lossy().into_owned();
+    let mut conn = open_target(&database_target(target)?)?;
+    // `VACUUM INTO` reads a URI, so the output is one too. A lossy string
+    // changes a non-UTF-8 name (#2589 item 15), and a relative name that
+    // starts with `file:` becomes a URI (item 18).
+    let out = replication::file_uri(out_path).ok_or_else(|| not_unicode(out_path))?;
     diesel::sql_query("VACUUM INTO ?")
         .bind::<Text, _>(&out)
         .execute(&mut conn)
@@ -342,9 +386,11 @@ fn flush(path: &Path) -> Result<(), SnapshotError> {
 /// world-readable, and a restore run under `sudo` can leave a root-owned file the
 /// service account cannot write.
 ///
-/// Best-effort on ownership: only a privileged user may change it, so a failed
-/// `chown` is ignored rather than failing a restore that is otherwise correct.
-/// A missing target (a first restore onto a fresh path) leaves both alone.
+/// Only a privileged user may change ownership, so `chown` can fail. That is
+/// safe only when the old owner can still read and write the file. If not, the
+/// restore stops before the rename (#2589 item 4): the service could not open
+/// its own database. A missing target (a first restore onto a fresh path)
+/// leaves both alone.
 #[cfg(unix)]
 fn inherit_target_permissions_via(
     db: &Path,
@@ -365,8 +411,42 @@ fn inherit_target_permissions_via(
             "setting the mode of {}",
             staged_path.display()
         )))?;
-    let _ = std::os::unix::fs::fchown(staged, Some(existing.uid()), Some(existing.gid()));
-    Ok(())
+    // One call changes both or neither. If the uid cannot change, still try to
+    // keep the group: a member of it may give the file that group.
+    if std::os::unix::fs::fchown(staged, Some(existing.uid()), Some(existing.gid())).is_err() {
+        let _ = std::os::unix::fs::fchown(staged, None, Some(existing.gid()));
+    }
+    let staged_uid = staged
+        .metadata()
+        .map_err(SnapshotError::io(format!(
+            "inspecting {}",
+            staged_path.display()
+        )))?
+        .uid();
+    if owner_keeps_access(existing.uid(), staged_uid, existing.mode()) {
+        return Ok(());
+    }
+    Err(SnapshotError::Io {
+        context: format!("keeping the owner of {}", db.display()),
+        detail: format!(
+            "this account (uid {staged_uid}) cannot give the restored file to its owner \
+             (uid {owner}), and mode {mode:o} does not let that owner read and write it, so \
+             the service could not open its database. Run the restore as uid {owner}, or as \
+             an account that can change file ownership.",
+            owner = existing.uid(),
+            mode = existing.mode() & 0o7777,
+        ),
+    })
+}
+
+/// Whether uid `owner` can read and write a file that uid `file` owns, with
+/// `mode`.
+///
+/// The owner may or may not be in the file's group, and POSIX then uses the
+/// group bits or the other bits. So both must give read and write.
+#[cfg(unix)]
+const fn owner_keeps_access(owner: u32, file: u32, mode: u32) -> bool {
+    owner == 0 || owner == file || mode & 0o066 == 0o066
 }
 
 /// Non-unix mode inheritance: `set_permissions` carries the read-only flag, and
@@ -493,13 +573,19 @@ mod tests {
     /// Seed a WAL-mode database with one row and leave the connection open, so
     /// the file has a live `-wal` beside it (the realistic live-app shape).
     fn seeded(path: &Path) -> SqliteConnection {
-        let mut conn =
-            SqliteConnection::establish(&path.to_string_lossy()).expect("establish sqlite");
-        conn.batch_execute(
-            "PRAGMA journal_mode = WAL; \
+        seeded_in(path, "WAL")
+    }
+
+    /// Seed with a given journal mode. Through a URI, so an awkward name
+    /// (non-UTF-8, `file:`) is created exactly.
+    fn seeded_in(path: &Path, journal_mode: &str) -> SqliteConnection {
+        let uri = replication::file_uri(path).expect("a URI") + "?mode=rwc";
+        let mut conn = SqliteConnection::establish(&uri).expect("establish sqlite");
+        conn.batch_execute(&format!(
+            "PRAGMA journal_mode = {journal_mode}; \
              CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL); \
-             INSERT INTO t (v) VALUES ('a'), ('b');",
-        )
+             INSERT INTO t (v) VALUES ('a'), ('b');"
+        ))
         .expect("seed");
         conn
     }
@@ -511,8 +597,7 @@ mod tests {
     }
 
     fn row_count(path: &Path) -> i64 {
-        let mut conn =
-            SqliteConnection::establish(&path.to_string_lossy()).expect("establish sqlite");
+        let mut conn = open(path).expect("open sqlite");
         let rows: Vec<Count> = diesel::sql_query("SELECT COUNT(*) AS n FROM t")
             .load(&mut conn)
             .expect("count");
@@ -864,6 +949,167 @@ mod tests {
             .open(&staged)
             .expect("create");
         same_file_as_handle(&handle, &staged).expect("an unswapped name must pass");
+    }
+
+    /// Item 7: the source opens with no create. A file removed after the
+    /// existence check fails the open and is not created again.
+    #[test]
+    fn connect_never_creates_a_database_that_vanished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("gone.db");
+        let uri = replication::no_create_uri(&gone).expect("a URI");
+        let Err(err) = connect(&uri, &gone) else {
+            panic!("a missing file must not open");
+        };
+        assert!(matches!(err, SnapshotError::Open { .. }), "{err}");
+        assert!(!gone.exists(), "the open must not create {gone:?}");
+    }
+
+    /// Item 3: a non-UTF-8 `file:` source is backed up.
+    ///
+    /// Not on macOS: APFS refuses a name that is not UTF-8 (`EILSEQ`), so
+    /// there such a file cannot exist.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn snapshot_reads_a_non_utf8_file_uri_source() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join(std::ffi::OsStr::from_bytes(b"app\xFF.db"));
+        drop(seeded(&db));
+        let url = format!("file:{}/app%FF.db", dir.path().display());
+        let out = dir.path().join("control.sqlite");
+        snapshot(&url, &out).expect("snapshot");
+        assert_eq!(row_count(&out), 2);
+    }
+
+    /// Item 12: a source opened through a locking VFS is backed up through the
+    /// same VFS.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_keeps_the_source_vfs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("app.db");
+        // Rollback journal: `unix-dotfile` has no shared memory, so WAL cannot
+        // open through it.
+        drop(seeded_in(&db, "DELETE"));
+        let url = format!("file:{}?vfs=unix-dotfile", db.display());
+        let target = database_target(&url).expect("a file");
+        assert!(
+            target
+                .no_create_uri()
+                .is_some_and(|uri| uri.contains("vfs=unix-dotfile")),
+            "the opener must keep the VFS"
+        );
+        let out = dir.path().join("control.sqlite");
+        snapshot(&url, &out).expect("snapshot");
+        assert_eq!(row_count(&out), 2);
+
+        // An unknown VFS fails, so the opener really uses the source VFS.
+        let unknown = format!("file:{}?vfs=autumn-no-such-vfs", db.display());
+        let err = snapshot(&unknown, &dir.path().join("other.sqlite"))
+            .expect_err("an unknown VFS must fail the open");
+        assert!(matches!(err, SnapshotError::Open { .. }), "{err}");
+    }
+
+    /// Item 15: a non-UTF-8 output directory is used exactly.
+    ///
+    /// Not on macOS: APFS refuses a name that is not UTF-8 (`EILSEQ`), so
+    /// there such a file cannot exist.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn snapshot_writes_into_a_non_utf8_directory() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("app.db");
+        drop(seeded(&db));
+        let out_dir = dir.path().join(std::ffi::OsStr::from_bytes(b"run\xFF"));
+        std::fs::create_dir(&out_dir).expect("mkdir");
+        let out = out_dir.join("control.sqlite");
+        snapshot(&format!("sqlite://{}", db.display()), &out).expect("snapshot");
+        assert_eq!(row_count(&out), 2, "the artifact must be at {out:?}");
+    }
+
+    /// Item 18: a relative output path that starts with `file:` is a path, not
+    /// a URI.
+    ///
+    /// It writes a directory in the working directory, because the hazard is
+    /// only for a relative path. The name is unique to the process, and the
+    /// guard removes it. Unix only: Windows does not allow `:` in a name.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_writes_to_a_relative_path_that_starts_with_file() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("app.db");
+        drop(seeded(&db));
+        let out_dir = PathBuf::from(format!("file:autumn-2589-{}", std::process::id()));
+        let _cleanup = Cleanup(out_dir.clone());
+        std::fs::create_dir_all(&out_dir).expect("mkdir");
+        let out = out_dir.join("control.sqlite");
+        snapshot(&format!("sqlite://{}", db.display()), &out).expect("snapshot");
+        assert_eq!(row_count(&out), 2, "the artifact must be at {out:?}");
+    }
+
+    /// Item 14: a restore replaces a read-only (`0444`) database and keeps its
+    /// mode.
+    #[cfg(unix)]
+    #[test]
+    fn restore_replaces_a_read_only_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.db");
+        drop(seeded(&source));
+        let artifact = dir.path().join("control.sqlite");
+        snapshot(&format!("sqlite://{}", source.display()), &artifact).expect("snapshot");
+
+        let target = dir.path().join("target.db");
+        let mut live = seeded(&target);
+        live.batch_execute("INSERT INTO t (v) VALUES ('c');")
+            .expect("third row");
+        drop(live);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod target");
+
+        restore(&artifact, &format!("sqlite://{}", target.display())).expect("restore");
+        assert_eq!(row_count(&target), 2);
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o444);
+    }
+
+    /// Item 4: when the uid cannot be kept, the old owner must still read and
+    /// write the file.
+    #[cfg(unix)]
+    #[test]
+    fn owner_keeps_access_needs_the_same_uid_or_shared_read_write() {
+        // (owner uid, file uid, mode, owner keeps access)
+        for (owner, file, mode, keeps) in [
+            (1000, 1000, 0o600, true),
+            (1000, 1001, 0o600, false),
+            (1000, 1001, 0o660, false),
+            (1000, 1001, 0o666, true),
+            (1000, 1001, 0o646, false),
+            (1000, 1001, 0o644, false),
+            (0, 1001, 0o600, true),
+        ] {
+            assert_eq!(
+                owner_keeps_access(owner, file, mode),
+                keeps,
+                "owner={owner} file={file} mode={mode:o}"
+            );
+        }
     }
 
     #[test]

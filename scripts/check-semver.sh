@@ -347,11 +347,17 @@ for crate in "${CRATES[@]}"; do
     # Keep the two lists in step: a feature added to the Postgres list belongs
     # here too, against the same demonstrated compile.
     autumn_web_semver_sqlite_features="${autumn_web_semver_features},sqlite"
+    # The `postgres` feature now holds the Postgres client. `db` alone does not
+    # compile (#2605). The 0.7.0 baseline has no `postgres` feature, so name it
+    # for the current build only. Both passes then check the same surface as
+    # the baseline's `db`.
+    autumn_web_semver_current_only="postgres"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
     pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
-      --features "$autumn_web_semver_features" 2>&1)"
+      --features "$autumn_web_semver_features" \
+      --current-features "$autumn_web_semver_current_only" 2>&1)"
     pg_exit_code=$?
 
     # Run the SQLite pass regardless of pass 1's outcome, so one report names
@@ -360,7 +366,8 @@ for crate in "${CRATES[@]}"; do
     echo "  pass 2/2: SQLite surface (--features $autumn_web_semver_sqlite_features)"
     sqlite_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
-      --features "$autumn_web_semver_sqlite_features" 2>&1)"
+      --features "$autumn_web_semver_sqlite_features" \
+      --current-features "$autumn_web_semver_current_only" 2>&1)"
     sqlite_exit_code=$?
     set -e
 
