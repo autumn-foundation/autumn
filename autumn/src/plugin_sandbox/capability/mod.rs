@@ -87,7 +87,8 @@ use super::manifest::{SandboxCapability, SandboxManifest};
 use quota::QuotaLedger;
 
 pub use audit::{
-    ActivitySummary, CapabilityEvent, CapabilityOutcome, MAX_LOG_EVENTS, PluginActivityLog,
+    ActivitySummary, CapabilityEvent, CapabilityOutcome, DroppedCalls, MAX_LOG_EVENTS,
+    PluginActivityLog,
 };
 // Aliased for use *inside* this module only, so the `pub use` above can carry
 // the real names without shadowing itself.
@@ -927,6 +928,26 @@ impl CapabilityCall {
             Self::JobEnqueue { .. } => "job-enqueue",
         }
     }
+
+    /// Whether this call can change state outside the guest.
+    ///
+    /// A failed request that made such a call can make it again on retry. An
+    /// outbound `GET` or `HEAD` is a read. An unknown method counts as a write.
+    #[must_use]
+    pub fn commits(&self) -> bool {
+        match self {
+            Self::KvGet { .. } | Self::DbGet { .. } | Self::DbQuery { .. } => false,
+            Self::HttpFetch { method, .. } => {
+                !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"))
+            }
+            Self::KvSet { .. }
+            | Self::KvDelete { .. }
+            | Self::DbInsert { .. }
+            | Self::DbUpdate { .. }
+            | Self::DbDelete { .. }
+            | Self::JobEnqueue { .. } => true,
+        }
+    }
 }
 
 // ── The results ──────────────────────────────────────────────────────────
@@ -1245,8 +1266,9 @@ pub struct CapabilityRuntime {
     quotas: QuotaLedger,
     rate: Option<Arc<quota::CapabilityRateLimiter>>,
     events: Vec<Event>,
-    /// Calls the ledger could not hold, so a truncated summary says it is one.
-    dropped_events: u64,
+    /// Calls the ledger could not hold, and when, so a truncated summary says
+    /// it is one.
+    dropped: Option<DroppedCalls>,
     /// `(operation, outcome)` pairs already warned about this request.
     warned: Vec<(&'static str, Outcome)>,
 }
@@ -1314,7 +1336,7 @@ impl CapabilityRuntime {
             services,
             quotas: QuotaLedger::new(manifest.quotas),
             events: Vec::new(),
-            dropped_events: 0,
+            dropped: None,
             warned: Vec::new(),
         }
     }
@@ -1378,7 +1400,38 @@ impl CapabilityRuntime {
     /// the one thing an operator must not have to guess at.
     #[must_use]
     pub const fn dropped_events(&self) -> u64 {
-        self.dropped_events
+        match self.dropped {
+            Some(dropped) => dropped.count,
+            None => 0,
+        }
+    }
+
+    /// As [`dropped_events`](Self::dropped_events), with the times of the
+    /// first and last dropped call. `None` when no call was dropped.
+    ///
+    /// Give it to [`PluginActivityLog::ingest_dropped_calls`]. The log then
+    /// windows the drops by when they occurred, not by when the request ended.
+    #[must_use]
+    pub const fn dropped_calls(&self) -> Option<DroppedCalls> {
+        self.dropped
+    }
+
+    /// The bytes `call`'s reply may take at its worst, under this plugin's
+    /// quotas. See [`CapabilityCall::reply_reserve_for`].
+    pub(crate) const fn reply_reserve(&self, call: &CapabilityCall) -> usize {
+        let quotas = self.quotas();
+        let reserve =
+            call.reply_reserve_for(quotas.kv_value_bytes as usize, quotas.db_rows as usize);
+        match call {
+            // The body is at most `outbound_response_bytes`, and one byte
+            // escapes to at most six. Smaller than `MAX_RESULT_BYTES` when the
+            // plugin asks for small replies.
+            CapabilityCall::HttpFetch { .. } => {
+                let body = (quotas.outbound_response_bytes as usize).saturating_mul(6);
+                reserve.saturating_sub(MAX_RESULT_BYTES.saturating_sub(body))
+            }
+            _ => reserve,
+        }
     }
 
     /// Whether this plugin may use `capability` at all.
@@ -1405,6 +1458,18 @@ impl CapabilityRuntime {
     /// A call whose worst-case reply does not fit is refused before it runs.
     /// See [`CapabilityCall::reply_reserve`].
     pub fn dispatch_within(&mut self, call: &CapabilityCall, reply_room: usize) -> CallResult {
+        self.dispatch_checked(call, reply_room, |_| true)
+    }
+
+    /// As [`dispatch_within`](Self::dispatch_within). `fuel_covers` gets the
+    /// worst-case reply in bytes. When it returns `false`, the call is refused
+    /// before it runs.
+    pub(crate) fn dispatch_checked(
+        &mut self,
+        call: &CapabilityCall,
+        reply_room: usize,
+        fuel_covers: impl FnOnce(usize) -> bool,
+    ) -> CallResult {
         let id = call.id();
         let capability = call.capability();
         // What the call *names*, computed before any check, so every refusal
@@ -1466,10 +1531,8 @@ impl CapabilityRuntime {
 
         // Room for the answer, before anything is charged or committed: once a
         // write has happened its reply can no longer be refused.
-        let quotas = self.quotas();
-        if reply_room
-            < call.reply_reserve_for(quotas.kv_value_bytes as usize, quotas.db_rows as usize)
-        {
+        let reserve = self.reply_reserve(call);
+        if reply_room < reserve {
             return self.record(
                 call,
                 &target,
@@ -1478,6 +1541,18 @@ impl CapabilityRuntime {
                     DenialReason::QuotaExceeded,
                     "there is not room to deliver this call's answer; read the pending replies \
                      and retry",
+                ),
+            );
+        }
+        if !fuel_covers(reserve) {
+            return self.record(
+                call,
+                &target,
+                CallResult::denied(
+                    id,
+                    DenialReason::QuotaExceeded,
+                    "the fuel left cannot read this call's answer and finish the request; \
+                     increase `fuel`",
                 ),
             );
         }
@@ -1689,13 +1764,14 @@ impl CapabilityRuntime {
                 self.warned.push((call.operation(), outcome));
             }
         }
+        let at = crate::time::ambient_instant();
         if self.events.len() < MAX_EVENTS {
             self.events.push(Event {
                 capability: call.capability(),
                 operation: call.operation(),
                 target,
                 outcome,
-                at: crate::time::ambient_instant(),
+                at,
             });
         } else {
             // Counted rather than dropped silently. The ledger is bounded
@@ -1704,7 +1780,21 @@ impl CapabilityRuntime {
             // reading a number the plugin chose. `MAX_EVENTS` is not
             // unreachable: the quotas that would bound it live in the plugin's
             // own manifest, so the plugin sets them.
-            self.dropped_events = self.dropped_events.saturating_add(1);
+            //
+            // Keep the time too. The log ingests the request when it ends. A
+            // slow request must not make an old drop look recent (#2523).
+            self.dropped = Some(self.dropped.map_or(
+                DroppedCalls {
+                    count: 1,
+                    first: at,
+                    last: at,
+                },
+                |dropped| DroppedCalls {
+                    count: dropped.count.saturating_add(1),
+                    last: at,
+                    ..dropped
+                },
+            ));
         }
         result
     }
@@ -3860,6 +3950,158 @@ path = "/shop/panel"
         assert_eq!(summary.dropped, 25);
         let rendered = summary.to_string();
         assert!(rendered.contains("floor"), "{rendered}");
+    }
+
+    #[test]
+    fn a_dropped_call_keeps_its_own_time_not_the_time_of_ingest() {
+        // #2523 finding 18. The log ingests a request when it ends. A slow
+        // request must not make its old drops look recent.
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let hour = std::time::Duration::from_secs(3600);
+        let clock = TickingClock::starting_at(
+            chrono::Utc
+                .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
+                .single()
+                .expect("a valid date"),
+        );
+        let _clock = install_ambient(Arc::new(clock.clone()));
+        let mut manifest = manifest(&everything());
+        manifest.quotas.calls = MAX_QUOTA;
+        manifest.quotas.kv_reads = MAX_QUOTA;
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            },
+        );
+        let log = audit::PluginActivityLog::new();
+        let mut kv_get = (0..).map(|id| CapabilityCall::KvGet {
+            id,
+            key: "k".to_owned(),
+        });
+        let start = crate::time::ambient_instant();
+        for call in kv_get.by_ref().take(MAX_EVENTS + 20) {
+            let _ = runtime.dispatch(&call);
+        }
+        // Five more drops 30 minutes later.
+        clock.advance(hour / 2);
+        let later = crate::time::ambient_instant();
+        for call in kv_get.take(5) {
+            let _ = runtime.dispatch(&call);
+        }
+        // The request ends 90 minutes after that.
+        clock.advance(3 * hour / 2);
+        let dropped = runtime.dropped_calls().expect("25 calls were dropped");
+        assert_eq!(dropped.count, 25);
+        assert_eq!(dropped.first, start);
+        assert_eq!(dropped.last, later);
+        log.ingest("shop", runtime.take_events());
+        log.ingest_dropped_calls("shop", dropped);
+        assert_eq!(log.summary("shop", hour).dropped, 0);
+        // The window holds the last drop, not the first.
+        assert_eq!(log.summary("shop", 7 * hour / 4).dropped, 25);
+    }
+
+    #[test]
+    fn the_outbound_reply_reserve_follows_the_response_quota() {
+        let post = CapabilityCall::HttpFetch {
+            id: 1,
+            method: "POST".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let fixture = fixture(&everything(), Some("alpha"));
+        // The default quota escapes past `MAX_RESULT_BYTES`, so that bound holds.
+        assert_eq!(fixture.runtime.reply_reserve(&post), post.reply_reserve());
+        let mut manifest = manifest(&everything());
+        manifest.quotas.outbound_response_bytes = 4096;
+        let small = CapabilityRuntime::new(&manifest, CapabilityServices::none());
+        assert_eq!(
+            small.reply_reserve(&post),
+            6 * 4096 + outbound::MAX_RESPONSE_HEADER_BYTES * 6 + 4096
+        );
+    }
+
+    #[test]
+    fn a_call_commits_when_it_can_change_state_outside_the_guest() {
+        let fetch = |method: &str| CapabilityCall::HttpFetch {
+            id: 1,
+            method: method.to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let table = || "orders".to_owned();
+        let commits = [
+            CapabilityCall::KvSet {
+                id: 1,
+                key: "k".to_owned(),
+                value: PluginValue::Null,
+            },
+            CapabilityCall::KvDelete {
+                id: 1,
+                key: "k".to_owned(),
+            },
+            CapabilityCall::DbInsert {
+                id: 1,
+                table: table(),
+                row: PluginRow::new(),
+            },
+            CapabilityCall::DbUpdate {
+                id: 1,
+                table: table(),
+                row_id: "r1".to_owned(),
+                row: PluginRow::new(),
+            },
+            CapabilityCall::DbDelete {
+                id: 1,
+                table: table(),
+                row_id: "r1".to_owned(),
+            },
+            CapabilityCall::JobEnqueue {
+                id: 1,
+                job_type: "reindex".to_owned(),
+                payload: PluginRow::new(),
+            },
+            fetch("POST"),
+            fetch("PUT"),
+            fetch("PATCH"),
+            fetch("DELETE"),
+            // An unknown method is refused later. Here it counts as a write.
+            fetch("BREW"),
+        ];
+        for call in &commits {
+            assert!(call.commits(), "{call:?}");
+        }
+        let reads = [
+            CapabilityCall::KvGet {
+                id: 1,
+                key: "k".to_owned(),
+            },
+            CapabilityCall::DbGet {
+                id: 1,
+                table: table(),
+                row_id: "r1".to_owned(),
+            },
+            CapabilityCall::DbQuery {
+                id: 1,
+                table: table(),
+                filter: PluginRow::new(),
+                limit: 0,
+                after: None,
+            },
+            fetch("GET"),
+            fetch("HEAD"),
+            fetch("get"),
+        ];
+        for call in &reads {
+            assert!(!call.commits(), "{call:?}");
+        }
     }
 
     #[test]

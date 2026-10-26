@@ -531,6 +531,11 @@ fn a_guest_that_never_reads_its_replies_is_stopped_rather_than_growing_the_host(
         "the ledger is bounded: {}",
         outcome.activity.len()
     );
+    // The calls the ledger dropped reach the outcome with their times (#2523).
+    assert!(outcome.dropped_activity > 0, "the flood overran the ledger");
+    let dropped = outcome.dropped_calls.expect("the drops carry their times");
+    assert_eq!(dropped.count, outcome.dropped_activity);
+    assert!(dropped.first <= dropped.last);
     let quota_hits = outcome
         .activity
         .iter()
