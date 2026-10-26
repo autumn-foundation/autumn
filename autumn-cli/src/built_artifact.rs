@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Executables from the builds this process ran, newest last.
 static BUILT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -43,25 +43,6 @@ fn same_slot(a: &Path, b: &Path) -> bool {
     a.file_name() == b.file_name() && profile_dir(a) == profile_dir(b)
 }
 
-/// Whether a binary for `triple` can start on this machine.
-///
-/// The arch and the OS of the triple must agree with this CLI. The triple
-/// directory of a build without `build.target` is not a triple, so it fails.
-fn runs_here(triple: &str) -> bool {
-    let mut parts = triple.split('-');
-    let arch = parts.next().unwrap_or_default();
-    let arch_ok = match std::env::consts::ARCH {
-        "x86" => matches!(arch, "i386" | "i586" | "i686"),
-        "arm" => arch.starts_with("arm") || arch.starts_with("thumb"),
-        host => arch == host,
-    };
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    };
-    arch_ok && parts.any(|part| part == os)
-}
-
 /// Add the `executables` of one build to `built`, newest last.
 ///
 /// A build replaces the older paths in the same slot. The paths of one build
@@ -77,17 +58,52 @@ fn record_into(built: &mut Vec<PathBuf>, executables: &[PathBuf]) {
 }
 
 /// The path in `built` that matches `guess` by file name and profile directory.
-///
-/// With more than one triple, the path for this machine wins. Otherwise the
-/// newest path wins.
 fn lookup_in(built: &[PathBuf], guess: &Path) -> Option<PathBuf> {
+    lookup_with(built, guess, native_triple)
+}
+
+/// Like [`lookup_in`], with the native triple from `native`.
+///
+/// With more than one triple, one build reports one path for each triple.
+/// Then the path for the native triple wins, because it can start here.
+/// Otherwise the newest path wins. `native` runs only for more than one match.
+fn lookup_with(
+    built: &[PathBuf],
+    guess: &Path,
+    native: impl FnOnce() -> Option<String>,
+) -> Option<PathBuf> {
     let matches: Vec<&PathBuf> = built.iter().filter(|path| same_slot(path, guess)).collect();
-    matches
-        .iter()
-        .rev()
-        .find(|path| triple_dir(path).is_some_and(runs_here))
-        .or_else(|| matches.last())
-        .map(|path| (*path).clone())
+    let newest = *matches.last()?;
+    let for_native = (matches.len() > 1)
+        .then(native)
+        .flatten()
+        .and_then(|triple| {
+            matches
+                .iter()
+                .rev()
+                .find(|path| triple_dir(path) == Some(triple.as_str()))
+                .copied()
+        });
+    Some(for_native.unwrap_or(newest).clone())
+}
+
+/// The host triple of the `rustc` that Cargo uses, from `rustc -vV`.
+///
+/// This is the triple whose binaries can start here. The arch name in
+/// `std::env::consts` is not enough: it is `powerpc64` for the native
+/// `powerpc64le-...` triple, and `riscv64` for `riscv64gc-...`.
+fn native_triple() -> Option<String> {
+    static NATIVE: OnceLock<Option<String>> = OnceLock::new();
+    NATIVE
+        .get_or_init(|| {
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let output = Command::new(rustc).arg("-vV").output().ok()?;
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix("host: "))
+                .map(|host| host.trim().to_owned())
+        })
+        .clone()
 }
 
 /// Remember the executables of a finished build.
@@ -155,20 +171,6 @@ mod tests {
         assert!(parse_executables(&out).is_empty());
     }
 
-    /// A triple that [`runs_here`] accepts on this machine.
-    fn local_triple() -> String {
-        let arch = match std::env::consts::ARCH {
-            "x86" => "i686",
-            "arm" => "armv7",
-            other => other,
-        };
-        let os = match std::env::consts::OS {
-            "macos" => "darwin",
-            other => other,
-        };
-        format!("{arch}-unknown-{os}")
-    }
-
     #[test]
     fn newer_build_replaces_older_path_in_same_slot() {
         let mut built = Vec::new();
@@ -195,27 +197,54 @@ mod tests {
     }
 
     #[test]
-    fn local_triple_wins_over_a_foreign_triple() {
-        // `build.target = [local, foreign]`: one build reports both, in any order.
-        let local = PathBuf::from(format!("/t/{}/debug/app", local_triple()));
-        let foreign = PathBuf::from("/t/sparc64-unknown-netbsd/debug/app");
-        for order in [[&local, &foreign], [&foreign, &local]] {
+    fn native_triple_wins_over_a_foreign_triple() {
+        // `build.target = [native, foreign]`: one build reports both, in any order.
+        let native = PathBuf::from("/t/x86_64-unknown-linux-gnu/debug/app");
+        let foreign = PathBuf::from("/t/aarch64-unknown-linux-gnu/debug/app");
+        let host = || Some("x86_64-unknown-linux-gnu".to_owned());
+        for order in [[&native, &foreign], [&foreign, &native]] {
             let mut built = Vec::new();
             record_into(&mut built, &order.map(PathBuf::clone));
             assert_eq!(built.len(), 2);
             assert_eq!(
-                lookup_in(&built, Path::new("/t/debug/app")),
-                Some(local.clone())
+                lookup_with(&built, Path::new("/t/debug/app"), host),
+                Some(native.clone())
             );
         }
     }
 
     #[test]
-    fn newer_build_beats_an_older_local_triple_entry() {
+    fn newest_wins_when_no_triple_is_native() {
+        let first = PathBuf::from("/t/a-b-c/debug/app");
+        let last = PathBuf::from("/t/d-e-f/debug/app");
+        let mut built = Vec::new();
+        record_into(&mut built, &[first, last.clone()]);
+        let guess = Path::new("/t/debug/app");
+        assert_eq!(lookup_with(&built, guess, || None), Some(last.clone()));
+        assert_eq!(
+            lookup_with(&built, guess, || Some("x-y-z".into())),
+            Some(last)
+        );
+    }
+
+    #[test]
+    fn one_match_does_not_probe_rustc() {
+        let built = vec![PathBuf::from("/t/a-b-c/debug/app")];
+        let probe = || -> Option<String> { panic!("probed rustc for one match") };
+        assert_eq!(
+            lookup_with(&built, Path::new("/t/debug/app"), probe),
+            Some(built[0].clone())
+        );
+    }
+
+    #[test]
+    fn newer_build_beats_an_older_triple_entry() {
         // `build.target` was removed between two builds in one process.
         let mut built = Vec::new();
-        let local = PathBuf::from(format!("/t/{}/debug/app", local_triple()));
-        record_into(&mut built, &[local]);
+        record_into(
+            &mut built,
+            &[PathBuf::from("/t/x86_64-unknown-linux-gnu/debug/app")],
+        );
         record_into(&mut built, &[PathBuf::from("/t/debug/app")]);
         assert_eq!(
             lookup_in(&built, Path::new("/t/debug/app")),
@@ -224,12 +253,38 @@ mod tests {
     }
 
     #[test]
-    fn runs_here_needs_the_local_arch_and_os() {
-        assert!(runs_here(&local_triple()));
-        assert!(runs_here(&format!("{}-gnu", local_triple())));
-        assert!(!runs_here("sparc64-unknown-netbsd"));
-        assert!(!runs_here("wasm32-wasip1"));
-        assert!(!runs_here("target"));
+    fn native_triple_is_the_rustc_host() {
+        let host = native_triple().expect("rustc -vV reports a host");
+        assert!(host.contains('-'), "{host}");
+        if matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
+            assert!(host.starts_with(std::env::consts::ARCH), "{host}");
+        }
+    }
+
+    #[test]
+    fn prefer_built_swaps_a_stale_guess() {
+        record(&[PathBuf::from("/t/triple/debug/yy_app")]);
+        assert_eq!(
+            prefer_built(PathBuf::from("/t/debug/yy_app")),
+            PathBuf::from("/t/triple/debug/yy_app")
+        );
+    }
+
+    #[test]
+    fn native_triple_wins_when_its_name_differs_from_consts_arch() {
+        // Little-endian PowerPC: `consts::ARCH` is `powerpc64`, the native
+        // triple is `powerpc64le-...`. One build reports both triples.
+        let le = PathBuf::from("/t/powerpc64le-unknown-linux-gnu/debug/app");
+        let be = PathBuf::from("/t/powerpc64-unknown-linux-gnu/debug/app");
+        let host = || Some("powerpc64le-unknown-linux-gnu".to_owned());
+        for order in [[&le, &be], [&be, &le]] {
+            let mut built = Vec::new();
+            record_into(&mut built, &order.map(PathBuf::clone));
+            assert_eq!(
+                lookup_with(&built, Path::new("/t/debug/app"), host),
+                Some(le.clone())
+            );
+        }
     }
 
     #[test]
