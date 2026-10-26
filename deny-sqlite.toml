@@ -37,11 +37,6 @@ unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
-    # RUSTSEC-2026-0381 — webpki-roots bundles the emSign ECC Root CA - G3. Same
-    # entry and reasoning as the root deny.toml: the workspace copy is 1.0.10; the
-    # 0.26.11 copy comes through sqlx-core <- postgresql_embedded (dev-time Postgres
-    # download only), and no 0.26.x release has the fix. Review-by: 2026-11-03.
-    { id = "RUSTSEC-2026-0381", reason = "fixed in the workspace copy (1.0.10); remaining 0.26.11 copy only via postgresql_embedded dev-time download; no 0.26.x fix; review-by 2026-11-03" },
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
     # No patched rsa release exists (advisory: "no safe upgrade available").
     # Ingress: rsa 0.9.10 -> jsonwebtoken -> autumn-web, i.e. only the RSA-family
@@ -63,9 +58,6 @@ ignore = [
     # (build) postgresql_embedded -> autumn-web. Not a runtime vulnerability and no
     # safe upgrade (author recommends web-time). Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive via postgresql_embedded (managed-pg-bundled feature); no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2026-0381 — webpki-roots 0.26.11 via sqlx-core under the
-    # managed-pg-bundled stack. Kept identical to deny.toml; see the rationale there.
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 under build-time postgresql_embedded; no patched 0.26.x; workspace copy fixed at 1.0.10; local embedded Postgres only; review-by 2026-11-20" },
     # RUSTSEC-2026-0253 — `lru`'s `LruCache::pop()` is not panic-safe. Kept
     # identical to deny.toml on purpose (see the note above the ignore list);
     # the full rationale lives there. Short version: the workspace's own `lru` is
@@ -75,15 +67,6 @@ ignore = [
     # `CacheKey(String)` (no panicking `Drop`) and which never calls `pop()`, so
     # neither precondition for the UB holds. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2026-0381 — webpki-roots bundles the distrusted emSign ECC Root
-    # CA - G3. FIXED for the 1.x copy Autumn controls (1.0.9 -> 1.0.10, the
-    # advisory's fixed release). This entry covers only the SECOND copy,
-    # webpki-roots 0.26.11, which arrives through sqlx-core 0.8.6 ->
-    # postgresql_embedded (the managed-pg features). The advisory's only fix is
-    # `>=1.0.10`; there is no patched 0.26.x, and sqlx 0.8 pins the 0.26 line.
-    # The fix needs a postgresql_embedded/sqlx release on webpki-roots 1.x.
-    # Review-by: 2026-11-04 (or when such a release ships).
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 -> postgresql_embedded (managed-pg); no patched 0.26.x; the 1.x copy is fixed at 1.0.10; needs a sqlx/postgresql_embedded bump; review-by 2026-11-04" },
     # RUSTSEC-2026-0387 — crypto-bigint secret-dependent branches in nominally
     # constant-time operations. Fixed only in >=0.7.6; no 0.4.x/0.5.x release
     # carries it. Two copies: 0.4.9 via aws-sigv4 -> p256 0.11 (SigV4a ECDSA
