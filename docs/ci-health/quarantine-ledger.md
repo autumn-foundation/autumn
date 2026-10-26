@@ -79,6 +79,36 @@ quarantine, per the rule above.
 - **Linked issue/PR**: none.
 - **Skip mechanism**: none; the test still runs.
 
+### `db::fleet::tests::close_if_unused_spares_a_leased_or_used_database`: `block_in_place` panic on Windows (observed, not quarantined)
+
+- **Observed**: 2026-10-26, trunk-dev run 40272176482 (head `8ecc0ca0`), job
+  `SQLite fleet (windows-latest)`, step "Fleet unit tests". Nothing was
+  skipped or ignored. The other 181 fleet tests in that job passed.
+- **Owner**: Semaphore (CI-health routine) - triage only, no fix yet.
+- **Diagnose-by**: 2026-11-09. If still n=1, close as "transient,
+  unreproduced". If it recurs, root-cause before touching the test.
+- **Rerun-rate baseline**: 0/70 on Linux (50 plain + 20 pinned to one CPU
+  with `taskset -c 0`; binary built with `--features "sqlite,test-support"`),
+  2026-10-26. Windows: 1 failure seen, no same-commit rerun possible from
+  the routine, so no Windows rate exists yet.
+- **Failure signature**: `FleetError::Unavailable { name: "slot:00001",
+  detail: "open task failed: task 622 panicked with message \"can call
+  blocking only when running on the multi-threaded runtime\"" }` at
+  `fleet.rs:4389`, inside a `#[tokio::test]` (current-thread runtime).
+- **Mechanism (if known)**: hypothesis, not proven. The only
+  `block_in_place` reachable from the open path is diesel-async 0.9.2
+  `SyncConnectionWrapper`'s `CancelWrapper::drop`
+  (`sync_connection_wrapper/mod.rs:552`). It runs when a wrapped connection
+  future is dropped before it finishes, and panics on a current-thread
+  runtime. That would mean something in `open_now` dropped an unfinished
+  connection future under Windows timing. If so, the test is not at fault:
+  production uses a multi-threaded runtime, where the same early drop blocks
+  a worker thread instead of panicking. Do not make the test tolerant of it.
+  To test: log which future is dropped early (pool build, migration run, or
+  `quiesce_workers`).
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none; the test still runs.
+
 ## Closed entries
 
 ### RUSTSEC-2026-0385 (`ctutils` 0.4.2) fails the advisory gates on every branch
