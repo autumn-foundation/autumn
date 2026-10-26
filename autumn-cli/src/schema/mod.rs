@@ -813,15 +813,12 @@ fn diff_at_with(
         return Err(clash);
     }
 
-    // The SQLite table-recreate path needs each affected table's full desired (up)
-    // / baseline (down) shape, which the per-change deltas don't carry; thread them
-    // in via the context. Postgres ignores it (identical output).
-    // The baseline side is the renamed baseline: the plan's non-rename changes
-    // use the new names.
-    let ctx = diff::SchemaContext::from_tables(
-        &desired.tables,
-        &rename::renamed_baseline(&baseline_tables, &plan.changes),
-    );
+    // A SQLite table-recreate needs the full desired and baseline tables, and the
+    // skipped decimal columns. Postgres ignores the context. The baseline is the
+    // renamed baseline: the plan's non-rename changes use the new names.
+    let renamed = rename::renamed_baseline(&baseline_tables, &plan.changes);
+    let ctx =
+        diff::SchemaContext::from_tables(&desired.tables, &renamed).with_skipped_decimals(&desired);
     let up = diff::emit_up_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
     let down = diff::emit_down_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
 

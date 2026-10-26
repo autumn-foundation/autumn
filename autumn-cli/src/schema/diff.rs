@@ -1219,10 +1219,18 @@ fn diff_table(
 /// with no clean class) or the ambiguous [`Numeric`](SqliteAffinity::Numeric)
 /// catch-all falls back to exact equality so distinct verbatim types are never
 /// conflated. Beyond the `Attachment`/`Json` exception above, this rule is
-/// strictly `SQLite`-gated and never affects the pg lane.
+/// strictly `SQLite`-gated and never affects the pg lane. Two
+/// [`Decimal`](ColumnType::Decimal)s with a different precision or scale are not
+/// equivalent: their `SQLite` `CHECK`s are different (issue #2598).
 fn column_types_equivalent(base: &ColumnType, want: &ColumnType, backend: Backend) -> bool {
     if base == want {
         return true;
+    }
+    if matches!(
+        (base, want),
+        (ColumnType::Decimal { .. }, ColumnType::Decimal { .. })
+    ) {
+        return false;
     }
     if matches!(
         (base, want),
@@ -2318,6 +2326,9 @@ pub struct SchemaContext {
     pub desired: BTreeMap<String, Table>,
     /// Baseline (pre-migration) tables, by name — the "new shape" for a down rebuild.
     pub baseline: BTreeMap<String, Table>,
+    /// `(table, column)` of each decimal column that the parser skipped (a bad
+    /// `#[decimal_shape]`, issue #2598). A `SQLite` rebuild of its table refuses.
+    pub skipped_decimals: BTreeSet<(String, String)>,
 }
 
 impl SchemaContext {
@@ -2334,7 +2345,26 @@ impl SchemaContext {
                 .iter()
                 .map(|t| (t.name.clone(), t.clone()))
                 .collect(),
+            skipped_decimals: BTreeSet::new(),
         }
+    }
+
+    /// Record the decimal columns that the parser skipped in `desired` (issue
+    /// #2598). The rebuild cannot write their `CHECK`.
+    #[must_use]
+    pub fn with_skipped_decimals(mut self, desired: &ParsedSchema) -> Self {
+        self.skipped_decimals = desired
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    ColumnType::from_rust_type(&d.rust_type),
+                    Some(ColumnType::Decimal { .. })
+                )
+            })
+            .map(|d| (d.table.clone(), d.field.clone()))
+            .collect();
+        self
     }
 }
 
@@ -2664,7 +2694,8 @@ enum RebuildLeg {
 /// shape (`baseline` + this table's diff deltas — the same value the up leg builds
 /// as its target), **not** the parser's partial `ctx.desired`, so a
 /// retained-but-parser-invisible column is copied back on rollback rather than
-/// dropped.
+/// dropped. Both legs take the decimal precision and scale from `ctx.desired`
+/// ([`with_desired_decimal_shapes`]), so the decimal `CHECK` stays.
 fn emit_sqlite_rebuild(
     table: &str,
     ctx: &SchemaContext,
@@ -2698,10 +2729,10 @@ fn emit_sqlite_rebuild(
             ),
         });
     }
-    // Fetched as a validated precondition (a missing desired shape is a directed
-    // error, exercised by the up leg's missing-context path); neither leg copies
-    // from the parser's partial desired table any more.
-    let _desired = ctx
+    // A missing desired table is an error. Neither leg copies columns from the
+    // desired table. The desired table supplies only the decimal precision and
+    // scale.
+    let desired = ctx
         .desired
         .get(table)
         .ok_or_else(|| missing_rebuild_shape(table, "desired"))?;
@@ -2709,16 +2740,39 @@ fn emit_sqlite_rebuild(
         .baseline
         .get(table)
         .ok_or_else(|| missing_rebuild_shape(table, "baseline"))?;
+    let post_migration = baseline_with_changes_applied(baseline, changes, table);
+    // #2598: a decimal column that the parser skipped has no desired precision
+    // and scale. A `CHECK` from the baseline values can be wrong, and a `TEXT`
+    // baseline gives no `CHECK`, so refuse.
+    if let Some(column) = post_migration.columns.iter().find(|c| {
+        ctx.skipped_decimals
+            .contains(&(table.to_owned(), c.name.clone()))
+            || (matches!(c.ty, ColumnType::Decimal { .. })
+                && !desired.columns.iter().any(|d| d.name == c.name))
+    }) {
+        return Err(EmitError::SqliteRebuildUnsupported {
+            table: table.to_owned(),
+            kind: "table rebuild",
+            reason: format!(
+                "the model does not give the precision and scale of the decimal column \
+                 `{}`, so the rebuild cannot write its `CHECK`. Correct the \
+                 `#[decimal_shape]` of the field, or write this change as a manual migration",
+                column.name
+            ),
+        });
+    }
+    let fk_cols = fk_type_change_columns(changes, table);
     match leg {
         // Build the up-leg target from the rich baseline with this table's explicit
         // diff deltas applied, preserving every unchanged baseline facet the parser
         // could not observe; the source (INSERT..SELECT) columns are the baseline's,
         // i.e. the actual existing table.
         RebuildLeg::Up => {
-            let new_shape = baseline_with_changes_applied(baseline, changes, table);
-            let fk_cols = fk_type_change_columns(changes, table);
+            let mut new_shape = post_migration;
+            let mut added = with_desired_decimal_shapes(&mut new_shape, desired);
+            added.extend(decimal_type_changes(changes, table, leg));
             Ok(render_sqlite_rebuild(
-                table, &new_shape, baseline, leg, &fk_cols,
+                table, &new_shape, baseline, leg, &fk_cols, &added,
             ))
         }
         // The down leg rolls back to the rich baseline shape. Its copy SOURCE is the
@@ -2730,14 +2784,16 @@ fn emit_sqlite_rebuild(
         // post-migration source copies back every baseline column the up migration did
         // not drop, in baseline order.
         RebuildLeg::Down => {
-            let post_migration = baseline_with_changes_applied(baseline, changes, table);
-            let fk_cols = fk_type_change_columns(changes, table);
+            let mut old_shape = baseline.clone();
+            let mut added = with_desired_decimal_shapes(&mut old_shape, desired);
+            added.extend(decimal_type_changes(changes, table, leg));
             Ok(render_sqlite_rebuild(
                 table,
-                baseline,
+                &old_shape,
                 &post_migration,
                 leg,
                 &fk_cols,
+                &added,
             ))
         }
     }
@@ -2849,6 +2905,62 @@ fn baseline_with_changes_applied(
     shape
 }
 
+/// Copy the desired decimal precision and scale into a `SQLite` rebuild table,
+/// for each baseline column that lost its decimal type (issue #2598).
+///
+/// The renderer builds the decimal `CHECK` from the precision and scale.
+/// `--dev-url` and `schema pull` read a decimal column as `TEXT`. Without this
+/// function, a rebuild removes the `CHECK`. A baseline decimal keeps its
+/// precision and scale: a different value is a type change in the plan. A
+/// column with a different storage class keeps its baseline type: that is a
+/// real type change too.
+///
+/// Returns the names of the columns it changes. The rebuild writes a new
+/// `CHECK` for each of them.
+fn with_desired_decimal_shapes(shape: &mut Table, desired: &Table) -> Vec<String> {
+    let mut changed = Vec::new();
+    for column in &mut shape.columns {
+        if let Some(want) = desired.columns.iter().find(|c| c.name == column.name)
+            && matches!(want.ty, ColumnType::Decimal { .. })
+            && !matches!(column.ty, ColumnType::Decimal { .. })
+            && column_types_equivalent(&column.ty, &want.ty, Backend::Sqlite)
+        {
+            column.ty = want.ty.clone();
+            changed.push(column.name.clone());
+        }
+    }
+    changed
+}
+
+/// The columns of `table` with a type change to a decimal in the `leg` target:
+/// `to` for the up leg, `from` for the down leg (issue #2598). The rebuild
+/// writes a new decimal `CHECK` for each.
+fn decimal_type_changes(changes: &[&SchemaChange], table: &str, leg: RebuildLeg) -> Vec<String> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            SchemaChange::AlterColumnType {
+                table: t,
+                column,
+                from,
+                to,
+            } if t == table
+                && matches!(
+                    if matches!(leg, RebuildLeg::Up) {
+                        to
+                    } else {
+                        from
+                    },
+                    ColumnType::Decimal { .. }
+                ) =>
+            {
+                Some(column.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The [`EmitError::SqliteRebuildUnsupported`] for a rebuild whose `which`
 /// (`"desired"` / `"baseline"`) table shape is absent from the context.
 fn missing_rebuild_shape(table: &str, which: &'static str) -> EmitError {
@@ -2872,6 +2984,7 @@ fn render_sqlite_rebuild(
     source_shape: &Table,
     leg: RebuildLeg,
     fk_type_change_cols: &[String],
+    new_decimal_checks: &[String],
 ) -> String {
     let new_table = format!("{table}__autumn_new");
     let source_cols: BTreeSet<&str> = source_shape
@@ -2918,17 +3031,7 @@ fn render_sqlite_rebuild(
         out,
         "-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error."
     );
-    // When an FK-bound column's type is changed by this recreate, warn that SQLite
-    // (unlike Postgres, which refuses the change outright) does not enforce that the
-    // column still matches the referenced key's type — that consistency is now the
-    // author's responsibility.
-    if !fk_type_change_cols.is_empty() {
-        let cols = fk_type_change_cols.join(", ");
-        let _ = writeln!(
-            out,
-            "-- autumn-safety: foreign-key column(s) {cols} have their type changed by this recreate; SQLite does not enforce that they still match the referenced key's type, so ensure the referenced column stays type-compatible (Postgres rejects this change outright, which is why it is emitted only for SQLite)."
-        );
-    }
+    push_rebuild_advisories(&mut out, fk_type_change_cols, new_decimal_checks);
     // Preserve the AUTOINCREMENT high-water mark only when both the copy source and the
     // target shape's single PK are `BigSerial` — an `INTEGER PRIMARY KEY AUTOINCREMENT`
     // column. Such a source table has a `sqlite_sequence` row that `DROP TABLE` would
@@ -2996,6 +3099,33 @@ fn render_sqlite_rebuild(
     let _ = writeln!(out, "PRAGMA foreign_key_check;");
     let _ = writeln!(out, "PRAGMA foreign_keys=ON;");
     out
+}
+
+/// Write the optional `-- autumn-safety:` lines of a `SQLite` rebuild.
+fn push_rebuild_advisories(
+    out: &mut String,
+    fk_type_change_cols: &[String],
+    new_decimal_checks: &[String],
+) {
+    // When an FK-bound column's type is changed by this recreate, warn that SQLite
+    // (unlike Postgres, which refuses the change outright) does not enforce that the
+    // column still matches the referenced key's type — that consistency is now the
+    // author's responsibility.
+    if !fk_type_change_cols.is_empty() {
+        let cols = fk_type_change_cols.join(", ");
+        let _ = writeln!(
+            out,
+            "-- autumn-safety: foreign-key column(s) {cols} have their type changed by this recreate; SQLite does not enforce that they still match the referenced key's type, so ensure the referenced column stays type-compatible (Postgres rejects this change outright, which is why it is emitted only for SQLite)."
+        );
+    }
+    // #2598: the table can have rows that a new decimal `CHECK` rejects.
+    if !new_decimal_checks.is_empty() {
+        let cols = new_decimal_checks.join(", ");
+        let _ = writeln!(
+            out,
+            "-- autumn-safety: this recreate writes a new decimal CHECK for column(s) {cols}. If a row does not agree with the CHECK, the copy fails. Correct the rows first."
+        );
+    }
 }
 
 /// Join statement groups with a blank line and a trailing newline (empty for an
@@ -3609,8 +3739,9 @@ fn emit_add_column(table: &str, column: &Column, backend: Backend) -> Result<Str
 }
 
 /// Render a column definition body: `{name} {type} {NOT NULL|NULL} [REFERENCES
-/// t(c) [ON DELETE a] [ON UPDATE a]] [DEFAULT d]`. Shared by `CREATE TABLE` (non-PK columns) and `ADD
-/// COLUMN`.
+/// t(c) [ON DELETE a] [ON UPDATE a]] [DEFAULT d] [CHECK (…)]`. Shared by `CREATE
+/// TABLE` (non-PK columns) and `ADD COLUMN`. The `CHECK` is the `SQLite` decimal
+/// `CHECK` only.
 fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> String {
     let mut def = format!(
         "{} {} {}",
@@ -3639,6 +3770,19 @@ fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> 
     }
     if let Some(default) = &column.default {
         let _ = write!(def, " DEFAULT {}", default_sql(default, backend));
+    }
+    // #2598: a `SQLite` decimal is `TEXT`. A `CHECK` enforces its precision and
+    // scale. The generator uses the same builder, so the two lanes write the
+    // same `CHECK`.
+    if backend == Backend::Sqlite
+        && let ColumnType::Decimal { precision, scale } = column.ty
+    {
+        let check = crate::generate::schema_edit::sqlite_decimal_check(
+            &column.name,
+            u32::from(precision),
+            u32::from(scale),
+        );
+        let _ = write!(def, " {check}");
     }
     def
 }
@@ -7743,7 +7887,7 @@ PRAGMA foreign_keys=ON;
             "a default-less UUID PK is not the IdKind::Uuid convention shape"
         );
         for leg in [RebuildLeg::Up, RebuildLeg::Down] {
-            let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg, &[]);
+            let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg, &[], &[]);
             assert!(
                 !sql.contains("sqlite_sequence"),
                 "no sqlite_sequence statements for a Uuid PK ({leg:?}): {sql}"
@@ -7947,6 +8091,313 @@ PRAGMA foreign_keys=ON;
             "sqlite PK: {up}"
         );
         assert!(up.contains("ADD COLUMN bio TEXT NULL"), "{up}");
+    }
+
+    // -- #2598: the SQLite decimal CHECK on the declarative lane -------------
+
+    const PRICE: ColumnType = ColumnType::Decimal {
+        precision: 10,
+        scale: 2,
+    };
+
+    /// The generator's `CHECK` for `price decimal{10,2}`: the one builder both
+    /// lanes share.
+    fn price_check() -> String {
+        crate::generate::schema_edit::sqlite_decimal_check("price", 10, 2)
+    }
+
+    /// `CREATE TABLE` and `ADD COLUMN` on `SQLite` put the generator's decimal
+    /// `CHECK` on the column, byte for byte. Postgres gets `NUMERIC` and no
+    /// `CHECK`.
+    #[test]
+    fn sqlite_decimal_column_renders_the_generator_check() {
+        let table = sqlite_table("products", vec![col("price", PRICE)], vec![]);
+        let mut cost = col("cost", PRICE);
+        cost.nullable = true;
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![
+                SchemaChange::CreateTable(table.clone()),
+                SchemaChange::AddColumn {
+                    table: "products".to_owned(),
+                    column: cost,
+                },
+            ],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains(&format!("    price TEXT NOT NULL {}", price_check())),
+            "CREATE TABLE carries the generator CHECK: {up}"
+        );
+        let cost_check = crate::generate::schema_edit::sqlite_decimal_check("cost", 10, 2);
+        assert!(
+            up.contains(&format!("ADD COLUMN cost TEXT NULL {cost_check};")),
+            "ADD COLUMN carries the generator CHECK: {up}"
+        );
+
+        let mut pg_table = table;
+        pg_table.backend = Backend::Postgres;
+        let pg = emit_create_table(&pg_table, Backend::Postgres);
+        assert!(pg.contains("price NUMERIC(10,2) NOT NULL"), "{pg}");
+        assert!(!pg.contains("CHECK"), "Postgres needs no CHECK: {pg}");
+    }
+
+    /// The baseline and the model for the rebuild tests. `DROP NOT NULL` on
+    /// `views` is the change: `SQLite` applies it only with a rebuild. `price`
+    /// and the nullable `cost` are decimals with different shapes.
+    fn decimal_rebuild_tables(price: ColumnType, cost: ColumnType) -> (Table, Table) {
+        let mut cost_col = col("cost", cost);
+        cost_col.nullable = true;
+        let baseline = sqlite_table(
+            "products",
+            vec![
+                col("views", ColumnType::Int64),
+                col("price", price),
+                cost_col,
+            ],
+            vec![],
+        );
+        let mut views = col("views", ColumnType::Int64);
+        views.nullable = true;
+        let mut cost_want = col(
+            "cost",
+            ColumnType::Decimal {
+                precision: 5,
+                scale: 0,
+            },
+        );
+        cost_want.nullable = true;
+        let desired = sqlite_table(
+            "products",
+            vec![views, col("price", PRICE), cost_want],
+            vec![],
+        );
+        (baseline, desired)
+    }
+
+    /// The up SQL and the down SQL of the plan from `baseline` to `desired`.
+    fn rebuild_legs(
+        baseline: &Table,
+        desired: &Table,
+        changes: usize,
+    ) -> [(&'static str, String); 2] {
+        let plan = diff_schema(
+            std::slice::from_ref(baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            DiffOptions::default(),
+        );
+        assert_eq!(plan.changes.len(), changes, "{:?}", plan.changes);
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(desired),
+            std::slice::from_ref(baseline),
+        );
+        [
+            (
+                "up",
+                emit_up_sql_with_context(&plan, &ctx).expect("emit up"),
+            ),
+            (
+                "down",
+                emit_down_sql_with_context(&plan, &ctx).expect("emit down"),
+            ),
+        ]
+    }
+
+    /// A rebuild for a different change keeps the decimal `CHECK` of each
+    /// column. `--dev-url` and `schema pull` read a decimal column as `TEXT`.
+    /// Then the model gives the precision and scale, and the SQL tells the user
+    /// that the rebuild adds the `CHECK`.
+    #[test]
+    fn sqlite_rebuild_keeps_the_desired_decimal_check() {
+        let cost = ColumnType::Decimal {
+            precision: 5,
+            scale: 0,
+        };
+        let cost_check = crate::generate::schema_edit::sqlite_decimal_check("cost", 5, 0);
+        for (price, cost, text_baseline) in [
+            (PRICE, cost, false),
+            (ColumnType::Text, ColumnType::Text, true),
+        ] {
+            let (baseline, desired) = decimal_rebuild_tables(price, cost.clone());
+            for (leg, sql) in rebuild_legs(&baseline, &desired, 1) {
+                assert!(
+                    sql.contains(&format!("    price TEXT NOT NULL {}", price_check())),
+                    "the {leg} rebuild keeps the `price` CHECK: {sql}"
+                );
+                assert!(
+                    sql.contains(&format!("    cost TEXT NULL {cost_check}")),
+                    "the {leg} rebuild keeps the `cost` CHECK: {sql}"
+                );
+                assert_eq!(
+                    sql.contains(
+                        "-- autumn-safety: this recreate writes a new decimal CHECK for column(s) price, cost."
+                    ),
+                    text_baseline,
+                    "the {leg} rebuild tells the user only when it adds a CHECK: {sql}"
+                );
+            }
+        }
+    }
+
+    /// On `SQLite`, a different decimal precision or scale is a type change.
+    /// Both are `TEXT`, but the `CHECK` is different. The up leg writes the new
+    /// `CHECK`, and the down leg writes the old `CHECK` again.
+    #[test]
+    fn sqlite_decimal_shape_change_is_a_type_change() {
+        let old = ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        };
+        let old_check = crate::generate::schema_edit::sqlite_decimal_check("price", 12, 2);
+        let baseline = sqlite_table("products", vec![col("price", old)], vec![]);
+        let desired = sqlite_table("products", vec![col("price", PRICE)], vec![]);
+        let [(_, up), (_, down)] = rebuild_legs(&baseline, &desired, 1);
+        assert!(up.contains(&price_check()), "{up}");
+        assert!(!up.contains(&old_check), "{up}");
+        assert!(down.contains(&old_check), "{down}");
+        assert!(!down.contains(&price_check()), "{down}");
+        for sql in [&up, &down] {
+            assert!(
+                sql.contains("writes a new decimal CHECK for column(s) price."),
+                "the SQL does not tell the user about the new CHECK: {sql}"
+            );
+        }
+    }
+
+    /// A decimal column that the parser skipped (a bad `#[decimal_shape]`) has
+    /// no desired precision and scale. The rebuild refuses: a `CHECK` from the
+    /// baseline values can be wrong, and a `TEXT` baseline gives no `CHECK`.
+    #[test]
+    fn sqlite_rebuild_refuses_a_skipped_decimal_column() {
+        let stale = ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        };
+        let skipped = SchemaDiagnostic {
+            rust_type: "rust_decimal::Decimal".to_owned(),
+            ..diag("Product", "products", "price")
+        };
+        for baseline_ty in [stale, ColumnType::Text] {
+            let baseline = sqlite_table(
+                "products",
+                vec![col("views", ColumnType::Int64), col("price", baseline_ty)],
+                vec![],
+            );
+            let mut views = col("views", ColumnType::Int64);
+            views.nullable = true;
+            let desired = parsed(
+                vec![sqlite_table("products", vec![views], vec![])],
+                vec![skipped.clone()],
+            );
+            let plan = diff_schema(
+                std::slice::from_ref(&baseline),
+                &desired,
+                DiffOptions::default(),
+            );
+            let ctx = SchemaContext::from_tables(&desired.tables, std::slice::from_ref(&baseline))
+                .with_skipped_decimals(&desired);
+            for result in [
+                emit_up_sql_with_context(&plan, &ctx),
+                emit_down_sql_with_context(&plan, &ctx),
+            ] {
+                let err = result.expect_err("the rebuild did not refuse");
+                assert!(
+                    matches!(err, EmitError::SqliteRebuildUnsupported { .. }),
+                    "{err:?}"
+                );
+                assert!(err.to_string().contains("`price`"), "{err}");
+            }
+        }
+    }
+
+    /// A column that the parser skipped for a different reason (an enum) does
+    /// not block the rebuild.
+    #[test]
+    fn sqlite_rebuild_allows_a_skipped_non_decimal_column() {
+        let baseline = sqlite_table(
+            "products",
+            vec![
+                col("views", ColumnType::Int64),
+                col("status", ColumnType::Text),
+            ],
+            vec![],
+        );
+        let mut views = col("views", ColumnType::Int64);
+        views.nullable = true;
+        let desired = parsed(
+            vec![sqlite_table("products", vec![views], vec![])],
+            vec![SchemaDiagnostic {
+                rust_type: "ProductStatus".to_owned(),
+                ..diag("Product", "products", "status")
+            }],
+        );
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &desired,
+            DiffOptions::default(),
+        );
+        let ctx = SchemaContext::from_tables(&desired.tables, std::slice::from_ref(&baseline))
+            .with_skipped_decimals(&desired);
+        emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+    }
+
+    /// The model precision and scale replace only a baseline type of the same
+    /// storage class. A real type change (`INTEGER` to `TEXT`) keeps the
+    /// baseline type in the down leg.
+    #[test]
+    fn sqlite_rebuild_down_leg_keeps_a_changed_column_type() {
+        let baseline = sqlite_table("products", vec![col("price", ColumnType::Int64)], vec![]);
+        let desired = sqlite_table("products", vec![col("price", PRICE)], vec![]);
+        let [(_, up), (_, down)] = rebuild_legs(&baseline, &desired, 1);
+        assert!(up.contains(&price_check()), "the up leg has no CHECK: {up}");
+        assert!(up.contains("writes a new decimal CHECK"), "{up}");
+        assert!(down.contains("    price INTEGER NOT NULL"), "{down}");
+        assert!(!down.contains("CHECK"), "the down leg has a CHECK: {down}");
+    }
+
+    /// `ADD COLUMN` with the decimal `CHECK` applies to a table with rows, and
+    /// the new column then rejects what the `CHECK` rejects.
+    #[test]
+    fn sqlite_add_decimal_column_applies_on_real_sqlite() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL);\n\
+             INSERT INTO products (title) VALUES ('a'), ('b');",
+        )
+        .expect("seed");
+        let mut price = col("price", PRICE);
+        price.nullable = true;
+        let up = emit_up_sql(&MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AddColumn {
+                table: "products".to_owned(),
+                column: price,
+            }],
+        })
+        .expect("emit");
+        conn.batch_execute(&up).expect("apply ADD COLUMN");
+        let insert = |conn: &mut SqliteConnection, value: &str| {
+            conn.batch_execute(&format!(
+                "INSERT INTO products (title, price) VALUES ('c', {value});"
+            ))
+            .is_ok()
+        };
+        assert!(insert(&mut conn, "'19.99'"), "the CHECK rejects '19.99'");
+        assert!(insert(&mut conn, "NULL"), "the CHECK rejects NULL");
+        for value in crate::generate::schema_edit::SQLITE_DECIMAL_10_2_REJECTS {
+            assert!(
+                !insert(&mut conn, &format!("'{value}'")),
+                "the CHECK accepts '{value}'"
+            );
+        }
+        assert!(
+            !insert(&mut conn, "x'31392e3939'"),
+            "the CHECK accepts a blob"
+        );
     }
 
     #[test]

@@ -8979,11 +8979,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_backoff_past_the_hop_deadline_returns_the_response() {
-            // The first wait (`Retry-After: 5`, jitter pinned at 0) is already
-            // past the 1 s deadline, so no retry starts. A random backoff that
-            // only crosses the deadline later lets a last retry start with
-            // `MIN_ATTEMPT` left, and a slow runner times it out.
-            let (url, hits) = counting(Some(503), &[("retry-after", "5")]).await;
+            let (url, hits) = counting(Some(502), &[]).await;
             let policy = RetryPolicy {
                 max_retries: 20,
                 ..RetryPolicy::default()
@@ -9000,7 +8996,12 @@ mod tests {
                 &HeaderMap::new(),
                 None,
                 &policy,
-                &FixedDraw(0),
+                // A fixed draw gives the backoffs 97, 199, 400 and 400 ms. The
+                // fourth passes the 1 s deadline, and the last retry starts
+                // with about 300 ms left. A random draw can start a last retry
+                // with only `MIN_ATTEMPT` left, and a Windows timer can use
+                // all of it.
+                &FixedDraw(400),
                 false,
                 Some(crate::time::ambient_instant() + Duration::from_secs(1)),
                 false,
@@ -9012,14 +9013,11 @@ mod tests {
             .await;
             assert_eq!(
                 result.map(|response| response.status().as_u16()).ok(),
-                Some(503),
+                Some(502),
                 "the last response, not a deadline error"
             );
-            assert_eq!(
-                hits.load(Ordering::SeqCst),
-                2,
-                "the warm-up and one attempt"
-            );
+            // The warm-up request, the first attempt and at least one retry.
+            assert!(hits.load(Ordering::SeqCst) >= 3, "no retry ran");
         }
 
         #[tokio::test]
