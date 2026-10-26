@@ -21,9 +21,10 @@ use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_co
 use autumn_macros_support::cascade::{CASCADE_LEVELS, CascadeLeg, any_const, cascade_level};
 use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
 use autumn_macros_support::schema::{
-    apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
-    field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
-    field_serde_serialize_rename, has_attr, is_option_type, schema_property_name, serde_bare_word,
+    SerdeSide, apply_serde_rename_all_rule, emit_request_schema_fn_body, emit_schema_fn_body_full,
+    emit_schema_fn_body_named, field_has_skip_serializing_if, field_is_collaborative,
+    field_is_translatable, field_serde_serialize_rename, has_attr, has_serde_default,
+    is_option_type, schema_property_name, serde_bare_word, serde_rename_all_rule_for,
     serde_rename_all_serialize_rule, serde_valued_key, type_name_str,
 };
 
@@ -7768,7 +7769,9 @@ fn emit_state_machine_on_conn(
         })
         .collect();
 
+    // The method takes `AsyncPgConnection`, so it needs `postgres` (#2605).
     quote! {
+        ::autumn_web::__if_postgres! {
         impl #model_name {
             /// Validates a `{field}` transition and, for the fired edge, runs
             /// its declared effects on `conn` (issue #1973): first a sync
@@ -7789,6 +7792,7 @@ fn emit_state_machine_on_conn(
                 }
                 ::core::result::Result::Ok(__new_state)
             }
+        }
         }
     }
 }
@@ -9754,7 +9758,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if upsert_columns.is_empty() {
         upsert_columns.push(quote! {
-            #table_ident::id.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::id))
+            #table_ident::id.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::id))
         });
     }
 
@@ -10498,12 +10502,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // it just cannot be `required`, because a response that trips the predicate
     // omits it and a strict client would reject that response.
     //
-    // Sound HERE and only here, because this schema describes a RESPONSE: the
-    // generated repository API takes `New*` / `Update*` as its request bodies,
-    // never the query struct. `#[derive(OpenApiSchema)]` has no such guarantee
-    // — the same type may be a `Json<T>` request — so it refuses the shape
-    // instead, since `skip_serializing_if` governs serialization alone and
-    // serde still rejects a request that omits the field.
+    // Sound because this schema describes a RESPONSE only. A request body of
+    // the model type uses the request schema below (#2607).
+    // `#[derive(OpenApiSchema)]` has one schema for both directions, so it
+    // refuses the shape instead: serde still rejects a request that omits the
+    // field.
     let query_struct_schema_body = emit_schema_fn_body_full(
         &serializable_field_refs,
         false,
@@ -10567,6 +10570,123 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     name: stringify!(#name),
                     identity: ::autumn_web::openapi::type_name_of::<#name>,
                     schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+                }
+            }
+        }
+    };
+
+    // #2607: a custom route can take `Json<Model>`. That request includes the
+    // fields the read schema skips (`#[private]`, hidden `#[encrypted]`,
+    // `#[classified]`), and `skip_serializing_if` does not make a field
+    // optional in it. Submit the request schema as an override. The spec
+    // builder makes one component when the two schemas are equal.
+    //
+    // A deserialize-side adapter makes the field types wrong for a request.
+    // An `alias` adds a second accepted name. Then the override has no schema,
+    // and the request is the placeholder. `#[derive(OpenApiSchema)]` refuses
+    // the same attributes.
+    let request_field_refs: Vec<&&Field> = all_field_refs
+        .iter()
+        .filter(|f| serde_bare_word(&f.attrs, &["skip", "skip_deserializing"]).is_none())
+        .copied()
+        .collect();
+    let request_reshaped = serde_bare_word(outer_attrs, &["transparent"]).is_some()
+        || serde_valued_key(outer_attrs, &["from", "try_from", "tag"]).is_some()
+        || request_field_refs.iter().any(|f| {
+            serde_bare_word(&f.attrs, &["flatten"]).is_some()
+                || serde_valued_key(&f.attrs, &["with", "deserialize_with", "alias"]).is_some()
+        });
+    let request_schema_descriptor = if request_reshaped {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Request,
+                    schema: ::core::option::Option::None,
+                }
+            }
+        }
+    } else {
+        let request_rename_all_rule =
+            serde_rename_all_rule_for(outer_attrs, SerdeSide::Deserialize);
+        let container_default = has_serde_default(outer_attrs);
+        let request_schema_body = emit_request_schema_fn_body(
+            &request_field_refs,
+            request_rename_all_rule.as_deref(),
+            &|f: &Field| container_default || has_serde_default(&f.attrs),
+        );
+        // `deny_unknown_fields` rejects every key not in the schema.
+        let request_schema_body =
+            if serde_bare_word(outer_attrs, &["deny_unknown_fields"]).is_some() {
+                quote! {{
+                    let mut __autumn_request = { #request_schema_body };
+                    if let ::core::option::Option::Some(__autumn_object) =
+                        __autumn_request.as_object_mut()
+                    {
+                        __autumn_object.insert(
+                            "additionalProperties".to_owned(),
+                            ::autumn_web::reexports::serde_json::json!(false),
+                        );
+                    }
+                    __autumn_request
+                }}
+            } else {
+                request_schema_body
+            };
+        quote! {
+            impl #name {
+                #[doc(hidden)]
+                pub fn __autumn_openapi_request_schema()
+                    -> ::autumn_web::reexports::serde_json::Value
+                {
+                    #request_schema_body
+                }
+            }
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Request,
+                    schema: ::core::option::Option::Some(#name::__autumn_openapi_request_schema),
+                }
+            }
+        }
+    };
+
+    // #2607: `NewModel` skips a classified field on serialize. Thus a response
+    // does not have it, but its one schema requires it. Submit a response
+    // schema without those fields. With no classified field, submit nothing.
+    let new_response_hidden: Vec<String> = fields_for_new
+        .iter()
+        .filter(|f| field_is_classified(f))
+        .filter_map(|f| f.ident.as_ref().map(unraw_ident))
+        .collect();
+    let new_response_schema_descriptor = if new_response_hidden.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            impl #new_name {
+                #[doc(hidden)]
+                pub fn __autumn_openapi_response_schema()
+                    -> ::autumn_web::reexports::serde_json::Value
+                {
+                    let mut __schema =
+                        <#new_name as ::autumn_web::openapi::OpenApiSchema>::schema();
+                    ::autumn_web::openapi::remove_schema_properties(
+                        &mut __schema,
+                        &[#(#new_response_hidden),*],
+                    );
+                    __schema
+                }
+            }
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#new_name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Response,
+                    schema: ::core::option::Option::Some(
+                        #new_name::__autumn_openapi_response_schema
+                    ),
                 }
             }
         }
@@ -11807,6 +11927,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // in every generated client — even though the real schema was compiled
         // in all along.
         #query_schema_descriptor
+        #request_schema_descriptor
+        #new_response_schema_descriptor
 
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::openapi::DerivedSchemaDescriptor {
@@ -19279,6 +19401,56 @@ mod tests {
             generated.contains("enqueue_on_conn")
                 && generated.contains("< SendShippedEmailJob > :: NAME"),
             "the effect must enqueue the named job on the connection: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_conn_method_needs_the_postgres_feature() {
+        // The method takes `AsyncPgConnection`. A SQLite-only app has no such
+        // type, so the method compiles only with `postgres` (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let gate = generated
+            .find(":: autumn_web :: __if_postgres !")
+            .expect("the `_on_conn` impl must sit in `__if_postgres!`");
+        let method = generated
+            .find("transition_status_to_on_conn")
+            .expect("the `_on_conn` method must be emitted");
+        assert!(gate < method, "{generated}");
+    }
+
+    #[test]
+    fn id_only_model_upsert_uses_the_backend_neutral_excluded() {
+        // `diesel::pg` does not exist in a SQLite-only build (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Tag {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("pg :: upsert :: excluded"),
+            "an id-only model must not name `diesel::pg`: {generated}"
+        );
+        assert!(
+            generated.contains("diesel :: upsert :: excluded"),
+            "{generated}"
         );
     }
 

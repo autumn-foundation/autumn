@@ -15,6 +15,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# The `constela` target measures peak live bytes. Safe API over a counting
+# global allocator, as in `autumn/tests/constela_memory.rs`.
+allocation-counter = "0.8.1"
+serde_json = "1"
 
 # The framework crate is published as `autumn-web`; pull it in under the `autumn`
 # name via a path dependency so the fuzz targets `use autumn::__fuzz`. Only the
@@ -28,8 +32,9 @@ package = "autumn-web"
 # `router::extract_path_params`, the path-parameter extraction seam).
 # `plugin-sandbox` is here for the `sandbox` target: the container reader, the
 # manifest validator and the guest frame parser all decode bytes an unaudited
-# artifact produced. `acme` is here for the `dns` target.
-features = ["inbound-mail", "multipart", "openapi", "acme", "plugin-sandbox"]
+# artifact produced. `acme` is here for the `dns` target. `constela` is here for
+# the `constela` target: it parses documents a language model wrote.
+features = ["inbound-mail", "multipart", "openapi", "acme", "plugin-sandbox", "constela"]
 
 # cargo-fuzz builds in release mode with ASAN instrumentation, which is the
 # repo's heaviest build; debug info is a large share of that footprint and is
@@ -93,6 +98,14 @@ bench = false
 [[bin]]
 name = "sandbox"
 path = "fuzz_targets/sandbox.rs"
+test = false
+doc = false
+bench = false
+
+# Constela documents: no panic, bounded peak memory (issue #2626).
+[[bin]]
+name = "constela"
+path = "fuzz_targets/constela.rs"
 test = false
 doc = false
 bench = false

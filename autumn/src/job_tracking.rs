@@ -2061,7 +2061,7 @@ pub(crate) fn build_redis_tracking_store(
 // ── Postgres store ───────────────────────────────────────────────────────────
 
 /// Maximum TTL in seconds (100 years). A larger value could overflow `timestamptz`.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const MAX_PG_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 
 /// Postgres-backed [`JobTrackingStore`].
@@ -2073,7 +2073,7 @@ const MAX_PG_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 ///
 /// The database clock (`NOW()`) sets and checks `expires_at`. Host clocks can
 /// differ, so the store never uses them for expiry (#2875).
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 pub struct PgJobTrackingStore {
     pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
@@ -2081,7 +2081,7 @@ pub struct PgJobTrackingStore {
     clock: Arc<dyn ClockSource>,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgTrackingRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -2091,7 +2091,7 @@ struct PgTrackingRow {
     version: i64,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl PgJobTrackingStore {
     /// Construct a store backed by `pool`, expiring records `ttl_secs` after
     /// their last write.
@@ -2185,7 +2185,7 @@ impl PgJobTrackingStore {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl JobTrackingStore for PgJobTrackingStore {
     fn create<'a>(&'a self, key: &'a str, owner: TrackedJobOwner) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {

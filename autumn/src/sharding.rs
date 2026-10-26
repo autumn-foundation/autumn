@@ -49,6 +49,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::db::RuntimeConnection;
+#[cfg(feature = "postgres")]
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -347,6 +348,7 @@ struct ShardNameRow {
 /// invalidation listener subscribes to it; the trigger
 /// (`autumn_notify_shard_directory_change`, in the shard-directory migration)
 /// must `pg_notify` the same channel. Keep the two in sync.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 const DIRECTORY_NOTIFY_CHANNEL: &str = "autumn_shard_directory";
 
 /// How often the invalidation listener wakes while idle to sweep expired cache
@@ -445,6 +447,7 @@ impl DirectoryShardRouter {
     /// spawns this automatically when directory routing is enabled via the
     /// built-in path. `sweep_interval` only bounds idle housekeeping (see
     /// [`DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL`]).
+    #[cfg(feature = "postgres")]
     #[must_use]
     pub fn spawn_invalidation_listener(
         router: Arc<Self>,
@@ -521,6 +524,7 @@ impl DirectoryShardRouter {
     /// only reclaims keys that are looked up again; this bounds memory for
     /// pinned tenants that are never re-observed. Called periodically by the
     /// invalidation listener.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     fn sweep_expired(&self) {
         if let Ok(mut cache) = self.cache.write() {
             let now = crate::time::ambient_instant();

@@ -3599,6 +3599,14 @@ the operations reaching them; those are the types a generated client can only
 see as `unknown` / `serde_json::Value`. Fix each with
 `#[derive(OpenApiSchema)]` on the type. See `docs/guide/openapi.md`.
 
+A request body or `Query<T>` uses the shape a type deserializes from. A
+response uses the shape it serializes to (#2607). A `#[model]` with
+`#[private]`, `#[classified]` or hidden `#[encrypted]` fields has two shapes.
+When both positions use it, the spec has two components: `Widget` (response)
+and `WidgetRequest`. Expect both in a generated client. A `#[model]` with
+`deserialize_with`, `with`, `flatten`, `alias`, `from`, `try_from`,
+`transparent` or `tag` is opaque in a request.
+
 Reach for `autumn graph` before reading a codebase to answer a structural
 question. It is derived from the macros at compile time and embedded in the
 binary, so it cannot drift from the code: `/actuator/graph` serves the same

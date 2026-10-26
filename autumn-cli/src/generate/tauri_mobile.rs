@@ -792,11 +792,16 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
         Some(toml::Value::Table(t)) => table_default_features(t),
         _ => None,
     };
-    let default_features_part =
+    // With defaults off, `offline-sync` needs a backend (#2605). Name
+    // `postgres`, as `db` did before.
+    let (default_features_part, shell_features) =
         if member_default_features.or(resolved_default_features) == Some(false) {
-            "default-features = false, "
+            (
+                "default-features = false, ",
+                r#""offline-sync", "postgres""#,
+            )
         } else {
-            ""
+            ("", r#""offline-sync""#)
         };
 
     // Path/git sources are mirrored directly onto the shell's edge.
@@ -810,7 +815,7 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
         return ShellAutumnWebDep {
             dep_entry: format!(
                 "autumn-web = {{ {version_part}{source}, \
-                 {default_features_part}features = [\"offline-sync\"] }}"
+                 {default_features_part}features = [{shell_features}] }}"
             ),
             patch_entry: None,
         };
@@ -846,7 +851,7 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
     let registry_entry = |req: &str| {
         format!(
             "autumn-web = {{ version = \"{req}\", \
-             {registry_part}{default_features_part}features = [\"offline-sync\"] }}"
+             {registry_part}{default_features_part}features = [{shell_features}] }}"
         )
     };
     let Some(version) = version else {
@@ -2851,7 +2856,7 @@ mod tests {
         );
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync"] }"#,
+            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
 
@@ -2863,7 +2868,7 @@ mod tests {
         );
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { path = "../../autumn", default-features = false, features = ["offline-sync"] }"#,
+            r#"autumn-web = { path = "../../autumn", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
 
         // And an edge that does NOT opt out stays unchanged.
@@ -3003,7 +3008,7 @@ mod tests {
         let dep = workspace_dep(r#"{ version = "0.9.1" }"#, ", default-features = false");
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync"] }"#,
+            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
         // Legacy spelling too.
         let dep = workspace_dep(r#"{ version = "0.9.1" }"#, ", default_features = false");
@@ -3261,7 +3266,7 @@ mod tests {
         );
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { version = "0.9.1", registry = "internal", default-features = false, features = ["offline-sync"] }"#,
+            r#"autumn-web = { version = "0.9.1", registry = "internal", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
 
         // Workspace-inherited entries carry their registry key through the

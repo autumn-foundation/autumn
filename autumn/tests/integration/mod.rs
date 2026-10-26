@@ -297,6 +297,8 @@ mod offline_sync_push_batching_perf;
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
+#[cfg(all(feature = "db", feature = "openapi"))]
+mod openapi_direction;
 #[cfg(feature = "openapi")]
 mod openapi_export;
 #[cfg(feature = "db")]
@@ -502,6 +504,7 @@ mod sim_testapp_jobs;
 #[cfg(feature = "sla")]
 mod sla_obligation_macro;
 mod sqlite_ci_coverage;
+mod sqlite_postgres_free;
 #[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]

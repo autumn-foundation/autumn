@@ -1428,6 +1428,7 @@ impl JobRegistry {
     /// that in fact never left the queue. A non-terminal retry re-adds the
     /// entry with the retry's own mark via [`Self::record_pg_enqueue`]; a
     /// job that succeeds or terminally fails never needs it again.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub(crate) fn record_pg_start(&self, name: &str, id: &str) {
         if let Ok(mut guard) = self.inner.write()
             && let Some(status) = guard.get_mut(name)

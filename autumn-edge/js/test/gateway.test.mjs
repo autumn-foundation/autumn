@@ -500,11 +500,16 @@ test("a multi-MB capsule body is served, not refused as malformed", async () => 
 });
 
 test("a stalled origin probe times out and does not stall the edge lane", async () => {
-  let probes = 0;
-  const server = await listen((request) => {
-    probes += 1; // never answers
-  });
+  const server = await listen(() => {}); // never answers
   const base = `http://127.0.0.1:${server.address().port}`;
+  // Count probe attempts at the gateway, not at the server. The timeout can
+  // abort a probe before its request reaches the server (seen on Windows).
+  let probes = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    if (String(input instanceof Request ? input.url : input).startsWith(base)) probes += 1;
+    return realFetch(input, init);
+  };
   try {
     const gateway = createEdgeGateway({
       capsule: respond([served(200, [], "edge")]),
@@ -522,6 +527,7 @@ test("a stalled origin probe times out and does not stall the edge lane", async 
     assert.ok(Date.now() - again < 100);
     assert.equal(probes, 1);
   } finally {
+    globalThis.fetch = realFetch;
     server.closeAllConnections();
     server.close();
   }

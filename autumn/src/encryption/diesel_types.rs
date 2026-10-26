@@ -57,6 +57,7 @@ macro_rules! encrypted_text_wrapper {
             }
         }
 
+        #[cfg(feature = "postgres")]
         impl ToSql<Text, ::diesel::pg::Pg> for $name {
             fn to_sql<'b>(
                 &'b self,
