@@ -1721,6 +1721,20 @@ pub fn enabled_features_from_manifest_for_resolver(
     requested: &[&str],
     resolver_v1: bool,
 ) -> BTreeSet<String> {
+    enabled_features_with_defaults(manifest, requested, resolver_v1, true)
+}
+
+/// [`enabled_features_from_manifest_for_resolver`], with `seed_default`
+/// false for `--no-default-features`: the `default` set is then on only when
+/// `requested` names it. Its definition stays, so `--features default`
+/// still turns its members on, as Cargo does.
+#[must_use]
+pub fn enabled_features_with_defaults(
+    manifest: &str,
+    requested: &[&str],
+    resolver_v1: bool,
+    seed_default: bool,
+) -> BTreeSet<String> {
     let mut enabled = BTreeSet::new();
     let table = toml::from_str::<toml::Table>(manifest).ok();
     let features_table = table
@@ -1747,7 +1761,7 @@ pub fn enabled_features_from_manifest_for_resolver(
         .and_then(|features| features.get("default"))
         .and_then(toml::Value::as_array);
     let mut queue: Vec<String> = Vec::new();
-    if let Some(members) = default_members {
+    if let Some(members) = default_members.filter(|_| seed_default) {
         queue.push("default".to_owned());
         queue.extend(
             members

@@ -9559,12 +9559,12 @@ fn render_reference_option_loaders(
                 let (load_ty, label_expr) = if display.column_nullable {
                     (
                         "Option<String>",
-                        "label.filter(|label| !label.trim().is_empty()).unwrap_or_else(|| id.to_string())",
+                        "label.filter(|label| !autumn_web::a11y::is_blank(label)).unwrap_or_else(|| id.to_string())",
                     )
                 } else {
                     (
                         "String",
-                        "if label.trim().is_empty() { id.to_string() } else { label }",
+                        "if autumn_web::a11y::is_blank(&label) { id.to_string() } else { label }",
                     )
                 };
                 let _ = write!(

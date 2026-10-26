@@ -855,8 +855,8 @@ primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`,
 - The types prove that a name is present, not that it holds text. An empty or
   blank name (`Img::new(src, "")`, `.aria_label("")`, a blank
   `RadioOption`/`SelectOption` label) trips a `debug_assert!` at the call site
-  (#2666). Give a name from data a fallback; use `Img::decorative(src)` for an
-  image with no information.
+  (#2666). Give a name from data a fallback (`a11y::is_blank(text)` uses the
+  same rule); use `Img::decorative(src)` for an image with no information.
 
 ### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` / `RadioGroup`)
 

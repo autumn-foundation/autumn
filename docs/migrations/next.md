@@ -1794,8 +1794,9 @@ Issue #2666:
 - A blank accessible name trips a `debug_assert!` in a debug build:
   `Img::new(src, "")`, `.label("")`, `.aria_label(" ")`, a blank
   `SelectOption` or `RadioOption` label. A release build renders it as
-  before. If the name comes from data, give it a fallback. For an image with
-  no information, use `Img::decorative(src)`.
+  before. If the name comes from data, give it a fallback:
+  `autumn_web::a11y::is_blank(text)` uses the same rule as the check. For an
+  image with no information, use `Img::decorative(src)`.
 - A `RadioGroup` choice id whose first part does not start with a letter
   (after any leading `_`) gets one more `_` at the start. Group `1plan` gives
   `_1plan-2x`, not `1plan-2x`, and `_1plan` gives `__1plan-2x`. Update a CSS

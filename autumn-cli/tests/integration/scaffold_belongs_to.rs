@@ -59,7 +59,7 @@ fn select_loader_uses_title_display_column_heuristic() {
     );
     assert!(
         routes.contains(
-            ".map(|(id, label)| (id.to_string(), if label.trim().is_empty() { id.to_string() } else { label }))"
+            ".map(|(id, label)| (id.to_string(), if autumn_web::a11y::is_blank(&label) { id.to_string() } else { label }))"
         ),
         "options must be labeled by the display value, not the id:\n{routes}"
     );
@@ -76,7 +76,7 @@ fn select_loader_labels_a_blank_nullable_display_value_by_id() {
     );
     assert!(
         routes.contains(
-            ".map(|(id, label)| (id.to_string(), label.filter(|label| !label.trim().is_empty()).unwrap_or_else(|| id.to_string())))"
+            ".map(|(id, label)| (id.to_string(), label.filter(|label| !autumn_web::a11y::is_blank(label)).unwrap_or_else(|| id.to_string())))"
         ),
         "a blank or missing display value must fall back to the id:\n{routes}"
     );

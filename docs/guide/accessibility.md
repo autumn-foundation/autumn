@@ -623,8 +623,10 @@ text: `Img::new(src, "")` or `.aria_label("")` compiles, and gives an element
 with no name. Every entry point that takes a name has a `debug_assert!`, so an
 empty or blank name panics at the call site in a debug build. A release build
 renders the name as it is. For an image that carries no information, use
-`Img::decorative(src)`. A name from data can be blank, so give it a fallback:
-the generated select-options loader uses the row id when the label is blank.
+`Img::decorative(src)`. A name from data can be blank, so give it a fallback.
+`autumn_web::a11y::is_blank(text)` uses the same rule as the check (white
+space and zero-width characters). The generated select-options loader uses it,
+and puts the row id in place of a blank label.
 
 What still belongs to runtime/authoring review:
 whether that name is *meaningful* (a helpful `alt`, not `"image"`), plus page

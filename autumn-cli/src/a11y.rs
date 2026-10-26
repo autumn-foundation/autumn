@@ -490,15 +490,8 @@ impl<'a> CrateFeatures<'a> {
 ///
 /// `--features` names apply to every crate of the scan.
 fn enabled_features(manifest: &str, selection: &CargoFeatures) -> Option<BTreeSet<String>> {
-    let mut table = toml::from_str::<toml::Table>(manifest).ok()?;
+    let table = toml::from_str::<toml::Table>(manifest).ok()?;
     table.get("package")?;
-    if selection.no_default
-        && let Some(features) = table
-            .get_mut("features")
-            .and_then(toml::Value::as_table_mut)
-    {
-        features.remove("default");
-    }
     let mut requested: Vec<String> = selection
         .features
         .iter()
@@ -509,7 +502,7 @@ fn enabled_features(manifest: &str, selection: &CargoFeatures) -> Option<BTreeSe
         .collect();
     if selection.all {
         if let Some(features) = table.get("features").and_then(toml::Value::as_table) {
-            requested.extend(features.keys().filter(|name| *name != "default").cloned());
+            requested.extend(features.keys().cloned());
         }
         // An optional dependency is also a feature of the same name.
         let targets = table
@@ -526,10 +519,14 @@ fn enabled_features(manifest: &str, selection: &CargoFeatures) -> Option<BTreeSe
         requested.extend(optional);
     }
     let requested: Vec<&str> = requested.iter().map(String::as_str).collect();
-    let manifest = toml::to_string(&table).ok()?;
     // `true`: an optional dependency of any target table counts. With `false`,
     // the edge scan keeps only the edge capsule's targets.
-    Some(crate::edge_scan::enabled_features_from_manifest_for_resolver(&manifest, &requested, true))
+    Some(crate::edge_scan::enabled_features_with_defaults(
+        manifest,
+        &requested,
+        true,
+        !selection.no_default,
+    ))
 }
 
 /// Tokenize one source string and analyze every `html!` block within it. No
@@ -5182,6 +5179,30 @@ mod tests {
         };
         let on = enabled_features(MANIFEST, &selection).expect("a package");
         assert!(on.contains("admin") && !on.contains("db"), "{on:?}");
+    }
+
+    #[test]
+    fn no_default_features_still_expands_an_explicit_default() {
+        // Cargo turns on `default` and its members when `--features default`
+        // is asked for, even with `--no-default-features`.
+        let selection = CargoFeatures {
+            features: vec!["default".to_owned()],
+            all: false,
+            no_default: true,
+        };
+        let on = enabled_features(MANIFEST, &selection).expect("a package");
+        assert!(on.contains("default") && on.contains("db"), "{on:?}");
+    }
+
+    #[test]
+    fn all_features_with_no_default_features_turns_on_default() {
+        let selection = CargoFeatures {
+            features: Vec::new(),
+            all: true,
+            no_default: true,
+        };
+        let on = enabled_features(MANIFEST, &selection).expect("a package");
+        assert!(on.contains("default") && on.contains("db"), "{on:?}");
     }
 
     #[test]

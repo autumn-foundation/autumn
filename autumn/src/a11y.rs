@@ -553,7 +553,19 @@ fn checked_name(entry: &str, name: impl Into<String>) -> String {
 }
 
 /// Whether `text` shows nothing: only white space and zero-width characters.
-fn is_blank(text: &str) -> bool {
+///
+/// Such a text gives no accessible name, and the name check of every
+/// primitive rejects it. Use this to give a name from data a fallback:
+///
+/// ```rust
+/// use autumn_web::a11y::is_blank;
+///
+/// let title = "\u{200B}".to_owned();
+/// let label = if is_blank(&title) { "Untitled".to_owned() } else { title };
+/// assert_eq!(label, "Untitled");
+/// ```
+#[must_use]
+pub fn is_blank(text: &str) -> bool {
     text.chars().all(|c| {
         c.is_whitespace()
             || matches!(
@@ -3009,6 +3021,16 @@ mod tests {
             .unwrap_or_default();
         assert!(message.contains("Img::new"), "{message}");
         assert!(message.contains("Img::decorative"), "{message}");
+    }
+
+    #[test]
+    fn is_blank_matches_what_the_name_check_rejects() {
+        for text in ["", " ", "\t\n", "\u{200B}", "\u{FEFF} ", "\u{2060}"] {
+            assert!(is_blank(text), "{text:?}");
+        }
+        for text in ["a", " a ", "\u{200B}a"] {
+            assert!(!is_blank(text), "{text:?}");
+        }
     }
 
     #[test]

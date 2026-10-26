@@ -5,7 +5,8 @@
   `MenuItem`, `SelectOption::new`, `Select::option`, `RadioOption::new`, and
   every `.label(..)`, `.aria_label(..)` and `.labelled_by(..)`. A release
   build does not change. Use `Img::decorative(src)` for an image that carries
-  no information, and give a name from data a fallback
+  no information, and give a name from data a fallback. The new
+  `autumn_web::a11y::is_blank` tells you when a text is blank
   ([migration guide](docs/migrations/next.md)).
 - **scaffold:** the generated select-options loader of a `references` field
   uses the row id when the display column is blank, so no option has an
