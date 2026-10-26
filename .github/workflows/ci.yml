@@ -970,7 +970,7 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         # `autumn-edge`'s JS host suite (`tests/js_host.rs`) runs the
         # web-standard host under Node and fails under CI without one (ADR-0024).
         # Installed after the cleanup above, which removes /opt/hostedtoolcache.
@@ -3081,7 +3081,7 @@ jobs:
         with:
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2.7.8
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         # Tier J runs the web-standard JS host (`autumn-edge/js`, ADR-0024)
         # over the same corpus as the reference host.
         with:
