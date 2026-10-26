@@ -192,6 +192,8 @@ fn new_struct_without_normalize_columns_implements_normalize() {
 }
 
 #[test]
+// The `&&` receiver is the codegen call shape. Keep it for every type.
+#[allow(clippy::needless_borrow)]
 fn insert_probe_borrows_when_normalize_is_a_noop() {
     // The repository insert path must not clone a `New*` that has nothing to
     // normalize (#2634). Same call shape as the `#[repository]` codegen.
@@ -208,7 +210,10 @@ fn insert_probe_borrows_when_normalize_is_a_noop() {
         title: "  Kept  ".into(),
     };
     let got: &NewPlainNote = (&&SpezNormalize(&one)).spez_normalize_insert();
-    assert!(std::ptr::eq(got, &one), "save must not clone a no-op New*");
+    assert!(
+        std::ptr::eq(got, std::ptr::from_ref(&one)),
+        "save must not clone a no-op New*"
+    );
 
     let many = vec![one.clone(), one.clone()];
     let got: &[NewPlainNote] = (&&SpezNormalize(many.as_slice())).spez_normalize_insert_many();
@@ -219,6 +224,8 @@ fn insert_probe_borrows_when_normalize_is_a_noop() {
 }
 
 #[test]
+// The `&&` receiver is the codegen call shape. Keep it for every type.
+#[allow(clippy::needless_borrow)]
 fn insert_probe_normalizes_when_columns_are_declared() {
     // All arms in scope, as in the codegen. Only the winning arms are used.
     #[allow(unused_imports)]

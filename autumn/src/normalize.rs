@@ -370,6 +370,8 @@ mod tests {
     impl NormalizeNoop for Noop {}
 
     #[test]
+    // The `&&` receiver is the codegen call shape. Keep it for every type.
+    #[allow(clippy::needless_borrow)]
     fn spez_normalize_picks_noop_then_yes_then_no() {
         use super::{SpezNormalizeNo as _, SpezNormalizeNoop as _, SpezNormalizeYes as _};
         use std::borrow::Borrow as _;
@@ -384,18 +386,23 @@ mod tests {
         // `NormalizeNoop`: the caller's borrow comes back. No clone (#2634).
         let z = Noop("  Foo ".into());
         let z_ref: &Noop = (&&SpezNormalize(&z)).spez_normalize_insert();
-        assert!(std::ptr::eq(z_ref, &z), "no-op type must not be cloned");
+        assert!(
+            std::ptr::eq(z_ref, std::ptr::from_ref(&z)),
+            "no-op type must not be cloned"
+        );
 
         // No `Normalize` impl: the borrow comes back untouched.
         let p = Plain("  Foo ".into());
         let p_ref: &Plain = (&&SpezNormalize(&p)).spez_normalize_insert();
         assert!(
-            std::ptr::eq(p_ref, &p),
+            std::ptr::eq(p_ref, std::ptr::from_ref(&p)),
             "non-Normalize type must be untouched"
         );
     }
 
     #[test]
+    // The `&&` receiver is the codegen call shape. Keep it for every type.
+    #[allow(clippy::needless_borrow)]
     fn spez_normalize_insert_many_picks_noop_then_yes_then_no() {
         use super::{
             SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _, SpezNormalizeManyYes as _,
