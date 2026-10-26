@@ -1180,6 +1180,9 @@ struct FieldAttrs {
     /// An unknown action value. The parser skips the column and records a
     /// diagnostic.
     reference_error: Option<String>,
+    /// `#[decimal_shape(precision = p, scale = s)]` (issue #2598): the declared
+    /// `decimal{p,s}`, or the problem with a bad attribute.
+    decimal_shape: Option<Result<(u8, u8), String>>,
 }
 
 /// The SQL default a `#[translatable]` column's storage requires — the empty
@@ -1205,6 +1208,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         on_delete: None,
         on_update: None,
         reference_error: None,
+        decimal_shape: None,
     };
     for attr in &field.attrs {
         let Some(ident) = attr.path().get_ident() else {
@@ -1229,6 +1233,11 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             // #1806: same storage contract as `#[translatable]` — `TEXT NOT
             // NULL` with an empty-container default the type cannot carry.
             "collaborative" => out.is_collaborative = true,
+            // #2598: the first good attribute wins, as in the `#[model]`
+            // macro. A bad attribute counts only when no good one follows.
+            "decimal_shape" if !matches!(out.decimal_shape, Some(Ok(_))) => {
+                out.decimal_shape = Some(parse_decimal_shape(attr));
+            }
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
@@ -1267,6 +1276,38 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         }
     }
     out
+}
+
+/// Read `#[decimal_shape(precision = p, scale = s)]` (issue #2598).
+///
+/// `autumn generate` writes it on each `decimal{p,s}` field. The Rust type does
+/// not carry the shape. The bounds are the bounds of the generator DSL.
+fn parse_decimal_shape(attr: &syn::Attribute) -> Result<(u8, u8), String> {
+    let mut precision = None;
+    let mut scale = None;
+    attr.parse_nested_meta(|meta| {
+        let slot = if meta.path.is_ident("precision") {
+            &mut precision
+        } else if meta.path.is_ident("scale") {
+            &mut scale
+        } else {
+            return Err(meta.error("expected `precision` or `scale`"));
+        };
+        *slot = Some(meta.value()?.parse::<syn::LitInt>()?.base10_parse::<u8>()?);
+        Ok(())
+    })
+    .map_err(|e| format!("bad `#[decimal_shape]`: {e}"))?;
+    let (Some(precision), Some(scale)) = (precision, scale) else {
+        return Err("`#[decimal_shape]` needs `precision` and `scale`".to_owned());
+    };
+    let max = crate::generate::dsl::MAX_DECIMAL_PRECISION;
+    if precision == 0 || u32::from(precision) > max || scale > precision {
+        return Err(format!(
+            "`#[decimal_shape(precision = {precision}, scale = {scale})]` is out of range \
+             (precision 1 to {max}, scale 0 to precision)"
+        ));
+    }
+    Ok((precision, scale))
 }
 
 /// Return the problem with the `#[references]` actions of `raw`, or `None`. A
@@ -1394,6 +1435,28 @@ fn build_table(
             Some(ColumnType::Text)
         } else {
             ColumnType::from_rust_type(&raw.rust_type)
+        };
+        // #2598: the declared shape replaces the `{12, 2}` default. A bad
+        // attribute skips the column: a guessed shape gives a wrong `SQLite`
+        // `CHECK`.
+        let column_ty = match (column_ty, &raw.attrs.decimal_shape) {
+            (Some(ColumnType::Decimal { .. }), Some(Ok((precision, scale)))) => {
+                Some(ColumnType::Decimal {
+                    precision: *precision,
+                    scale: *scale,
+                })
+            }
+            (Some(ColumnType::Decimal { .. }), Some(Err(problem))) => {
+                diagnostics.push(SchemaDiagnostic {
+                    model: model_name.clone(),
+                    table: table_name.clone(),
+                    field: raw.name.clone(),
+                    rust_type: raw.rust_type.clone(),
+                    message: format!("{problem} on `{model_name}.{}`; column skipped", raw.name),
+                });
+                continue;
+            }
+            (ty, _) => ty,
         };
         let Some(ty) = column_ty else {
             // Unknown/unsupported type (a generated enum, an association type):
@@ -2331,6 +2394,105 @@ mod tests {
                 scale: 2
             }
         );
+    }
+
+    /// #2598: `#[decimal_shape]` carries the declared `decimal{p,s}`. The Rust
+    /// type does not, so without it every decimal reads as `{12, 2}`.
+    #[test]
+    fn decimal_shape_attr_sets_precision_and_scale() {
+        let src = r#"
+            #[model]
+            pub struct Product {
+                #[id]
+                pub id: i64,
+                #[decimal_shape(precision = 10, scale = 2)]
+                pub price: rust_decimal::Decimal,
+                #[decimal_shape(precision = 5, scale = 0)]
+                pub qty: Option<autumn_web::db::sqlite_types::SqliteDecimal>,
+                pub plain: rust_decimal::Decimal,
+            }
+        "#;
+        let table = parse_one(src);
+        assert_eq!(
+            col(&table, "price").ty,
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        let qty = col(&table, "qty");
+        assert_eq!(
+            qty.ty,
+            ColumnType::Decimal {
+                precision: 5,
+                scale: 0
+            }
+        );
+        assert!(qty.nullable);
+        // No attribute: the bare `decimal` default.
+        assert_eq!(
+            col(&table, "plain").ty,
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+    }
+
+    /// #2598: a bad `#[decimal_shape]` skips the column with a diagnostic. A
+    /// silent `{12, 2}` fallback gives a wrong `SQLite` `CHECK`.
+    #[test]
+    fn malformed_decimal_shape_attr_skips_the_column() {
+        for attr in [
+            "#[decimal_shape(precision = 10)]",
+            "#[decimal_shape(scale = 2)]",
+            "#[decimal_shape(precision = 10, scale = 2, extra = 1)]",
+            "#[decimal_shape(precision = \"ten\", scale = 2)]",
+            "#[decimal_shape(precision = 0, scale = 0)]",
+            "#[decimal_shape(precision = 29, scale = 2)]",
+            "#[decimal_shape(precision = 300, scale = 2)]",
+            "#[decimal_shape(precision = 4, scale = 5)]",
+            "#[decimal_shape]",
+        ] {
+            let src = format!(
+                "#[model]\npub struct Product {{\n    #[id]\n    pub id: i64,\n    \
+                 {attr}\n    pub price: rust_decimal::Decimal,\n}}\n"
+            );
+            let parsed = parse_model_source(&src, Backend::Sqlite).expect("parse");
+            assert!(
+                parsed.tables[0].columns.iter().all(|c| c.name != "price"),
+                "`{attr}` did not skip the column"
+            );
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "`{attr}` did not add one diagnostic"
+            );
+            assert_eq!(parsed.diagnostics[0].field, "price");
+            assert!(
+                parsed.diagnostics[0].message.contains("decimal_shape"),
+                "the diagnostic names the attribute: {}",
+                parsed.diagnostics[0].message
+            );
+        }
+    }
+
+    /// #2598: `#[decimal_shape]` on a field that is not a decimal changes
+    /// nothing. The `#[model]` macro ignores it there too.
+    #[test]
+    fn decimal_shape_attr_on_a_non_decimal_field_is_ignored() {
+        let src = r#"
+            #[model]
+            pub struct Product {
+                #[id]
+                pub id: i64,
+                #[decimal_shape(precision = 10, scale = 2)]
+                pub name: String,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(col(&parsed.tables[0], "name").ty, ColumnType::Text);
     }
 
     #[test]
