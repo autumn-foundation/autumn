@@ -53,6 +53,14 @@ use super::policy;
 /// The DSL versions this implementation accepts.
 pub const SUPPORTED_VERSIONS: &[&str] = &["1.0"];
 
+/// The most faults one [`ConstelaError::Invalid`] reports.
+///
+/// A hostile document can have thousands of faults. After this many,
+/// validation keeps no more and adds one [`codes::LIMIT`] diagnostic, so the
+/// list holds at most `MAX_DIAGNOSTICS + 1` entries. The generator must fix
+/// these faults and send the document again.
+pub const MAX_DIAGNOSTICS: usize = 256;
+
 /// What is in lexical scope at a point in the view tree.
 struct Scope<'a> {
     /// Loop bindings currently in scope.
@@ -81,6 +89,9 @@ struct Scope<'a> {
     /// an ordering mistake, not a payload key, and it is caught against
     /// [`Validator::action_results`].
     allow_unbound_vars: bool,
+    /// Whether this node can render more than one time: inside an `each`
+    /// body, and not under an `if` there. A literal `id` here repeats.
+    repeats: bool,
 }
 
 impl Scope<'_> {
@@ -91,6 +102,7 @@ impl Scope<'_> {
             params: None,
             in_component: false,
             allow_unbound_vars: false,
+            repeats: false,
         }
     }
 }
@@ -104,6 +116,8 @@ struct Validator<'a> {
     /// `result`, anywhere in it. Empty while walking the view.
     action_results: BTreeSet<&'a str>,
     diagnostics: Vec<Diagnostic>,
+    /// Whether a fault was found after [`MAX_DIAGNOSTICS`] were kept.
+    truncated: bool,
 }
 
 /// Whether `name` is usable as a binding, state field, or action name.
@@ -132,6 +146,7 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
         action_names: BTreeSet::new(),
         action_results: BTreeSet::new(),
         diagnostics: Vec::new(),
+        truncated: false,
     };
 
     validator.check_version();
@@ -141,12 +156,12 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
     // Cycles first: the component walk below would not terminate on a cyclic
     // graph, so this is the one check that gates the rest.
     if let Some(cycle) = validator.find_component_cycle() {
-        validator.diagnostics.push(Diagnostic::new(
+        validator.error(
             "components",
             codes::CYCLE,
             format!("components reference each other in a cycle: {cycle}"),
-        ));
-        return Err(ConstelaError::Invalid(validator.diagnostics));
+        );
+        return Err(validator.finish());
     }
 
     validator.check_styles();
@@ -163,13 +178,43 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
     if validator.diagnostics.is_empty() {
         Ok(())
     } else {
-        Err(ConstelaError::Invalid(validator.diagnostics))
+        Err(validator.finish())
     }
 }
 
 impl<'a> Validator<'a> {
+    /// Record one fault. The only way a diagnostic enters the list.
+    ///
+    /// After [`MAX_DIAGNOSTICS`] the fault is not kept. [`Self::finish`] then
+    /// adds one diagnostic that says the list was cut.
     fn error(&mut self, path: impl Into<String>, code: &'static str, message: impl Into<String>) {
+        if self.is_full() {
+            self.truncated = true;
+            return;
+        }
         self.diagnostics.push(Diagnostic::new(path, code, message));
+    }
+
+    /// Whether the list holds [`MAX_DIAGNOSTICS`] faults.
+    ///
+    /// A loop that can report one fault per entry checks this, so that it
+    /// stops formatting messages nobody keeps.
+    const fn is_full(&self) -> bool {
+        self.diagnostics.len() >= MAX_DIAGNOSTICS
+    }
+
+    /// The error for the faults found.
+    fn finish(mut self) -> ConstelaError {
+        if self.truncated {
+            self.diagnostics.push(Diagnostic::new(
+                "",
+                codes::LIMIT,
+                format!(
+                    "validation stopped after {MAX_DIAGNOSTICS} problems; fix these and validate again to see the rest"
+                ),
+            ));
+        }
+        ConstelaError::Invalid(self.diagnostics)
     }
 
     fn check_version(&mut self) {
@@ -311,6 +356,7 @@ impl<'a> Validator<'a> {
             params: None,
             in_component: false,
             allow_unbound_vars: true,
+            repeats: false,
         };
 
         match step {
@@ -578,6 +624,7 @@ impl<'a> Validator<'a> {
                 params: Some(&component.params),
                 in_component: true,
                 allow_unbound_vars: false,
+                repeats: false,
             };
             self.check_node(
                 &component.view,
@@ -701,10 +748,14 @@ impl<'a> Validator<'a> {
                 otherwise,
             } => {
                 self.check_expr(condition, &format!("{path}.condition"), scope);
+                // A branch can select one pass of a loop, so a literal id in
+                // it is not a sure repeat. The render-time check covers it.
+                let repeats = std::mem::replace(&mut scope.repeats, false);
                 self.check_node(then, &format!("{path}.then"), scope);
                 if let Some(otherwise) = otherwise {
                     self.check_node(otherwise, &format!("{path}.else"), scope);
                 }
+                scope.repeats = repeats;
             }
             Node::Each {
                 items,
@@ -748,7 +799,18 @@ impl<'a> Validator<'a> {
                 self.check_expr(language, &format!("{path}.language"), scope);
                 self.check_expr(content, &format!("{path}.content"), scope);
             }
-            Node::Portal { children, .. } => {
+            Node::Portal { target, children } => {
+                if target.len() > policy::MAX_PORTAL_TARGET_BYTES {
+                    self.error(
+                        format!("{path}.target"),
+                        codes::LIMIT,
+                        format!(
+                            "portal target is {} bytes, over the {}-byte limit; name a place in the host layout, e.g. \"body\" or \"#modal-root\"",
+                            target.len(),
+                            policy::MAX_PORTAL_TARGET_BYTES
+                        ),
+                    );
+                }
                 for (i, child) in children.iter().enumerate() {
                     self.check_node(child, &format!("{path}.children[{i}]"), scope);
                 }
@@ -891,7 +953,9 @@ impl<'a> Validator<'a> {
         if let Some(key) = key {
             self.check_expr(key, &format!("{path}.key"), scope);
         }
+        let repeats = std::mem::replace(&mut scope.repeats, true);
         self.check_node(body, &format!("{path}.body"), scope);
+        scope.repeats = repeats;
         scope.vars.truncate(restore);
     }
 
@@ -911,23 +975,34 @@ impl<'a> Validator<'a> {
                 format!("no component named {name:?} is declared"),
             ),
             Some(component) => {
+                // One fault per param, so stop once the list is full. The
+                // path names the invocation, so the message does not repeat
+                // the component name: a name can be as long as the document.
                 for (param, def) in &component.params {
                     if def.required && !props.contains_key(param) {
+                        if self.is_full() {
+                            self.truncated = true;
+                            break;
+                        }
                         self.error(
                             format!("{path}.props"),
                             codes::UNKNOWN_REF,
                             format!(
-                                "component {name:?} requires a {param:?} prop, which is not supplied"
+                                "this component requires a {param:?} prop, which is not supplied"
                             ),
                         );
                     }
                 }
                 for supplied in props.keys() {
                     if !component.params.contains_key(supplied) {
+                        if self.is_full() {
+                            self.truncated = true;
+                            break;
+                        }
                         self.error(
                             format!("{path}.props.{supplied}"),
                             codes::UNKNOWN_REF,
-                            format!("component {name:?} declares no parameter {supplied:?}"),
+                            format!("this component declares no parameter {supplied:?}"),
                         );
                     }
                 }
@@ -999,6 +1074,19 @@ impl<'a> Validator<'a> {
                 }
                 if policy::is_url_attr(&canonical) {
                     self.check_literal_url(expr, path);
+                }
+                // Found here, not only at render time: a loop over a list that
+                // is empty now renders, and fails later when the list grows.
+                if canonical == "id"
+                    && scope.repeats
+                    && let Expr::Lit { value } = expr
+                    && value.as_str().is_some_and(|id| !id.is_empty())
+                {
+                    self.error(
+                        path,
+                        codes::DUPLICATE,
+                        "a literal id in an `each` body repeats on each pass; set \"index\": \"i\" on the `each` and build the id with `concat`",
+                    );
                 }
                 self.check_expr(expr, path, scope);
             }

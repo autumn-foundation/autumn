@@ -1236,11 +1236,15 @@ jobs:
         # `markdown` node kind reachable: without it that node fails validation
         # with `constela.feature_required` and the sanitizing render path is
         # never exercised.
+        #
+        # `constela_memory` is its own binary (a counting global allocator).
+        # It checks that a hostile document uses bounded peak memory (#2626).
         run: |
           cargo test -p autumn-web --features constela --lib constela::
           cargo test -p autumn-web --features constela --doc constela
           cargo test -p autumn-web --features constela --test integration_tests constela
           cargo test -p autumn-web --features "constela,markdown" --test integration_tests constela
+          cargo test -p autumn-web --features constela --test constela_memory
       - name: Run inbound-mail-gated tests (untrusted MIME parsing)
         if: matrix.lane == 'inbound-mail'
         # `inbound-mail` and its provider aliases are not default features, so
