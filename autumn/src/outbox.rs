@@ -185,11 +185,8 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
                     return Ok(());
                 }
                 tokio::spawn(async move {
-                    match pool.get().await {
-                        Ok(mut conn) => ensure_claim_index(&mut conn).await,
-                        Err(error) => {
-                            tracing::warn!(%error, "no connection to build idx_autumn_outbox_claim");
-                        }
+                    if let Err(error) = build_claim_index(&pool).await {
+                        tracing::warn!(%error, "could not build idx_autumn_outbox_claim; the outbox claim stays slow on a large backlog of sent rows");
                     }
                 });
                 return Ok(());
@@ -214,22 +211,22 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
 /// the primary key past every sent row that the purge has not deleted yet.
 /// The build is `CONCURRENTLY`, so it blocks no writes, and the index covers
 /// only pending rows. [`ensure_schema`] runs it in a background task, because
-/// the build waits for older transactions on the table and must not delay boot. A role that cannot create indexes keeps working, only
-/// slower: the failure is a warning. After a failed build, drop the invalid
+/// the build waits for older transactions on the table and must not delay
+/// boot. A role that cannot create indexes keeps working, only slower: the
+/// failure is a warning. After a failed build, drop the invalid
 /// `idx_autumn_outbox_claim` and restart.
 #[cfg(not(feature = "sqlite"))]
-async fn ensure_claim_index(conn: &mut RuntimeConnection) {
-    match tables_exist(conn, &["idx_autumn_outbox_claim"]).await {
-        Ok(true) => {}
-        Ok(false) => {
-            if let Err(error) = conn.batch_execute(CLAIM_INDEX_SQL).await {
-                tracing::warn!(%error, "could not create idx_autumn_outbox_claim; the outbox claim stays slow on a large backlog of sent rows");
-            }
-        }
-        Err(error) => {
-            tracing::warn!(%error, "could not probe idx_autumn_outbox_claim");
-        }
+async fn build_claim_index(pool: &Pool<RuntimeConnection>) -> Result<(), String> {
+    let mut conn = pool.get().await.map_err(|error| error.to_string())?;
+    let present = tables_exist(&mut conn, &["idx_autumn_outbox_claim"])
+        .await
+        .map_err(|error| error.to_string())?;
+    if present {
+        return Ok(());
     }
+    conn.batch_execute(CLAIM_INDEX_SQL)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(not(feature = "sqlite"))]

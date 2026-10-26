@@ -222,6 +222,25 @@ mod docker {
             "ensure_schema builds the claim index in the background"
         );
     }
+
+    /// A pool of one has no connection to spare for the background build, so
+    /// `ensure_schema` skips it (and still succeeds).
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_outbox_ensure_schema_skips_the_index_build_on_a_single_connection_pool() {
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+        let db = autumn_web::test::TestDb::shared().await;
+        outbox::ensure_schema(&db.pool()).await.unwrap();
+        let single: PgPool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            db.url(),
+        ))
+        .max_size(1)
+        .build()
+        .unwrap();
+        outbox::ensure_schema(&single).await.unwrap();
+    }
 }
 
 #[cfg(feature = "test-support")]
