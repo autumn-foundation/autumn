@@ -2625,6 +2625,12 @@ jobs:
             tests::parse_edge \
             | tee "$RUNNER_TEMP/cli-edge-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-edge-cov.log"
+          # Issue #2589: same gap for `deploy::` (the SQLite data-file ops and
+          # `deploy plan`) and `db::sqlite_snapshot::` (backup and restore).
+          # Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deploy:: db::sqlite_snapshot:: \
+            | tee "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
