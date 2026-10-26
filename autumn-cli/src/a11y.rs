@@ -539,7 +539,8 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
     scan_source_with(src, file, None, scan);
 }
 
-/// [`scan_source`], with `cfg(feature = "…")` read against `features`.
+/// Tokenize one source string and analyze every `html!` block within it,
+/// with `cfg(feature = "…")` read against `features`.
 fn scan_source_with(src: &str, file: &str, features: Option<&BTreeSet<String>>, scan: &mut Scan) {
     let Ok(stream) = TokenStream::from_str(src) else {
         return;
