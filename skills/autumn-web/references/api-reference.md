@@ -409,8 +409,9 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `#[normalize(downcase)]` with a `unique` column yields case-insensitive
   uniqueness. Non-`String` fields are a compile error (mirrors `#[encrypted]`).
   Generated hooks: `impl autumn_web::normalize::Normalize` on the model and
-  `NewX`; `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on
-  every model.
+  on every `NewX` (a no-op when the model has no `#[normalize]` columns);
+  `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on every
+  model.
 
 ## Repository-generated methods (`#[repository]`)
 
