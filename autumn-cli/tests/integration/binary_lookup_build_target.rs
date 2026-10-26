@@ -50,7 +50,7 @@ enum TargetSource {
 
 /// A fixture app in its own temporary directory.
 struct Fixture {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     app: PathBuf,
     log: PathBuf,
     triple: String,
@@ -89,7 +89,7 @@ impl Fixture {
 
         let log = root.path().join("launch.log");
         Self {
-            _root: root,
+            root,
             app,
             log,
             triple,
@@ -103,9 +103,12 @@ impl Fixture {
         cmd.args(args)
             .current_dir(&self.app)
             .env(LOG_ENV, &self.log)
-            // Keep the build in the fixture's own `target/`.
-            .env_remove("CARGO_TARGET_DIR")
+            // An empty `CARGO_HOME` stops a user config from adding a triple
+            // or a target directory. The fixture has no dependencies.
+            .env("CARGO_HOME", self.root.path().join("cargo-home"))
+            .env("CARGO_TARGET_DIR", self.app.join("target"))
             .env_remove("CARGO_BUILD_TARGET_DIR")
+            // Only `source` sets the triple.
             .env_remove("CARGO_BUILD_TARGET");
         if matches!(self.source, TargetSource::Env) {
             cmd.env("CARGO_BUILD_TARGET", &self.triple);
@@ -113,7 +116,7 @@ impl Fixture {
         cmd.output().expect("run autumn")
     }
 
-    /// The mode lists the fixture logged, one per start.
+    /// The logged modes. Each line is one start of the fixture.
     fn launches(&self) -> Vec<String> {
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
@@ -137,7 +140,7 @@ impl Fixture {
     }
 }
 
-/// The host triple from `rustc -vV`. The fixture must run on this machine.
+/// The host triple from `rustc -vV`. Only a binary for it can start here.
 fn host_triple() -> String {
     let output = Command::new("rustc")
         .arg("-vV")
@@ -160,7 +163,7 @@ fn describe(output: &Output) -> String {
     )
 }
 
-/// Run `autumn routes` and check that it finds, starts and reads the binary.
+/// Run `autumn routes`. Check that it starts the binary and reads its output.
 fn assert_routes_ok(fixture: &Fixture) {
     let output = fixture.autumn(&["routes", "--format", "json"]);
     assert!(output.status.success(), "{}", describe(&output));
@@ -172,40 +175,42 @@ fn assert_routes_ok(fixture: &Fixture) {
     );
 }
 
-/// Check that Cargo used the triple directory, so the test is not a no-op.
-fn assert_built_under_triple(fixture: &Fixture, profile: &str) {
-    let with_triple = fixture.binary(true, profile);
-    let without = fixture.binary(false, profile);
-    assert!(with_triple.is_file(), "missing {}", with_triple.display());
-    assert!(!without.exists(), "unexpected {}", without.display());
+/// Check the directory Cargo used. If it is not the expected one, the test
+/// proves nothing.
+fn assert_built_where_expected(fixture: &Fixture, profile: &str) {
+    let with_triple = !matches!(fixture.source, TargetSource::None);
+    let expected = fixture.binary(with_triple, profile);
+    let other = fixture.binary(!with_triple, profile);
+    assert!(expected.is_file(), "missing {}", expected.display());
+    assert!(!other.exists(), "unexpected {}", other.display());
 }
 
 #[test]
 fn routes_finds_binary_without_a_target_triple() {
     let fixture = Fixture::new(TargetSource::None);
     assert_routes_ok(&fixture);
-    assert!(fixture.binary(false, "debug").is_file());
+    assert_built_where_expected(&fixture, "debug");
 }
 
 #[test]
 fn routes_finds_binary_with_cargo_build_target_env() {
     let fixture = Fixture::new(TargetSource::Env);
     assert_routes_ok(&fixture);
-    assert_built_under_triple(&fixture, "debug");
+    assert_built_where_expected(&fixture, "debug");
 }
 
 #[test]
 fn routes_finds_binary_with_build_target_in_app_config() {
     let fixture = Fixture::new(TargetSource::AppConfig);
     assert_routes_ok(&fixture);
-    assert_built_under_triple(&fixture, "debug");
+    assert_built_where_expected(&fixture, "debug");
 }
 
 #[test]
 fn routes_finds_binary_with_build_target_in_parent_config() {
     let fixture = Fixture::new(TargetSource::ParentConfig);
     assert_routes_ok(&fixture);
-    assert_built_under_triple(&fixture, "debug");
+    assert_built_where_expected(&fixture, "debug");
 }
 
 /// A second run compiles nothing. Cargo must still report the path.
@@ -230,7 +235,7 @@ const BUILD_AND_RUN: &[(&[&str], &str)] = &[
 
 /// Check that each [`BUILD_AND_RUN`] command starts the binary it built.
 ///
-/// Most of these commands then stop, because the fixture prints no manifest.
+/// Most of these commands then fail, because the fixture prints no manifest.
 /// This checks only that the binary started in the correct mode.
 fn assert_every_command_starts_binary(source: TargetSource) {
     let fixture = Fixture::new(source);
@@ -247,9 +252,14 @@ fn assert_every_command_starts_binary(source: TargetSource) {
             describe(&output)
         );
     }
-    // `calibrate` builds release; the others build debug.
-    assert_built_under_triple(&fixture, "debug");
-    assert_built_under_triple(&fixture, "release");
+    // `calibrate` builds the release profile. The others build the debug profile.
+    assert_built_where_expected(&fixture, "debug");
+    assert_built_where_expected(&fixture, "release");
+}
+
+#[test]
+fn every_command_starts_binary_without_a_target_triple() {
+    assert_every_command_starts_binary(TargetSource::None);
 }
 
 #[test]

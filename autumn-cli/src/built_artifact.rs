@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
+/// The triple this CLI runs on. Only a binary for it can start here.
+const HOST_TRIPLE: &str = env!("AUTUMN_CLI_HOST_TRIPLE");
+
 /// Executables from the builds this process ran, newest last.
 static BUILT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
@@ -33,25 +36,30 @@ fn profile_dir(path: &Path) -> Option<&OsStr> {
     path.parent()?.file_name()
 }
 
-/// Add `executables` to `built`. A newer path replaces an older one with the
-/// same file name and profile directory.
+/// The triple directory of an artifact path: `t` in `.../t/debug/app`.
+fn triple_dir(path: &Path) -> Option<&OsStr> {
+    path.parent()?.parent()?.file_name()
+}
+
+/// Add `executables` to `built`, newest last. A path is kept once.
 fn record_into(built: &mut Vec<PathBuf>, executables: &[PathBuf]) {
     for exe in executables {
-        built.retain(|old| {
-            old.file_name() != exe.file_name() || profile_dir(old) != profile_dir(exe)
-        });
+        built.retain(|old| old != exe);
         built.push(exe.clone());
     }
 }
 
 /// The path in `built` that matches `guess` by file name and profile directory.
+///
+/// `build.target` can name more than one triple. Then the host triple wins,
+/// because only its binary can start here. Otherwise the newest match wins.
 fn lookup_in(built: &[PathBuf], guess: &Path) -> Option<PathBuf> {
-    built
-        .iter()
-        .find(|path| {
-            path.file_name() == guess.file_name() && profile_dir(path) == profile_dir(guess)
-        })
-        .cloned()
+    let mut matches = built.iter().rev().filter(|path| {
+        path.file_name() == guess.file_name() && profile_dir(path) == profile_dir(guess)
+    });
+    let newest = matches.clone().next()?;
+    let host = matches.find(|path| triple_dir(path) == Some(OsStr::new(HOST_TRIPLE)));
+    Some(host.unwrap_or(newest).clone())
 }
 
 /// Remember the executables of a finished build.
@@ -120,14 +128,15 @@ mod tests {
     }
 
     #[test]
-    fn newer_path_replaces_older_with_same_file_name() {
+    fn newest_path_wins_for_same_file_name() {
         let mut built = Vec::new();
         record_into(
             &mut built,
             &[PathBuf::from("/a/debug/bin"), PathBuf::from("/a/other")],
         );
         record_into(&mut built, &[PathBuf::from("/b/debug/bin")]);
-        assert_eq!(built.len(), 2);
+        record_into(&mut built, &[PathBuf::from("/b/debug/bin")]);
+        assert_eq!(built.len(), 3, "a path is kept once: {built:?}");
         assert_eq!(
             lookup_in(&built, Path::new("/t/debug/bin")),
             Some(PathBuf::from("/b/debug/bin"))
@@ -151,6 +160,23 @@ mod tests {
         assert_eq!(lookup_in(&built, Path::new("/t/debug/app")), None);
         record_into(&mut built, &[PathBuf::from("/t/triple/debug/app")]);
         assert_eq!(built.len(), 2);
+    }
+
+    #[test]
+    fn host_triple_wins_over_a_foreign_triple() {
+        // `build.target = [host, foreign]`: Cargo reports both, in any order.
+        let host = PathBuf::from(format!("/t/{HOST_TRIPLE}/debug/app"));
+        let foreign = PathBuf::from("/t/foreign-triple/debug/app");
+        for order in [[&host, &foreign], [&foreign, &host]] {
+            let mut built = Vec::new();
+            for exe in order {
+                record_into(&mut built, std::slice::from_ref(exe));
+            }
+            assert_eq!(
+                lookup_in(&built, Path::new("/t/debug/app")),
+                Some(host.clone())
+            );
+        }
     }
 
     #[test]
