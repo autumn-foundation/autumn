@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f44e87fbf63d7a3147b4ef595f9045c809760c6bbf7f3b3d18d6701a6d6468e0 # shrinks to rows = [(4294967296, true), (9223372036854775807, true), (-4294967296, true)]
+cc 4f1320c759956b5634f11ac3d7d81179df551150e438b3d808a214756156e9a4 # shrinks to rows = [(-9223372036854775808, true, true), (4294967295, true, false), (4294967295, false, false), (9223372036854775807, true, false)]

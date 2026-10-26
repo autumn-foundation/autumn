@@ -10,11 +10,14 @@
 //! * **Repair agrees with the delta paths.** After `save_many` folds
 //!   `MAX, 1, -1`, drift is 0, `recompute` rebuilds `MAX`, and `delete_many`
 //!   goes back to 0.
+//! * **Bulk delete lands when only the batch sum leaves `i64`.** Deleting
+//!   `MAX, MAX` from `MAX, MAX, MIN` gives `MIN`.
 //! * **A new derivation finishes its backfill** over the same rows.
 //! * **A total that does not fit is still an error.** It is not a REAL and
 //!   not a clamped value.
 //!
-//! Its own binary, so this file registers one derivation only. Run:
+//! Own binary: the backfill runs every registered derivation, so this binary
+//! registers only one. Run:
 //! `cargo test -p autumn-web --features sqlite --test sqlite_derivation_wide_sum`.
 #![cfg(feature = "sqlite")]
 
@@ -216,9 +219,35 @@ async fn repair_accepts_a_partial_sum_that_leaves_i64() {
     assert_eq!(derived(&pool, post).await, i64::MAX);
     assert_eq!(derived_type(&pool, post).await, "integer");
 
+    drop(conn);
+
     let ids: Vec<i64> = saved.iter().map(|row| row.id).collect();
     repo.delete_many(&ids).await.expect("bulk delete runs");
     assert_eq!(derived(&pool, post).await, 0);
+}
+
+#[tokio::test]
+async fn a_bulk_delete_whose_batch_sum_leaves_i64_still_lands() {
+    let pool = boot_pool("ws_bulk").await;
+    let repo = PgWsWeightRepository::with_pool_untracked(pool.clone());
+    let post = seed_post(&pool, "bulk").await;
+
+    // MAX + MAX + MIN = MAX - 1, so the parent is in range.
+    let saved = repo
+        .save_many(&[i64::MAX, i64::MAX, i64::MIN].map(|weight| NewWsWeight {
+            post_id: post,
+            weight,
+        }))
+        .await
+        .expect("save_many folds the batch in i128");
+    assert_eq!(derived(&pool, post).await, i64::MAX - 1);
+
+    // The batch sums to 2 * MAX, but the parent ends at MIN.
+    repo.delete_many(&[saved[0].id, saved[1].id])
+        .await
+        .expect("bulk delete runs");
+    assert_eq!(derived(&pool, post).await, i64::MIN);
+    assert_eq!(derived_type(&pool, post).await, "integer");
 }
 
 #[tokio::test]

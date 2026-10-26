@@ -456,9 +456,8 @@ fn aggregate_expr(view: &SqlView, alias: &str) -> String {
     }
 }
 
-/// `COALESCE(SUM(x), 0)`, because `SUM` over an empty set is NULL and the
-/// maintained column is not. Postgres sums `bigint` as `numeric`, so a partial
-/// sum cannot overflow.
+/// Sums `contrib`. `SUM` of no rows is NULL, so `COALESCE` gives 0. Postgres
+/// sums `bigint` as `numeric`, so a partial sum cannot overflow.
 #[cfg(not(feature = "sqlite"))]
 pub fn sum_expr(contrib: &str) -> String {
     format!("COALESCE(SUM({contrib}), 0)")
@@ -467,23 +466,48 @@ pub fn sum_expr(contrib: &str) -> String {
 /// An exact `SQLite` sum that no row order can overflow (#2663).
 ///
 /// `SQLite`'s `SUM` raises `integer overflow` when a partial sum is outside
-/// `i64`, also when the total is in range. The delta paths add in `i128`, so
-/// the set-based paths must accept the same rows.
+/// `i64`, even when the total is in range. The delta paths add in `i128`. The
+/// set-based paths must accept the same rows. See [`split_join`].
 ///
-/// Each row splits as `x = (x >> 32) * 2^32 + (x & 0xFFFFFFFF)`, and the two
-/// halves sum separately. Each half-sum stays in `i64` for fewer than 2^31
-/// rows per parent. The carry of the low sum goes into the high sum, so
-/// `0 <= lo < 2^32`. Then the total is in `i64` only when `hi` is in `i32`,
-/// and the `CASE` checks this. When the total is out of range, `abs(i64::MIN)`
-/// raises `integer overflow`, as `SUM` did. Without the check, `SQLite` would
-/// change the product to a REAL.
+/// See also `money::ledger::split_sum`, which joins its halves in Rust.
 #[cfg(feature = "sqlite")]
 pub fn sum_expr(contrib: &str) -> String {
-    let lo = format!("COALESCE(SUM(({contrib}) & 4294967295), 0)");
-    let hi = format!("(COALESCE(SUM(({contrib}) >> 32), 0) + ({lo} >> 32))");
+    let (hi, lo) = split_sums(contrib);
+    split_join(&hi, &lo)
+}
+
+/// The low 32 bits of a split `i64`.
+#[cfg(feature = "sqlite")]
+const LOW_MASK: u32 = u32::MAX;
+
+/// `(hi, lo)` sums of `contrib`, with the total `hi * 2^32 + lo`.
+///
+/// Each row splits as `x = (x >> 32) * 2^32 + (x & 0xFFFFFFFF)`. Each half-sum
+/// stays in `i64` for fewer than 2^31 rows.
+#[cfg(feature = "sqlite")]
+fn split_sums(contrib: &str) -> (String, String) {
+    (
+        format!("COALESCE(SUM(({contrib}) >> 32), 0)"),
+        format!("COALESCE(SUM(({contrib}) & {LOW_MASK}), 0)"),
+    )
+}
+
+/// `hi * 2^32 + lo` as one `i64`, or `integer overflow` when it is out of range.
+///
+/// The carry of `lo` goes into `hi`, and the low part that stays,
+/// `lo & 0xFFFFFFFF`, is in `[0, 2^32)`. Thus the total is in `i64` only when
+/// the carried `hi` is in `i32`. The `CASE` checks this. Without the check,
+/// `SQLite` would change the product to a REAL.
+#[cfg(feature = "sqlite")]
+fn split_join(hi: &str, lo: &str) -> String {
+    let (min, max, radix) = (i32::MIN, i32::MAX, 1_i64 << 32);
+    let hi = format!("({hi} + (({lo}) >> 32))");
+    // `abs(i64::MIN)` raises `integer overflow`, as `SUM` did. It is spelled
+    // `-MAX - 1`: SQLite reads `9223372036854775808` as a REAL, and `abs` of a
+    // REAL does not raise.
     format!(
-        "CASE WHEN {hi} BETWEEN -2147483648 AND 2147483647 \
-         THEN {hi} * 4294967296 + ({lo} & 4294967295) \
+        "CASE WHEN {hi} BETWEEN {min} AND {max} \
+         THEN {hi} * {radix} + (({lo}) & {LOW_MASK}) \
          ELSE abs(-9223372036854775807 - 1) END"
     )
 }
@@ -1330,8 +1354,9 @@ fn bulk_decrement_sql(view: &SqlView, id_list: &str) -> String {
     // cross-tenant child contributes to neither the count nor the row set.
     let tenant = tenant_predicate_joined(view);
     let accumulator = accumulator(view, &counter_column);
+    let (minuend, aggregate) = bulk_decrement_parts(view, &accumulator, aggregate);
     format!(
-        "UPDATE {parent_table} SET {counter_column} = {accumulator} - \
+        "UPDATE {parent_table} SET {counter_column} = {minuend}\
          (SELECT {aggregate} FROM {child_table} AS {CHILD_ALIAS} \
           WHERE {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk} \
             AND {CHILD_ALIAS}.{child_pk} IN ({id_list}){live}{filter}{tenant}) \
@@ -1341,6 +1366,39 @@ fn bulk_decrement_sql(view: &SqlView, id_list: &str) -> String {
               AND {CHILD_ALIAS}.{fk_column} IS NOT NULL{live}{filter} \
               AND {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk}{tenant})"
     )
+}
+
+/// The text before the bulk decrement's sub-select, and its select list.
+///
+/// `<current> - ` and the batch's aggregate.
+#[cfg(not(feature = "sqlite"))]
+fn bulk_decrement_parts(_view: &SqlView, current: &str, aggregate: String) -> (String, String) {
+    (format!("{current} - "), aggregate)
+}
+
+/// The text before the bulk decrement's sub-select, and its select list.
+///
+/// A `SQLite` sum moves the parent's value into the sub-select, and joins it
+/// with the batch's split sums (#2663). The batch's own sum can be outside
+/// `i64` when the parent's new value is in range: deleting `MAX, MAX` from
+/// `MAX, MAX, MIN` gives `MIN`. A count cannot overflow, so it keeps the
+/// plain form.
+#[cfg(feature = "sqlite")]
+fn bulk_decrement_parts(view: &SqlView, current: &str, aggregate: String) -> (String, String) {
+    if view.counts_rows() {
+        return (format!("{current} - "), aggregate);
+    }
+    // Qualified: inside the sub-select, a bare name can bind to the child.
+    let Quoted {
+        parent_table,
+        counter_column,
+        ..
+    } = quoted(view);
+    let parent_value = accumulator(view, &format!("{parent_table}.{counter_column}"));
+    let (hi, lo) = split_sums(&contrib_expr(view, CHILD_ALIAS));
+    let hi = format!("(({parent_value}) >> 32) - {hi}");
+    let lo = format!("(({parent_value}) & {LOW_MASK}) - {lo}");
+    (String::new(), split_join(&hi, &lo))
 }
 
 /// Render `ids` as a literal SQL list.
@@ -3033,6 +3091,7 @@ mod tests {
         const { assert!(!Dummy::HAS_COUNTER_CACHES) };
         assert!(Dummy::counter_caches().is_empty());
     }
+
     /// The `SQLite` sum aggregate, run against a real database (#2663).
     #[cfg(feature = "sqlite")]
     mod sqlite_sum {
@@ -3046,7 +3105,7 @@ mod tests {
             total: i64,
         }
 
-        /// Fold `rows` (weight, published) with the derivation's aggregate, in
+        /// Sum `rows` (weight, published) with the derivation's aggregate, in
         /// row order.
         fn sqlite_sum(rows: &[(i64, bool)]) -> Result<i64, diesel::result::Error> {
             let mut conn =
@@ -3136,12 +3195,101 @@ mod tests {
             ]
         }
 
+        /// Seed one post and its `rows` (weight, published), set the post to
+        /// `start`, then bulk-decrement the rows with ids in `deleted`.
+        fn sqlite_bulk_decrement(
+            rows: &[(i64, bool)],
+            start: i64,
+            deleted: &[i64],
+        ) -> Result<i64, diesel::result::Error> {
+            let mut conn =
+                diesel::SqliteConnection::establish(":memory:").expect("in-memory database");
+            for ddl in [
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, visible_score BIGINT NOT NULL)",
+                "CREATE TABLE comments (id INTEGER PRIMARY KEY, post_id BIGINT NOT NULL, \
+                 score BIGINT NOT NULL, published BOOLEAN NOT NULL)",
+            ] {
+                diesel::RunQueryDsl::execute(diesel::sql_query(ddl), &mut conn).expect("DDL");
+            }
+            diesel::RunQueryDsl::execute(
+                diesel::sql_query("INSERT INTO posts (id, visible_score) VALUES (1, ?)")
+                    .bind::<diesel::sql_types::BigInt, _>(start),
+                &mut conn,
+            )
+            .expect("seed post");
+            for (score, published) in rows {
+                diesel::RunQueryDsl::execute(
+                    diesel::sql_query(
+                        "INSERT INTO comments (post_id, score, published) VALUES (1, ?, ?)",
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(score)
+                    .bind::<diesel::sql_types::Bool, _>(published),
+                    &mut conn,
+                )
+                .expect("seed row");
+            }
+            let sql = super::bulk_decrement_sql(&view(&sum_spec()), &super::id_list(deleted));
+            diesel::RunQueryDsl::execute(diesel::sql_query(sql), &mut conn)?;
+            diesel::RunQueryDsl::get_result::<SumRow>(
+                diesel::sql_query("SELECT visible_score AS total FROM posts WHERE id = 1"),
+                &mut conn,
+            )
+            .map(|row| row.total)
+        }
+
+        #[test]
+        fn a_bulk_decrement_whose_batch_sum_leaves_i64_still_lands() {
+            // MAX + MAX + MIN = MAX - 1. Deleting both MAX rows leaves MIN.
+            let rows = published(&[i64::MAX, i64::MAX, i64::MIN]);
+            assert_eq!(
+                sqlite_bulk_decrement(&rows, i64::MAX - 1, &[1, 2]).expect("decrement"),
+                i64::MIN
+            );
+        }
+
+        #[test]
+        fn a_bulk_decrement_whose_result_leaves_i64_is_an_error() {
+            let err = sqlite_bulk_decrement(&published(&[1]), i64::MIN, &[1])
+                .expect_err("MIN - 1 has no i64 value");
+            assert!(err.to_string().contains("integer overflow"), "{err}");
+        }
+
         proptest! {
             #[test]
             fn the_sum_is_exact_or_an_overflow_error(
                 rows in prop::collection::vec((weight(), any::<bool>()), 0..8)
             ) {
                 match (exact_sum(&rows), sqlite_sum(&rows)) {
+                    (Some(want), got) => prop_assert_eq!(got.ok(), Some(want)),
+                    (None, Ok(got)) => prop_assert!(false, "{rows:?} gave {got}"),
+                    (None, Err(err)) => {
+                        prop_assert!(err.to_string().contains("integer overflow"), "{err}");
+                    }
+                }
+            }
+
+            #[test]
+            fn the_bulk_decrement_is_exact_or_an_overflow_error(
+                rows in prop::collection::vec((weight(), any::<bool>(), any::<bool>()), 0..8)
+            ) {
+                let seeded: Vec<(i64, bool)> = rows.iter().map(|(w, p, _)| (*w, *p)).collect();
+                // The parent holds the exact total, as the delta paths leave it.
+                let Some(start) = exact_sum(&seeded) else {
+                    return Ok(());
+                };
+                let deleted: Vec<i64> = (1_i64..)
+                    .zip(&rows)
+                    .filter(|(_, (_, _, delete))| *delete)
+                    .map(|(id, _)| id)
+                    .collect();
+                let kept: Vec<(i64, bool)> = rows
+                    .iter()
+                    .filter(|(_, _, delete)| !*delete)
+                    .map(|(w, p, _)| (*w, *p))
+                    .collect();
+                let want = exact_sum(&kept);
+                let got = sqlite_bulk_decrement(&seeded, start, &deleted);
+                match (want, got) {
                     (Some(want), got) => prop_assert_eq!(got.ok(), Some(want)),
                     (None, Ok(got)) => prop_assert!(false, "{rows:?} gave {got}"),
                     (None, Err(err)) => {

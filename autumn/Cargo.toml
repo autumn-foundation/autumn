@@ -1072,7 +1072,8 @@ name = "sqlite_derivation"
 path = "tests/sqlite_derivation.rs"
 
 # SQLite proof that a `sum` derivation's repair paths accept partial sums
-# that leave `i64` (issue #2663). Own binary: it registers one derivation.
+# that leave `i64` (issue #2663). Own binary: the backfill runs every
+# registered derivation, so this binary registers only one.
 [[test]]
 name = "sqlite_derivation_wide_sum"
 path = "tests/sqlite_derivation_wide_sum.rs"

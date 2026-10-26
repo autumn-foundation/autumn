@@ -427,12 +427,13 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   their total), but a parent already sitting at `i64::MIN` or `i64::MAX` that
   receives weights of the same magnitude can still refuse an intermediate
   value. The set-based paths (backfill, `recompute`, drift, bulk delete) do
-  not fail on row order: on SQLite they sum the high and low 32 bits of each
-  weight separately, so a running total outside `i64` is not an error when
-  the total is in range. This holds for fewer than 2^31 child rows per parent.
-  A total outside `i64` is an error on every path and on both backends. A
-  summed column whose values approach 2^63 is outside what a derivation is
-  for; keep weights far from that bound.
+  not depend on row order. A running total outside `i64` is not an error if
+  the total is in range. A bulk delete lands when the parent's new value is
+  in range, even if the deleted rows' sum is not. On SQLite, this is true
+  for fewer than 2^31 child rows per parent. A total outside `i64` is an error on every path and on
+  both backends. A summed column whose values approach 2^63 is outside what
+  a derivation is for; keep each parent's value far from `i64::MIN` and
+  `i64::MAX`.
 - **No configuration keys.** Reconciliation and the boot backfill are automatic
   and use the default `BackfillOptions`. Call `run_backfill` to pace a large
   repair by hand.
