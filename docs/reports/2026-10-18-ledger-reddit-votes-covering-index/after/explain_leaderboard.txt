@@ -1,0 +1,34 @@
+                                                                                   QUERY PLAN                                                                                   
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=108756.94..108756.95 rows=5 width=16) (actual time=580.765..580.768 rows=5 loops=1)
+   Output: post_id, (sum(value))
+   Buffers: shared hit=3 read=11464
+   I/O Timings: shared read=42.577
+   ->  Sort  (cost=108756.94..109025.86 rows=107569 width=16) (actual time=577.298..577.299 rows=5 loops=1)
+         Output: post_id, (sum(value))
+         Sort Key: (sum(votes.value)) DESC NULLS LAST, votes.post_id
+         Sort Method: top-N heapsort  Memory: 25kB
+         Buffers: shared hit=3 read=11464
+         I/O Timings: shared read=42.577
+         ->  GroupAggregate  (cost=0.43..106970.26 rows=107569 width=16) (actual time=4.992..533.558 rows=474971 loops=1)
+               Output: post_id, sum(value)
+               Group Key: votes.post_id
+               Buffers: shared read=11464
+               I/O Timings: shared read=42.577
+               ->  Index Only Scan using idx_votes_post_id_value on public.votes  (cost=0.43..90938.04 rows=2991307 width=10) (actual time=0.068..300.922 rows=2991307 loops=1)
+                     Output: post_id, value
+                     Heap Fetches: 0
+                     Buffers: shared read=11464
+                     I/O Timings: shared read=42.577
+ Query Identifier: -910236275765372446
+ Planning:
+   Buffers: shared hit=151 read=10
+   I/O Timings: shared read=0.062
+ Planning Time: 0.472 ms
+ JIT:
+   Functions: 4
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+   Timing: Generation 0.161 ms, Inlining 0.000 ms, Optimization 0.179 ms, Emission 3.308 ms, Total 3.647 ms
+ Execution Time: 594.464 ms
+(30 rows)
+

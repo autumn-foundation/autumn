@@ -1,0 +1,14 @@
+ calls |  blks  | pct  |  rows  | tmpw  | wal_bytes |                                                                           q                                                                            
+-------+--------+------+--------+-------+-----------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+    27 | 230970 | 49.7 | 437907 |  2871 |         0 | SELECT c."id" AS id, c."parent_id" AS parent_id, c."author_id" AS author_id, c."body" AS body, c."created_at" AS created_at, __autumn_cmt_author."user
+     5 | 124725 | 26.9 |     25 | 70178 |         0 | SELECT "post_id" AS agg_key, CAST(SUM("value") AS bigint) AS agg_val FROM "votes" WHERE "post_id" IS NOT NULL AND ($1 IS NULL OR "post_id" = $1) AND (
+     9 |  65601 | 14.1 |      9 |     0 |         0 | SELECT COUNT(*) FROM "posts" WHERE ("posts"."subreddit_id" = $1)
+     9 |  41593 |  9.0 |    180 |     0 |         0 | SELECT "posts"."id", "posts"."title", "posts"."slug", "posts"."score", "posts"."comment_count", "users"."username", "posts"."created_at" FROM ("posts"
+    32 |    459 |  0.1 |    152 |     0 |         0 | SELECT "users"."id", "users"."username", "users"."password_hash", "users"."karma", "users"."role", "users"."created_at", "users"."avatar" FROM "users"
+     5 |    143 |  0.0 |    125 |     0 |         0 | SELECT "posts"."id", "posts"."title", "posts"."slug", "posts"."body", "posts"."url", "posts"."author_id", "posts"."subreddit_id", "posts"."score", "po
+    27 |    135 |  0.0 |     27 |     0 |         0 | SELECT "id" AS id FROM "posts" WHERE "posts"."id" = $1
+    27 |    126 |  0.0 |      9 |     0 |         0 | SELECT "post_tags"."post_id", "tags"."id", "tags"."name", "tags"."slug" FROM ("post_tags" INNER JOIN "tags" ON ("tags"."id" = "post_tags"."tag_id")) W
+     5 |    115 |  0.0 |     95 |     0 |         0 | SELECT "subreddits"."id", "subreddits"."name", "subreddits"."slug", "subreddits"."description", "subreddits"."creator_id", "subreddits"."subscriber_co
+     5 |    112 |  0.0 |     25 |     0 |         0 | SELECT "posts"."id", "posts"."title" FROM "posts" WHERE ("posts"."id" = ANY($1))
+(10 rows)
+

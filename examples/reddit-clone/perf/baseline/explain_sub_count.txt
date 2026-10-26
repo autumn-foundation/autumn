@@ -1,0 +1,20 @@
+                                                                      QUERY PLAN                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=838.03..838.04 rows=1 width=8) (actual time=1.276..1.277 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=3 read=215 dirtied=1
+   I/O Timings: shared read=0.954
+   ->  Index Only Scan using idx_posts_subreddit_id on public.posts  (cost=0.42..837.29 rows=297 width=0) (actual time=0.066..1.251 rows=193 loops=1)
+         Output: subreddit_id
+         Index Cond: (posts.subreddit_id = 895)
+         Heap Fetches: 212
+         Buffers: shared hit=3 read=215 dirtied=1
+         I/O Timings: shared read=0.954
+ Query Identifier: -3265465098764853822
+ Planning:
+   Buffers: shared hit=128 read=30
+   I/O Timings: shared read=0.174
+ Planning Time: 0.593 ms
+ Execution Time: 1.327 ms
+(16 rows)
+

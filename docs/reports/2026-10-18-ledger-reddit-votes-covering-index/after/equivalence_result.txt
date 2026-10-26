@@ -1,0 +1,7 @@
+# psql -f equivalence.sql on the reseeded fixture (votes checksum a8faa6de1f369fec4fb993d2b90fbabb, 2,991,307 rows)
+-- index path
+474971|649360b2e95a8eb60e6e361ba29ca049|29810|39599    (groups | md5 | negative-sum groups | zero-sum groups)
+  ->  Index Only Scan using idx_votes_post_id_value on votes
+-- heap path (enable_indexonlyscan/indexscan/bitmapscan = off, diagnostic session only)
+474971|649360b2e95a8eb60e6e361ba29ca049|29810|39599
+                    ->  Parallel Seq Scan on votes
