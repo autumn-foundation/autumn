@@ -18,7 +18,8 @@ VACUUM ANALYZE autumn_jobs;
 SQL
   for v in baseline after_v1_regressed after; do
     f=claim_$v.sql
-    b=$( { echo "BEGIN;"; echo "EXPLAIN (ANALYZE, BUFFERS)"; sed '$ s/RETURNING id AS jid;/RETURNING id;/' $f; echo "ROLLBACK;"; } | psql -At | grep -m1 -E "^ +Buffers: shared" | sed 's/^ *//')
+    out=$( { echo "BEGIN;"; echo "EXPLAIN (ANALYZE, BUFFERS)"; sed '$ s/RETURNING id AS jid;/RETURNING id;/' $f; echo "ROLLBACK;"; } | psql -At)
+    b=$(grep -m1 -E "^ +Buffers: shared" <<<"$out" | sed 's/^ *//')
     echo "sat_backlog=$sat variant=$v  $b"
   done
 done | tee saturated_result.txt

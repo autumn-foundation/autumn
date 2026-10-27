@@ -11663,6 +11663,10 @@ fn pg_claim_sql_single_queue() -> String {
 /// before). Row locks are taken per probe and drop with the statement, as in the
 /// multi-queue claim.
 ///
+/// `heads` is referenced twice (the walk's base term tests it) so Postgres 12+
+/// materializes it instead of inlining it into every iteration; `AS MATERIALIZED`
+/// is not used because Postgres 11, the test-container default, rejects it.
+///
 /// Used only when `deferred` is non-empty, so the common path is untouched.
 #[cfg(feature = "postgres")]
 fn pg_claim_sql_single_queue_deferred() -> String {
@@ -11679,7 +11683,7 @@ fn pg_claim_sql_single_queue_deferred() -> String {
          CROSS JOIN LATERAL (SELECT name FROM autumn_jobs \
          WHERE status = 'enqueued' AND queue = $2 AND name > names.n ORDER BY name LIMIT 1) nx \
          ), \
-         heads AS MATERIALIZED ( \
+         heads AS ( \
          SELECT names.n, h.head, row_number() OVER (ORDER BY h.head, names.n) AS i FROM names \
          CROSS JOIN LATERAL (SELECT run_at AS head FROM autumn_jobs \
          WHERE status = 'enqueued' AND queue = $2 AND name = names.n AND run_at <= NOW() \
@@ -11687,7 +11691,7 @@ fn pg_claim_sql_single_queue_deferred() -> String {
          WHERE NOT names.skip \
          ), \
          walk(i, best_at, best_id) AS ( \
-         SELECT 0::bigint, NULL::timestamptz, NULL::text \
+         SELECT 0::bigint, NULL::timestamptz, NULL::text WHERE EXISTS (SELECT 1 FROM heads) \
          UNION ALL \
          SELECT heads.i, COALESCE(p.run_at, walk.best_at), COALESCE(p.id, walk.best_id) \
          FROM walk \

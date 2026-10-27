@@ -10,7 +10,7 @@ WHERE id = (
       CROSS JOIN LATERAL (SELECT name FROM autumn_jobs
         WHERE status = 'enqueued' AND queue = 'default' AND name > names.n ORDER BY name LIMIT 1) nx
   ),
-  heads AS MATERIALIZED (
+  heads AS (
     SELECT names.n, h.head, row_number() OVER (ORDER BY h.head, names.n) AS i FROM names
     CROSS JOIN LATERAL (SELECT run_at AS head FROM autumn_jobs
       WHERE status = 'enqueued' AND queue = 'default' AND name = names.n AND run_at <= NOW()
@@ -18,7 +18,7 @@ WHERE id = (
     WHERE NOT names.skip
   ),
   walk(i, best_at, best_id) AS (
-    SELECT 0::bigint, NULL::timestamptz, NULL::text
+    SELECT 0::bigint, NULL::timestamptz, NULL::text WHERE EXISTS (SELECT 1 FROM heads)
     UNION ALL
     SELECT heads.i, COALESCE(p.run_at, walk.best_at), COALESCE(p.id, walk.best_id)
     FROM walk

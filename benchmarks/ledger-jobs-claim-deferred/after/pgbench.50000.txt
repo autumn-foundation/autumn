@@ -8,6 +8,6 @@ maximum number of tries: 1
 number of transactions per client: 300
 number of transactions actually processed: 300/300
 number of failed transactions: 0 (0.000%)
-latency average = 1.992 ms
-initial connection time = 3.108 ms
-tps = 502.069363 (without initial connection time)
+latency average = 2.450 ms
+initial connection time = 5.146 ms
+tps = 408.151049 (without initial connection time)

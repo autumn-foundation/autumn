@@ -1,8 +1,8 @@
  calls | blks  | shared_blks_hit | shared_blks_read | temp_blks_written | wal_bytes | rows |                                             q                                              
 -------+-------+-----------------+------------------+-------------------+-----------+------+--------------------------------------------------------------------------------------------
-   300 | 32423 |           32173 |              250 |                 0 |   1128206 |  300 | UPDATE autumn_jobs SET status = $1, started_at = NOW(), claimed_by = $2, claimed_at = NOW(
-   300 |  4701 |            4685 |               16 |                 0 |    264505 |  300 | INSERT INTO autumn_jobs (id, name, status, run_at, queue, payload) VALUES (md5(random()::t
-   300 |  4598 |            4597 |                1 |                 0 |    118700 |  300 | UPDATE autumn_jobs SET status = $2, finished_at = NOW() WHERE id = $1
+   300 | 32423 |           32172 |              251 |                 0 |   1128206 |  300 | UPDATE autumn_jobs SET status = $1, started_at = NOW(), claimed_by = $2, claimed_at = NOW(
+   300 |  4701 |            4683 |               18 |                 0 |    264457 |  300 | INSERT INTO autumn_jobs (id, name, status, run_at, queue, payload) VALUES (md5(random()::t
+   300 |  4598 |            4597 |                1 |                 0 |    118706 |  300 | UPDATE autumn_jobs SET status = $2, finished_at = NOW() WHERE id = $1
      1 |     0 |               0 |                0 |                 0 |         0 |    1 | select pg_current_wal_lsn()
      1 |     0 |               0 |                0 |                 0 |         0 |    1 | SELECT pg_stat_reset()
      1 |     0 |               0 |                0 |                 0 |         0 |    1 | SELECT pg_stat_statements_reset()

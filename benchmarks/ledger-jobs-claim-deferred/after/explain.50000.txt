@@ -1,125 +1,128 @@
 BEGIN
                                                                                                                                           QUERY PLAN                                                                                                                                           
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Update on public.autumn_jobs  (cost=985.27..993.30 rows=1 width=150) (actual time=0.858..0.864 rows=1 loops=1)
+ Update on public.autumn_jobs  (cost=999.29..1007.31 rows=1 width=150) (actual time=0.858..0.864 rows=1 loops=1)
    Output: autumn_jobs.id
    Buffers: shared hit=117 read=1 dirtied=1
-   InitPlan 5 (returns $12)
-     ->  Limit  (cost=984.84..984.84 rows=1 width=40) (actual time=0.679..0.684 rows=1 loops=1)
+   InitPlan 6 (returns $13)
+     ->  Limit  (cost=998.86..998.86 rows=1 width=40) (actual time=0.685..0.690 rows=1 loops=1)
            Output: walk_1.best_id, walk_1.i
            Buffers: shared hit=103
            CTE names
-             ->  Recursive Union  (cost=0.42..51.85 rows=101 width=8) (actual time=0.075..0.315 rows=10 loops=1)
+             ->  Recursive Union  (cost=0.42..51.82 rows=101 width=8) (actual time=0.056..0.371 rows=10 loops=1)
                    Buffers: shared hit=52
-                   ->  Limit  (cost=0.42..0.47 rows=1 width=8) (actual time=0.075..0.075 rows=1 loops=1)
+                   ->  Limit  (cost=0.42..0.47 rows=1 width=8) (actual time=0.054..0.054 rows=1 loops=1)
                          Output: autumn_jobs_1.name, ((autumn_jobs_1.name = ANY ('{report.slow}'::text[])))
                          Buffers: shared hit=5
-                         ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on public.autumn_jobs autumn_jobs_1  (cost=0.42..7592.61 rows=148997 width=8) (actual time=0.074..0.074 rows=1 loops=1)
+                         ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on public.autumn_jobs autumn_jobs_1  (cost=0.42..7615.64 rows=150225 width=8) (actual time=0.050..0.051 rows=1 loops=1)
                                Output: autumn_jobs_1.name, (autumn_jobs_1.name = ANY ('{report.slow}'::text[]))
                                Index Cond: (autumn_jobs_1.queue = 'default'::text)
                                Heap Fetches: 1
                                Buffers: shared hit=5
-                   ->  Nested Loop  (cost=0.42..5.04 rows=10 width=8) (actual time=0.023..0.023 rows=1 loops=10)
+                   ->  Nested Loop  (cost=0.42..5.03 rows=10 width=8) (actual time=0.031..0.031 rows=1 loops=10)
                          Output: autumn_jobs_2.name, (autumn_jobs_2.name = ANY ('{report.slow}'::text[]))
                          Buffers: shared hit=47
                          ->  WorkTable Scan on names  (cost=0.00..0.20 rows=10 width=32) (actual time=0.000..0.000 rows=1 loops=10)
                                Output: names.n, names.skip
-                         ->  Limit  (cost=0.42..0.47 rows=1 width=7) (actual time=0.022..0.022 rows=1 loops=10)
+                         ->  Limit  (cost=0.42..0.47 rows=1 width=7) (actual time=0.030..0.030 rows=1 loops=10)
                                Output: autumn_jobs_2.name
                                Buffers: shared hit=47
-                               ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on public.autumn_jobs autumn_jobs_2  (cost=0.42..2604.24 rows=49666 width=7) (actual time=0.022..0.022 rows=1 loops=10)
+                               ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on public.autumn_jobs autumn_jobs_2  (cost=0.42..2612.42 rows=50075 width=7) (actual time=0.030..0.030 rows=1 loops=10)
                                      Output: autumn_jobs_2.name
                                      Index Cond: ((autumn_jobs_2.queue = 'default'::text) AND (autumn_jobs_2.name > names.n))
                                      Heap Fetches: 9
                                      Buffers: shared hit=47
            CTE heads
-             ->  WindowAgg  (cost=27.82..28.82 rows=50 width=48) (actual time=0.543..0.547 rows=9 loops=1)
+             ->  WindowAgg  (cost=27.81..28.81 rows=50 width=48) (actual time=0.551..0.555 rows=9 loops=1)
                    Output: names_1.n, autumn_jobs_3.run_at, row_number() OVER (?)
                    Buffers: shared hit=95
-                   ->  Sort  (cost=27.82..27.95 rows=50 width=40) (actual time=0.533..0.534 rows=9 loops=1)
+                   ->  Sort  (cost=27.81..27.93 rows=50 width=40) (actual time=0.542..0.543 rows=9 loops=1)
                          Output: names_1.n, autumn_jobs_3.run_at
                          Sort Key: autumn_jobs_3.run_at, names_1.n
                          Sort Method: quicksort  Memory: 25kB
                          Buffers: shared hit=95
-                         ->  Nested Loop  (cost=0.42..26.41 rows=50 width=40) (actual time=0.101..0.500 rows=9 loops=1)
+                         ->  Nested Loop  (cost=0.42..26.40 rows=50 width=40) (actual time=0.087..0.507 rows=9 loops=1)
                                Output: names_1.n, autumn_jobs_3.run_at
                                Buffers: shared hit=89
-                               ->  CTE Scan on names names_1  (cost=0.00..2.02 rows=50 width=32) (actual time=0.076..0.326 rows=9 loops=1)
+                               ->  CTE Scan on names names_1  (cost=0.00..2.02 rows=50 width=32) (actual time=0.057..0.382 rows=9 loops=1)
                                      Output: names_1.n, names_1.skip
                                      Filter: (NOT names_1.skip)
                                      Rows Removed by Filter: 1
                                      Buffers: shared hit=52
-                               ->  Limit  (cost=0.42..0.48 rows=1 width=8) (actual time=0.019..0.019 rows=1 loops=9)
+                               ->  Limit  (cost=0.42..0.48 rows=1 width=8) (actual time=0.013..0.013 rows=1 loops=9)
                                      Output: autumn_jobs_3.run_at
                                      Buffers: shared hit=37
-                                     ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on public.autumn_jobs autumn_jobs_3  (cost=0.42..824.88 rows=14898 width=8) (actual time=0.018..0.018 rows=1 loops=9)
+                                     ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on public.autumn_jobs autumn_jobs_3  (cost=0.42..827.64 rows=15021 width=8) (actual time=0.013..0.013 rows=1 loops=9)
                                            Output: autumn_jobs_3.run_at
                                            Index Cond: ((autumn_jobs_3.queue = 'default'::text) AND (autumn_jobs_3.name = names_1.n) AND (autumn_jobs_3.run_at <= now()))
                                            Heap Fetches: 10
                                            Buffers: shared hit=37
            CTE walk
-             ->  Recursive Union  (cost=0.00..903.39 rows=31 width=48) (actual time=0.005..0.649 rows=2 loops=1)
+             ->  Recursive Union  (cost=0.02..917.45 rows=31 width=48) (actual time=0.557..0.661 rows=2 loops=1)
                    Buffers: shared hit=100
-                   ->  Result  (cost=0.00..0.01 rows=1 width=48) (actual time=0.001..0.001 rows=1 loops=1)
+                   ->  Result  (cost=0.02..0.03 rows=1 width=48) (actual time=0.553..0.553 rows=1 loops=1)
                          Output: '0'::bigint, NULL::timestamp with time zone, NULL::text
-                   ->  Nested Loop Left Join  (cost=0.75..90.31 rows=3 width=48) (actual time=0.316..0.321 rows=0 loops=2)
-                         Output: heads.i, COALESCE(p.run_at, walk.best_at), COALESCE(p.id, walk.best_id)
-                         Buffers: shared hit=100
-                         ->  Hash Join  (cost=0.33..1.70 rows=3 width=80) (actual time=0.299..0.303 rows=0 loops=2)
-                               Output: walk.best_at, walk.best_id, heads.i, heads.n
-                               Hash Cond: (heads.i = (walk.i + 1))
-                               Join Filter: ((walk.best_at IS NULL) OR (heads.head < walk.best_at))
+                         One-Time Filter: $6
+                         Buffers: shared hit=95
+                         InitPlan 3 (returns $6)
+                           ->  CTE Scan on heads  (cost=0.00..1.00 rows=50 width=0) (actual time=0.552..0.552 rows=1 loops=1)
+                                 Buffers: shared hit=95
+                   ->  Nested Loop Left Join  (cost=0.75..91.71 rows=3 width=48) (actual time=0.038..0.051 rows=0 loops=2)
+                         Output: heads_1.i, COALESCE(p.run_at, walk.best_at), COALESCE(p.id, walk.best_id)
+                         Buffers: shared hit=5
+                         ->  Hash Join  (cost=0.33..1.70 rows=3 width=80) (actual time=0.021..0.034 rows=0 loops=2)
+                               Output: walk.best_at, walk.best_id, heads_1.i, heads_1.n
+                               Hash Cond: (heads_1.i = (walk.i + 1))
+                               Join Filter: ((walk.best_at IS NULL) OR (heads_1.head < walk.best_at))
                                Rows Removed by Join Filter: 0
-                               Buffers: shared hit=95
-                               ->  CTE Scan on heads  (cost=0.00..1.00 rows=50 width=48) (actual time=0.272..0.275 rows=9 loops=2)
-                                     Output: heads.n, heads.head, heads.i
-                                     Buffers: shared hit=95
-                               ->  Hash  (cost=0.20..0.20 rows=10 width=48) (actual time=0.008..0.009 rows=1 loops=2)
+                               ->  CTE Scan on heads heads_1  (cost=0.00..1.00 rows=50 width=48) (actual time=0.000..0.012 rows=9 loops=2)
+                                     Output: heads_1.n, heads_1.head, heads_1.i
+                               ->  Hash  (cost=0.20..0.20 rows=10 width=48) (actual time=0.005..0.005 rows=1 loops=2)
                                      Output: walk.best_at, walk.best_id, walk.i
                                      Buckets: 1024  Batches: 1  Memory Usage: 9kB
-                                     ->  WorkTable Scan on walk  (cost=0.00..0.20 rows=10 width=48) (actual time=0.003..0.003 rows=1 loops=2)
+                                     ->  WorkTable Scan on walk  (cost=0.00..0.20 rows=10 width=48) (actual time=0.001..0.001 rows=1 loops=2)
                                            Output: walk.best_at, walk.best_id, walk.i
-                         ->  Subquery Scan on p  (cost=0.42..29.53 rows=1 width=19) (actual time=0.032..0.033 rows=1 loops=1)
+                         ->  Subquery Scan on p  (cost=0.42..29.99 rows=1 width=19) (actual time=0.030..0.031 rows=1 loops=1)
                                Output: p.id, p.run_at
                                Buffers: shared hit=5
-                               ->  Limit  (cost=0.42..29.52 rows=1 width=25) (actual time=0.031..0.032 rows=1 loops=1)
+                               ->  Limit  (cost=0.42..29.98 rows=1 width=25) (actual time=0.029..0.030 rows=1 loops=1)
                                      Output: candidate.id, candidate.run_at, candidate.ctid
                                      Buffers: shared hit=5
-                                     ->  LockRows  (cost=0.42..145932.17 rows=5016 width=25) (actual time=0.031..0.031 rows=1 loops=1)
+                                     ->  LockRows  (cost=0.42..149491.28 rows=5057 width=25) (actual time=0.029..0.030 rows=1 loops=1)
                                            Output: candidate.id, candidate.run_at, candidate.ctid
                                            Buffers: shared hit=5
-                                           ->  Index Scan using idx_autumn_jobs_queue_name_ready on public.autumn_jobs candidate  (cost=0.42..145882.01 rows=5016 width=25) (actual time=0.018..0.018 rows=1 loops=1)
+                                           ->  Index Scan using idx_autumn_jobs_queue_name_ready on public.autumn_jobs candidate  (cost=0.42..149440.71 rows=5057 width=25) (actual time=0.019..0.020 rows=1 loops=1)
                                                  Output: candidate.id, candidate.run_at, candidate.ctid
-                                                 Index Cond: ((candidate.queue = 'default'::text) AND (candidate.name = heads.n) AND (candidate.run_at <= now()))
-                                                 Filter: (((walk.best_at IS NULL) OR (candidate.run_at < walk.best_at)) AND (candidate.status = 'enqueued'::text) AND ((candidate.concurrency_limit IS NULL) OR ((SubPlan 3) < candidate.concurrency_limit)))
+                                                 Index Cond: ((candidate.queue = 'default'::text) AND (candidate.name = heads_1.n) AND (candidate.run_at <= now()))
+                                                 Filter: (((walk.best_at IS NULL) OR (candidate.run_at < walk.best_at)) AND (candidate.status = 'enqueued'::text) AND ((candidate.concurrency_limit IS NULL) OR ((SubPlan 4) < candidate.concurrency_limit)))
                                                  Buffers: shared hit=4
-                                                 SubPlan 3
-                                                   ->  Aggregate  (cost=8.45..8.46 rows=1 width=8) (never executed)
+                                                 SubPlan 4
+                                                   ->  Aggregate  (cost=8.61..8.62 rows=1 width=8) (never executed)
                                                          Output: count(*)
-                                                         ->  Index Only Scan using idx_autumn_jobs_concurrency_running on public.autumn_jobs running  (cost=0.14..8.45 rows=1 width=0) (never executed)
+                                                         ->  Index Only Scan using idx_autumn_jobs_concurrency_running on public.autumn_jobs running  (cost=0.14..8.60 rows=1 width=0) (never executed)
                                                                Output: running.name, running.concurrency_key
                                                                Index Cond: (running.name = candidate.name)
                                                                Filter: (NOT (running.concurrency_key IS DISTINCT FROM candidate.concurrency_key))
                                                                Heap Fetches: 0
-           ->  Sort  (cost=0.78..0.85 rows=31 width=40) (actual time=0.678..0.678 rows=1 loops=1)
+           ->  Sort  (cost=0.78..0.85 rows=31 width=40) (actual time=0.684..0.684 rows=1 loops=1)
                  Output: walk_1.best_id, walk_1.i
                  Sort Key: walk_1.i DESC
                  Sort Method: quicksort  Memory: 25kB
                  Buffers: shared hit=103
-                 ->  CTE Scan on walk walk_1  (cost=0.00..0.62 rows=31 width=40) (actual time=0.628..0.651 rows=1 loops=1)
+                 ->  CTE Scan on walk walk_1  (cost=0.00..0.62 rows=31 width=40) (actual time=0.623..0.662 rows=1 loops=1)
                        Output: walk_1.best_id, walk_1.i
                        Filter: (walk_1.best_id IS NOT NULL)
                        Rows Removed by Filter: 1
                        Buffers: shared hit=100
-   ->  Index Scan using autumn_jobs_pkey on public.autumn_jobs  (cost=0.43..8.46 rows=1 width=150) (actual time=0.733..0.733 rows=1 loops=1)
+   ->  Index Scan using autumn_jobs_pkey on public.autumn_jobs  (cost=0.43..8.46 rows=1 width=150) (actual time=0.735..0.735 rows=1 loops=1)
          Output: 'running'::text, now(), 'w1'::text, now(), CASE WHEN (autumn_jobs.unique_window = 'pending'::text) THEN NULL::text ELSE autumn_jobs.unique_key END, CASE WHEN (autumn_jobs.unique_window = 'pending'::text) THEN autumn_jobs.unique_key ELSE NULL::text END, autumn_jobs.ctid
-         Index Cond: (autumn_jobs.id = $12)
+         Index Cond: (autumn_jobs.id = $13)
          Buffers: shared hit=106 read=1
- Query Identifier: -2251716798824332385
+ Query Identifier: -6002917494051308364
  Planning:
    Buffers: shared hit=262
- Planning Time: 2.507 ms
- Execution Time: 1.283 ms
-(119 rows)
+ Planning Time: 1.905 ms
+ Execution Time: 1.443 ms
+(122 rows)
 
 ROLLBACK
