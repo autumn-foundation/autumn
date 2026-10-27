@@ -126,7 +126,7 @@ impl MasterKey {
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0u8; KEY_LEN];
-        getrandom::getrandom(&mut bytes).expect("OS RNG failed");
+        getrandom::fill(&mut bytes).expect("OS RNG failed");
         Self {
             bytes,
             source: "generated".to_owned(),
@@ -200,10 +200,10 @@ pub fn encrypt(key: &MasterKey, plaintext: &[u8]) -> Vec<u8> {
     use aes_gcm::{Aes256Gcm, Nonce};
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce_bytes).expect("OS RNG failed");
+    getrandom::fill(&mut nonce_bytes).expect("OS RNG failed");
 
     let cipher = Aes256Gcm::new_from_slice(&key.bytes).expect("key is always 32 bytes");
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = <&Nonce<_>>::from(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
         .expect("AES-GCM encryption cannot fail for valid inputs");
@@ -245,7 +245,7 @@ pub fn decrypt(key: &MasterKey, ciphertext: &[u8]) -> Result<Vec<u8>, Credential
     let data = &ciphertext[1 + NONCE_LEN..];
 
     let cipher = Aes256Gcm::new_from_slice(&key.bytes).expect("key is always 32 bytes");
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = <&Nonce<_>>::from(nonce_bytes);
 
     cipher
         .decrypt(nonce, data)

@@ -327,7 +327,7 @@ pub fn jittered_ttl(base: Duration, fraction: f64) -> Duration {
     }
 
     let mut buf = [0_u8; 4];
-    if getrandom::getrandom(&mut buf).is_err() {
+    if getrandom::fill(&mut buf).is_err() {
         // Fallback entropy source if the OS RNG is unavailable.
         let nanos = crate::time::ambient_system_time()
             .duration_since(UNIX_EPOCH)

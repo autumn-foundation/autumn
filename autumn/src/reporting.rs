@@ -351,7 +351,7 @@ thread_local! {
 /// non-zero constant if that ever fails (Xorshift must never start at zero).
 fn seed_rng() -> u64 {
     let mut buf = [0u8; 8];
-    if getrandom::getrandom(&mut buf).is_ok() {
+    if getrandom::fill(&mut buf).is_ok() {
         let seed = u64::from_ne_bytes(buf);
         if seed != 0 {
             return seed;

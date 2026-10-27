@@ -8937,12 +8937,12 @@ fn totp_enc_key() -> AutumnResult<[u8; 32]> {
 fn encrypt_secret(plaintext: &[u8]) -> AutumnResult<String> {
     use rand::TryRngCore;
     let key = totp_enc_key()?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::from(&key));
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng
         .try_fill_bytes(&mut nonce_bytes)
         .map_err(|_| AutumnError::internal_server_error_msg("RNG failure generating nonce"))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = <&Nonce<_>>::from(&nonce_bytes);
     let ct = cipher
         .encrypt(nonce, plaintext)
         .map_err(|_| AutumnError::internal_server_error_msg("failed to encrypt TOTP secret"))?;
@@ -8954,7 +8954,7 @@ fn encrypt_secret(plaintext: &[u8]) -> AutumnResult<String> {
 /// Decrypt a stored TOTP secret produced by [`encrypt_secret`].
 fn decrypt_secret(stored: &str) -> AutumnResult<Vec<u8>> {
     let key = totp_enc_key()?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::from(&key));
     let raw = B64
         .decode(stored.trim())
         .map_err(|_| AutumnError::internal_server_error_msg("stored TOTP secret is not valid base64"))?;
@@ -8964,7 +8964,7 @@ fn decrypt_secret(stored: &str) -> AutumnResult<Vec<u8>> {
         ));
     }
     let (nonce_bytes, ct) = raw.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = <&Nonce<_>>::from(nonce_bytes);
     cipher
         .decrypt(nonce, ct)
         .map_err(|_| AutumnError::internal_server_error_msg("failed to decrypt TOTP secret"))

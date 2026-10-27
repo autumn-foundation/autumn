@@ -145,7 +145,7 @@ pub enum RememberDecision {
 /// Generate one cryptographically-random opaque id (URL-safe, ≥128 bits).
 fn generate_opaque_id() -> String {
     let mut bytes = [0u8; REMEMBER_ID_BYTES];
-    getrandom::getrandom(&mut bytes).expect("getrandom must not fail on supported platforms");
+    getrandom::fill(&mut bytes).expect("getrandom must not fail on supported platforms");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

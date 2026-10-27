@@ -317,7 +317,7 @@ pub fn verification_record_name(hostname: &str) -> String {
 fn mint_verification_token() -> io::Result<String> {
     use std::fmt::Write as _;
     let mut bytes = [0_u8; 16];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|e| io::Error::other(format!("the OS random source failed: {e}")))?;
     let mut out = String::with_capacity(32);
     for byte in bytes {

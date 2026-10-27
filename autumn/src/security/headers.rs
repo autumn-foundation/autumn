@@ -134,7 +134,7 @@ where
 fn generate_nonce() -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("getrandom must not fail on supported platforms");
+    getrandom::fill(&mut bytes).expect("getrandom must not fail on supported platforms");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

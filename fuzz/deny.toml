@@ -37,12 +37,6 @@ ignore = [
     # JWT sign/verify path specifically. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), matching the
     # root policy's own review-by for this same advisory.
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken, same as root deny.toml; not exercised by any fuzz target; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2024-0449 — unsafe-libyaml unmaintained (not a vulnerability).
-    # Same ingress and verdict as the root `deny.toml`: unsafe-libyaml ->
-    # serde_yaml 0.9 -> autumn-web's `openapi` feature. It only serializes the
-    # OpenAPI document; no fuzz target parses untrusted YAML. No safe upgrade.
-    # Review-by: 2026-11-12, matching the root policy.
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (not a vulnerability); serde_yaml only serializes the OpenAPI document, parses no untrusted YAML; no safe upgrade; same as root deny.toml; review-by 2026-11-12" },
     # RUSTSEC-2026-0387 — crypto-bigint secret-dependent branches in nominally
     # constant-time operations. Fixed only in >=0.7.6; no 0.4.x/0.5.x release
     # carries it. Two copies: 0.4.9 via aws-sigv4 -> p256 0.11 (SigV4a ECDSA

@@ -90,18 +90,6 @@ ignore = [
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05: still no fixed
     # rsa release; see docs/reports/2026-10-05-ballast-dependency-ledger-audit.md).
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2024-0449 — `unsafe-libyaml` is unmaintained.
-    # https://rustsec.org/advisories/RUSTSEC-2024-0449
-    #
-    # Ships pre-waived because it is unavoidable: it arrives through
-    # `serde_yaml` (itself deprecated), a dependency of autumn-web. Unmaintained,
-    # not vulnerable — there is no exploit here, and no safe upgrade exists.
-    # autumn-web only serializes the OpenAPI document with it; it parses no
-    # untrusted YAML. Autumn drops this waiver when it moves to a safe-Rust YAML
-    # crate, so the review-by below is Autumn's cadence: on a date that has
-    # passed, take the newest autumn-web and re-run the audit.
-    # Review-by: 2026-11-12.
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (not a vulnerability); reaches this app only through autumn-web's serde_yaml, which serializes the OpenAPI document and parses no untrusted YAML; no safe upgrade; review-by 2026-11-12" },
     # RUSTSEC-2026-0387 — `crypto-bigint` has secret-dependent branches in
     # nominally constant-time operations.
     # https://rustsec.org/advisories/RUSTSEC-2026-0387

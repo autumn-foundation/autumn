@@ -1539,10 +1539,10 @@ pub mod unsubscribe {
         let key = derive_key(&keys.current);
         let cipher = Aes256Gcm::new_from_slice(&key).expect("derived key is always 32 bytes");
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce_bytes).expect("OS RNG failed");
+        getrandom::fill(&mut nonce_bytes).expect("OS RNG failed");
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                <&Nonce<_>>::from(&nonce_bytes),
                 plaintext(subscriber, list_id, expiry_unix).as_bytes(),
             )
             .expect("AES-GCM encryption cannot fail for valid inputs");
@@ -1576,7 +1576,7 @@ pub mod unsubscribe {
         if blob[0] != TOKEN_VERSION {
             return Err(TokenError::Malformed);
         }
-        let nonce = Nonce::from_slice(&blob[1..=NONCE_LEN]);
+        let nonce = <&Nonce<_>>::from(&blob[1..=NONCE_LEN]);
         let ciphertext = &blob[1 + NONCE_LEN..];
         // Try the current key first, then any rotation-grace `previous` keys. A
         // wrong key (or any tampering) fails AES-GCM authentication.

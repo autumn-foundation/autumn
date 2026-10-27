@@ -339,7 +339,7 @@ impl KeyRing {
         let (mode_byte, data_key, nonce_bytes) = match mode {
             Mode::Randomized => {
                 let mut nonce = [0u8; NONCE_LEN];
-                getrandom::getrandom(&mut nonce).expect("OS RNG failed");
+                getrandom::fill(&mut nonce).expect("OS RNG failed");
                 (MODE_RANDOMIZED, &self.primary, nonce)
             }
             Mode::Deterministic => {
@@ -358,7 +358,7 @@ impl KeyRing {
 
         let ciphertext = data_key
             .cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+            .encrypt(<&Nonce<_>>::from(&nonce_bytes), plaintext)
             .expect("AES-GCM encryption cannot fail for valid inputs");
 
         let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
@@ -417,7 +417,7 @@ impl KeyRing {
             .ok_or(EncryptionError::UnknownKeyId(key_id))?;
         data_key
             .cipher
-            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+            .decrypt(<&Nonce<_>>::from(nonce_bytes), ciphertext)
             .map_err(|_| EncryptionError::DecryptionFailed)
     }
 }
@@ -967,7 +967,7 @@ mod tests {
         static S: OnceLock<[u8; 16]> = OnceLock::new();
         S.get_or_init(|| {
             let mut b = [0u8; 16];
-            getrandom::getrandom(&mut b).expect("OS RNG");
+            getrandom::fill(&mut b).expect("OS RNG");
             b
         })
     }
@@ -976,7 +976,7 @@ mod tests {
         static S: OnceLock<[u8; 16]> = OnceLock::new();
         S.get_or_init(|| {
             let mut b = [1u8; 16];
-            getrandom::getrandom(&mut b).expect("OS RNG");
+            getrandom::fill(&mut b).expect("OS RNG");
             b
         })
     }
