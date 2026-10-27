@@ -37,15 +37,9 @@ tower = { workspace = true, features = ["util"] }
 # Pure-Rust WASM interpreter for the reference host behind the `host` feature.
 # Not pinned in `[workspace.dependencies]` because nothing else in the workspace
 # links it and the dependency is native-only (never compiled for wasm). MSRV
-# verified: wasmi 2.0 declares `rust-version = "1.86"`, below this workspace's
+# verified: wasmi 0.40 declares `rust-version = "1.86"`, below this workspace's
 # 1.88 floor. Licensed MIT OR Apache-2.0, matching the workspace policy.
-# `portable-dispatch`: wasmi 2.0's default dispatch chains instruction
-# handlers as tail calls and relies on LLVM turning them into jumps. That is an
-# optimization, not a guarantee (stable Rust has no `become`); when it does not
-# happen, every interpreted instruction takes a native stack frame and a long
-# guest run aborts the process with a stack overflow, as rustc 1.99 builds did
-# in CI. The loop dispatcher keeps native stack flat whatever the toolchain.
-wasmi = { version = "2.0", optional = true, features = ["portable-dispatch"] }
+wasmi = { version = "0.40", optional = true }
 # The edge node (feature `node`, native only). The HTTP server and the origin
 # client. Same reqwest line as `autumn-cli`. `http-body` (already in the graph
 # through axum) lets the node send a request body to the origin without a

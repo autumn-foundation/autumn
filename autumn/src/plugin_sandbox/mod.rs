@@ -179,30 +179,23 @@ mod manifest_guard {
             .expect("the plugin-sandbox feature is declared")
     }
 
-    /// The interpreter is two crates: `wasmi` and its own `wasmi_core`, named
-    /// directly only because wasmi 2.0 keeps `LimiterError` (what the
-    /// `ResourceLimiter` the sandbox implements returns) in a private module.
-    /// `wasmi_core` is already in the graph under `wasmi`, so the pair adds
-    /// nothing a `wasmi` edge alone would not.
     #[test]
-    fn the_feature_adds_only_the_interpreter() {
+    fn the_feature_adds_exactly_one_dependency() {
         assert_eq!(
             feature_line(),
-            r#"plugin-sandbox = ["dep:wasmi", "dep:wasmi_core"]"#,
+            r#"plugin-sandbox = ["dep:wasmi"]"#,
             "enabling the sandbox must pull in the interpreter and nothing else"
         );
     }
 
     #[test]
     fn the_interpreter_is_optional_so_a_default_build_never_links_it() {
-        for name in ["wasmi =", "wasmi_core ="] {
-            let dependency = MANIFEST
-                .lines()
-                .map(str::trim)
-                .find(|line| line.starts_with(name))
-                .unwrap_or_else(|| panic!("`{name}` is a dependency"));
-            assert!(dependency.contains("optional = true"), "{dependency}");
-        }
+        let wasmi = MANIFEST
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("wasmi ="))
+            .expect("wasmi is a dependency");
+        assert!(wasmi.contains("optional = true"), "{wasmi}");
         let default = MANIFEST
             .lines()
             .map(str::trim)

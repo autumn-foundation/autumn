@@ -308,7 +308,7 @@ edge = ["dep:autumn-edge"]
 # the always-on workspace clippy and test lanes cover the module — but it is
 # why "off by default" is a statement about `autumn-web`'s feature set, not
 # about every build in the tree.
-plugin-sandbox = ["dep:wasmi", "dep:wasmi_core"]
+plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
 autumn-edge = { version = "0.9.0", path = "../autumn-edge", optional = true }
@@ -316,14 +316,7 @@ autumn-edge = { version = "0.9.0", path = "../autumn-edge", optional = true }
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
 # floor); licensed MIT OR Apache-2.0.
-# `portable-dispatch`: see autumn-edge/Cargo.toml.
-wasmi = { version = "2.0", optional = true, features = ["portable-dispatch"] }
-# wasmi 2.0 keeps `LimiterError` (the error type `ResourceLimiter`'s methods
-# return) in a private module, so the sandbox's limiter names it through
-# `wasmi_core` directly. Already in `Cargo.lock` as wasmi's own dependency, so
-# this adds no crate to the graph. `default-features = false` matches how wasmi
-# itself depends on it; wasmi's `std` feature turns `std` back on.
-wasmi_core = { version = "2.0", default-features = false, optional = true }
+wasmi = { version = "0.40", optional = true }
 # `default-features = false` drops the database-layer macros from the core
 # macro crate; the `db` feature above pulls them back in through the
 # `autumn-macros-model` / `autumn-macros-repository` crates. A no-database app

@@ -186,10 +186,6 @@ impl EdgeArtifact {
         // itself does not change what a well-behaved capsule computes.
         let mut config = Config::default();
         config.consume_fuel(true);
-        // Translate the whole capsule at load. wasmi 2.0's default lazy
-        // translation would bill the first request's fuel budget for code
-        // every later request reuses.
-        config.compilation_mode(wasmi::CompilationMode::Eager);
         let engine = Engine::new(&config);
         let module =
             Module::new(&engine, wasm).map_err(|err| EdgeHostError::Load(err.to_string()))?;
@@ -245,7 +241,9 @@ impl EdgeArtifact {
         let mut linker = <Linker<HostState<'_>>>::new(&self.engine);
         define_wasi_shim(&mut linker)?;
 
-        let started = linker.instantiate_and_start(&mut store, &self.module);
+        let started = linker
+            .instantiate(&mut store, &self.module)
+            .and_then(|pre| pre.start(&mut store));
         let instance = match started {
             Ok(instance) => instance,
             Err(err) => {
@@ -267,7 +265,7 @@ impl EdgeArtifact {
         let fuel_exhausted = trap
             .as_ref()
             .and_then(wasmi::Error::as_trap_code)
-            .is_some_and(|code| matches!(code, wasmi::TrapCode::OutOfFuel));
+            .is_some_and(|code| matches!(code, wasmi::core::TrapCode::OutOfFuel));
         let state = store.into_data();
 
         if let Some(outcome) = state.terminal.clone() {
