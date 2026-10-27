@@ -316,7 +316,8 @@ autumn-edge = { version = "0.9.0", path = "../autumn-edge", optional = true }
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
 # floor); licensed MIT OR Apache-2.0.
-wasmi = { version = "2.0", optional = true }
+# `portable-dispatch`: see autumn-edge/Cargo.toml.
+wasmi = { version = "2.0", optional = true, features = ["portable-dispatch"] }
 # wasmi 2.0 keeps `LimiterError` (the error type `ResourceLimiter`'s methods
 # return) in a private module, so the sandbox's limiter names it through
 # `wasmi_core` directly. Already in `Cargo.lock` as wasmi's own dependency, so
