@@ -222,6 +222,46 @@ fn text_area_aria_label_variant() {
 }
 
 #[test]
+fn text_area_labelled_by_variant() {
+    let markup = TextArea::new("note")
+        .labelled_by("note-heading")
+        .render()
+        .into_string();
+    assert!(
+        markup.contains("aria-labelledby=\"note-heading\""),
+        "{markup}"
+    );
+    assert!(!markup.contains("<label"), "{markup}");
+}
+
+#[test]
+fn text_area_aria_invalid_and_required_variants() {
+    let invalid = TextArea::new("bio")
+        .aria_invalid(true)
+        .label("Bio")
+        .render()
+        .into_string();
+    assert!(invalid.contains("aria-invalid=\"true\""), "{invalid}");
+
+    let valid = TextArea::new("bio")
+        .aria_invalid(false)
+        .label("Bio")
+        .render()
+        .into_string();
+    assert!(valid.contains("aria-invalid=\"false\""), "{valid}");
+
+    let unset = TextArea::new("bio").label("Bio").render().into_string();
+    assert!(!unset.contains("aria-invalid"), "{unset}");
+
+    let required = TextArea::new("bio")
+        .aria_required()
+        .label("Bio")
+        .render()
+        .into_string();
+    assert!(required.contains("aria-required=\"true\""), "{required}");
+}
+
+#[test]
 fn select_renders_each_option_with_value_label_and_selected() {
     let markup = Select::new("role")
         .option("", "— Select —")
@@ -274,6 +314,43 @@ fn select_placeholder_option_can_be_disabled() {
 }
 
 #[test]
+fn select_aria_label_variant() {
+    let markup = Select::new("role")
+        .option("admin", "Admin")
+        .aria_label("Role")
+        .render()
+        .into_string();
+    assert!(markup.contains("aria-label=\"Role\""), "{markup}");
+    assert!(!markup.contains("<label"), "{markup}");
+}
+
+#[test]
+fn select_aria_invalid_variant() {
+    let invalid = Select::new("role")
+        .option("admin", "Admin")
+        .aria_invalid(true)
+        .label("Role")
+        .render()
+        .into_string();
+    assert!(invalid.contains("aria-invalid=\"true\""), "{invalid}");
+
+    let valid = Select::new("role")
+        .option("admin", "Admin")
+        .aria_invalid(false)
+        .label("Role")
+        .render()
+        .into_string();
+    assert!(valid.contains("aria-invalid=\"false\""), "{valid}");
+
+    let unset = Select::new("role")
+        .option("admin", "Admin")
+        .label("Role")
+        .render()
+        .into_string();
+    assert!(!unset.contains("aria-invalid"), "{unset}");
+}
+
+#[test]
 fn checkbox_renders_type_checked_and_label_association() {
     let markup = Checkbox::new("accept_terms")
         .value("true")
@@ -310,6 +387,49 @@ fn checkbox_unchecked_by_default() {
 }
 
 #[test]
+fn checkbox_labelled_by_variant() {
+    let markup = Checkbox::new("subscribe")
+        .labelled_by("subscribe-heading")
+        .render()
+        .into_string();
+    assert!(
+        markup.contains("aria-labelledby=\"subscribe-heading\""),
+        "{markup}"
+    );
+    assert!(!markup.contains("<label"), "{markup}");
+}
+
+#[test]
+fn checkbox_aria_invalid_and_required_variants() {
+    let invalid = Checkbox::new("terms")
+        .aria_invalid(true)
+        .label("Accept")
+        .render()
+        .into_string();
+    assert!(invalid.contains("aria-invalid=\"true\""), "{invalid}");
+
+    let valid = Checkbox::new("terms")
+        .aria_invalid(false)
+        .label("Accept")
+        .render()
+        .into_string();
+    assert!(valid.contains("aria-invalid=\"false\""), "{valid}");
+
+    let unset = Checkbox::new("terms")
+        .label("Accept")
+        .render()
+        .into_string();
+    assert!(!unset.contains("aria-invalid"), "{unset}");
+
+    let required = Checkbox::new("terms")
+        .aria_required()
+        .label("Accept")
+        .render()
+        .into_string();
+    assert!(required.contains("aria-required=\"true\""), "{required}");
+}
+
+#[test]
 fn file_field_renders_type_accept_and_multiple() {
     let markup = FileField::new("docs")
         .accept("application/pdf")
@@ -342,6 +462,49 @@ fn visible_labeled_file_field_emits_no_competing_aria_label() {
         !markup.contains("aria-label"),
         "a visible-labeled file field must not emit a competing aria-label: {markup}"
     );
+}
+
+#[test]
+fn file_field_labelled_by_variant() {
+    let markup = FileField::new("avatar")
+        .labelled_by("avatar-heading")
+        .render()
+        .into_string();
+    assert!(
+        markup.contains("aria-labelledby=\"avatar-heading\""),
+        "{markup}"
+    );
+    assert!(!markup.contains("<label"), "{markup}");
+}
+
+#[test]
+fn file_field_aria_invalid_and_required_variants() {
+    let invalid = FileField::new("avatar")
+        .aria_invalid(true)
+        .label("Avatar")
+        .render()
+        .into_string();
+    assert!(invalid.contains("aria-invalid=\"true\""), "{invalid}");
+
+    let valid = FileField::new("avatar")
+        .aria_invalid(false)
+        .label("Avatar")
+        .render()
+        .into_string();
+    assert!(valid.contains("aria-invalid=\"false\""), "{valid}");
+
+    let unset = FileField::new("avatar")
+        .label("Avatar")
+        .render()
+        .into_string();
+    assert!(!unset.contains("aria-invalid"), "{unset}");
+
+    let required = FileField::new("avatar")
+        .aria_required()
+        .label("Avatar")
+        .render()
+        .into_string();
+    assert!(required.contains("aria-required=\"true\""), "{required}");
 }
 
 #[test]
