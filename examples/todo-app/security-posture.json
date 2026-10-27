@@ -248,7 +248,7 @@
           "provenance": "provable"
         },
         {
-          "path": "/static/js/autumn-webmcp.ccab5f38.js",
+          "path": "/static/js/autumn-webmcp.243e2734.js",
           "method": "GET",
           "name": "webmcp",
           "classification": "framework",
@@ -686,7 +686,7 @@
           "mtls_required": false
         },
         {
-          "path": "/static/js/autumn-webmcp.ccab5f38.js",
+          "path": "/static/js/autumn-webmcp.243e2734.js",
           "method": "GET",
           "mtls_required": false
         },
