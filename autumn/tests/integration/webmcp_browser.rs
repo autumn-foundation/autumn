@@ -26,6 +26,8 @@ static DELETES: AtomicUsize = AtomicUsize::new(0);
 static DROPS: AtomicUsize = AtomicUsize::new(0);
 /// Posts to `/quiet`, which only the `quiet_note` form sends.
 static QUIET: AtomicUsize = AtomicUsize::new(0);
+/// Requests to `/override`, which only the `override_drop` form sends.
+static OVERRIDES: AtomicUsize = AtomicUsize::new(0);
 
 const STUB_JS: &str = r#"
 window.__reg = {};
@@ -88,6 +90,12 @@ fn page_html(stub: bool) -> String {
   <input name="title">
   <button>Quiet</button>
 </form>
+<form hx-post="/override" hx-target="#out">
+  <span hidden data-webmcp-tool="override_drop" data-webmcp-description="Drop by override"></span>
+  <input type="hidden" name="_method" value="DELETE">
+  <input name="reason">
+  <button>Drop</button>
+</form>
 </body></html>"##,
         form("add_note")
     )
@@ -133,6 +141,18 @@ async fn slow_note(axum::Form(note): axum::Form<Note>) -> Html<String> {
 async fn quiet_note() -> Html<&'static str> {
     QUIET.fetch_add(1, Ordering::SeqCst);
     Html("<p>Quiet</p>")
+}
+
+#[post("/override")]
+async fn override_post() -> Html<&'static str> {
+    OVERRIDES.fetch_add(1, Ordering::SeqCst);
+    Html("<p>Posted</p>")
+}
+
+#[delete("/override")]
+async fn override_delete() -> Html<&'static str> {
+    OVERRIDES.fetch_add(1, Ordering::SeqCst);
+    Html("<p>Deleted</p>")
 }
 
 #[derive(serde::Serialize, autumn_web::openapi::OpenApiSchema)]
@@ -190,6 +210,8 @@ async fn runner() -> autumn_web::system_test::SystemTestRunner {
                 add_note,
                 slow_note,
                 quiet_note,
+                override_post,
+                override_delete,
                 list_items,
                 delete_item
             ])
@@ -461,6 +483,32 @@ async fn cancelling_a_form_call_aborts_the_htmx_request() {
     .await;
     assert!(out.contains("\"isError\":true"), "{out}");
     wait_for(&page, "window.__xhrAborted === true").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn an_hx_post_form_with_a_delete_override_asks_first() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    page.visit("/").await.expect("visit");
+    wait_for(&page, "!!(window.__reg && window.__reg.override_drop)").await;
+    let before = OVERRIDES.load(Ordering::SeqCst);
+
+    let out = eval_string(
+        &page,
+        "(() => { window.__asked = 0; \
+           window.confirm = () => { window.__asked++; return false; }; \
+           return window.__reg.override_drop.tool.execute({ reason: 'spam' }, {}) \
+             .then(r => JSON.stringify(r)); })()",
+    )
+    .await;
+    assert!(out.contains("\"isError\":true"), "{out}");
+    assert!(
+        eval_bool(&page, "window.__asked === 1").await,
+        "a DELETE override asks the user"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(OVERRIDES.load(Ordering::SeqCst), before, "nothing was sent");
 }
 
 #[tokio::test]

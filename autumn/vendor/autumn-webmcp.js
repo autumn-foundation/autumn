@@ -432,12 +432,12 @@
     return flag === "true";
   }
 
-  // The HTTP method the form sends: an hx-<verb> attribute, else the
-  // `_method` override of a POST form, else the `method` attribute.
+  // The HTTP method that the route sees. The form sends with its hx-<verb>
+  // attribute, else its `method` attribute. The server applies the `_method`
+  // override of a POST, also for an htmx POST.
   function formMethod(form) {
     var verb = htmxVerb(form);
-    if (verb) return verb.toUpperCase();
-    var method = (form.getAttribute("method") || "get").trim().toUpperCase();
+    var method = verb ? verb.toUpperCase() : (form.getAttribute("method") || "get").trim().toUpperCase();
     var override = form.querySelector('input[name="_method"]');
     if (method === "POST" && override && override.value.trim()) return override.value.trim().toUpperCase();
     return method;

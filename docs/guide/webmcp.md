@@ -149,7 +149,8 @@ When the agent cancels a call, the script stops the htmx request. A call
 that the agent cancels before the submit sends nothing.
 
 A `DELETE` form asks the user first. The method comes from `hx-delete` and
-the other `hx-*` verbs, else from the `_method` field, else from `method`.
+the other `hx-*` verbs, else from `method`. On a `POST`, the `_method` field
+replaces it, also for `hx-post`.
 For another form that the user cannot undo, use
 `webmcp::form_tool_confirm(name, description)`. The script asks before it
 fills a field, so a "no" changes nothing on the page.
