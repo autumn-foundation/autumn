@@ -111,6 +111,78 @@ codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ---
 
+### WebMCP: `ApiDoc` gains `webmcp_tool` and `webmcp_exclude` fields
+
+**Why:** a WebMCP tool (`#[api_doc(webmcp)]`, issue #2619) needs flags on
+the route metadata. A new public field breaks a struct literal, as for
+`mcp_task`. The route macros set the fields for you.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::openapi::ApiDoc;
+
+let doc = ApiDoc {
+    method: "GET",
+    path: "/api/todos",
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::openapi::ApiDoc;
+
+let doc = ApiDoc {
+    method: "GET",
+    path: "/api/todos",
+    ..ApiDoc::default()
+};
+```
+
+Both new fields are `bool` and `false` by default. A route that does not opt
+in behaves as before.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+means to leave at their defaults.
+
+### Agent authority: manifest rows gain WebMCP fields
+
+**Why:** the agent-authority manifest reports WebMCP exposure apart from
+`/mcp` exposure (issue #2619). `RouteSummary` gains `webmcp_tool` and
+`webmcp_exposed_by`. `RouteRef` and `UnregisteredAuthority` gain
+`webmcp_tool`. `AgentAuthorityManifest` gains `ungoverned_webmcp_tools`.
+
+This affects only code that builds these structs by hand. The JSON does not
+change for an app with no WebMCP tool. The JSON omits each new field when it
+is `false` or empty, so a committed manifest does not drift.
+
+**Before (`{X.Y}`):**
+
+```rust
+let route = RouteSummary {
+    // …
+    duplicate_operation_id: false,
+    agent_authority: None,
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let route = RouteSummary {
+    // …
+    duplicate_operation_id: false,
+    webmcp_tool: false,
+    webmcp_exposed_by: None,
+    agent_authority: None,
+};
+```
+
+**Automation:** `manual` — add the fields with `false`, `None`, or an empty
+`Vec`.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**

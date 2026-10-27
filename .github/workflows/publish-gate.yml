@@ -228,6 +228,21 @@ jobs:
           cargo test -p autumn-web --features system-tests \
             --test integration_tests system_test_api -- --include-ignored
 
+      # WebMCP in a real browser (#2619): the default CSP, route and form
+      # tools, and htmx swaps. `webmcp` is not a default feature, so the step
+      # above does not compile `webmcp_browser`. A filter that matches
+      # nothing exits 0, so check the count.
+      - name: Run the WebMCP browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features "system-tests,webmcp" \
+            --test integration_tests webmcp_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/webmcp-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/webmcp-browser.log" \
+            || { echo "::error::no WebMCP browser tests ran"; exit 1; }
+
   # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------

@@ -168,6 +168,18 @@ pub struct Summary {
     pub pending: i64,
 }
 
+/// List all todos for the agent in the user's browser (#2619).
+///
+/// `#[api_doc(webmcp)]` makes it a WebMCP tool. The call needs no API token,
+/// so the route is outside the `/api` scope. Like the HTML pages of this
+/// demo, it is public.
+#[get("/todos.json")]
+#[public]
+#[api_doc(webmcp, summary = "List all todos")]
+pub async fn list_for_page(mut db: Db) -> AutumnResult<Json<Vec<Todo>>> {
+    Ok(Json(Todo::all(&mut db).await?))
+}
+
 /// Serve the todo summary as HTML to browsers and JSON to API clients.
 ///
 /// `Negotiate` captures the `Accept` preference; `.respond` picks the

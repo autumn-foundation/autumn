@@ -8,6 +8,9 @@ you want to expose and mount one server; Autumn derives the tool schemas,
 speaks JSON-RPC over Streamable HTTP, and dispatches each tool call through
 your **real, authenticated handler pipeline**.
 
+For the agent in the user's own browser, see [WebMCP](webmcp.md). It uses
+the same derivation, with a separate `#[api_doc(webmcp)]` opt-in.
+
 No second app. No hand-written protocol, transport, or tool schemas. The tool
 catalog is derived from the same `ApiDoc` metadata that drives `generate_spec`,
 so it **cannot drift** from your handlers — change a handler's types and the

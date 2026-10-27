@@ -43,6 +43,9 @@ openapi = ["dep:serde-saphyr"]
 # agents can call the real, authenticated handler pipeline. Builds on the
 # same `ApiDoc` registry that drives `openapi`, so it implies that feature.
 mcp = ["openapi"]
+# WebMCP (issue #2619): route tools for the agent in the user's browser.
+# Implies `mcp` (one tool derivation) and `htmx` (the framework script bundle).
+webmcp = ["mcp", "htmx"]
 # Optional Markdown rendering with frontmatter parsing and SSG integration,
 # plus the safe *user-submitted* rich-text path (issue #1255): `ammonia` is the
 # allowlist HTML sanitizer `markdown::render_user_content` runs its output

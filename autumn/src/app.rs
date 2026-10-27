@@ -126,6 +126,8 @@ pub fn app() -> AppBuilder {
         openapi: None,
         #[cfg(feature = "mcp")]
         mcp: None,
+        #[cfg(feature = "webmcp")]
+        webmcp: None,
         audit_logger: None,
         #[cfg(feature = "i18n")]
         i18n_bundle: None,
@@ -540,6 +542,10 @@ pub struct AppBuilder {
     /// feature (which implies `openapi`).
     #[cfg(feature = "mcp")]
     mcp: Option<crate::mcp::McpRuntime>,
+    /// `WebMCP` runtime config. `Some` once [`AppBuilder::mount_webmcp`] or
+    /// [`AppBuilder::expose_all_as_webmcp`] is called.
+    #[cfg(feature = "webmcp")]
+    webmcp: Option<crate::webmcp::WebMcpRuntime>,
     /// Shared audit logger used for append-only compliance events.
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
     /// Loaded i18n translation bundle. When `Some`, an `axum::Extension`
@@ -1201,6 +1207,45 @@ impl AppBuilder {
             rt.endpoint_layer = Some(applier);
             self.mcp = Some(rt);
         }
+        self
+    }
+
+    /// Serve the `WebMCP` tool list, so the page script
+    /// (`asset_url("js/autumn-webmcp.js")`) can register the routes tagged
+    /// `#[api_doc(webmcp)]` with the browser agent.
+    ///
+    /// Each tool comes from the same derivation as `/mcp`: the same
+    /// eligibility rule, names and `inputSchema`. A tool call is a
+    /// same-origin `fetch` with the user's session cookie and CSRF token, so
+    /// the full route pipeline runs. `/mcp` does not have to be mounted.
+    ///
+    /// `#[api_doc(mcp)]` does not imply `WebMCP`. See `docs/guide/webmcp.md`.
+    ///
+    /// Requires the `webmcp` Cargo feature.
+    ///
+    /// ```rust,ignore
+    /// autumn_web::app()
+    ///     .routes(routes![list_todos, add_todo])
+    ///     .mount_webmcp()
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[cfg(feature = "webmcp")]
+    #[must_use]
+    pub fn mount_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default);
+        self
+    }
+
+    /// Whole-API hatch for `WebMCP`: each eligible `GET` route is a tool
+    /// with no `#[api_doc(webmcp)]` tag. A write still needs the tag, and
+    /// `#[api_doc(webmcp = false)]` still wins. Also mounts the tool list.
+    ///
+    /// Requires the `webmcp` Cargo feature.
+    #[cfg(feature = "webmcp")]
+    #[must_use]
+    pub fn expose_all_as_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default).expose_all = true;
         self
     }
 
@@ -4006,6 +4051,8 @@ impl AppBuilder {
             openapi,
             #[cfg(feature = "mcp")]
             mcp,
+            #[cfg(feature = "webmcp")]
+            webmcp,
             audit_logger,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -5066,6 +5113,8 @@ impl AppBuilder {
                     },
                     #[cfg(feature = "mcp")]
                     mcp,
+                    #[cfg(feature = "webmcp")]
+                    webmcp,
                 },
             )
         } else {
@@ -6571,6 +6620,8 @@ impl AppBuilder {
             openapi,
             #[cfg(feature = "mcp")]
                 mcp: _,
+            #[cfg(feature = "webmcp")]
+                webmcp: _,
             audit_logger: _,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -7013,6 +7064,8 @@ impl AppBuilder {
                 openapi: static_openapi,
                 #[cfg(feature = "mcp")]
                 mcp: None,
+                #[cfg(feature = "webmcp")]
+                webmcp: None,
             },
         )
         .unwrap_or_else(|error| {
@@ -7247,6 +7300,16 @@ impl AppBuilder {
         let expose_all = self.mcp.as_ref().is_some_and(|rt| rt.expose_all);
         #[cfg(not(feature = "mcp"))]
         let expose_all = false;
+        // The WebMCP hatch, likewise. A WebMCP tool runs in the user's own
+        // session, so the document lists it apart from the `/mcp` tools.
+        #[cfg(feature = "webmcp")]
+        let webmcp_expose_all = self.webmcp.is_some_and(|rt| rt.expose_all);
+        #[cfg(not(feature = "webmcp"))]
+        let webmcp_expose_all = false;
+        let exposure = AgentExposure {
+            mcp_expose_all: expose_all,
+            webmcp_expose_all,
+        };
         // Top-level routes carry their own path; a scoped group's children do
         // not -- the group's prefix is applied at mount time, so the path on
         // the `Route` is the child path alone. Passing that through would
@@ -7255,10 +7318,10 @@ impl AppBuilder {
         let mut routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
             .routes
             .iter()
-            .map(|route| agent_authority_route_summary(route, None, expose_all))
+            .map(|route| agent_authority_route_summary(route, None, exposure))
             .chain(self.scoped_groups.iter().flat_map(|group| {
                 group.routes.iter().map(move |route| {
-                    agent_authority_route_summary(route, Some(&group.prefix), expose_all)
+                    agent_authority_route_summary(route, Some(&group.prefix), exposure)
                 })
             }))
             .collect();
@@ -9063,6 +9126,8 @@ impl AppBuilder {
                 openapi: None,
                 #[cfg(feature = "mcp")]
                 mcp: None,
+                #[cfg(feature = "webmcp")]
+                webmcp: None,
             },
         )
         .unwrap_or_else(|error| {
@@ -9370,6 +9435,15 @@ fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::grap
     }
 }
 
+/// The whole-API hatches the agent-authority manifest reads.
+#[derive(Debug, Clone, Copy, Default)]
+struct AgentExposure {
+    /// `expose_all_as_mcp()` was called.
+    mcp_expose_all: bool,
+    /// `expose_all_as_webmcp()` was called.
+    webmcp_expose_all: bool,
+}
+
 /// The slice of a [`Route`] the agent-authority manifest needs (#1691).
 ///
 /// Built here rather than in `agent_authority::manifest` so that module needs
@@ -9387,7 +9461,7 @@ fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::grap
 fn agent_authority_route_summary(
     route: &Route,
     scope_prefix: Option<&str>,
-    expose_all: bool,
+    exposure: AgentExposure,
 ) -> crate::agent_authority::manifest::RouteSummary {
     // One string, used both for the row and for the predicate, so the two can
     // never disagree about a route's verb.
@@ -9399,17 +9473,22 @@ fn agent_authority_route_summary(
         || route.path.to_string(),
         |prefix| crate::router::join_nested_path(prefix, route.path),
     );
-    let exposed_by = crate::agent_authority::manifest::mcp_exposure(
-        &crate::agent_authority::manifest::McpExposureInput {
-            method: &method,
-            hidden: route.api_doc.hidden,
-            mcp_tool: route.api_doc.mcp_tool,
-            mcp_exclude: route.api_doc.mcp_exclude,
-            mcp_stream: route.api_doc.mcp_stream,
-            has_response_schema: route.api_doc.response.is_some(),
-            success_status: route.api_doc.success_status,
-            expose_all,
-        },
+    let input = crate::agent_authority::manifest::McpExposureInput {
+        method: &method,
+        hidden: route.api_doc.hidden,
+        mcp_tool: route.api_doc.mcp_tool,
+        mcp_exclude: route.api_doc.mcp_exclude,
+        mcp_stream: route.api_doc.mcp_stream,
+        has_response_schema: route.api_doc.response.is_some(),
+        success_status: route.api_doc.success_status,
+        expose_all: exposure.mcp_expose_all,
+    };
+    let exposed_by = crate::agent_authority::manifest::mcp_exposure(&input);
+    let webmcp_exposed_by = crate::agent_authority::manifest::webmcp_exposure(
+        &input,
+        route.api_doc.webmcp_tool,
+        route.api_doc.webmcp_exclude,
+        exposure.webmcp_expose_all,
     );
     crate::agent_authority::manifest::RouteSummary {
         method,
@@ -9422,6 +9501,8 @@ fn agent_authority_route_summary(
         mcp_tool: exposed_by.is_some(),
         exposed_by,
         duplicate_operation_id: false,
+        webmcp_tool: webmcp_exposed_by.is_some(),
+        webmcp_exposed_by,
         // Filled by the route macro from the handler's `#[agent_operable]`
         // marker, in either attribute order.
         agent_authority: route.api_doc.agent_authority,
@@ -15424,13 +15505,14 @@ mod agent_authority_route_summary_tests {
         // `/api/v1/items` would make the manifest wrong about where the agent
         // surface is, and a scope rename would produce no drift at all.
         let route = route_with("/items", true);
-        let summary = agent_authority_route_summary(&route, Some("/api/v1"), false);
+        let summary =
+            agent_authority_route_summary(&route, Some("/api/v1"), AgentExposure::default());
         assert_eq!(summary.path, "/api/v1/items");
         assert_eq!(summary.method, "GET");
         assert!(summary.mcp_tool);
 
         // A top-level route has no prefix and is unchanged.
-        let top = agent_authority_route_summary(&route, None, false);
+        let top = agent_authority_route_summary(&route, None, AgentExposure::default());
         assert_eq!(top.path, "/items");
     }
 
@@ -15439,7 +15521,7 @@ mod agent_authority_route_summary_tests {
         // Delegated to `join_nested_path` rather than string concatenation, so
         // the manifest and the spec cannot disagree about trailing slashes.
         let root = route_with("/", true);
-        let summary = agent_authority_route_summary(&root, Some("/api"), false);
+        let summary = agent_authority_route_summary(&root, Some("/api"), AgentExposure::default());
         assert_eq!(
             summary.path,
             crate::router::join_nested_path("/api", "/"),
@@ -15451,19 +15533,72 @@ mod agent_authority_route_summary_tests {
     fn the_operation_id_names_the_tool_and_exposure_says_why() {
         use crate::agent_authority::manifest::McpExposedBy;
 
-        let tagged = agent_authority_route_summary(&route_with("/items", true), None, false);
+        let tagged = agent_authority_route_summary(
+            &route_with("/items", true),
+            None,
+            AgentExposure::default(),
+        );
         assert_eq!(tagged.operation_id, "list_items");
         assert_eq!(tagged.exposed_by, Some(McpExposedBy::Attribute));
 
         // Untagged and no hatch: not a tool at all.
-        let plain = agent_authority_route_summary(&route_with("/items", false), None, false);
+        let plain = agent_authority_route_summary(
+            &route_with("/items", false),
+            None,
+            AgentExposure::default(),
+        );
         assert!(!plain.mcp_tool);
         assert_eq!(plain.exposed_by, None);
 
         // Untagged, but the whole-API hatch sweeps up a read-only verb.
-        let hatched = agent_authority_route_summary(&route_with("/items", false), None, true);
+        let hatched = agent_authority_route_summary(
+            &route_with("/items", false),
+            None,
+            AgentExposure {
+                mcp_expose_all: true,
+                webmcp_expose_all: false,
+            },
+        );
         assert!(hatched.mcp_tool);
         assert_eq!(hatched.exposed_by, Some(McpExposedBy::Hatch));
+        assert!(
+            !hatched.webmcp_tool,
+            "the MCP hatch is not the WebMCP hatch"
+        );
+    }
+
+    #[test]
+    fn webmcp_exposure_is_reported_apart_from_mcp() {
+        use crate::agent_authority::manifest::McpExposedBy;
+
+        let mut route = route_with("/items", true);
+        route.api_doc.webmcp_tool = true;
+        let both = agent_authority_route_summary(&route, None, AgentExposure::default());
+        assert!(both.mcp_tool && both.webmcp_tool);
+        assert_eq!(both.webmcp_exposed_by, Some(McpExposedBy::Attribute));
+
+        let web_hatch = agent_authority_route_summary(
+            &route_with("/items", false),
+            None,
+            AgentExposure {
+                mcp_expose_all: false,
+                webmcp_expose_all: true,
+            },
+        );
+        assert!(!web_hatch.mcp_tool);
+        assert_eq!(web_hatch.webmcp_exposed_by, Some(McpExposedBy::Hatch));
+
+        let mut excluded = route_with("/items", false);
+        excluded.api_doc.webmcp_exclude = true;
+        let excluded = agent_authority_route_summary(
+            &excluded,
+            None,
+            AgentExposure {
+                mcp_expose_all: false,
+                webmcp_expose_all: true,
+            },
+        );
+        assert!(!excluded.webmcp_tool);
     }
 }
 
@@ -20263,6 +20398,8 @@ mod tests {
                 openapi: None,
                 #[cfg(feature = "mcp")]
                 mcp: None,
+                #[cfg(feature = "webmcp")]
+                webmcp: None,
             },
         )
         .expect("router builds");
@@ -20348,6 +20485,8 @@ mod tests {
                 openapi: None,
                 #[cfg(feature = "mcp")]
                 mcp: None,
+                #[cfg(feature = "webmcp")]
+                webmcp: None,
             },
         )
         .expect("router builds");
@@ -20523,6 +20662,8 @@ mod tests {
                 openapi: None,
                 #[cfg(feature = "mcp")]
                 mcp: None,
+                #[cfg(feature = "webmcp")]
+                webmcp: None,
             },
         )
         .expect("router builds");
@@ -20633,6 +20774,8 @@ mod tests {
                     openapi: None,
                     #[cfg(feature = "mcp")]
                     mcp: None,
+                    #[cfg(feature = "webmcp")]
+                    webmcp: None,
                 },
             )
             .unwrap_or_else(|e| panic!("tenancy source {source:?}: router builds: {e}"));
@@ -20742,6 +20885,8 @@ mod tests {
                 openapi: None,
                 #[cfg(feature = "mcp")]
                 mcp: None,
+                #[cfg(feature = "webmcp")]
+                webmcp: None,
             },
         )
         .expect("router builds");

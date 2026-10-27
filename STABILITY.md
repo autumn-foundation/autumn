@@ -611,6 +611,41 @@ constructor — it is a return type, not something downstream code builds.
 `autumn-web`'s public API surface here; it is re-exported as
 `autumn_web::reexports::http` (`autumn_web::http` is the HTTP *client* module).
 
+## WebMCP (issue #2619)
+
+The `webmcp` feature tracks the W3C WebMCP community-group draft of
+2026-04-23. The draft is **not** a standard, and its JavaScript API changes
+between revisions.
+
+- **Stable:** `#[api_doc(webmcp)]`, `#[api_doc(webmcp = false)]`,
+  `Route::webmcp`, `Route::webmcp_exclude`, `AppBuilder::mount_webmcp`,
+  `AppBuilder::expose_all_as_webmcp`, the `TestApp` and `SystemTest`
+  equivalents, `webmcp::derive_tools`, `webmcp::needs_confirmation`,
+  `webmcp::form_tool`, `webmcp::form_tool_confirm`, `webmcp::head_tags`,
+  `webmcp::WebMcpRuntime`, `webmcp::TOOLS_PATH`, `webmcp::SHIM_PATH`, and
+  the `data-webmcp-tool`, `data-webmcp-description` and
+  `data-webmcp-confirm` marker attributes. These follow the normal SemVer
+  rules.
+- **Not stable:** the page script (`js/autumn-webmcp.js`, `webmcp::SHIM_JS`)
+  and the shape of `/_autumn/webmcp/tools.json` (`webmcp::manifest_json`,
+  `webmcp::MANIFEST_VERSION`). A minor release can change them when the
+  draft changes. The document has a `version` field.
+
+### New public items
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `ApiDoc::webmcp_tool`, `ApiDoc::webmcp_exclude` | `autumn_web::openapi` | Set by `#[api_doc(webmcp)]` |
+| `Route::webmcp`, `Route::webmcp_exclude` | `autumn_web` | Registration-time opt-in and opt-out |
+| `AppBuilder::mount_webmcp`, `AppBuilder::expose_all_as_webmcp` | `autumn_web::app` | `webmcp` feature |
+| `webmcp` module | `autumn_web::webmcp` | `webmcp` feature |
+| `McpToolInfo::path_params`, `has_body`, `has_query` | `autumn_web::mcp` | Read the dispatch shape of a tool |
+| `RouteSummary::webmcp_tool`, `webmcp_exposed_by` | `autumn_web::agent_authority::manifest` | **Breaking** for a hand-built `RouteSummary { .. }` literal |
+| `AgentAuthorityManifest::ungoverned_webmcp_tools`, `ungoverned_mutating_webmcp_tools` | same | The JSON omits the field when it is empty, so a committed manifest does not drift |
+| `RouteRef::webmcp_tool`, `UnregisteredAuthority::webmcp_tool` | same | The JSON omits the field when it is `false` |
+| `TestApp::mount_webmcp`, `TestApp::expose_all_as_webmcp`, `SystemTest::mount_webmcp` | `autumn_web::test`, `autumn_web::system_test` | `webmcp` feature |
+| `webmcp_exposure`, `WEBMCP_TOOL_EXPOSURE` | same | The exposure rule and the `"webmcp-tool"` row value |
+
 ## Pre-1.0 notes
 
 Until Autumn reaches `1.0.0`:

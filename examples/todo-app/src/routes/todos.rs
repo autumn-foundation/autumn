@@ -92,6 +92,8 @@ fn layout(title: &str, content: Markup) -> Markup {
                 link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
+                // WebMCP (#2619): registers the page tools with a browser agent.
+                (autumn_web::webmcp::head_tags(None))
             }
             body class="bg-stone-50 min-h-screen font-sans text-stone-800 antialiased" {
                 main id="main-content" class="max-w-xl mx-auto py-12 px-6" {
@@ -205,6 +207,7 @@ fn new_todo_form(pending: &ChangesetForm<TodoForm>) -> Markup {
         &paths::create(),
         "post",
         html! {
+            (autumn_web::webmcp::form_tool("add_todo", "Add an item to the todo list"))
             div class="flex gap-2 items-start" {
                 (title_field_partial(pending))
                 button type="submit"
@@ -384,6 +387,8 @@ fn detail_view(todo: &Todo, csrf_token: Option<&str>) -> Markup {
                      action=(paths::delete_todo(todo.id))
                      class="mt-6 flex items-center gap-3 border-t border-stone-100 pt-4" {
                     (method_input("DELETE"))
+                    // A DELETE form tool asks the user before it submits.
+                    (autumn_web::webmcp::form_tool("delete_todo", "Delete this todo"))
                     @if let Some(token) = csrf_token {
                         input type="hidden" name="_csrf" value=(token);
                     }

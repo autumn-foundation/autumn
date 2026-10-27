@@ -20,7 +20,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:329",
+          "location": "examples/todo-app/src/routes/todos.rs:332",
           "provenance": "provable"
         },
         {
@@ -248,6 +248,28 @@
           "provenance": "provable"
         },
         {
+          "path": "/static/js/autumn-webmcp.243e2734.js",
+          "method": "GET",
+          "name": "webmcp",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/autumn-webmcp.js",
+          "method": "GET",
+          "name": "webmcp",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
           "path": "/static/js/autumn-widgets.3dc97cf9.js",
           "method": "GET",
           "name": "autumn_widgets",
@@ -355,7 +377,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:339",
+          "location": "examples/todo-app/src/routes/todos.rs:342",
           "provenance": "provable"
         },
         {
@@ -367,7 +389,19 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:462",
+          "location": "examples/todo-app/src/routes/todos.rs:467",
+          "provenance": "provable"
+        },
+        {
+          "path": "/todos.json",
+          "method": "GET",
+          "name": "list_for_page",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/todo-app/src/routes/api.rs:176",
           "provenance": "provable"
         },
         {
@@ -379,7 +413,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:488",
+          "location": "examples/todo-app/src/routes/todos.rs:493",
           "provenance": "provable"
         },
         {
@@ -391,7 +425,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/api.rs:178",
+          "location": "examples/todo-app/src/routes/api.rs:190",
           "provenance": "provable"
         },
         {
@@ -403,7 +437,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:452",
+          "location": "examples/todo-app/src/routes/todos.rs:457",
           "provenance": "provable"
         },
         {
@@ -415,7 +449,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:569",
+          "location": "examples/todo-app/src/routes/todos.rs:574",
           "provenance": "provable"
         },
         {
@@ -427,7 +461,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:419",
+          "location": "examples/todo-app/src/routes/todos.rs:424",
           "provenance": "provable"
         },
         {
@@ -439,7 +473,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:536",
+          "location": "examples/todo-app/src/routes/todos.rs:541",
           "provenance": "provable"
         }
       ]
@@ -652,6 +686,16 @@
           "mtls_required": false
         },
         {
+          "path": "/static/js/autumn-webmcp.243e2734.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-webmcp.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
           "path": "/static/js/autumn-widgets.3dc97cf9.js",
           "method": "GET",
           "mtls_required": false
@@ -704,6 +748,11 @@
         {
           "path": "/todos",
           "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/todos.json",
+          "method": "GET",
           "mtls_required": false
         },
         {

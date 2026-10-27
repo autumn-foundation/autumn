@@ -264,6 +264,7 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding |
 | `openapi` | OpenAPI route metadata and spec generation |
 | `mcp` | Project typed JSON endpoints as MCP tools; implies `openapi` |
+| `webmcp` | Routes (`#[api_doc(webmcp)]` + `mount_webmcp()`) and forms (`webmcp::form_tool`) as tools for the agent in the user's browser; implies `mcp` and `htmx`. Guide: `docs/guide/webmcp.md` |
 | `markdown` | Markdown rendering with frontmatter and static-site support, plus the safe user-submitted rich-text path (`render_user_content`, `rich_text_area`) — see [rich text](../../docs/guide/rich-text.md) |
 | `constela` | Parse, validate and server-render [Constela](https://github.com/yuuichieguchi/constela) documents — the constrained JSON UI language — so an app can serve an interface a language model generated; implies `maud`, see [generated UI](../../docs/guide/constela.md) |
 | `telemetry-otlp` | OpenTelemetry OTLP export |
