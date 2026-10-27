@@ -142,7 +142,11 @@ nothing:
 
 - an invalid form,
 - a value that the field cannot hold (for example, a `<select>` value with
-  no option).
+  no option),
+- a second call to a form while its first call runs.
+
+When the agent cancels a call, the script stops the htmx request. A call
+that the agent cancels before the submit sends nothing.
 
 A `DELETE` form asks the user first. The method comes from `hx-delete` and
 the other `hx-*` verbs, else from the `_method` field, else from `method`.

@@ -24,6 +24,8 @@ static DELETES: AtomicUsize = AtomicUsize::new(0);
 /// Deletes of item 9, which only the `drop_item` form sends. A separate
 /// count keeps the parallel tests apart.
 static DROPS: AtomicUsize = AtomicUsize::new(0);
+/// Posts to `/quiet`, which only the `quiet_note` form sends.
+static QUIET: AtomicUsize = AtomicUsize::new(0);
 
 const STUB_JS: &str = r#"
 window.__reg = {};
@@ -76,6 +78,16 @@ fn page_html(stub: bool) -> String {
   <button>Drop</button>
 </form>
 <button id="swap" hx-get="/panel" hx-target="#panel">Swap</button>
+<form id="slow" hx-post="/slow" hx-target="#out">
+  <span hidden data-webmcp-tool="slow_note" data-webmcp-description="Add a note slowly"></span>
+  <input name="title">
+  <button>Slow</button>
+</form>
+<form hx-post="/quiet" hx-target="#out">
+  <span hidden data-webmcp-tool="quiet_note" data-webmcp-description="Add a quiet note"></span>
+  <input name="title">
+  <button>Quiet</button>
+</form>
 </body></html>"##,
         form("add_note")
     )
@@ -109,6 +121,18 @@ struct Note {
 #[post("/notes")]
 async fn add_note(axum::Form(note): axum::Form<Note>) -> Html<String> {
     Html(format!("<p>Saved {}</p>", note.title))
+}
+
+#[post("/slow")]
+async fn slow_note(axum::Form(note): axum::Form<Note>) -> Html<String> {
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    Html(format!("<p>Slow {}</p>", note.title))
+}
+
+#[post("/quiet")]
+async fn quiet_note() -> Html<&'static str> {
+    QUIET.fetch_add(1, Ordering::SeqCst);
+    Html("<p>Quiet</p>")
 }
 
 #[derive(serde::Serialize, autumn_web::openapi::OpenApiSchema)]
@@ -164,6 +188,8 @@ async fn runner() -> autumn_web::system_test::SystemTestRunner {
                 stub_js,
                 panel,
                 add_note,
+                slow_note,
+                quiet_note,
                 list_items,
                 delete_item
             ])
@@ -357,6 +383,84 @@ async fn an_htmx_swap_unregisters_the_form_tool_and_the_new_form_registers() {
     page.expect_no_console_errors()
         .await
         .expect("no console errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_second_call_while_the_form_is_busy_is_refused() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    page.visit("/").await.expect("visit");
+    wait_for(&page, "!!(window.__reg && window.__reg.slow_note)").await;
+
+    let out = eval_string(
+        &page,
+        "(() => { const t = window.__reg.slow_note.tool; \
+           return Promise.all([t.execute({ title: 'one' }, {}), t.execute({ title: 'two' }, {})]) \
+             .then(r => JSON.stringify(r)); })()",
+    )
+    .await;
+    let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out[0]["isError"], false, "{out}");
+    assert!(
+        out[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Slow one"),
+        "{out}"
+    );
+    assert_eq!(out[1]["isError"], true, "{out}");
+    assert!(
+        out[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("busy"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_cancelled_call_sends_nothing() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    page.visit("/").await.expect("visit");
+    wait_for(&page, "!!(window.__reg && window.__reg.quiet_note)").await;
+    let before = QUIET.load(Ordering::SeqCst);
+
+    let out = eval_string(
+        &page,
+        "(() => { const c = new AbortController(); c.abort(); \
+           return window.__reg.quiet_note.tool.execute({ title: 'x' }, { signal: c.signal }) \
+             .then(r => JSON.stringify(r)); })()",
+    )
+    .await;
+    assert!(out.contains("\"isError\":true"), "{out}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(QUIET.load(Ordering::SeqCst), before, "nothing was sent");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn cancelling_a_form_call_aborts_the_htmx_request() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    page.visit("/").await.expect("visit");
+    wait_for(&page, "!!(window.__reg && window.__reg.slow_note)").await;
+
+    let out = eval_string(
+        &page,
+        "(() => { window.__xhrAborted = false; \
+           document.getElementById('slow').addEventListener('htmx:xhr:abort', \
+             () => { window.__xhrAborted = true; }); \
+           const c = new AbortController(); \
+           const p = window.__reg.slow_note.tool.execute({ title: 'x' }, { signal: c.signal }); \
+           setTimeout(() => c.abort(), 200); \
+           return p.then(r => JSON.stringify(r)); })()",
+    )
+    .await;
+    assert!(out.contains("\"isError\":true"), "{out}");
+    wait_for(&page, "window.__xhrAborted === true").await;
 }
 
 #[tokio::test]

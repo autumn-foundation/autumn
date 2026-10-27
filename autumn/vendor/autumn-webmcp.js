@@ -282,6 +282,8 @@
   var VERBS = ["get", "post", "put", "patch", "delete"];
   // form -> { controller, name }
   var forms = new Map();
+  // The forms with a call in progress.
+  var busy = new WeakSet();
 
   // The fields the agent can fill. The browser does not submit a disabled
   // field. The user cannot change a read-only field, so the agent cannot.
@@ -450,6 +452,17 @@
     }
   }
 
+  // Stop the htmx request of a form. htmx aborts the request of an element
+  // that gets `htmx:abort`.
+  function stopHtmx(form) {
+    try {
+      if (window.htmx && typeof window.htmx.trigger === "function") window.htmx.trigger(form, "htmx:abort");
+      else form.dispatchEvent(new CustomEvent("htmx:abort"));
+    } catch (_) {
+      // Nothing more to do.
+    }
+  }
+
   // Submit through htmx. Wait for the result of this form's request.
   function submitHtmx(form, signal) {
     return new Promise(function (resolve) {
@@ -467,8 +480,10 @@
         if (signal) signal.removeEventListener("abort", onAbort);
         resolve(out);
       }
+      // Finish first, so this call does not read its own abort event.
       function onAbort() {
         finish(result("The agent cancelled the call.", true));
+        stopHtmx(form);
       }
       function onEvent(evt) {
         var d = evt.detail || {};
@@ -489,7 +504,10 @@
         document.addEventListener(type, onEvent);
       });
       if (signal) signal.addEventListener("abort", onAbort);
-      timer = setTimeout(function () { finish(result("The form got no response in time.", true)); }, FORM_TIMEOUT_MS);
+      timer = setTimeout(function () {
+        finish(result("The form got no response in time.", true));
+        stopHtmx(form);
+      }, FORM_TIMEOUT_MS);
       form.requestSubmit();
     });
   }
@@ -512,25 +530,35 @@
         annotations: { readOnlyHint: readOnly, consequentialHint: !readOnly || confirm },
         execute: async function (input, options) {
           if (!form.isConnected) return result("The form is no longer on the page.", true);
-          // Ask first: filling a field can start an htmx request.
-          if (confirm && !(await approve(title, options))) {
-            return result("The user did not allow this call. Nothing was sent.", true);
-          }
+          // One call at a time: a second call would refill the form and
+          // read the response of the first.
+          if (busy.has(form)) return result("The form is busy with another call. Try again when it ends.", true);
+          busy.add(form);
           try {
-            fill(form, isContainer(input) ? input : {});
-          } catch (e) {
-            if (e && e.webmcp) return result(e.message, true);
-            throw e;
+            var signal = signalOf(options);
+            // Ask first: filling a field can start an htmx request.
+            if (confirm && !(await approve(title, options))) {
+              return result("The user did not allow this call. Nothing was sent.", true);
+            }
+            if (signal && signal.aborted) return result("The agent cancelled the call. Nothing was sent.", true);
+            try {
+              fill(form, isContainer(input) ? input : {});
+            } catch (e) {
+              if (e && e.webmcp) return result(e.message, true);
+              throw e;
+            }
+            if (!form.checkValidity()) {
+              var bad = fields(form)
+                .filter(function (el) { return !el.validity.valid; })
+                .map(function (el) { return el.name + ": " + el.validationMessage; });
+              return result("The form is not valid. " + bad.join("; "), true);
+            }
+            if (isHtmxForm(form)) return await submitHtmx(form, signal);
+            form.requestSubmit();
+            return result("The form was submitted. The page loads the response.", false);
+          } finally {
+            busy.delete(form);
           }
-          if (!form.checkValidity()) {
-            var bad = fields(form)
-              .filter(function (el) { return !el.validity.valid; })
-              .map(function (el) { return el.name + ": " + el.validationMessage; });
-            return result("The form is not valid. " + bad.join("; "), true);
-          }
-          if (isHtmxForm(form)) return submitHtmx(form, signalOf(options));
-          form.requestSubmit();
-          return result("The form was submitted. The page loads the response.", false);
         },
       },
       controller.signal,
