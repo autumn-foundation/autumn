@@ -46,6 +46,24 @@ quarantine, per the rule above.
 
 ## Open entries
 
+### `Trybuild rest`: runner shutdown signal (observed, infra, not quarantined)
+
+- **Observed**: 2026-10-26, trunk-dev run 40364710727 (head `900dd93c`), job
+  `Trybuild rest`, step "Run the trybuild shard", 17:58Z. Nothing was skipped.
+- **Owner**: Semaphore (CI-health routine) - triage only.
+- **Diagnose-by**: 2026-11-09. Close as "runner infra" if it does not recur.
+- **Rerun-rate baseline**: 1 occurrence, no same-commit rerun. The job was
+  still compiling example crates (last line `Compiling collab-notes`) when
+  it died, so no trybuild case had a verdict. Four newer trunk pushes
+  cancelled the sibling runs in the same minutes, so this was not a test
+  result.
+- **Failure signature**: `##[error]The runner has received a shutdown
+  signal` / `Process completed with exit code 143`.
+- **Mechanism (if known)**: runner loss (infra), unpinned external service.
+  The `Test suite` gate failed only because this shard did.
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none; the test still runs.
+
 ### `postgresql_embedded` build script: `version not found for '*'` (observed, not quarantined)
 
 - **Observed**: 2026-10-22, trunk-dev run 39808879528 (head `84cd1e7f`), job
@@ -106,6 +124,32 @@ quarantine, per the rule above.
   a worker thread instead of panicking. Do not make the test tolerant of it.
   To test: log which future is dropped early (pool build, migration run, or
   `quiesce_workers`).
+- **Recurrence 2026-10-27 (n=2)**: trunk-dev run 40438942405 (head
+  `49732691`), job `SQLite fleet (windows-latest)`, step "Fleet integration
+  tests": `sqlite_fleet::a_slot_fleet_shares_one_file_per_slot_and_isolates_by_tenant_id`
+  (`tests/sqlite_fleet.rs:366`, `#[tokio::test]`, current-thread) failed with
+  the same panic text at diesel-async 0.9.2
+  `sync_connection_wrapper/mod.rs:552`. 5 other tests in the binary passed.
+  A different test and a different step from the first sighting, same job
+  family, same OS. The full backtrace now names the dropped future, so the
+  hypothesis above is narrowed: the drop comes from deadpool's
+  `create_timeout` (`deadpool_runtime::timeout` -> `Timeout<create>`) firing
+  while `custom_setup` was inside `apply_sqlite_pragmas` -> `batch_execute`
+  (`db.rs:2109`, `db.rs:2179`). Pool creation exceeded `connect_timeout_secs`
+  (default 5s) on the Windows runner; the test then ran 15s before failing.
+  Category: resource contention (slow first-open I/O on Windows), with the
+  panic as a current-thread-only symptom: on the production multi-thread
+  runtime the same drop would call `block_in_place` and succeed. Verdict:
+  not made tolerant. Raising `connect_timeout_secs` or switching the tests to
+  a multi-thread flavor would hide the stall, so neither is applied. Still
+  open: why a SQLite open plus pragmas takes more than 5s on that runner, and
+  whether the `CancelWrapper` drop is also what turns the timeout into a
+  panic in the unit-test lane. Next step is a Windows-only timing log around
+  `RuntimeConnection::establish` and `apply_sqlite_pragmas`. Linux cannot
+  reproduce it (0/70 above), so the rate has to come from Windows trunk runs:
+  2 Windows fleet failures in the 7 non-cancelled `ci.yml` trunk runs from 2026-10-23 onward.
+  Diagnose-by stays 2026-11-09.
+
 - **Linked issue/PR**: none.
 - **Skip mechanism**: none; the test still runs.
 
