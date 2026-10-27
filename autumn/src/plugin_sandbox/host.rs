@@ -1333,6 +1333,12 @@ impl SandboxHost {
         // plugin gets a bounded number of instructions". It must be on before
         // the module is compiled, because the counting is compiled in.
         config.consume_fuel(true);
+        // Translate every function here, once. wasmi 2.0 defaults to
+        // translating on first call and charges that work to the calling
+        // store's fuel, so the first request after load would pay for code
+        // every later request reuses, and identical requests would no longer
+        // cost identical fuel.
+        config.compilation_mode(wasmi::CompilationMode::Eager);
         let engine = Engine::new(&config);
         let module =
             Module::new(&engine, wasm).map_err(|err| SandboxLoadError::Wasm(err.to_string()))?;
@@ -4682,12 +4688,16 @@ path = "/hello/greet"
             "1 MiB of host-side copying cost only {} fuel units",
             bulk.fuel_used
         );
-        // …and the loop itself is nothing, so the charge is the copy.
+        // …and the loop itself is nothing, so the charge is the copy: a whole
+        // honest request costs a small fraction of it. Relative, not a fixed
+        // count, because the interpreter's own per-instruction prices are
+        // wasmi's to change between releases (2.0 prices HELLO well above 0.40).
         let honest = host(guests::HELLO).run(&get("/hello/greet"));
         assert!(
-            honest.fuel_used < COPIED / 64,
-            "the baseline is not a baseline: {} units",
-            honest.fuel_used
+            honest.fuel_used.saturating_mul(10) < bulk.fuel_used,
+            "the baseline is not a baseline: {} units against {} for the copy",
+            honest.fuel_used,
+            bulk.fuel_used
         );
     }
 

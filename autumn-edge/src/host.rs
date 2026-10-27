@@ -186,6 +186,10 @@ impl EdgeArtifact {
         // itself does not change what a well-behaved capsule computes.
         let mut config = Config::default();
         config.consume_fuel(true);
+        // Translate the whole capsule at load. wasmi 2.0's default lazy
+        // translation would bill the first request's fuel budget for code
+        // every later request reuses.
+        config.compilation_mode(wasmi::CompilationMode::Eager);
         let engine = Engine::new(&config);
         let module =
             Module::new(&engine, wasm).map_err(|err| EdgeHostError::Load(err.to_string()))?;

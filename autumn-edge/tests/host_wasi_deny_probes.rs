@@ -46,10 +46,15 @@ fn assert_denied_at_load(outcome: &EdgeOutcome, expected_import: &str) {
         detail.contains("could not be instantiated"),
         "expected an instantiation-time refusal, got: {detail}"
     );
-    assert!(
-        detail.contains(expected_import),
-        "expected the refusal to name `{expected_import}`, got: {detail}"
-    );
+    // `module::field` names a non-WASI import; require each half rather than
+    // one spelling of the pair, which is wasmi's to choose (0.40 wrote
+    // `env::system`, 2.0 writes `(env,system)`).
+    for part in expected_import.split("::") {
+        assert!(
+            detail.contains(part),
+            "expected the refusal to name `{expected_import}`, got: {detail}"
+        );
+    }
 }
 
 /// R1: no ambient filesystem. A guest that imports `path_open` — the one
