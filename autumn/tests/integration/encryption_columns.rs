@@ -44,7 +44,7 @@ fn itest_salt() -> &'static [u8] {
     static S: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
     S.get_or_init(|| {
         let mut b = [0u8; 16];
-        getrandom::getrandom(&mut b).expect("OS RNG");
+        getrandom::fill(&mut b).expect("OS RNG");
         b
     })
 }

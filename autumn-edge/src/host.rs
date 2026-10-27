@@ -241,9 +241,7 @@ impl EdgeArtifact {
         let mut linker = <Linker<HostState<'_>>>::new(&self.engine);
         define_wasi_shim(&mut linker)?;
 
-        let started = linker
-            .instantiate(&mut store, &self.module)
-            .and_then(|pre| pre.start(&mut store));
+        let started = linker.instantiate_and_start(&mut store, &self.module);
         let instance = match started {
             Ok(instance) => instance,
             Err(err) => {
@@ -265,7 +263,7 @@ impl EdgeArtifact {
         let fuel_exhausted = trap
             .as_ref()
             .and_then(wasmi::Error::as_trap_code)
-            .is_some_and(|code| matches!(code, wasmi::core::TrapCode::OutOfFuel));
+            .is_some_and(|code| matches!(code, wasmi::TrapCode::OutOfFuel));
         let state = store.into_data();
 
         if let Some(outcome) = state.terminal.clone() {

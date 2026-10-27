@@ -760,10 +760,10 @@ mod tests {
         let cek = hkdf_sha256(salt, &ikm, b"Content-Encoding: aes128gcm\0", 16);
         let nonce = hkdf_sha256(salt, &ikm, b"Content-Encoding: nonce\0", 12);
 
-        let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&cek));
+        let cipher = Aes128Gcm::new(<&Key<Aes128Gcm>>::from(cek.as_slice()));
         let mut plaintext = cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                <&Nonce<_>>::from(nonce.as_slice()),
                 Payload {
                     msg: ciphertext,
                     aad: b"",

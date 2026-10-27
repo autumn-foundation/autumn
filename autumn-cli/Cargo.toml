@@ -86,7 +86,7 @@ autumn-web = { version = "0.9.0", path = "../autumn", default-features = false, 
     # `openapi::opaque_component_schemas` rather than re-deriving the predicate,
     # so the exporter and the runtime cannot disagree about what counts as
     # opaque. Additive and small: the feature's only extra dependency is
-    # `serde_yaml`.
+    # `serde-saphyr`.
     "openapi"
 ] }
 autumn-schema-core = { version = "0.9.0", path = "../autumn-schema-core" }
@@ -172,7 +172,7 @@ testcontainers-modules = { workspace = true }
 rcgen = { workspace = true }
 # Parses the YAML that `autumn slo generate` writes, in its tests (#3069).
 # The lock file already has it through `autumn-web/openapi`.
-serde_yaml = "0.9"
+serde-saphyr = "1.1"
 
 [lints]
 workspace = true

@@ -1107,7 +1107,7 @@ pub async fn oauth2_authorize_url(
 
     // PKCE S256: generate a 32-byte random verifier, base64url-encode it.
     let mut verifier_bytes = [0u8; 32];
-    getrandom::getrandom(&mut verifier_bytes).map_err(|e| {
+    getrandom::fill(&mut verifier_bytes).map_err(|e| {
         crate::AutumnError::service_unavailable_msg(format!("pkce rng failed: {e}"))
     })?;
     let code_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);

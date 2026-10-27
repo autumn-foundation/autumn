@@ -948,7 +948,7 @@ pub fn write_openapi_spec_to_dist(
     let json = serde_json::to_string_pretty(spec).map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.json"), &json)?;
 
-    let yaml = serde_yaml::to_string(spec).map_err(std::io::Error::other)?;
+    let yaml = serde_saphyr::to_string(spec).map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.yaml"), yaml)?;
 
     Ok(())

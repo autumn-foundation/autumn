@@ -61,14 +61,6 @@ ignore = [
     # RSA private-key decryption oracle, so real exposure is limited. Tracked by
     # issue #1600. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05; or when a fixed rsa ships).
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken; tracked in #1600; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2024-0449 — unsafe-libyaml unmaintained (repository archived,
-    # last release 0.2.11). An unmaintained notice, not a vulnerability. Ingress:
-    # unsafe-libyaml -> serde_yaml 0.9 (itself deprecated) -> autumn-web's
-    # `openapi` feature and autumn-cli. autumn-web only SERIALIZES the OpenAPI
-    # document with `serde_yaml::to_string`; it parses no untrusted YAML. No safe
-    # upgrade exists; the fix is to move to a safe-Rust YAML crate (serde-saphyr),
-    # which is a dependency swap larger than this advisory. Review-by: 2026-11-12.
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (not a vulnerability); serde_yaml only serializes the OpenAPI document, parses no untrusted YAML; no safe upgrade; move to a safe-Rust YAML crate; review-by 2026-11-12" },
     # RUSTSEC-2024-0384 — instant unmaintained. Build-time, transitive, and only
     # pulled in by the managed-pg-bundled feature scanned above:
     # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->

@@ -190,7 +190,7 @@ fn generate_password() -> String {
     let mut bytes = [0u8; 24];
     // Fall back to a time-seeded value only if the OS RNG is unavailable; the
     // password protects a local single-user cluster.
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0u128, |d| d.as_nanos());

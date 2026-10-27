@@ -38,7 +38,7 @@ tailwind = []
 http-client = ["dep:reqwest", "dep:sha1"]
 oauth2 = ["http-client"]
 webauthn = ["dep:webauthn-rs"]
-openapi = ["dep:serde_yaml"]
+openapi = ["dep:serde-saphyr"]
 # Project typed JSON endpoints as MCP (Model Context Protocol) tools so AI
 # agents can call the real, authenticated handler pipeline. Builds on the
 # same `ApiDoc` registry that drives `openapi`, so it implies that feature.
@@ -308,7 +308,7 @@ edge = ["dep:autumn-edge"]
 # the always-on workspace clippy and test lanes cover the module — but it is
 # why "off by default" is a statement about `autumn-web`'s feature set, not
 # about every build in the tree.
-plugin-sandbox = ["dep:wasmi"]
+plugin-sandbox = ["dep:wasmi", "dep:wasmi_core"]
 
 [dependencies]
 autumn-edge = { version = "0.9.0", path = "../autumn-edge", optional = true }
@@ -316,7 +316,13 @@ autumn-edge = { version = "0.9.0", path = "../autumn-edge", optional = true }
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
 # floor); licensed MIT OR Apache-2.0.
-wasmi = { version = "0.40", optional = true }
+wasmi = { version = "2.0", optional = true }
+# wasmi 2.0 keeps `LimiterError` (the error type `ResourceLimiter`'s methods
+# return) in a private module, so the sandbox's limiter names it through
+# `wasmi_core` directly. Already in `Cargo.lock` as wasmi's own dependency, so
+# this adds no crate to the graph. `default-features = false` matches how wasmi
+# itself depends on it; wasmi's `std` feature turns `std` back on.
+wasmi_core = { version = "2.0", default-features = false, optional = true }
 # `default-features = false` drops the database-layer macros from the core
 # macro crate; the `db` feature above pulls them back in through the
 # `autumn-macros-model` / `autumn-macros-repository` crates. A no-database app
@@ -346,7 +352,7 @@ http-body-util = "0.1"
 # compression-br features (used to precompute static CSS encodings once
 # instead of recompressing on every request — see `static_css_response`).
 flate2 = "1"
-brotli = "8"
+brotli = "9"
 bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
@@ -447,7 +453,7 @@ chrono = { workspace = true }
 chrono-tz.workspace = true
 # `serde` is a default feature, named here because `SqliteDecimal` depends on it.
 rust_decimal = { workspace = true, features = ["serde"] }
-croner = "3.0.1"
+croner = "4.0.2"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 proptest = { version = "1.4", optional = true }
@@ -456,7 +462,11 @@ serde_urlencoded = "0.7"
 # key into a `Vec<T>` field. Decode only.
 serde_html_form = { version = "0.4.1", default-features = false, features = ["de", "ser", "std"] }
 serde_path_to_error = "0.1"
-serde_yaml = { version = "0.9", optional = true }
+# Writes `openapi.yaml` next to `openapi.json`. Safe-Rust YAML (no
+# `unsafe-libyaml`, whose RUSTSEC-2024-0449 unmaintained notice `serde_yaml`
+# carried). The resolver picks 1.1.x: 1.2 raised its MSRV to 1.89, above this
+# workspace's 1.88 floor.
+serde-saphyr = { version = "1.1", optional = true }
 fd-lock = { version = "4", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 ammonia = { workspace = true, optional = true }
@@ -493,7 +503,7 @@ zeroize = "1"
 # direct edge plus the `ecdh` feature, which is a feature flag on the
 # already-compiled `elliptic-curve`, not a new dependency.
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "std"] }
-getrandom = "0.2"
+getrandom = "0.4"
 hex = "0.4"
 # Public Suffix List for custom-domain apex detection (issue #2643, ADR 0026).
 # The crate contains the list as code. It shares `psl-types` with `publicsuffix`.
@@ -511,7 +521,7 @@ lettre = { version = "0.11.21", default-features = false, features = ["builder",
 # optional network (`http`/reqwest) and local-file stylesheet fetchers — Autumn
 # only inlines embedded `<style>` blocks, never remote CSS — keeping the added
 # graph to the html5ever/selectors parsing stack. Gated behind the `mail` feature.
-css-inline = { version = "0.21", default-features = false, optional = true }
+css-inline = { version = "0.23", default-features = false, optional = true }
 chromiumoxide = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 

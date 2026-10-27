@@ -187,15 +187,18 @@ async fn plugin_assets_macro_embeds_a_directory() {
         "$CARGO_MANIFEST_DIR/tests/fixtures/plugin_assets"
     );
 
-    let paths: Vec<&str> = EMBEDDED.iter().map(|a| a.logical_path()).collect();
-    assert_eq!(paths, ["css/theme.css", "init.js"]);
-
     struct EmbeddedPlugin;
     impl Plugin for EmbeddedPlugin {
         fn build(self, app: AppBuilder) -> AppBuilder {
             app.plugin_assets(&EMBEDDED)
         }
     }
+
+    let paths: Vec<&str> = EMBEDDED
+        .iter()
+        .map(autumn_web::assets::PluginAsset::logical_path)
+        .collect();
+    assert_eq!(paths, ["css/theme.css", "init.js"]);
 
     let client = TestApp::new().plugin(EmbeddedPlugin).build();
     let response = client.get(&EMBEDDED.url("init.js")).send().await;

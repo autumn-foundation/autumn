@@ -1364,8 +1364,7 @@ impl SandboxHost {
         let Some(memory) = memory else {
             return Err(SandboxLoadError::MissingMemory);
         };
-        let initial_bytes =
-            u64::from(u32::from(memory.initial_pages())).saturating_mul(WASM_PAGE_BYTES);
+        let initial_bytes = memory.minimum().saturating_mul(WASM_PAGE_BYTES);
         if initial_bytes > manifest.limits.memory_bytes as u64 {
             return Err(SandboxLoadError::MemoryTooLarge {
                 found: initial_bytes,
@@ -1816,9 +1815,7 @@ impl SandboxHost {
             );
         }
 
-        let started = linker
-            .instantiate(&mut store, &self.module)
-            .and_then(|pre| pre.start(&mut store));
+        let started = linker.instantiate_and_start(&mut store, &self.module);
         let instance = match started {
             Ok(instance) => instance,
             Err(err) => {
@@ -2010,7 +2007,7 @@ fn record_limiter_refusals(state: &mut HostState, limits: ResourceLimits) -> usi
 }
 
 fn instantiation_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
-    if err.as_trap_code() == Some(wasmi::core::TrapCode::OutOfFuel) {
+    if err.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel) {
         SandboxFailure::FuelExhausted {
             budget: limits.fuel,
         }
@@ -2023,7 +2020,7 @@ fn guest_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
     if let Some(code) = err.i32_exit_status() {
         return SandboxFailure::Exited(code);
     }
-    if err.as_trap_code() == Some(wasmi::core::TrapCode::OutOfFuel) {
+    if err.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel) {
         return SandboxFailure::FuelExhausted {
             budget: limits.fuel,
         };
@@ -2971,7 +2968,7 @@ impl fmt::Display for AnswerComplete {
     }
 }
 
-impl wasmi::core::HostError for AnswerComplete {}
+impl wasmi::errors::HostError for AnswerComplete {}
 
 impl fmt::Display for OutputBudgetExhausted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2979,7 +2976,7 @@ impl fmt::Display for OutputBudgetExhausted {
     }
 }
 
-impl wasmi::core::HostError for OutputBudgetExhausted {}
+impl wasmi::errors::HostError for OutputBudgetExhausted {}
 
 // ── Host state ───────────────────────────────────────────────────────────
 
@@ -3022,7 +3019,7 @@ struct MemoryLimiter {
     table_refusals: usize,
     /// Elements held across every table of this instance, so the ceiling is on
     /// the instance rather than on each table separately.
-    table_elements: u32,
+    table_elements: usize,
 }
 
 impl wasmi::ResourceLimiter for MemoryLimiter {
@@ -3031,7 +3028,7 @@ impl wasmi::ResourceLimiter for MemoryLimiter {
         _current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> Result<bool, wasmi::errors::MemoryError> {
+    ) -> Result<bool, wasmi_core::LimiterError> {
         if desired > self.max {
             self.memory_refusals = self.memory_refusals.saturating_add(1);
             // `Ok(false)` makes the guest's `memory.grow` return -1, which is a
@@ -3046,10 +3043,10 @@ impl wasmi::ResourceLimiter for MemoryLimiter {
 
     fn table_growing(
         &mut self,
-        current: u32,
-        desired: u32,
-        _maximum: Option<u32>,
-    ) -> Result<bool, wasmi::errors::TableError> {
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool, wasmi_core::LimiterError> {
         // Across the instance, not per table: four tables each under a per-table
         // ceiling would still be four times that ceiling of host storage, which
         // is exactly the accounting hole this closes.
@@ -3057,7 +3054,7 @@ impl wasmi::ResourceLimiter for MemoryLimiter {
             .table_elements
             .saturating_sub(current)
             .saturating_add(desired);
-        if total > MAX_TABLE_ELEMENTS {
+        if total > MAX_TABLE_ELEMENTS as usize {
             self.table_refusals = self.table_refusals.saturating_add(1);
             return Ok(false);
         }
@@ -3786,12 +3783,12 @@ fn is_shim_function(name: &str) -> bool {
 
 /// Build a [`wasmi::FuncType`] from a signature descriptor pair.
 fn signature_type(params: &str, results: &str) -> Option<wasmi::FuncType> {
-    fn types(descriptor: &str) -> Option<Vec<wasmi::core::ValType>> {
+    fn types(descriptor: &str) -> Option<Vec<wasmi::ValType>> {
         descriptor
             .chars()
             .map(|ch| match ch {
-                'i' => Some(wasmi::core::ValType::I32),
-                'l' => Some(wasmi::core::ValType::I64),
+                'i' => Some(wasmi::ValType::I32),
+                'l' => Some(wasmi::ValType::I64),
                 _ => None,
             })
             .collect()
@@ -3890,7 +3887,7 @@ fn charge_units(caller: &mut Caller<'_, HostState>, units: u64) -> Result<(), wa
     let left = caller.get_fuel()?;
     let remaining = left
         .checked_sub(units)
-        .ok_or_else(|| wasmi::Error::from(wasmi::core::TrapCode::OutOfFuel))?;
+        .ok_or_else(|| wasmi::Error::from(wasmi::TrapCode::OutOfFuel))?;
     caller.set_fuel(remaining)
 }
 
@@ -4455,8 +4452,8 @@ fn deny(
     let mut params = Vec::with_capacity(signature.len());
     for ch in signature.chars() {
         params.push(match ch {
-            'i' => wasmi::core::ValType::I32,
-            'l' => wasmi::core::ValType::I64,
+            'i' => wasmi::ValType::I32,
+            'l' => wasmi::ValType::I64,
             other => {
                 return Err(SandboxLoadError::Engine(format!(
                     "unknown signature character `{other}` for {name}"
@@ -4464,7 +4461,7 @@ fn deny(
             }
         });
     }
-    let ty = wasmi::FuncType::new(params, [wasmi::core::ValType::I32]);
+    let ty = wasmi::FuncType::new(params, [wasmi::ValType::I32]);
     linker
         .func_new(
             WASI,

@@ -10651,7 +10651,7 @@ async fn run_cron_task_loop(
         handler,
     } = task;
 
-    let cron = match expression.parse::<croner::Cron>() {
+    let cron = match parse_cron_expression(&expression) {
         Ok(cron) => cron,
         Err(error) => {
             tracing::error!(task = %name, expression = %expression, error = %error, "Failed to create cron job");
@@ -10767,6 +10767,18 @@ fn format_next_task_run_after(
     delay: std::time::Duration,
 ) -> String {
     crate::job::due_at_from(now, delay).to_rfc3339()
+}
+
+/// Parses a `#[scheduled(cron = "...")]` expression.
+///
+/// croner 4 rejects the shorthand step syntax 3.x accepted (`5/5 * * * *`,
+/// `/10 * * * *`) unless `sloppy_ranges` is on. Keep it on so an expression
+/// that scheduled under the earlier release still schedules under this one.
+fn parse_cron_expression(expression: &str) -> Result<croner::Cron, croner::errors::CronError> {
+    croner::parser::CronParser::builder()
+        .sloppy_ranges(true)
+        .build()
+        .parse(expression)
 }
 
 fn next_cron_occurrence_after<Tz: chrono::TimeZone>(
@@ -23304,6 +23316,35 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("scheduled task handler panicked"))
         );
+    }
+
+    // croner 4 made shorthand steps (`5/5`) opt-in; the scheduler keeps
+    // accepting what croner 3 accepted, with the same meaning.
+    #[test]
+    fn cron_expressions_keep_accepting_shorthand_steps() {
+        use chrono::TimeZone as _;
+
+        let shorthand = super::parse_cron_expression("5/5 * * * *").expect("shorthand step");
+        let explicit = super::parse_cron_expression("5-59/5 * * * *").expect("explicit range");
+        let now = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 6, 0)
+            .unwrap();
+        let next = shorthand
+            .find_next_occurrence(&now, false)
+            .expect("next occurrence");
+        assert_eq!(
+            next,
+            explicit
+                .find_next_occurrence(&now, false)
+                .expect("next occurrence")
+        );
+        assert_eq!(
+            next,
+            chrono_tz::UTC
+                .with_ymd_and_hms(2026, 5, 5, 12, 10, 0)
+                .unwrap()
+        );
+        assert!(super::parse_cron_expression("not a cron").is_err());
     }
 
     #[test]
