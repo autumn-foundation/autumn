@@ -4,7 +4,7 @@ Enable the optional mail subsystem when your app needs password resets, signup
 confirmations, or transactional notifications:
 
 ```toml
-autumn-web = { version = "0.8", features = ["mail"] }
+autumn-web = { version = "0.9", features = ["mail"] }
 ```
 
 ## Configuration
@@ -410,7 +410,7 @@ from your mail provider, which Autumn verifies, parses into an
 Receiving is its own Cargo feature, and it does not come with `mail`:
 
 ```toml
-autumn-web = { version = "0.8", features = ["mail", "inbound-mailgun"] }
+autumn-web = { version = "0.9", features = ["mail", "inbound-mailgun"] }
 ```
 
 `inbound-mail` is the base feature — it carries the router, the RFC 5322 parser,

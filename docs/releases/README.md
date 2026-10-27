@@ -13,6 +13,11 @@ new in this one?" and does not want 145 changelog entries.
 
 ## Index
 
+- [`0.9.0.md`](0.9.0.md) — *Stay up under load*: load shedding,
+  retry budgets and deadlines on by default, adaptive admission control and
+  per-tenant bulkheads; a
+  transactional outbox, fenced leases and once-only scheduler ticks; SQLite
+  fleets with one database per tenant; MCP Tasks and progressive discovery.
 - [`0.8.0.md`](0.8.0.md) — *Prove it, then run it anywhere*: simulated
   networks and build-time query budgets, SQLite as a full backend, `Money`,
   ledgered and confidential data, mTLS and DNS-01 certificates, shadow deploys,

@@ -13,7 +13,7 @@ connection limits ([Server Connection Limits](connection-limits.md)).
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.8", features = ["ws"] }
+autumn-web = { version = "0.9", features = ["ws"] }
 ```
 
 ## Publish

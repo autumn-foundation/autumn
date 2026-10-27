@@ -66,7 +66,7 @@ description = "One line. Same as the crate description."
 origin = "community"
 repository = "https://github.com/<you>/autumn-plugin-<name>"
 version = "0.1.0"
-autumn_web = "0.8"
+autumn_web = "0.9"
 tier = "stable"
 trust = "native"
 status = "listed"
@@ -75,8 +75,8 @@ prefix = "/<name>"          # or `no_routes = true` for a plugin with none
 
 [plugin.conformance]
 result = "pass"
-autumn_web = "0.8.0"
-checked = "2026-09-27"
+autumn_web = "0.9.0"
+checked = "2026-10-26"
 ```
 
 ## Admission rules

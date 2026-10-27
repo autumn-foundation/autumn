@@ -9,6 +9,2649 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.9.0] - 2026-10-26
+
+For a narrative tour of this release, see the
+[0.9.0 release walkthrough](docs/releases/0.9.0.md); for the upgrade path from
+0.8.x, see the [migration guide](docs/migrations/0.9.0.md).
+
+### Breaking Changes
+
+- **Breaking:** **media:** `MediaPlugin` now installs only the primitives you
+  enable (issue #1974,
+  [migration guide](docs/migrations/0.9.0.md)).
+  Before, `build` installed storage, the encode jobs and the retention sweep
+  with no primitive enabled, and `with_broadcast()` did nothing. Now
+  `with_broadcast()` installs `MediaMtxClient` and `MediaUrls`. A plugin with
+  no primitive installs no routes, extensions or jobs, and logs a warning. If
+  your app queues media jobs, call `with_broadcast()` or `with_rooms()`.
+
+- **Breaking:** `ApiDoc` gains a public `mcp_task` field. A struct literal
+  needs `..ApiDoc::default()`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `ApiDoc` gains a public `mcp_core` field. A struct literal
+  needs `..ApiDoc::default()`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `JobInfo` has a new public `timeout` field. A `JobInfo { … }`
+  struct literal must add `timeout: None`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** the `autumn_web::commentable` functions `add_comment`,
+  `comment_thread`, `delete_comment` and `recompute_comment_count` take a new
+  last argument, `soft_delete: Option<bool>`. Pass `None` to keep the old
+  behavior. The generated `{Model}Comments` methods do not change. See the
+  [migration guide](docs/migrations/0.9.0.md#commentable-the-runtime-helpers-take-soft_delete-optionbool).
+
+- **Breaking:** `RouteIdempotency` has a new `Off` variant. An exhaustive
+  `match` needs an arm for it ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** **billing:** `store::Write` has a `Tie` variant and is
+  `#[non_exhaustive]` (issue #3111,
+  [migration guide](docs/migrations/0.9.0.md)). A custom `BillingStore` must
+  return it from `upsert_subscription` when `SubscriptionUpsert::check_ties`
+  (set with `with_tie_check`) is set.
+
+- **Breaking:** `TenancyConfig`, `JobConfig` and `JobPostgresConfig` have new
+  public fields. A struct literal needs `..Default::default()`.
+  `tenancy::TenantPropagatingBody` has a new `db_bulkhead` field
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `AutumnConfig` gains a public `fault_injection` field. A
+  struct literal needs `..AutumnConfig::default()`.
+  `capsule::schema::HttpErrorKind` has a new variant `FaultInjected`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `Route` has a new public field `criticality`, and
+  `config::ServerConfig` and `config::HttpClientConfig` each have a new
+  public field (issue #3068). A struct literal must set it or use
+  `..Default::default()`. `capsule::schema::HttpErrorKind` has a new variant
+  `ThrottledLocally` ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `autumn_web::ws::WebSocket` and
+  `autumn_web::ws::WebSocketUpgrade` are Autumn wrappers, not axum
+  re-exports. `#[ws]` handlers do not change. Call `into_parts()` for the
+  axum type and keep the returned `ConnectionHold` for the socket's life
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `autumn_http_request_duration_seconds` is now a histogram ([migration guide](docs/migrations/0.9.0.md)).
+  It has `method`, `route` and `status_class` labels (issue #3064). The old
+  quantile lines move to the deprecated
+  `autumn_http_request_duration_quantiles_seconds` summary.
+- **Breaking:** `TelemetryConfig` and `OtlpTraceRuntime` have a new `sample_ratio` field ([migration guide](docs/migrations/0.9.0.md)).
+  A struct literal must set it or use `..Default::default()`.
+
+- **Breaking:** before its first load, `PgFlagStore::get` on a Tokio runtime
+  returns an error ([migration guide](docs/migrations/0.9.0.md)). It starts a
+  load in the background. Call `PgFlagStore::refresh` first when you read
+  flags before the app starts. Apps that use `with_flag_store` need no change.
+
+- **Breaking:** `IdempotencyStore` is async ([migration guide](docs/migrations/0.9.0.md)).
+  Each method returns an `IdempotencyFuture` and a `Result` (issue #3061). The
+  trait has four required methods: `get`, `set(key, owner, …)`,
+  `try_lock(key, owner, ttl)` and `unlock(key, owner)`. `set` writes nothing
+  while another owner holds a live lock on the key or has stored an unexpired
+  response for it, and returns whether it stored. An optional
+  `renew_lock(key, owner, ttl)` renews the lock when the work before the
+  handler was slow; without it, such a request gets `409`. `try_get`, `try_set`, `try_lock_owned` and `unlock_owned`
+  are removed. The Redis store does not call `block_in_place`, so it works on
+  a current-thread runtime and does not hold a Tokio worker while it waits for
+  Redis.
+- **Breaking:** `idempotency.in_flight_ttl_secs` defaults to `60`, not `86400`
+  ([migration guide](docs/migrations/0.9.0.md)). `IdempotencyLayer::new` uses
+  60 s too, not the response TTL. When the record write fails after the
+  handler, a retry gets `409` for one minute, not one day.
+
+- **Breaking:** `CircuitBreakerPolicy` and `config::CircuitBreakerPolicyConfig`
+  have three new public fields for slow calls (issue #3060). A struct literal
+  must set them or use `..Default::default()`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `HealthConfig` gains the public fields `cache_ttl_ms`,
+  `ping_timeout_ms`, `db_readiness` and `redis_readiness`
+  ([migration guide](docs/migrations/0.9.0.md)). A struct literal over it
+  needs `..HealthConfig::default()`.
+
+- **Breaking:** `HttpClientConfig` gets `send_deadline_header` and
+  `retry_budget`, and `RequestTimeoutsConfig` gets `accept_deadline_header`
+  (issue #3058). Add `..Default::default()` to a struct literal
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** the `prod` profile sets `server.strict_config = true` ([migration guide](docs/migrations/0.9.0.md)).
+  An unknown top-level table, or an unknown key in `[server]`, `[deploy]` or
+  `[database]`, now stops the boot. A misspelled timeout key no longer falls
+  back to the default in silence. Unknown keys in other sections log a warning
+  (#3057).
+- **Breaking:** `capacity::AdmissionLimit` is `#[non_exhaustive]` and has a new `ProfileDefault` variant ([migration guide](docs/migrations/0.9.0.md)) (#3057).
+
+- **Breaking:** **http client:** `RequestBuilder::retries(n)` now sets only the retry count. It no longer enables retries for `POST` and `PATCH`. Call the new `.retry_non_idempotent()` to retry them. That call also sends an `Idempotency-Key` header (the same value on each attempt) when the request has none. `RetryPolicy`, `HttpClientConfig` and `JobConfig` have new public fields (`max_backoff`, `max_backoff_ms`) (issue #3054, [migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** the Postgres scheduler needs a new table ([migration guide](docs/migrations/0.9.0.md)).
+  `scheduler.backend = "postgres"` claims ticks in `autumn_scheduler_ticks`
+  (issue #3052). The runtime creates it on first use. If the app's database
+  role cannot run `CREATE TABLE`, apply `scheduler::PG_TICK_TABLE_DDL` before
+  you deploy.
+
+- **Breaking:** **`#[model]`:** if you wrote your own `impl Normalize for NewX`
+  for a model with no `#[normalize]` columns, remove it (issue #2692). It now
+  conflicts with the generated impl (`E0119`). If it changed values, move the
+  logic to `#[normalize(...)]` on the field or to a `before_create` hook
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** **constela:** a render that writes the same element id two
+  times now fails with `constela.duplicate`, and so does validation of a
+  literal `id` in an `each` body. An id with whitespace fails with
+  `constela.eval`; `true` and `""` now omit the attribute. A portal `target`
+  longer than 256 bytes fails validation
+  ([migration guide](docs/migrations/0.9.0.md)).
+- **Breaking:** **constela:** `ConstelaError::Invalid` holds at most
+  `MAX_DIAGNOSTICS` (256) faults plus one `constela.limit` diagnostic, and
+  `Diagnostic::new` cuts `path` and `message` to
+  `MAX_DIAGNOSTIC_FIELD_BYTES`. A copy of a value that a render or a dispatch
+  keeps now charges the allocation budget, so an action that copies more than
+  4 MiB fails ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `db` no longer compiles the Postgres client. The new
+  `postgres` feature (on by default) adds `pq-sys`, `tokio-postgres` and
+  diesel's Postgres backend. A SQLite app with default features off now
+  compiles none of them (issue #2605). A build that turns default features off
+  and enables `db` without `sqlite` must add `postgres`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** **jobs:** `JobTrackingStore::reset_for_retry` takes a
+  `RetryToken`, not a `DateTime<Utc>` (issue #2581,
+  [migration guide](docs/migrations/0.9.0.md)). `JobTrackingStore` has a new
+  required method, `get_with_token`. The token is a write counter. It changes
+  on every write, also under a frozen clock or inside one millisecond. A
+  retry no longer overwrites a job that a worker has already started. The
+  Postgres store needs the new `autumn_job_tracking.version` column: the
+  framework migration adds it.
+
+- **Breaking:** `autumn_web::graph::served()` takes the app's `&AppState` and
+  returns an `Arc` ([migration guide](docs/migrations/0.9.0.md)). Each
+  application now serves its own graph at `/actuator/graph`. The graph
+  descriptor types have a new `crate_version` field.
+
+- **Breaking:** `ScopedGroup` and `RouteInfo` gain a public `layer_guarded`
+  field. A struct literal that names every field needs the new field
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** the `#[agent_operable]` analyser now refuses handler shapes
+  that compiled before ([migration guide](docs/migrations/0.9.0.md)). Examples:
+  a bare `sleep(..)`, `session.x()` or `cache.x()` on an untyped value, an
+  opaque macro, and a `diesel::` write to an unresolved table. Write the
+  `tokio` path, type the parameter, or add `#[agent_effect(...)]`.
+
+- **Breaking:** **repository:** `delete_many` now fires each parent's
+  `before_delete` before any child hook, as `delete_by_id` does (issue #2427,
+  [migration guide](docs/migrations/0.9.0.md)). `DependentAction` gains a hidden
+  `Probe` variant, and `RuntimeDependentSpec` gains a `probe` field.
+
+- **Breaking:** `StaticRouteMeta` has a new `content_type` field. Add
+  `content_type: None` to each literal
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `model_path` in the data-flow manifest now includes the
+  compatible version of the defining crate, for example
+  `shop::Customer@2::Customer`
+  ([migration guide](docs/migrations/0.9.0.md)). Make the manifest again. Commit
+  it.
+
+- **Breaking:** **cache:** the coherence audit follows nested `dependent(...)`
+  cascades (issue #2364, [migration guide](docs/migrations/0.9.0.md)). A root
+  delete now registers a write for each model below it. A cached read of a
+  grandchild model is flagged unless the root declares an edge for it, so an
+  existing audit can newly fail. `MutationDescriptor` and `Mutation` have new
+  public fields.
+
+- **Breaking:** `capsule::CacheEffect` has new variants `Invalidate`,
+  `InvalidateNamespace` and `Clear`; `capsule::EffectSeam` has new variants
+  `Random` and `Detached`; `capsule::schema::MailErrorKind` has a new variant
+  `NoDurableQueueInProduction`; `capsule::JobEffect` has new public fields
+  `requested_due_at` and `error_status`; `capsule::CapsuleEffects` has a new public field
+  `state_cache`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** the `notifications` and `push_subscriptions` tables get a
+  `tenant_id` column ([migration guide](docs/migrations/0.9.0.md)). Add the
+  column and backfill it. `Notifications::topic` includes the tenant inside a
+  tenant scope.
+
+- **Breaking:** `ShadowStats` gains the public field `comparisons_abandoned`
+  ([migration guide](docs/migrations/0.9.0.md)). A struct literal over it needs
+  `..ShadowStats::default()`.
+
+- **Breaking:** a ledgered table refuses framework writes that record no
+  revision (issue #2319). A counter-cache column on a ledgered parent, and a
+  `dependent(..., on_delete = delete_all | nullify)` cascade into a ledgered
+  child, fail with `LedgerError::OutOfBandWrite`. Before, they changed the table
+  and `ledger_verify` reported `LiveStateMismatch`. Use `on_delete = destroy`,
+  or stop ledgering the table ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** more framework writes to a ledgered table are refused with
+  `LedgerError::OutOfBandWrite` (issue #2319): `#[votable]` reactions,
+  `#[commentable]` comment writes, `has_many(through)` link writes, capsule
+  imports, and writes (or `destroy` cascades) from an unledgered repository on
+  the same table. A model factory panics. A ledgered repository that declares a derived `delete_by_*`, or a
+  ledgered `tenant_scoped` repository with an `Option<String>` tenant column,
+  does not compile. An update that moves a ledgered record to another tenant
+  fails with `LedgerError::TenantChange`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `#[query_budget]` reports an associated function handed a
+  database or repository handle, such as `Post::published(&mut db)`, instead
+  of counting it as one query. Nothing at the call site tells a one-query
+  finder from a helper that loops. Put `#[query_cost(N)]` on the statement
+  (#2316, [migration guide](docs/migrations/0.9.0.md)).
+- **Breaking:** `#[query_budget]` reports a method that borrows a container
+  of handles, such as `repos.len()`, `repos.push(repo)` or `maybe.as_ref()`
+  on a `Vec`, `Option` or `Result` of a handle type. An application trait
+  method with that name may run in its place. A method that takes `self`
+  (`repos.into_iter()`, `maybe.unwrap()`), an index, a pattern and a `for`
+  loop stay free. Put `#[query_cost(N)]` on the statement
+  (#2316, [migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** **schema:** `autumn_schema_core::ForeignKey` gains the public
+  fields `on_delete` and `on_update`. A struct literal needs the two fields,
+  or use `ForeignKey::new` ([migration guide](docs/migrations/0.9.0.md)).
+- **Breaking:** **schema:** a snapshot with a foreign-key action is written as
+  `snapshot_version` 2. An older CLI refuses it with "unsupported
+  snapshot_version", so it cannot drop the action in silence. Upgrade the CLI
+  ([migration guide](docs/migrations/0.9.0.md)). A snapshot without an action
+  stays at version 1.
+
+- **Breaking:** **media:** `RoomStore::heartbeat` takes a `session_max`
+  argument, and `RoomStore::roster` does too (issue #1974,
+  [migration guide](docs/migrations/0.9.0.md)). A heartbeat never renews the
+  room token past `joined_at + session_max`. After that, heartbeat and roster
+  return the same opaque `404`; the client leaves, then joins again. Set it with
+  `[media] room_session_max_seconds` (default 12 hours, at least
+  `room_token_ttl_seconds`). `MediaConfig` has two new public fields.
+
+- **Breaking:** `AutumnConfig` gains a public `cost` field. A struct literal
+  needs `..AutumnConfig::default()`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+### Added
+
+- **sharding / sqlite:** a SQLite database fleet: one database file per
+  tenant or per routing slot, behind the existing sharding extractors
+  (ADR 0019). Configure `[database.fleet]` (`mode = "tenant"` or `"slot"`,
+  `root`, an optional `path` template with `{tenant}`, `{slot}` and
+  `{bucket}`). `ShardedDb`, `Shards`, `CrossShard` and
+  `#[repository(sharded)]` then route each request to its tenant's own file,
+  opened and migrated on first use, with no change to handlers. SQLite's one
+  writer becomes one writer per tenant. Databases close when idle or past
+  `max_open` (never with a connection checked out). `DatabaseFleet` provisions,
+  deletes, backs up (`VACUUM INTO`), lists and restores tenant databases.
+  Tenant ids that cannot safely name a file (`..`, `/`, uppercase, device
+  names) are refused with `400`. `AUTUMN_MIGRATE=1` migrates the whole fleet.
+  The `db:fleet` health indicator reports the counters.
+- **replication / sqlite:** with `[replication]` on, every open fleet database
+  ships its WAL to the same object storage under `fleet/tenant/<id>` or
+  `fleet/slot/<n>`. Closing a database ships its last frames first.
+  `database.fleet.restore_missing = true` rebuilds a database that is missing
+  from the local volume out of its replica, so a host with a fresh volume can
+  take over tenants or slots. `replication:fleet` reports the worst lag.
+- **sharding:** `ShardSet::resolve` returns an owned `Shard` and serves both
+  configured shards and a fleet; `Shard::metric_label` keeps metric labels
+  bounded (`shard=fleet` for every fleet database).
+
+- **repository:** `#[repository(.., mcp, grant = X)]` governs the generated MCP
+  tools with an authority grant (issue #2451). Each tool carries the grant. The
+  build fails if the grant does not list the model in `writes`.
+
+- **commentable:** `commentable::route_infos(prefix)` lists the two routes
+  `commentable::router()` serves. Pass it to `declare_plugin_routes` next to
+  the `nest`, and `autumn routes audit` accepts the mount. Before, the nested
+  router was opaque, so the audit failed on every app that mounted it. Reading
+  a thread is `public`. Posting is `gated`, with `provenance: "declared"`.
+- **examples:** the security posture gate now also covers `reddit-clone`. It
+  is the first example in the gate with `#[secured]` routes.
+- **docs:** `docs/guide/posture-gate.md` has a new recipe. It shows the
+  gate's report when a `reddit-clone` route changes from `#[secured]` to
+  `#[public]`. CI checks the report against golden files
+  (`scripts/check-posture-demo.sh`).
+
+- **assets:** plugins can ship JavaScript, CSS and fonts with content-hashed
+  URLs. Declare the files once as a `PluginAssets` bundle
+  (`autumn_web::plugin_assets!("my-plugin")` embeds the crate's `assets/`
+  directory; `PluginAssets::from_files` takes an explicit list) and install it
+  with `AppBuilder::plugin_assets`. Each file is served under
+  `/static/_plugins/<namespace>/` at a hashed URL cached `immutable` for a
+  year, and at its plain URL with `must-revalidate`, both with an `ETag`,
+  `304` revalidation and `Range` support. `script_tag`,
+  `deferred_script_tag` and `stylesheet_tag` emit the hashed URL with its
+  `sha384` SRI hash, and `asset_url("_plugins/<namespace>/<file>")` resolves
+  it from templates. See the [Plugin Assets guide](docs/guide/plugin-assets.md).
+
+- **mcp:** MCP Tasks extension (`io.modelcontextprotocol/tasks`). A tool
+  tagged `#[api_doc(mcp, task)]` (or `Route::mcp_task()`) returns a task
+  handle to a client that declares the extension. The client polls
+  `tasks/get`, and can call `tasks/cancel` and `tasks/update`. A task runs
+  outside the `POST /mcp` request, so only the route's own timeout applies.
+  `AppBuilder::mcp_tasks(McpTaskConfig)` sets the TTL, poll interval, store
+  size, per-client quota and stored-result byte budget. Autumn keeps tasks in
+  memory, per process. Only a caller with the same credentials can read a
+  task. See `docs/guide/mcp.md` §6.
+
+- **mcp:** MCP protocol revision `2026-07-28`. The endpoint is dual-era: a
+  request with `io.modelcontextprotocol/protocolVersion` in `params._meta`
+  is served with the modern rules (`server/discover`, per-request client
+  capabilities, `resultType` and `serverInfo` on results, the
+  `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` header checks, and the
+  `-32020`, `-32021` and `-32022` errors). Legacy clients keep the
+  `initialize` flow. See `docs/guide/mcp.md` §3.
+
+- **mcp:** progressive tool discovery. `#[api_doc(mcp, core)]` (or
+  `Route::mcp_core()`) marks a core tool. A core tool carries
+  `_meta["anthropic/alwaysLoad"]`, so a client that defers tools loads it
+  first. `AppBuilder::mcp_instructions` sets the server `instructions` on
+  `initialize` and `server/discover`. `AppBuilder::mcp_catalog(McpCatalog::Progressive)`
+  makes `tools/list` send the core tools and two meta-tools. `search_tools`
+  finds a tool. `call_tool` runs it through the normal dispatch path. See
+  `docs/guide/mcp.md` §3.
+
+- **lock:** `LeaseLock`, a lease lock with fencing tokens (issue #3053). Each
+  grant gets a strictly larger `FencingToken`. The lease renews in the
+  background, and `lease_lost()` signals a lost lease. Check the token at the
+  resource with `WHERE fencing_token <= $token`. See
+  `docs/guide/distributed-locks.md` and `verification/lease_fencing.rs`.
+- **lock:** new `LockError::LeaseLost { name, token }` variant. It maps to
+  `503 Service Unavailable`.
+- **db:** the pool builder logs one warning per target when the database
+  target points to a well-known connection pooler (`PgBouncer`, RDS Proxy,
+  Supabase, Neon). Session advisory locks are not safe in transaction mode.
+
+- **jobs:** `#[job(timeout = "30s")]` and `jobs.default_timeout_ms`
+  (`AUTUMN_JOBS__DEFAULT_TIMEOUT_MS`, default `0` = no limit). A run that
+  exceeds its timeout fails and retries, and the worker is free at once. See
+  [Claim leases and timeouts](docs/guide/jobs.md#claim-leases-and-timeouts).
+- **jobs:** `JobContext::lease_lost()`, `JobContext::is_cancelled()` and
+  `JobContext::cancelled()` let work that a handler spawns find out that the
+  worker stopped the run.
+
+- **schema:** `#[renamed_from("old_name")]` on a `#[model]` field or model
+  (issue #1975). `autumn schema diff` emits `ALTER TABLE ... RENAME` in place
+  of a drop plus an add, so the data stays. Convention-named indexes follow
+  the rename. An ambiguous hint is refused.
+- **schema:** `autumn schema diff --dev-url <URL>` (issue #1975). The command
+  applies the migrations to a scratch database (Postgres: created on the
+  server of the URL and dropped after; SQLite: in memory), reads the schema
+  back, and diffs the models against that schema. The database in the URL
+  does not change. The snapshot becomes optional. `AUTUMN_DEV_URL` can hold
+  the URL.
+
+- **gdpr:** portable data capsules (issue #1811). A capsule holds all data of
+  one subject in one signed directory. The directory holds the records, a
+  `manifest.json` of models, fields, and relationships, the blobs, and an
+  offline HTML viewer. Register models with `GdprRegistry::capsule`. Use
+  `autumn data capsule export|import|verify` or
+  `POST /actuator/capsules/{export,import,verify}`. Import verifies every file
+  first. On Postgres, import has no loss of data. See
+  `docs/guide/data-capsules.md`.
+- **actuator:** `ProvideActuatorState::data_capsules`, a method with a
+  default. A custom actuator state can give a `CapsuleService`.
+- **security:** `SigningSecretConfig` is now re-exported from
+  `autumn_web::security`.
+- **storage:** `BlobStore::put_if_absent` writes a blob only when its key is
+  free, in one atomic step, so it never replaces a blob that another writer
+  made. `LocalBlobStore` and `S3BlobStore` (`If-None-Match: *`) implement it.
+  The default returns `BlobStoreError::Unsupported`.
+
+- **routes:** `#[post("/x", idempotent = false)]` keeps the app-level
+  idempotency layer off one route, for a route that dedupes by its own key,
+  such as a durable workflow route. A hand-built `Route` uses
+  `RouteIdempotency::Off`.
+
+- **agent authority:** the MCP dispatcher now enforces a grant's `rate` cap
+  (issue #2451). One bucket serves the whole grant. A call over the cap is
+  refused and audited. The count is per process. `spend` is still declared
+  only.
+
+- **aeo:** agent readiness by default (`autumn_web::aeo`, `[aeo]` in
+  `autumn.toml`). An HTML page requested with `Accept: text/markdown` returns
+  Markdown, with `Vary: Accept`, `x-markdown-tokens`, and `Content-Signal`.
+  The homepage sends agent `Link` headers. See
+  [the AEO guide](docs/guide/aeo.md).
+- **aeo:** generated agent documents, served from the router fallback so an
+  app route at the same path wins: `/robots.txt` (when no `[seo]` route
+  serves it), `/llms.txt`, an agent skills index with a `site-guide` skill,
+  an ARD manifest (`/.well-known/ai-catalog.json` and
+  `/.well-known/ard.json`), an RFC 9727 API catalog, the MCP server card
+  (`/.well-known/mcp/server-card.json` and `<mcp>/server-card`), RFC 9728 and
+  RFC 8414 OAuth metadata, and `/auth.md`.
+- **aeo:** `robots.txt` lists the AI search, user-fetch, and training
+  crawlers and adds `Content-Signal: search=yes, ai-input=yes, ai-train=no`
+  (`[aeo.content_signals]`, `[aeo.ai_crawlers]`).
+- **aeo:** `autumn build` writes the agent documents into `dist/` when
+  `[seo] base_url` is set.
+- **aeo:** `AppBuilder::agent_skill`, `ucp_profile`, and `acp_discovery`.
+- **aeo:** WebMCP. `/_autumn/webmcp.js` registers the public MCP tools with
+  `document.modelContext.registerTool()`; add `aeo::webmcp::head_tags` to the
+  layout.
+- **aeo:** Web Bot Auth. With `[aeo.web_bot_auth] private_key_env`, Autumn
+  serves a signed JWKS directory, and
+  `http_client::RequestBuilder::sign_web_bot_auth` signs outbound requests
+  (RFC 9421).
+- **aeo:** x402 payments for `[[aeo.paid_routes]]` (facilitator verify and
+  settle, one use per payment header), MPP `x-payment-info` in
+  `/openapi.json`, and DNS-AID zone lines (`aeo::dns_aid::records`).
+- **cli:** `autumn aeo dns` prints the DNS-AID records to publish.
+- **scaffold:** new apps add `aeo::webmcp::head_tags` to the layout, and
+  `autumn.toml` documents `[aeo]`.
+- **test:** `TestClient::head`.
+
+- **forms:** `FieldOptions` and a `*_with` variant of each field helper,
+  `RowScope` included (issue #3395). `FieldOptions` adds a hint
+  (`{field}-hint`, named in `aria-describedby` before the error), the required
+  state, typed attributes (`placeholder`, `autocomplete`, `inputmode`,
+  `pattern`, `min`, `max`, `disabled`, `readonly`) and `data-*`/`hx-*`
+  attributes. It has no setter for `id`, `name` or `aria-*`.
+  `FormFor::field_options` sets options for one field. It works with every
+  `FieldControl`.
+- **forms:** `required_password_input`, `required_textarea_input`,
+  `required_checkbox_input`, and `RowScope::required_number_input` /
+  `required_textarea_input`.
+
+- **forms:** a repeated key now decodes into a `Vec<T>`, `HashSet<T>` or
+  `Option<Vec<T>>` field (issue #3394). Checkbox groups, `<select multiple>`
+  and tag inputs work with `ChangesetForm`, `NestedChangesetForm` and the
+  multipart path. The new `autumn_web::form::from_urlencoded` applies the same
+  rules to a raw body. `Changeset::field_values` returns every element of a
+  sequence field for re-render, and `NestedRow::values` / `RowScope::values`
+  return every submitted value of a nested row's subfield. See
+  `docs/guide/forms.md`.
+- **forms:** `ChangesetForm` keeps the file parts of a `multipart/form-data`
+  body: `form.file(..)`, `form.files(..)` and `form.take_files()`.
+  `FormFile::new` and `ChangesetForm::with_files` build one in a test.
+
+- **experiments:** `Experiments::assign_async` and
+  `ExperimentService::assign_async` run an assignment on the blocking pool.
+  Use them in async handlers. `ExperimentStore::preload` is a new method with a
+  default that does nothing.
+
+- **db:** the SQLite fleet sweeper (issue #3234). Outbox rows, commit hooks
+  and derivation backfills now work on fleet databases, also when the
+  database is closed. A write marks its database in `_autumn_fleet_pending`
+  on the control database. A worker process opens each marked database
+  (never past `max_open`), does the work and closes it again.
+  `/actuator/health` reports `fleet:sweeper` with the backlog and the oldest
+  pending age. New: `DatabaseFleet::open_background`,
+  `DatabaseFleet::close_if_unused`, `DatabaseFleet::get_open` and
+  `autumn_web::db::fleet_sweeper`.
+
+- **db:** slot ownership with epochs and fencing for the SQLite fleet (issue
+  #3233). With `[database.fleet.ownership]`, a host claims its slot ranges on
+  the control database and renews a lease on them. A key whose slot this host
+  does not own answers `421` (`FleetError::NotOwner`), and `restore_missing`
+  runs only for an owned key. Each replica generation records its epoch: a
+  restore takes the newest epoch, and a replicator that sees a newer epoch
+  stops. A host that gets a range back restores a file that is older than
+  the replica before it serves it. `/actuator/health` reports `fleet:ownership`. New:
+  `autumn_web::db::fleet_ownership`, `DatabaseFleet::install_ownership`,
+  `DatabaseFleet::start_ownership`, `DatabaseFleet::spawn_ownership`, `DatabaseFleet::release_ownership`,
+  `DatabaseFleet::owns`,
+  `DatabaseFleet::fence_unowned`, `FleetDatabase::epoch` and
+  `Replicator::with_epoch`. The built-in table is on the control database, so
+  it fences the processes of one host; hosts on different machines implement
+  `SlotOwnershipStore`. See "Failover: slot ownership" in the SQLite fleet
+  guide.
+
+- **cli:** `autumn fleet list | migrate | backup | delete | restore` operates a
+  SQLite database fleet from the command line (issue #3232). It needs the
+  `sqlite` build of the CLI. See "Operating the fleet" in
+  `docs/guide/sqlite-fleet.md`.
+- **db:** `DatabaseFleet::migrate` migrates one database, and
+  `DatabaseFleet::migrate_keys` a given list.
+  `DatabaseFleet::inspect` reads the identity row and the applied migrations
+  (`FleetDbInfo`) and writes nothing. `DatabaseFleet::remapped_migrations`
+  lists migrations recorded under a substitute version,
+  `known_migration_versions` the versions the fleet's sets record, and
+  `check_control_outside_root` refuses a control database inside the root. The builder gets
+  `migration_source` and `framework_migrations`.
+
+- **tenancy:** per-tenant bulkheads (issue #3072).
+  `tenancy.max_concurrent_requests` caps the in-flight requests of one tenant,
+  and `tenancy.max_db_connections` caps its database connections. A request
+  over a cap gets `503`. Other tenants are not affected.
+- **jobs:** tenant isolation for the `local` backend (issue #3072).
+  `[jobs.tenants]` serves each queue round-robin by tenant, caps the running
+  jobs of one tenant (`max_concurrent`), and gives each tenant a stable set of
+  worker lanes (`lanes`, `lanes_per_tenant`) by shuffle sharding.
+- **jobs:** shard-local job tables (issue #3072).
+  `jobs.postgres.shard_local = true` makes `autumn_jobs` on each shard and
+  runs workers for it. `enqueue_in_tx` on a shard connection then commits or
+  rolls back with the shard's data, and a control-database outage does not
+  stop the shard workers. See
+  [ADR 0018](docs/adr/0018-shard-local-framework-state.md).
+- **cells:** `cell_router::CellRouter` maps a tenant to a cell with the shard
+  slot hash. The new [cell isolation guide](docs/guide/cell-isolation.md)
+  gives the cell deployment pattern and the multi-region stance.
+
+- **fault injection:** an opt-in `[fault_injection]` section for staging
+  (issue #3071). It adds latency or errors to routes, database checkouts,
+  Redis session operations and outbound HTTP calls. Each fault has a rate and
+  a list of paths. It is refused in `prod` unless `allow_in_production =
+  true`. A burn-rate stop condition disarms it. Each arm or disarm writes an
+  audit event. See `docs/guide/fault-injection.md`.
+
+- **slo:** declare SLOs in `autumn.toml` as `[[slo]]` tables. Each table has `name`, `objective`, `sli` (`"availability"` or `"latency"`), and optional `route`, `threshold_ms` and `description`. The new `autumn_web::slo` module checks them. The `prod` profile accepts them (issue #3069).
+- **cli:** `autumn slo generate` writes monitoring files to `deploy/slo/`. They are Prometheus recording rules, multiwindow burn-rate alerts (14.4× over 1h/5m, 6× over 6h/30m, 1× over 3d/6h), a `PrometheusRule`, a Grafana dashboard, an Argo Rollouts `AnalysisTemplate`, Flagger `MetricTemplate`s and Helm values. `--rule-label NAME=VALUE` labels the `PrometheusRule` for a Prometheus `ruleSelector`. `--check` fails when the files are out of date. See `docs/guide/slo.md` (issue #3069).
+- **deploy:** `autumn deploy up` can bake each host after its cutover. Set `[deploy.bake] duration_secs`, or use `--bake-secs N`. The CLI samples `/actuator/metrics` on the host over SSH. It rolls the host back when the 5xx ratio or the latency is above the limit, or when the process restarts. The `[[slo]]` tables set the default limits (the 14.4× burn rate). A fleet halts at the step `bake` and rolls back each host on the new release. The bake is off by default (issue #3069).
+- **release:** `autumn release init --target kubernetes` writes a Helm chart (`deploy/helm/`) and a Kustomize base (`deploy/kustomize/base/`). They have `/startup`, `/live` and `/ready` probes, a `preStop` hook, a grace period longer than the drain window, and a `PodDisruptionBudget`. The chart has opt-in Argo Rollouts and Flagger canaries and an opt-in `PodMonitor`. See `docs/guide/kubernetes.md` (issue #3069).
+
+- **admission:** adaptive concurrency limit. Set
+  `[server.admission] mode = "adaptive"` and `algorithm = "gradient2"`
+  (default), `"vegas"` or `"aimd"`. The limit follows measured latency
+  between `min_limit` and `max_limit`. `max_limit` defaults to the static
+  ceiling (issue #3068, ADR 0016).
+- **admission:** route criticality. `#[get("/x", criticality = "sheddable")]`
+  (or `"critical"`, `"default"`). Under overload, the server rejects
+  `sheddable` routes first and `critical` routes last. Set the share of the limit for
+  each class under `[server.admission.partitions]` (defaults: `default = 1.0`,
+  `sheddable = 0.5`).
+- **admission:** the HTTP client sends the inbound request's criticality in
+  `X-Autumn-Criticality` when it is not `default`. `RequestBuilder::criticality` sets it for one call.
+  A server reads the header only with
+  `server.admission.trust_criticality_header = true`.
+- **http client:** client-side adaptive throttling (Google SRE), off by
+  default. `[http.client.adaptive_throttle] enabled = true`. A rejected
+  attempt returns `ClientError::ThrottledLocally`, which maps to `503`.
+- **metrics:** `/actuator/prometheus` shows `autumn_admission_limit` and
+  `autumn_admission_shed_total{criticality="..."}`.
+
+- **sim:** several replicas on one sim clock (issue #3067).
+  `Sim::mount_replica(name, app)` mounts named apps next to each other, each
+  with its own state, job runtime and scheduled tasks. `kill_replica` stops a
+  replica's tasks as a crash does, and `restart_replica` mounts it again.
+  With `Sim::net`, each replica is a `SimNet` host under its name.
+- **sim:** a clock per replica. `Replica::clock_ahead`, `clock_behind`,
+  `clock_drift_ppm` and `seeded_clock` set the offset and drift.
+  `Sim::step_replica_clock` jumps one clock, as an NTP step does.
+- **sim:** database faults per replica. `Sim::db_link(name)` and
+  `SqliteSubstrate::replica_pool` give each replica its own session on the
+  shared database. The link drops the session, fails a write part way
+  (mid-query error), or applies a write and then returns an error (commit
+  ambiguity).
+- **sim:** `Sim::run_for` moves time one event at a time. It does not move
+  time while a query runs. So a seed replays the same `SQLite` work across
+  replicas. `sim::runtime()` builds the runtime it needs, for a sim outside
+  `#[sim_test]`.
+- **sim:** `sim::trace::capture` records the framework's `tracing` events with
+  sim time, and `Trace::diff` compares two runs of one seed.
+- **sim-sweep:** with `--features sqlite`, the seed sweep also runs the jobs,
+  scheduler and lock scenarios across two or three replicas under seeded
+  faults, and runs the first seeds twice to compare their traces. Select
+  scenarios with `AUTUMN_SIM_SCENARIOS`.
+
+- **server:** `[server.http]` connection limits (issue #3065):
+  `header_read_timeout_ms`, `keep_alive_timeout_ms`, `max_header_bytes`,
+  `http2_max_concurrent_streams` and `max_connections`. The server
+  disconnects a slowloris client after the header-read timeout. See
+  [Server Connection Limits](docs/guide/connection-limits.md).
+- **server:** `autumn_web::http_server::serve`, the serve loop that applies
+  these limits. `App::run` uses it for every listener.
+- **server:** `autumn_web::http_server::KeepTunnel`. A handler on axum's own
+  `WebSocketUpgrade` keeps it for the socket's life, so an HTTP/2 WebSocket
+  is not closed by `keep_alive_timeout_ms`.
+- **ws:** `[realtime]` WebSocket limits: `max_connections` (`503` above the
+  cap), `max_message_bytes` (close code `1009`), `ping_interval_ms` and
+  `idle_timeout_ms` (close code `1001`). See
+  [WebSockets](docs/guide/websockets.md#limits).
+- **db:** `database.replica_max_lag_ms`. The app measures replica lag. While
+  the lag is over the limit or unknown, reads go to the primary. `/ready`
+  reports the lag. See
+  [Cloud-Native Autumn](docs/guide/cloud-native.md#lag-aware-reads).
+- **db:** a boot warning when a database URL looks like PgBouncer, RDS Proxy,
+  Supavisor or the Neon pooler (`database.warn_on_pooler`), and the
+  [Running behind PgBouncer / RDS Proxy](docs/guide/connection-poolers.md)
+  guide with a compatibility matrix.
+
+- **observability:** `/actuator/prometheus` exports the job queue depth, the
+  age of the oldest ready job, dead letters per job, the DB pool size,
+  available and waiting counts, and a DB pool wait histogram (issue #3064).
+- **observability:** a trusted proxy can set `X-Request-Id`. The app keeps a
+  well-formed id. `http_client` sends the request id on outbound calls;
+  `RequestBuilder::without_request_id` turns this off.
+- **telemetry:** `telemetry.sample_ratio` sets a parent-based ratio sampler.
+  `http_client` opens one CLIENT span per attempt. Request logs carry
+  `trace_id` and `span_id` when an OpenTelemetry span is active.
+
+- **feature_flags:** `FeatureFlagService::with_default(key, bool)` sets the
+  value of a flag that the store does not hold, or cannot read with no
+  last-known value. Without it, the value is `false`.
+- **feature_flags:** `AppBuilder::with_flag_service` (and
+  `TestApp::with_flag_service`) registers a configured service, for example
+  one with declared defaults.
+- **feature_flags:** `FlagStore::preload` (default: no-op) and
+  `PgFlagStore::refresh`. When the app installs the flag service, it runs
+  `preload` and waits up to 10 s for it, in every mode, before job workers,
+  startup hooks and requests.
+
+- **outbox:** a transactional outbox and inbox (issue #3062). `Outbox::write`
+  puts a message in the `autumn_outbox` table on the connection of your
+  transaction, so it commits or rolls back with your data. A relay sends it
+  after commit, in order per aggregate, with retries, jitter and dead letters.
+  `Inbox::seen` drops a copy for an at-least-once consumer. Postgres and
+  SQLite. Turn it on with `outbox.enabled = true`
+  (`AUTUMN_OUTBOX__ENABLED`); register handlers with
+  `AppBuilder::outbox_handler`. See `docs/guide/outbox.md`.
+- **outbox:** framework writers on the same table: `Outbox::publish` and
+  `Events::publish_in_tx` (durable event listeners), `Outbox::enqueue_job`
+  (Redis and SQLite job backends), `Outbox::deliver_mail`, and
+  `Outbox::dispatch_webhook` / `WebhookOutboundManager::dispatch_in_tx`.
+- **mail:** with `outbox.enabled = true`, `deliver_later` writes to the outbox
+  (`OutboxMailQueue`) when the app sets no `MailDeliveryQueue`, so a queued
+  mail survives a restart.
+- **webhooks:** each outbound delivery sends the Standard Webhooks headers
+  `webhook-id`, `webhook-timestamp` and `webhook-signature`. `webhook-id` is
+  the same on every retry, so a receiver can drop a copy, and the signature
+  covers it.
+- **webhooks:** `SqlOutboundWebhookStore` and `OutboundWebhookPlugin::sql()`, a
+  durable subscription and delivery-log store on the app database
+  (`WEBHOOK_SCHEMA_SQL`).
+- **testing:** `TestApp::with_outbox` and `TestApp::outbox_handler`.
+  `Sim::run_to_idle` drains the outbox.
+
+- **idempotency:** `DbIdempotencyStore` keeps records in the app database
+  (Postgres, or SQLite under `sqlite`). Select it with
+  `[idempotency] backend = "database"`. It needs the new framework migration
+  `autumn_idempotency_keys`. It honours a GDPR legal hold on that table
+  (`ModelRegistration::retain`): expired rows are kept, not swept.
+- **idempotency:** the `IdempotencyTx` extractor. `IdempotencyTx::commit`
+  writes the response in the handler's `Db::tx`, so the response commits with
+  the mutation. A crash after the commit no longer re-runs the mutation: when
+  the in-flight lock expires, the retry replays the committed response. If a
+  request's lock expired and another request took the key, `commit` returns
+  `409` and the transaction rolls back. If the handler also changes the
+  session, the key stays locked until the record holds the final
+  `Set-Cookie`. Use it on a primary `Db` connection, not a shard.
+- **idempotency:** `IdempotencyTx::set_recovery_point` and
+  `IdempotencyTx::recovery_point` let a multi-step handler resume after a
+  crash. A recovery point belongs to its request body: a retry with another
+  body gets `422`. A retry whose session has gone away still sees the
+  recovery point.
+- **idempotency:** a boot warning when `in_flight_ttl_secs` is shorter than
+  `server.timeouts.request_timeout_ms`, and a boot note when no request
+  timeout is set.
+
+- **resilience:** the circuit breaker opens on slow calls (issue #3060). Set
+  `slow_call_duration_threshold_ms` and `slow_call_rate_threshold` under
+  `[resilience.circuit_breaker.defaults]` or a host override.
+- **resilience:** a call cancelled at or after the slow-call threshold counts
+  as a slow call. `cancelled_call_outcome = "failure"` counts it as a failure.
+  A call cancelled before the threshold counts as nothing.
+- **resilience:** `/actuator/prometheus` shows
+  `autumn_circuit_breaker_slow_calls_total` and
+  `autumn_circuit_breaker_slow_call_ratio` for each breaker.
+  `/actuator/circuitbreakers` and the breaker health details show
+  `slow_call_ratio`.
+
+- **probes:** `health.cache_ttl_ms` (default `1000`) keeps each database ping
+  result and each health indicator result for a short time. When a result is
+  stale, one refresh runs and the other probes wait for it. Concurrent probes
+  cause a maximum of one ping in each TTL period. A prober that disconnects
+  does not stop the refresh. `0` turns the cache off.
+  `HealthIndicatorRegistry::set_cache_ttl` sets it for a registry you build.
+- **probes:** `health.ping_timeout_ms` (default `2000`) is the time limit for
+  one built-in database or Redis ping. `0` is refused at startup.
+- **probes:** `health.db_readiness = false` keeps a replica in rotation when
+  the primary fails: `/ready` does not ping the primary. `/actuator/health`
+  still pings it and shows `db` as `DOWN`.
+- **probes:** a change of the database ping result writes a `warn` (failed)
+  or `info` (recovered) log event.
+- **redis:** `RedisHealthIndicator` sends `PING` with a time limit. The
+  framework registers `redis:<subsystem>` for each subsystem that runs on
+  Redis (channels, idempotency, jobs, rate limit, sessions, submit tokens,
+  webhook replay). `RedisCachePlugin` registers `redis:cache`.
+  `RedisHealthIndicator::configured` applies the `[health]` rules to an
+  indicator you register. Subsystems on one URL share one connection
+  and one concurrent `PING`. A backend installed with the builder
+  (`with_session_store`, `with_cache_backend`, `with_channels_backend`) gets
+  no indicator.
+  The indicators show in `/actuator/health` only. Set
+  `health.redis_readiness = true` to make them gate `/ready`.
+- Env: `AUTUMN_HEALTH__CACHE_TTL_MS`, `AUTUMN_HEALTH__PING_TIMEOUT_MS`,
+  `AUTUMN_HEALTH__DB_READINESS`, `AUTUMN_HEALTH__REDIS_READINESS`.
+
+- **http:** the request deadline now reaches outbound calls (issue #3058).
+  Each attempt of the outbound `Client` uses `min(timeout_secs, time left)`.
+  The client does not start a retry or a wait that the time left cannot hold.
+  `ClientError::DeadlineExceeded` (`504`) tells you that the deadline stopped
+  the call; the circuit breaker counts it as a cancelled call, not as a
+  failure. See
+  [the guide](docs/guide/timeouts-and-budgets.md).
+- **http:** `autumn_web::deadline::Deadline::current()` gives a handler the
+  time left. `Deadline::scope` and `deadline::bounded` carry and apply it to
+  other work.
+- **server:** `server.timeouts.accept_deadline_header` (default `false`, env
+  `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER`) lets a caller's
+  `x-autumn-deadline-ms` header make the route deadline shorter.
+- **server:** the `autumn_web::extract::ShutdownToken` extractor. It is
+  cancelled when the server stops accepting connections.
+  `AppState::shutdown_token` no longer needs the `ws` feature.
+- **db:** the `Db` connection wait stops at the request deadline.
+
+- **database:** each framework transaction (`Db::tx`, `tx_with`,
+  `tx_immediate`, repository writes) starts with `SET LOCAL statement_timeout`
+  and `SET LOCAL idle_in_transaction_session_timeout`, so a transaction pooler
+  such as `PgBouncer` cannot drop them. A route's `StatementTimeout` applies
+  to them (#3057).
+- **migrations:** `MigrationLockPolicy`, `run_pending_with_policy`,
+  `run_pending_locked_with_policy`, and `MigrationError::LockContention`
+  (#3057).
+- **config:** new env vars `AUTUMN_DATABASE__STATEMENT_TIMEOUT`,
+  `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT`,
+  `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT`,
+  `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES`. `AUTUMN_SERVER__STRICT_CONFIG=false`
+  now turns strict config off (#3057).
+
+- **cache:** `Cache::invalidate_async` and `Cache::invalidate_namespace_async`
+  return `Result<(), InvalidationError>` (issue #3056). Both have defaults, so
+  a custom backend still compiles. `RedisCache` overrides them with real async
+  calls: no `block_in_place`, and they work on a current-thread runtime. Reads
+  and inserts still need a multi-thread runtime. Also
+  `coherence::invalidate_namespace_async` and the generated
+  `invalidate_declared_caches_async()`.
+- **cache:** `GetOrComputeOptions::stale_if_error(window)` (RFC 5861, issue
+  #3056). When a fill fails, the caller gets the last value for up to `window`
+  after it went stale. Counted in
+  `autumn_cache_read_through_stale_if_error_serves_total`.
+
+- **jobs:** `jobs.redis.dead_letter_limit` sets the maximum length of the Redis
+  dead-letter list (issue #3055). `0` keeps all dead letters. Env:
+  `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT`.
+- **jobs:** a Redis dead-letter trim logs a `warn` event and increments
+  `autumn_jobs_dead_letter_trimmed_total` on `/actuator/prometheus`.
+
+- **backoff:** new public module `autumn_web::backoff` (`full_jitter`, `full_jitter_ms`, `ceiling_ms`, `retry_after_wait`). New `RequestBuilder::retry_non_idempotent()` and `RequestBuilder::max_backoff(d)` (issue #3054).
+- **webhooks:** `OutboundWebhookPlugin::with_max_attempts(n)` sets the number of delivery attempts. The default stays 5 (`DEFAULT_WEBHOOK_MAX_ATTEMPTS`). `WebhookOutboundManager` has `with_max_attempts(n)` and `max_attempts()` (issue #3054).
+
+- **scheduler:** `scheduler::current_tick()` gives a running `#[scheduled]`
+  task its tick key. On the Postgres backend it also gives a fencing token
+  (the tick's `generation`).
+- **scheduler:** `SchedulerCoordinator::try_acquire_for_period`. It has a
+  default, so a custom coordinator needs no change.
+- **scheduler:** `SchedulerLease::release_and_free` frees a constant key that
+  works as a mutex.
+- **scheduler:** a boot warning when `scheduler.backend = "in_process"` runs
+  fleet tasks and a hint shows more than one replica: `jobs.backend` is
+  `postgres` or `redis`, `AUTUMN_REPLICAS` is more than 1, or
+  `KUBERNETES_SERVICE_HOST` is set.
+
+- **cli:** `autumn a11y verify` follows more calls when it finds the routes of
+  a finding (issue #2666): a turbofish call (`sidebar::<Html>()`), a function
+  passed by name (`.map(render_row)`), and a helper `fn` declared in the
+  handler body. An item or a call under a `#[cfg(feature = "…")]` that is off
+  no longer gives a route. The scan reads the default features of the nearest
+  `Cargo.toml`. The new `--features`, `--all-features` and
+  `--no-default-features` flags change them. Features change only the route
+  attribution, not the findings or the exit code.
+
+- **openapi:** `SchemaDirection`, `registered_derived_schema_for`,
+  `schema_entry_to_value_in` and `schema_component_index_for` (issue #2607).
+
+- **macros:** `#[derive(OpenApiSchema)]` accepts `#[openapi_schema(crate = "...")]`
+  (issue #2565). Use it when one crate holds two copies of `autumn-web`. The
+  generated impl and schema registration then use the named copy. [no-plugin]
+
+- **sqlite:** `autumn generate model --id uuid` now works on a SQLite app (#2555). The migration uses `TEXT PRIMARY KEY NOT NULL DEFAULT (...)` with a `randomblob` v4 UUID expression. The model field is `SqliteUuid`. The schema parser and diff accept this default.
+- **sqlite:** under `--features sqlite`, `autumn_web::test::TestDb` is a temp-file SQLite database with the same API as the Postgres one. New method `TestDb::reset_table` on both backends.
+
+- **db:** `autumn db scrub` runs against a `sqlite://` database and a `.sqlite`
+  backup artifact (issue #2553). It uses the same classifier as Postgres, so an
+  unclassified column still aborts the run. The production guard, `--check` and
+  `--dry-run` work the same. After the commit, Autumn runs `VACUUM` and truncates the
+  WAL. This removes the old values from the file. `--sample` is Postgres-only and is refused.
+- **retention:** `autumn db retention` sweeps `job_history`, `commit_hooks` and
+  `experiment_assignments` in a SQLite file (issue #2553). The report has the
+  same shape as on Postgres.
+
+- **routes:** `autumn routes audit` takes `--release`, `--profile`,
+  `--features`, `--all-features` and `--no-default-features` (issue #2472). A
+  route behind `#[cfg(not(debug_assertions))]` or a non-default feature is now
+  in the manifest when you audit the build you ship.
+- **routes:** the security manifest (schema v5) records its Cargo build in a
+  top-level `build` object. A non-default build is part of the posture
+  digest. `routes posture diff` reports `build_changed` as a widening when the
+  base and head come from different builds.
+- **routes:** `routes posture diff --ack-dir <DIR>` reads one file per
+  pull-request comment and parses each file alone. No comment text can fake a
+  comment boundary.
+
+- **cli:** `autumn upgrade` now adopts the root files for a Cargo workspace
+  member (issue #2469). It plans `clippy.toml`, `rustfmt.toml` and
+  `rust-toolchain.toml` at the workspace root, and `ci.yml` and
+  `posture-gate.yml` at the git root, as `../` paths. The workflows name the
+  member. A root file that exists already is a conflict, and the command does
+  not overwrite it. Use `--accept ../<file>` to leave it as it is.
+
+- **routes:** `AppBuilder::scoped_guarded` declares that a layer, such as
+  `RequireApiToken`, guards a route group (issue #2468). `autumn routes audit`
+  lists these routes as `gated`, with `provenance: "declared"`. The route dump
+  JSON adds `layer_guarded`. A plugin cannot use it for its own routes.
+- **routes:** `autumn routes posture diff` reports `guard_declared` (widening)
+  when a proven guard becomes a declared one, and `guard_proven` (narrowing) in
+  the other direction.
+- **examples:** the security posture gate now also covers `flock`, `invoice`
+  and `todo-app`.
+
+- **forms:** the NUL field error is localizable. `ChangesetForm` and
+  `NestedChangesetForm` look up `common.error.nul_character` in the request
+  locale when the request has an `i18n` bundle. If the key is missing, the English
+  text stays. `autumn generate scaffold --i18n` ships the key, and `autumn i18n check`
+  does not report it as unused.
+- **errors:** `error::nul_byte_json_fields` returns the paths of the string
+  values that hold a NUL byte. `i18n::Bundle::lookup` returns a message
+  without recording a miss.
+
+- **plugin-sandbox:** mount and unmount a sandboxed plugin on a running app
+  (issue #2433). Give the app a `PluginMounts` with `AppBuilder::plugin_mounts`.
+  Call `mount` and `unmount` at any time. The prefix answers after a mount and
+  returns 404 after an unmount. A running request finishes and keeps its
+  permit. A static route matches first, so ordinary routes have no added cost.
+  A framework prefix is refused. `list` and `routes` show what is mounted.
+
+- **repository:** `position(...)` now works with `dependent(...)`, in the
+  repository attribute and on the model. The old compile error is gone.
+
+- **static:** `#[static_get]` takes `content_type = "..."` (issue #2403).
+  The declared type is recorded in `manifest.json` and served as written,
+  also when it is `text/plain; charset=utf-8` or `application/octet-stream`
+  on a route with an asset extension. ISR does not check the handler type for
+  such a route. The type applies to the page served from `dist/` only.
+
+- **capsule:** `capsule::guard_egress`, `capsule::UnrecordedEgress` and
+  `capsule::spawn` (issue #2351). `guard_egress` checks a call that does not go
+  through the framework HTTP client. A replay refuses the call, and capture
+  marks the capsule incomplete. CAPTCHA, `OAuth2`, SES inbound mail,
+  `autumn-storage-s3` and the media plugin call it. `spawn` replaces
+  `tokio::spawn` for detached work. Capture marks the capsule incomplete. A
+  replay logs a divergence and gives the task the tape.
+- **capsule:** `autumn replay` keeps startup code off live services. Cache
+  backends stay offline, a mail send with no tape is refused, and a task that
+  startup code spawns gets a tape that refuses every call.
+- **capsule:** `autumn replay` installs a mailer. A mail-sending route reaches
+  the mail seam and replays from the capsule. Nothing is delivered. Its
+  `has_durable_delivery_queue()` answers as production's did, also when the
+  queue came from `[outbox] enabled = true`.
+- **capsule:** a capsule records whether the app builder installed a cache
+  (`with_cache_backend`). `autumn replay` then installs a cache that stores
+  nothing in the same places, so a cache call takes the production path and
+  the capsule answers it.
+- **capsule:** `CacheInvalidationError`, `CacheEffect::is_read`,
+  `CacheEffect::pending`, `OLDEST_READABLE_FORMAT_VERSION`,
+  `ReplayEffects::for_format_version` and `ReplayEntropy::width_mismatches`.
+
+- **session:** rotation hooks (issue #2347). `AppBuilder::on_session_rotation`
+  and `AppState::session_rotation_hooks` run code after a session-id rotation
+  is stored. `autumn generate auth` registers a hook that re-points the
+  tracked-session row, so impersonation no longer ends in a `401`.
+- **auth:** `impersonation::rebind` keeps an impersonation record across a
+  trusted same-user rotation.
+
+- **auth:** `ImpersonationPolicy::target_session_values` swaps extra session
+  keys (for example `user_email`) during impersonation (issue #2347).
+  `end_impersonation` restores the operator's values. If the policy returns a
+  reserved key or the auth key, `begin_impersonation` fails with `500`. The
+  key `impersonator_identity_keys` is now reserved.
+
+- **http-client:** `RequestBuilder::pin_to_addrs` pins one request to several
+  addresses of a host (issue #2336). reqwest tries the next address only if it
+  cannot connect. `pin_to` is no longer a `const fn`.
+
+- **ledger:** `ledgered(schema_version = N, upcast = path)` reads old revisions
+  after you rename or retype a snapshot field (issue #2326). A model at version
+  2 or more writes the version into each new snapshot, inside the hash. The
+  `upcast` function converts an older snapshot before the model reads it. A
+  model at version 1 writes no marker, so existing chains keep their hashes.
+- **ledger:** `LedgeredRecord` gains `LEDGER_SCHEMA_VERSION` and
+  `ledger_upcast`. Both have defaults.
+
+- **tls [no-plugin]:** end-to-end HTTP/2 tests for the in-process TLS listener (issue
+  #2321). The tests use real h2 and HTTP/1.1 clients. They check that ALPN
+  picks `h2`, that HTTP/1.1 clients still work, and that the request timeout,
+  SSE, graceful shutdown and `wss://` work over h2. CI runs them in the `tls`
+  lane.
+
+- **ledger:** `ledger_revisions_page` reads a record's chain in keyset pages
+  (`LedgerPageRequest`, `LedgerRevisionPage`). `ledger_verify` reads the chain
+  in pages too, so its memory does not grow with the chain. The new
+  `LedgerChainVerifier` checks a chain one revision at a time (issue #2319).
+
+- **repository:** `list_rows(query, limit)` and, with `owner =`,
+  `list_scoped_rows(owner_id, query, limit)` (#2185). They load up to `limit`
+  rows in `list`/`list_scoped` order, with the same allowlist and the same
+  soft-delete, tenant and owner scope. They use one statement and no
+  `COUNT(*)`. One statement reads one snapshot, so a concurrent write cannot
+  duplicate or skip a row. See the
+  [pagination guide](docs/guide/pagination.md#without-a-count-list_rows).
+
+- **console:** `autumn console --repl` opens an interactive Rhai prompt over
+  your repositories (issue #2148). `PostRepository::find_all()`,
+  `find_by_id(id)` and `count()` run with no compile per query. Rows show as
+  JSON; `#[classified]`, `#[private]` and `#[serde(skip)]` fields do not show.
+  `#[model]` and `#[repository]` register through `inventory`, behind the new
+  off-by-default `repl` feature of autumn-web. `--repl` turns it on for the
+  run only and does not change `Cargo.toml`. `SeedContext::build()` opens the
+  prompt, so any playground works and its body never runs in REPL mode. The
+  edit-and-run playground is unchanged. See `docs/guide/console.md`.
+
+- **schema:** `#[references]` accepts `on_delete` and `on_update` (issue
+  #1975). The values are `cascade`, `restrict`, `set_null`, `set_default` and
+  `no_action`. `autumn schema diff` writes the action. `schema pull` reads it
+  back on Postgres and SQLite. `schema doctor` reports a different action as
+  drift. The macro rejects an unknown value. It also rejects `set_null` and
+  `set_default` on a field that is not `Option<_>`.
+
+- **schema:** `autumn schema diff --write-migration` writes `src/schema.rs`
+  (issue #1975). Each managed model gets its `diesel::table!` block. The
+  command removes the block of a dropped table and gives a renamed table its
+  new name. It also updates `joinable!` and
+  `allow_tables_to_appear_in_same_query!`, also for a renamed or dropped
+  foreign key column. It does not change the block of an
+  unmanaged model or a block that already matches. It also updates the file
+  when the plan has no changes.
+- **schema:** `autumn schema diff --write-migration` records a newly managed
+  model as managed in the snapshot (issue #1975). A later delete of the model
+  then drops its table.
+- **schema:** two `autumn schema doctor` rows (issue #1975).
+  `schema-rs-drift` finds a missing or stale `src/schema.rs` block for a
+  managed model. `unmanaged-drift` compares each unmanaged model with its
+  table in the live database.
+
+- **media:** `[media] room_rate_limit_per_minute` limits each client IP on
+  each room route (default `0`, off). It uses the core `#[throttle]` limiter,
+  so `[security.trusted_proxies]` decides the client IP. An over-limit request
+  gets `429` before its body is read. On create and join, the session check
+  runs first, so an anonymous caller gets `401` (issue #1974).
+- **deploy:** `autumn deploy up` installs MediaMTX 1.19.3 at
+  `[media.mediamtx] binary_path` before cutover when nothing is there. It
+  copies the binary out of the digest-pinned `bluenviron/mediamtx` image and
+  checks its version. It installs `docker.io` with apt when Docker is missing.
+  It never replaces a file that is there. Set `install_binary = false` to
+  install it yourself (issue #1974).
+- **doctor:** when `[deploy]` is set and `[media.mediamtx] enabled = true`,
+  `autumn doctor` runs the two config-only media checks, and with `--online`
+  all six over SSH (issue #1974).
+
+- **edge:** Typed path helpers work inside a capsule (issue #1790). The helper
+  of an `#[edge]` route uses the new `autumn_edge::paths` encoders and
+  compiles for `wasm32-wasip1`. Collect helpers with `autumn_edge::paths![]`.
+  `autumn_edge::paths::PathExt` adds `with_query`. The encoders give the same
+  bytes as `autumn_web::paths`.
+- **edge:** `autumn build --embed` builds the edge capsule too. Before, it
+  stopped with an error when the app had `#[edge]` routes. The capsule build
+  gets the `embed-assets` feature, the same as the native build.
+
+- **edge:** `autumn edge serve` runs an edge node (issue #1790). The node puts
+  the capsule from `autumn build` in front of a remote origin. It serves what
+  the capsule serves and sends every other request to the origin over HTTP.
+  At start it copies the origin's static security and CSP headers. It
+  does not follow redirects, removes hop-by-hop headers, refuses a path with
+  a dot segment, and tunnels WebSocket upgrades to the origin. It replaces
+  the client's `x-forwarded-*` headers for both lanes, except from a
+  `--trusted-proxy` peer such as a TLS terminator.
+  In Rust:
+  `autumn_edge::node::EdgeNode` (feature `node`).
+- **edge:** `autumn edge ttfb` measures time to first byte at the edge node
+  and at the origin, and compares the bytes of each pair. It fails on one
+  divergence or on a median reduction below `--min-reduction` (default 50%).
+- **edge:** `conformance::CORS_HEADERS`. `compare_capsule` ignores them,
+  because the host sets them.
+- **edge:** The `edge-conformance` CI job has Tier E: the edge node over real
+  HTTP, with a simulated origin round trip of 150 ms, must show an at least
+  50% lower median TTFB and zero divergence.
+
+- **edge:** a web-standard JavaScript edge host, `autumn-edge/js/autumn-edge-host.mjs`
+  ([ADR-0024](docs/adr/0024-web-standard-js-edge-host.md)). It runs a capsule
+  on Cloudflare Workers, Deno, Bun or Node with the reference host's WASI
+  surface, determinism and response checks. It forwards every decline to the
+  origin unchanged. It reads an async KV store (a Workers KV binding) through
+  replay-on-miss, so a capsule needs no preloaded snapshot. The edge-greeting
+  conformance suite (Tier J) requires the same outcome as the reference host
+  over 10,000 generated requests.
+- **cli:** `autumn edge bundle --target cloudflare --origin <URL>` writes a
+  Worker that `wrangler deploy` deploys: the capsule, the host, a generated
+  `worker.mjs`, and a `wrangler.toml` that later bundles keep. It refuses a
+  capsule that imports something the host cannot link. CI runs the bundle in
+  workerd against the real origin.
+
+- **edge:** `autumn_edge::gateway::EdgeGateway` (feature `host`), a reference
+  gateway (issue #1790). It puts a capsule in front of any origin
+  `tower::Service`. When the capsule declines a request, the gateway sends the
+  original request to the origin and returns the origin's answer unchanged.
+  `with_response_headers` sets the origin's static security headers on edge
+  responses. The gateway refuses an edge response with `set-cookie`.
+- **edge:** `autumn doctor` has a new `edge_capabilities` check. It warns
+  when an `#[edge]` route needs something the edge cannot provide: an unknown
+  `needs(...)` capability, a write method, an origin-only extractor such as
+  `Db` or `Session`, or `EdgeIdentity` without `needs(identity)`. `autumn
+  build` names the same routes before it compiles.
+- **edge:** `conformance::SECURITY_HEADERS` and `conformance::compare_capsule`
+  compare a raw capsule response with the origin. Every header other than
+  the volatile and security headers must match in both directions.
+
+- **cost:** per-request cost records and a live cost signal (issue #1720).
+  `[cost] enabled = true` measures the CPU time, allocated bytes (with an
+  `AllocationProbe`) and DB queries of each request, by tenant. The cost goes
+  to the `Server-Timing` header (`cost-cpu`, `cost-db`, `cost-alloc`), the
+  `autumn.cost` metrics source and `GET /actuator/cost`. `CostSignal` holds a
+  carbon or price value. Set it from code, or from the `autumn_cost_signal`
+  runtime-config key with no redeploy. `#[job(deferrable)]` and
+  `#[scheduled(..., deferrable)]` work waits while the signal is above
+  `[cost] defer_threshold`. The work runs when the signal falls. The runtime
+  never drops it. Only the `local` jobs backend defers jobs. See
+  [the cost guide](docs/guide/cost.md).
+
+- **cost:** deferrable jobs wait on every jobs backend (issue #1720). On
+  `postgres` and `sqlite`, workers do not claim a `#[job(deferrable)]` job
+  while the cost signal is high. On `redis`, a worker parks it until the signal
+  falls. The job stays enqueued and uses no attempt. Autumn no longer
+  logs the boot warning for these backends.
+- **cost:** with `[cost] enabled`, Autumn meters each job run and scheduled
+  tick (CPU time, allocated bytes, DB queries). The cost of a `local` job goes
+  to the tenant that enqueued it. Autumn classifies each deferrable run as
+  `shifted` or `in_window`, and shows the shifted ratio. See `jobs` and
+  `tasks` in `GET /actuator/cost`, the `autumn_cost_work_*_total` and
+  `autumn_cost_deferrable_*_total` metrics, and
+  [the cost guide](docs/guide/cost.md).
+- **cost:** `CostSignal::set_recheck` sets the time between two signal checks.
+
+### Changed
+
+- **web:** `Query<T>` decoding stores a single-valued key's value inline instead of in a one-element `Vec`, cutting allocations per decode by ~14% (no behavior change). [no-plugin]
+
+- **htmx:** the framework's own scripts (`js/htmx.min.js`, `js/sse.js`,
+  `js/idiomorph.min.js`, `js/autumn-htmx-csrf.js`, `js/autumn-widgets.js`)
+  are now also served at content-hashed URLs, and `asset_url("js/htmx.min.js")`
+  (and the others) returns the hashed URL, cached `immutable`. The plain
+  `/static/js/...` paths keep working, now with an `ETag` so a revalidating
+  browser gets a `304` instead of the whole script again. They are served as
+  `text/javascript; charset=utf-8` rather than `application/javascript`.
+- **admin:** `autumn-admin-plugin` serves `admin.js` from
+  `/static/_plugins/autumn-admin/admin.<hash>.js` (with an SRI hash) instead
+  of `/admin/static/admin.<hash>.js`, and its layout loads htmx and the
+  widget runtime through their hashed URLs.
+
+- **outbox:** the relay's claim no longer reads every sent row that the purge
+  has not deleted yet. A new partial index `idx_autumn_outbox_claim`
+  (`autumn_outbox (seq) WHERE dispatched_at IS NULL AND dead_at IS NULL`)
+  serves the `ORDER BY seq` of the claim: 126,813 buffers per three claims
+  fall to 7,499 with 950,000 sent rows in retention, and the cost no longer
+  grows with them. New installs get the index from the schema. On an
+  existing install, `outbox::ensure_schema` builds it in a background task with
+  `CREATE INDEX CONCURRENTLY` at boot, and only logs a warning when the role
+  cannot create indexes or the pool has a single connection. The index adds
+  about 66 bytes of WAL to each
+  enqueued message. [no-plugin]
+
+- **feed:** `Feed::render` escapes text fields straight into the output
+  buffer instead of allocating a `String` per field. On the 30-entry Atom
+  feed workload: 22% fewer instructions and 42% fewer allocations per render. [no-plugin]
+
+- **cms:** renaming or re-parenting a nested page no longer issues one
+  query per ancestor per descendant to re-check settled paths. The guard now
+  loads the subtree and its shared ancestors in batched statements (one per
+  level of depth, plus one more for every further 1000 ids at a level), so
+  the statement count per edit stops multiplying with subtree size (968 → 14
+  for a 250-descendant page). Applies to the `examples/cms` app and the
+  `autumn new --starter cms` scaffold. [no-plugin]
+
+- **feed:** `Feed::render` XML-escapes text with a byte-table scan instead of decoding every `char`; output is identical. Callgrind on the 30-entry `feed_render` bench: 338,241 → 255,656 instructions per render (-24.4%). [no-plugin]
+
+- **billing:** the webhook endpoint declared in `autumn.toml` must now allow
+  request bodies of at least 4 MiB (`max_body_bytes = 4194304`); boot fails
+  with the line to add when it allows less. The webhook default (1 MiB) rejects
+  a provider event that carries many invoice lines with a 400, which the
+  provider retries unchanged, so the event was never applied. The billing
+  guide, the crate README and rustdoc, and the `autumn plugin add
+  autumn-billing` output now include the setting. A larger limit is allowed.
+
+- **idempotency:** `RequireApiToken` registered with `AppBuilder::layer` or
+  `static_gate` no longer forces fail-closed replay. A token client's retry
+  replays its own response instead of answering `409`, and keeps replaying
+  when the client rotates its token. Token APIs, agents and MCP clients can
+  use `.idempotent()` ([idempotency guide](docs/guide/idempotency.md#bearer-token-clients)).
+
+- **agent authority:** a delete through a generated repository is checked
+  against every model its `dependent(...)` cascade writes (issue #2451).
+  `repo.delete_by_id(..)` and `repo.delete_many(..)` in an `#[agent_operable]`
+  handler now need each dependent model in the grant's `writes`. `restrict`
+  legs write nothing and are skipped. A `destroy` child adds its own children,
+  up to 4 levels. A deeper cascade, or one that loops, is refused. Cascades
+  that loop still compile.
+  The same check covers the delete tool of `#[repository(.., mcp, grant = X)]`.
+
+- **seo:** an app with no `[seo]` settings now serves `/robots.txt` (from
+  the router fallback, so an app route still wins). It says `Disallow: /`
+  for the `dev` and `test` profiles. It also serves a `/sitemap.xml` of `/`
+  and the pages with a `seo(title)`. Set `[aeo] enabled = false` for the old
+  `404`s.
+
+- **forms:** a required field, rich text included, shows a `*` marker in its
+  label, with `aria-hidden="true"`. `required_text_input` now has the
+  `autumn-field*` classes. A field with no hint and no error no longer renders
+  an empty `aria-describedby=""`. `checkbox_input` shows the box before its
+  label, the same as `form_for`. In `form_for`, a required textarea is now
+  `required`.
+- **widgets:** each `error_summary` entry links to `#field`. The summary has
+  `id="error-summary"`, `tabindex="-1"` and `autofocus`, so focus moves to it
+  when a submit fails.
+- **ui:** the stylesheet shows the browser's invalid state with
+  `:user-invalid`, and styles `.autumn-field__hint`, `.autumn-field__required`,
+  `.autumn-field--checkbox` and a disabled control.
+
+- **forms:** a repeated key on a single-value field is a 422 with a message
+  that names the field, for `ChangesetForm` and `NestedChangesetForm`. Before,
+  it was a 400 (`duplicate field`). A `HashMap<String, String>` target also
+  rejects a repeated key now. Before, the last value won.
+- **forms:** a blank element of a typed list (`ids=`) is dropped, as a blank
+  `Option` is. A `bool` field also accepts `on`. A blank numeric or `bool`
+  `Option` is `None` even when the field has a `#[serde(default = "...")]`.
+- **forms:** the `ChangesetForm` multipart path applies the `security.upload`
+  policy to file parts (MIME allowlist, per-file cap). A file that fails it is
+  now a 400 or a 413. Before, the decoder dropped the file with no error. The
+  per-file cap also applies to each text part.
+- **generate scaffold:** the bulk-delete handler decodes its ids into a
+  `BulkSelection { ids: Vec<i64> }` field. The generated `parse_bulk_ids` is
+  gone. A malformed selection now flashes an error and deletes nothing. Before,
+  the handler dropped a non-integer id and deleted the rest.
+
+- **acme:** `CustomDomainStore` has three new methods: `load_attempts`,
+  `append_attempt` and `merge_attempts`. Their defaults keep nothing. `MemoryCustomDomainStore` and
+  `FsCustomDomainStore` implement them. `CustomDomainTask::hydrate_limiter` is
+  now `async`. [no-plugin]
+
+- **examples [no-plugin]:** `island-flock` now uses yew 0.23 (issue #3095). The committed
+  `flock` island bundle is rebuilt. This removes `anymap2` and the
+  RUSTSEC-2026-0319 waiver. The `bincode` and `proc-macro-error` waivers stay,
+  because yew 0.23 still uses them.
+
+- **sim:** `#[sim_test]` runs on `sim::runtime()`: one blocking thread, and
+  each query of a sim-substrate connection runs only while all tasks wait. A
+  seed then replays the same order of database work. A blocking task that
+  waits for a second blocking task now never ends in a sim test.
+- **jobs, scheduler, lock:** the background loops and the job claim
+  heartbeat use `biased;` in `tokio::select!`, with shutdown first, so a sim
+  replays their branch order.
+- **jobs:** the job claim heartbeat lets a renewal in flight finish on its
+  own task when it gives up or stops. Before, a `SQLite` renewal dropped on a
+  current-thread runtime panicked before the heartbeat stopped the run, and a
+  peer ran the job again. A late `SQLite` renewal also never moves a claim
+  time back. The #3067 sweep found this.
+- **lock:** the `SQLite` `LockGuard` stops its renewal task by a signal, not
+  by an abort, so a release does not drop a renewal query in flight.
+
+- **release:** release templates now use `/ready` for traffic checks and
+  `/live` for liveness, not the `/health` alias (issue #3066). The ECS target
+  group and the App Runner cutover now check `/ready`. `/health` is only an
+  alias of `/ready`. The image `HEALTHCHECK` checks `/startup`: it waits for
+  startup to complete, and Docker Swarm does not replace containers during a
+  database outage. Cloud Run gets a `/ready` startup probe (its traffic gate)
+  and a `/live` liveness probe. Azure Container Apps gets a
+  `/startup` startup probe, a `/ready` readiness probe and a `/live` liveness
+  probe. Files that you generated before this change
+  keep the old paths. Change them by hand.
+
+- **config:** the `prod` profile sets the `[server.http]` limits and the
+  `[realtime]` message size, ping and idle limits. An HTTP/1 request head over
+  64 KiB gets `431`. A WebSocket message over 1 MiB closes the socket with
+  code `1009`. See the
+  [migration guide](docs/migrations/0.9.0.md#prod-profile-connection-and-websocket-limits-issue-3065).
+
+- **observability:** a non-standard HTTP method is counted as `_other` in the
+  metrics, also in the `/actuator/metrics` JSON route keys. This bounds the
+  memory that the per-route metrics use.
+
+- **feature_flags:** `PgFlagStore::spawn_poll_listener` loads all flags at
+  once and then on each interval. Its thread stops when the store drops.
+- **feature_flags:** `PgFlagStore`'s `Debug` output no longer shows the
+  database URL, which can hold a password.
+
+- **resilience:** slow-call detection is on by default: a call of 60 s or more
+  is slow, and the breaker opens when all calls in the window are slow. Set
+  `slow_call_duration_threshold_ms = 0` to turn it off.
+- **resilience:** the sample window is a ring of 10 counter buckets. Memory is
+  constant at all request rates. A call stays in the window for 9/10 to 10/10
+  of `sample_window_secs`. A new window length keeps the counts.
+- **resilience:** a call that started before a state change does not change
+  the new state. Before, a late call could count as a half-open trial.
+
+- **probes:** each replica with a database keeps one more connection open
+  for the readiness ping (one more for a read replica). Count it in your
+  Postgres `max_connections` budget.
+- **test:** `TestApp` applies `health.cache_ttl_ms`. A test that changes a
+  health indicator and reads it again in less than 1 s gets the cached
+  result. Set `health.cache_ttl_ms = 0` in the test config.
+- **probes:** saturation is not a readiness signal. To shed load, set
+  `server.max_concurrent_requests`. It is off by default. When on, excess
+  requests get `503` with `Retry-After`.
+
+- **http:** a retry budget for each upstream host
+  (`[http.client.retry_budget]`, on by default). When an upstream always
+  fails, only about 10 % of requests retry. First attempts never wait.
+- **http:** the outbound client sends the time left in the
+  `x-autumn-deadline-ms` header to every host when a request deadline is set
+  (`http.client.send_deadline_header`, default `true`).
+- **server:** a timeout `503` now has a `Retry-After` header of 1-3 seconds,
+  with jitter.
+- **server:** the `prod` profile sets `server.shutdown_timeout_secs` to 35
+  (was 30): the 30 s request timeout plus a 5 s margin. Before, a request that
+  started just before shutdown could be stopped by the drain watchdog. Startup
+  logs a warning when the drain window is shorter than the request timeout
+  plus 5 s. Add 5 s to your orchestrator grace period.
+
+- **prod profile:** load shedding is on by default. The ceiling is the primary
+  pool size × 32 (`PROD_REQUESTS_PER_POOL_CONNECTION`), at least 256
+  (`PROD_MIN_ADMISSION_LIMIT`). An explicit `server.max_concurrent_requests`
+  or a capacity contract wins. When the contract cannot be used, the ceiling
+  falls back to this value, not to unlimited. Set
+  `max_concurrent_requests = 0` to turn it off (#3057).
+- **prod profile:** `database.statement_timeout = "30s"` and the new
+  `database.idle_in_transaction_timeout = "60s"` (Postgres builds) (#3057).
+- **migrations:** each transactional migration starts with
+  `SET LOCAL lock_timeout` (new `database.migration_lock_timeout`, default
+  `5s`). A migration that times out on a table lock is retried with jittered
+  backoff (new `database.migration_lock_retries`, default `5`). A
+  `run_in_transaction = false` migration gets no timeout (#3057).
+
+- **cache:** each generated write with `invalidates(...)` now awaits one
+  namespace sweep per declared read after commit (issue #3056). On Redis this
+  is a `SCAN MATCH`, so write latency grows with the keyspace. `with_lock`
+  invalidates too; `find_or_create_by_*` invalidates only when it creates a
+  row; the scheduled retention sweep invalidates when it deletes a row. With
+  `commit_hooks`, the durable runner sweeps again. A failed sweep is logged and
+  counted; it does not fail the write or the hook row.
+- **cache:** `coherence::invalidate_namespace` now logs `warn!` and counts
+  `autumn_cache_invalidation_failures_total` when the backend cannot drop the
+  namespace. A custom backend that keeps the default `invalidate_namespace`
+  logs this on each such write. Override it, or remove the `invalidates(...)`
+  edge.
+
+- **jobs:** the Redis dead-letter list keeps 10 000 entries by default. Before,
+  it kept 1 000 and removed older entries without a log or a metric. Each
+  entry uses Redis memory for a list entry and a per-id record, so the new
+  default can use up to 10 times more memory.
+
+- **http client, jobs:** retries use capped exponential backoff with full jitter, `random(0, min(cap, base * 2^n))`, from the new `autumn_web::backoff` module. Callers that fail together no longer retry at the same instant. This applies to the HTTP client and to the `local`, `postgres`, `redis` and `sqlite` job backends. The `local` backend changes from equal jitter to full jitter. New settings: `[http.client] max_backoff_ms` (default 20 s) and `[jobs] max_backoff_ms` / `AUTUMN_JOBS__MAX_BACKOFF_MS` (default 1 h). The durable job backends had no cap before. A claim recovered after its visibility timeout (a worker that crashed or hung) is also requeued with this jitter, not at once (issue #3054).
+- **http client:** a `503` with `Retry-After` now waits for the hint, as a `429` does. The wait is `backoff + min(hint, 5 s)`, so callers that get the same hint still spread out. A hint above 5 s is cut to about 5 s (issue #3054).
+
+- **a11y:** an empty or blank accessible name trips a `debug_assert!` at the
+  call site (issue #2666). This applies to `Img::new`, `Button`, `Link`,
+  `MenuItem`, `SelectOption::new`, `Select::option`, `RadioOption::new`, and
+  every `.label(..)`, `.aria_label(..)` and `.labelled_by(..)`. A release
+  build does not change. Use `Img::decorative(src)` for an image that carries
+  no information, and give a name from data a fallback. The new
+  `autumn_web::a11y::is_blank` tells you when a text is blank
+  ([migration guide](docs/migrations/0.9.0.md)).
+- **scaffold:** the generated select-options loader of a `references` field
+  uses the row id when the display column is blank, so no option has an
+  empty name.
+
+- **openapi:** a request `$ref` to a type with two shapes in use now points to
+  `WidgetRequest`. Regenerate clients. A type used only in requests now holds
+  its request schema. A `#[model]` with a deserialize-side adapter or `alias`
+  is now opaque in a request, so `--strict` can fail on it (issue #2607).
+- **openapi:** `schema_entry_to_value` renders a response reference. Use
+  `schema_entry_to_value_in` for a request (issue #2607).
+
+- **generate:** on SQLite, `Remove…From…` finds blocking indexes by replaying
+  earlier migrations in memory and asking SQLite (issue #2579). It no longer
+  reads SQL text. A column behind an inline `UNIQUE` or `PRIMARY KEY` now
+  fails at generate time. An earlier migration that does not replay stops
+  `generate migration` and names the file.
+
+- **sqlite:** a scaffolded SQLite app now has a SQLite-native smoke test. It is not `#[ignore]`d and needs no Docker. The generator no longer warns that `cargo test` does not compile.
+
+- **graph:** run `autumn graph show` once and commit the result. The
+  `limits` text, the census and the job access changed, so an older
+  committed graph fails `--check` one time. The descriptor types in
+  `autumn::graph` are for the macros. Do not build them by hand.
+
+- **posture:** acknowledging a new CSRF exemption now covers only the routes
+  that serve the exempt URLs (issue #2501). A route that a more specific route
+  shadows no longer changes the digest. [no-plugin]
+
+- **posture gate:** an acknowledgment now means "no wider than this" (issue #2497).
+  The report prints `/ack-posture <digest> ceiling=<posture>`. A later
+  narrowing keeps it valid. A removed constraint blocks again. A bare digest
+  still means "exactly this".
+
+- **routes:** the scaffolded `posture-gate.yml` audits the release build, from
+  one `POSTURE_AUDIT_FLAGS` setting, and harvests acknowledgments with
+  `--ack-dir`. After `autumn upgrade --apply`, regenerate the baseline with
+  `autumn routes audit --release --manifest security-posture.json`.
+  The pull request with the new baseline reports one `build_changed` widening
+  to acknowledge.
+
+- **release:** the deploy workflows read the posture manifest path from
+  `POSTURE_MANIFEST`. They print a `::warning::` when the file is missing.
+  Before, they skipped the attestation with no message.
+
+- **routes:** the security manifest is now schema v6. Each route entry can
+  carry `provenance: "declared"`. An older `autumn` CLI would read such a guard
+  as a proven one, so it now refuses a v6 manifest and asks you to upgrade. A
+  v3 to v5 manifest still reads.
+- **routes:** a posture acknowledgment ceiling now records whether a route's
+  guard is proven or declared. A marker approved for a proven guard does not
+  approve the same route once a layer only declares the guard.
+
+- **ci [no-plugin]:** the advisory gate now generates every `autumn new` flavor
+  and audits the real app with its own `deny.toml` (issue #2466). The audit
+  covers the app's own manifest, a fresh lockfile and its dev-dependencies.
+
+- **reddit-clone:** tags show their names, not slugs. A re-save keeps the
+  author's spelling. Rejected forms show an error summary and move focus to it.
+  CI now runs the example's Docker tests (issue #2454). [no-plugin]
+
+- **repository:** a dependent cascade now probes every `restrict` before any
+  hook fires (issue #2427). The probe reaches grandchildren and deeper, across a
+  parent's sibling associations and across all parents of a `delete_many` batch.
+  A blocked delete fires no hook. The probe reads each `destroy` child set once
+  more. A `restrict` that an earlier sibling leg would have removed now blocks.
+- **repository:** a batch root that is also another root's descendant still
+  fires its hooks once.
+
+- **capacity:** the runtime now checks the profile a `capacity.lock` was
+  calibrated under (issue #2418). If it is not the running profile, the
+  runtime ignores the contract and logs a warning. The profile default then
+  applies.
+- **capacity:** `autumn calibrate` now starts the child in the package
+  directory of the binary it found. This is true with or without `-p`.
+
+- **cli [no-plugin]:** `autumn sbom --binary` now gives a clear error for a byte-swapped
+  fat Mach-O header (`FAT_CIGAM`). Apple tools always write fat headers
+  big-endian (issue #2394).
+
+- **release [no-plugin]:** CLI archive provenance now names the release tag and the tagged
+  commit (issue #2380). `gh attestation verify --source-ref refs/tags/<tag>`
+  now passes for these assets. The Publish Gate builds
+  and attests the archives. `release.yml` only uploads them.
+
+- **cache:** the fill fence now works across replicas on `RedisCache`
+  (issue #2356). `invalidate_namespace` raises a per-namespace epoch in Redis
+  before it sweeps. A fill stores its value only if the epoch did not move, so
+  a fill on another replica cannot write back an invalidated value. A `true`
+  is now valid for all replicas. It is `false` if the epoch bump fails. The
+  invalidation now needs a Redis write (`INCR`). Cost: one `GET` on each miss. Custom backends opt in with `Cache::shares_fill_epoch`,
+  `Cache::fill_epoch` and `Cache::insert_raw_bytes_if_epoch`. Without them, the fence stays per
+  process.
+
+- **capsule:** the capsule format version is 4. This build still reads a
+  version 3 capsule, and replays it with the version 3 rules.
+- **capsule:** capture marks a capsule incomplete, so replay refuses it, when
+  the run starts detached work (`db::register_after_commit`, a
+  stale-while-revalidate refresh), runs a tracked job, makes egress outside
+  the HTTP seam, reads or writes an untyped cache value, or has a cache fill
+  that a distributed fill lock or the shared fill fence stops.
+
+- **admin:** the admin plugin passes layout state in one `AdminChrome` value
+  (issue #2347). Page output does not change.
+
+- **upgrade:** [no-plugin] `autumn upgrade --check` now reports a symlinked scaffold file
+  as a `conflict` even when its target matches the template (issue #2346). The
+  verdict no longer changes when a file outside the project changes. To accept
+  a deliberate link, run `autumn upgrade --accept <path>`.
+
+- **shadow:** The mirror deadline now covers the comparison too (issue #2333).
+  Decode, parse, digest and record run on the blocking pool under the same
+  deadline as the shadow request. A comparison that does not finish is counted
+  as `abandoned` (`comparisons_abandoned` in `/actuator/shadow`) and frees its
+  `max_in_flight` slot. `max_in_flight` bounds outstanding mirrors, end to end.
+  `autumn_shadow_comparisons_total` has a new `abandoned` outcome.
+
+- **generators:** a scaffolded `Bytea` column now exports, imports and edits as
+  `\x` + hex (issue #2330). The old UTF-8 text lost every non-UTF-8 byte, so a
+  CSV export or a form edit-and-save corrupted the column. A scaffold with
+  `--import` now imports `Bytea` columns, including required ones. Index and
+  show views still show the column as text. Existing scaffolds do not change.
+
+- **generate:** `comments:commentable` now stops with an error when the project
+  already has a plain `comments` table (issue #2283). It used to warn and write
+  a second `CREATE TABLE comments`. No file is written. Rename the `Comment`
+  resource, or add the polymorphic columns to its table, then run it again.
+
+- **schema:** `schema diff` refuses a changed `ON DELETE` / `ON UPDATE` action
+  on an existing foreign key, as it refuses a new target (issue #1975). The
+  error shows the two keys. A bare `#[references]` is `NO ACTION`. If the
+  database has `ON DELETE CASCADE`, declare `on_delete = "cascade"`.
+- **schema:** on SQLite, `schema diff` refuses a table-recreate of a table that
+  a table (also the same table) references with `ON DELETE CASCADE`, `SET NULL` or
+  `SET DEFAULT`. The migration transaction ignores `PRAGMA foreign_keys=OFF`,
+  so the recreate would delete or change the child rows.
+
+### Deprecated
+
+- **observability:** `autumn_http_request_duration_quantiles_seconds`. Use the
+  `autumn_http_request_duration_seconds` histogram. A later release removes it.
+
+- **scheduler:** `PostgresAdvisorySchedulerCoordinator` is now an alias of
+  `PostgresTickSchedulerCoordinator`. It does not use advisory locks.
+
+- **security:** `security::TrustedProxy` and `security::proxy::extract_client_ip`
+  are deprecated (issue #2452). This is a non-breaking change. The framework
+  never used them. For client IPs, use `ProxyResolver`. Both now share its CIDR
+  matcher.
+
+### Fixed
+
+- **ui:** status badges, alerts, the job-status success line and the upcoming
+  wizard step number now meet WCAG AA text contrast (4.5:1) on the shipped
+  tokens. Success and warning chip text is `color-mix`ed from the app's own
+  `--success` / `--warning` toward a fixed dark (chips keep their light tint
+  in dark themes); a theme with dark chips can set `--success-text` /
+  `--warning-text` to override. The job-status success line mixes toward
+  `--text`, so it follows dark themes. Error chip text uses `--danger-hover`;
+  the upcoming wizard number uses `--text`. Design tokens are unchanged.
+
+- **ui:** widget form fields, submit button, search and autocomplete inputs keep
+  a focus indicator in forced-colors (Windows High Contrast) mode; the
+  `outline: none` rules now use a transparent outline, which is invisible in
+  normal rendering and repainted in the system focus colour when forced.
+
+- **static_gen:** a release `autumn build` (the `prod` profile) renders its
+  static pages and agent documents again. Its in-process renders carry no
+  `Host`, and the trusted-host check refused them with `400`; a build render
+  now passes, while a live request without a `Host` is still refused.
+
+- **sim:** a dropped `Sim` now frees the apps of its replicas when it has a
+  `SimNet`. A replica is a host of the network and its app holds the
+  network, so the two kept each other alive. A long seed sweep with replicas
+  kept about 0.5 MiB per seed, until the runner ran out of memory.
+
+- `autumn generate scaffold --force` now removes an `autumn-web` feature from `Cargo.toml` when the new scaffold does not need it. This applies to `htmx`, `multipart`, `storage`, `markdown`, `csv` and `ws`. The command keeps a feature that other code uses. It keeps `i18n` and `maud`. (#2328)
+
+- **reddit-clone:** a post whose `created_at` is more than 2 hours ahead of
+  the clock (clock skew) no longer ranks as NaN, and no longer makes the
+  scheduled hot-rank `UPDATE` fail for all posts. The age is now 0 or more.
+  The DST nightly found it.
+
+- **docs:** the README quickstart now installs with
+  `cargo install autumn-cli --version 0.8.0 --locked`. Without `--locked`,
+  cargo re-resolves dependencies and picked `uuid 1.27.0` (rustc 1.89+), so the
+  first step failed on the advertised Rust 1.88.0 MSRV. The scaffolded project
+  README carries the same command, and `scripts/clean-room-msrv.sh` reruns the
+  journey on the MSRV toolchain with a pristine `CARGO_HOME`.
+
+- **circuit_breaker:** a `CircuitBreakerPolicy` built in code with
+  `half_open_trial_count: 0` no longer strands the breaker. A half-open breaker
+  with 0 trials refused every call, so nothing could close it again.
+  `CircuitBreaker::new` and `update_config` now clamp the count to at least 1,
+  as the `[resilience]` config already did. The new Verus spec
+  `verification/circuit_breaker.rs` found it.
+
+- **jobs:** the Postgres claim for workers with `[jobs] queues` priority config
+  (two or more queues) probes the head of each queue through
+  `idx_autumn_jobs_queue_ready` instead of sorting every ready job in all polled
+  queues. Claim cost no longer grows with the backlog (about 87k buffers and a
+  disk sort spill at 500k ready jobs, 44 buffers now). Claim order is unchanged.
+
+- **jobs:** a durable job that runs longer than the visibility timeout does
+  not run again on a second worker at the same time (issue #3051). Postgres,
+  Redis and `SQLite` workers renew each claim every third of the visibility
+  timeout. If a renewal finds the claim gone, or no renewal succeeds for two
+  thirds of the timeout, the worker stops the handler. It does not settle the
+  job. Crash recovery does not change: the heartbeat stops with the process.
+  A visibility timeout shorter than 30ms is raised to 30ms, with a warning.
+- **jobs:** Redis claim deadlines and the stale-claim check use the Redis
+  server clock (`TIME`), not the worker clock. A worker with a skewed clock
+  does not see a live claim as expired.
+
+- **deploy:** `autumn deploy status --strict` now reports state drift for a
+  deployed host whose installed kamal-proxy unit has no readable `--http-port`
+  (issue #2278). The next deploy refuses that host. Before this fix, `--strict`
+  exited 0. This reason does not apply to a host that is not deployed.
+
+- **cli:** a CLI build with `--features sqlite` compiles again. A wrapper in
+  `autumn migrate` did not have the `Send` bounds that the library requires.
+
+- **compression:** a response that carries `Content-Digest` or `Repr-Digest`
+  is no longer compressed. The digest, and any HTTP message signature over
+  it, covers the bytes the handler sent; encoding them afterwards broke both.
+
+- **`#[commentable]`:** the `{Model}Comments` helpers now use the soft-delete
+  rule of the repository you call them on (issue #2284). Before, one
+  `soft_delete` repository made every helper return `404` for a soft-deleted
+  parent. This also occurred through a plain repository whose finders return
+  that row.
+  The generic router has no repository, so it keeps the old rule.
+
+- **commentable:** `add_comment`, `delete_comment`, `recompute_comment_count`
+  and `comment_thread` now find the repository of the model when you give
+  them a copy of a registered `CommentableSpec` (issue #2286). Before, a copy
+  used only the `deleted_at` column. An audit `deleted_at` hid a live parent,
+  and the helpers returned `404`. If two models register equal specs, a copy
+  hides the parent when one of their repositories soft-deletes.
+
+- **capsule:** a failure capsule no longer records the `user:password@` part of
+  an outbound HTTP URL (or its redirect target). It is masked as
+  `[FILTERED]`, as an `Authorization` header already was, and the values are fed
+  to the echo pass so they are masked elsewhere in the capsule too.
+
+- **billing:** the plan gate (`Entitled<R>`, `Billing::is_entitled` and
+  `Billing::require`) now checks every subscription of the customer, not only
+  the one that `Billing::current_subscription` shows (issue #3114). A
+  customer with two paid plans no longer gets a 403 for a rule that only the
+  older plan satisfies. `require` and `Entitled<R>::view` now return the
+  satisfying subscription with the latest `last_event_at`. This can be an
+  older row than before. `canceled`, `incomplete` and expired subscriptions
+  still never grant access.
+
+- **billing:** two subscription events with the same timestamp but different statuses (`past_due` then `active`, `active` then `paused`) no longer drop the real transition. The reconciler now asks the provider for the subscription's current state on such a tie, through the new optional `BillingProvider::fetch_subscription` (implemented for Stripe).
+- **custom domains:** the ACME issuance budget now survives a restart, a deferred order no longer counts as a failure toward the failure backoff, and orders in a long pass are stamped with the time they actually ran.
+
+- **cli:** `autumn generate auth --mail` no longer panics when the target
+  project's `Cargo.toml` declares `autumn-web` as an inline table with a
+  multiline `features = [...]` array (legal TOML since 1.0). The `mail`
+  feature injector now scans forward for the array's real closing `]` the
+  same way the `oauth2`/`webauthn` variants already did, instead of
+  `.unwrap()`-ing a same-line search that returned `None` (issue #2753).
+
+- **agent authority:** a raw `TRUNCATE a, b` or `DROP TABLE a, b` now records
+  every table, so a grant for one table no longer allows the other (issue #2451).
+- **agent authority:** the MCP outcome audit event names the principal a route
+  guard resolved. It no longer says `agent:anonymous` for `#[secured]` tools.
+  The attempt event still does, because it is written before dispatch.
+
+- **supply chain:** dropped the `RUSTSEC-2026-0381` waiver from `deny.toml`,
+  `deny-sqlite.toml`, and the `autumn new --bundled-pg` scaffold template. The
+  advisory's own metadata now marks `webpki-roots` 0.26.11 unaffected whenever
+  its resolved `1.x` parent carries the fix, which this workspace's `1.0.10`
+  copy already does — `cargo deny` confirmed no crate matches the advisory
+  under either policy. A freshly scaffolded `--bundled-pg` app's `deny.toml`
+  now ships one fewer (stale) waiver.
+
+- **db:** a fleet host now renews its slot ranges at the same time (issue
+  #3361). Each store call has one renew interval. A slow range fails with a
+  time-out and no longer makes the other ranges lapse. The order of epochs
+  between ranges is not fixed.
+
+- **db:** busy open databases no longer take every pass of the SQLite fleet
+  sweeper (issue #3350). A pass takes rows in the order they became due. When
+  two rows became due at the same time, the older row goes first. Half of
+  each pass goes first to the open databases, so a fleet-wide backfill does
+  not stop their outbox. A pass takes no more closed databases than the
+  fleet has room for, and no database of another host. A new mark is due
+  when it is written, on every clock.
+
+- **db:** the SQLite commit-hook worker now retries a failed ack or nack write.
+  A write lost to a shared-cache table lock left the hook `running` for 60 s.
+
+- **forms:** Form gates now match `Content-Type` without regard to case
+  (issue #3267). `ChangesetForm` and `NestedChangesetForm` returned `415` for
+  `Application/X-WWW-Form-Urlencoded`. The `_method` override did nothing for
+  it. The CSRF layer accepted the same request. The captcha and inbound-mail
+  gates now also accept leading whitespace.
+
+- **experiments:** `PgExperimentStore` no longer connects to Postgres on the
+  Tokio worker (issue #3262). `get` reads an in-memory snapshot that a
+  background refresh updates. A failed refresh keeps the last-known configs.
+  `AppBuilder::with_experiment_store` preloads the snapshot at startup.
+  `PgConfigStore` keeps its cache: only admin routes read it.
+
+- **db:** a SQLite fleet database now stops its commit-hook worker, and waits
+  for it, before its pool closes (issue #3231). A hook that runs during an
+  idle close, a `max_open` eviction or a shutdown is acked, not replayed.
+  `start_repository_commit_hook_worker` now returns `Option<JoinHandle<()>>`.
+  New: `FleetDatabase::register_worker`.
+
+- **db:** processes that share a SQLite fleet root now elect one replicator per
+  database (issue #3230). The owner holds an OS lock on `<db>.replicator.lock`.
+  Other processes wait and take over, with a new generation, when the owner
+  exits. A restore no longer misses commits. `replication:fleet` health reports
+  `unowned` databases.
+
+- **db:** `DatabaseFleet` operations are cancellation-safe (issue #3229).
+  A dropped `delete`, `restore`, `close`, first `open` or `provision` now
+  finishes its work. It no longer strands a key on a drain. It no longer
+  leaves `on_open` hooks untracked. It no longer loses a creation: a retried
+  `provision` returns `Ok` when the first call never reported the creation.
+
+- **fleet:** four concurrency gaps in `DatabaseFleet` (issue #3228).
+  - `delete` and `restore` unlink the sidecar files first and the main file
+    last. A database that another process publishes at the path keeps its
+    `-wal`.
+  - Creating, restoring and deleting a database take a lock file in
+    `<root>/.fleet-locks/`. Under it, the fleet clears the stray `-wal` of an
+    absent database before it publishes a new one, so a crash cannot replay
+    old writes onto a new database, and a live `-wal` is never removed.
+  - `delete` and `restore` install the drain first. A late opener gets `410`
+    or waits, and cannot create the file. An open already running ends first.
+  - After `close_all` has drained the running operations, every open fails
+    with `503`.
+  - At shutdown, the fleet keeps shipping parked replicators until they catch
+    up or the flush deadline passes (`server.shutdown_timeout_secs`, bounded
+    by the shutdown wait). It logs an `error!` for each database it could not
+    ship and lists them as `unshipped` in the `replication:fleet` health
+    details.
+
+- **db:** `DatabaseFleet::delete` and `restore` of an existing SQLite database
+  now work on Windows (issue #3227). If another process opens the database
+  during the removal, the call fails with `409`.
+
+- **sim:** `sim::trace::capture` now keeps captures apart when they run
+  together on one thread, for example with `tokio::join!`. Each trace has only
+  its own events.
+- **sim:** `sim::runtime()` now returns `SimRuntime`. Its `block_on` installs
+  the gate before the first poll, so a runtime built on one thread and run on
+  another still gates the first query. `SimRuntime` derefs to `Runtime`.
+
+- **mcp:** a burst of lower-class `tools/call` requests is no longer over-shed
+  (issue #3186). N+1 concurrent calls at a class limit of N now shed one. A
+  replay that is shed no longer gives the adaptive limiter a false fast sample.
+
+- **cli:** `autumn generate auth` forms now bind each `<label>` to its input
+  with `for`/`id` (issue #3170). Screen readers can name the fields. The 2FA
+  confirm input gains a label.
+
+- **jobs:** `in_flight` now counts each claim once (issue #3166). Before, a job
+  that another replica enqueued had no admin record here. Stale recovery, then
+  a lease loss or lost ack, balanced the claim twice. `/actuator/jobs` then
+  showed too few running jobs. Recovery of a claim that another process
+  started now leaves `in_flight` alone. This holds on `postgres`, `sqlite` and
+  `redis`.
+
+- **jobs:** a stalled tracking store no longer holds a worker (issue #3151).
+  The job timeout now covers `mark_running`. The final `complete` or `fail`
+  call is capped at 5 seconds.
+
+- **supply chain:** an app made with `autumn new --bundled-pg` ships a
+  `deny.toml` waiver for RUSTSEC-2026-0381. The `webpki-roots` 0.26 copy that
+  the embedded-Postgres build stack pins has no fix. Cargo.lock now uses
+  `webpki-roots` 1.0.10, `webpki-root-certs` 1.0.10 and `rustls-webpki` 0.103.16.
+
+- **billing:** two webhooks for one subscription, at the same second and
+  with different statuses, now end at the provider's current status when they
+  run at the same time. The old tie check read the row before the write, so
+  both webhooks could miss it and the ranking decided. The store now reports the
+  tie inside the write (issue #3111).
+
+- **acme:** an order for an offboarded custom domain still counts against the
+  hourly budget after a restart (issue #3110).
+- **cli:** `autumn new --bundled-pg` ships a `deny.toml` waiver for RUSTSEC-2026-0381
+  (`webpki-roots` 0.26.11, pinned by `sqlx-core`). No fixed 0.26 release exists. [no-plugin]
+
+- **feed:** an out-of-range date no longer causes a panic in an RSS feed or an
+  invalid date in an Atom feed (issue #3093). The feed clamps Atom dates to
+  years 0000–9999. It clamps RSS dates and the `Last-Modified` header from
+  `Feed::conditional` to years 1900–9999, as RFC 5322 requires.
+
+- **billing:** dunning now ends a subscription when `invoice.payment_failed`
+  arrives before the subscription event (issue #3081).
+- **billing:** an invoice keeps the provider subscription id. Storing the
+  subscription links its invoices and open dunning rows.
+- **billing:** run the new migration
+  `20261008182813_billing_invoice_provider_subscription`. Invoices stored
+  before the upgrade are not linked.
+- **billing:** a custom `BillingStore` must override the new
+  `link_subscription` method to get the fix. The default does nothing.
+
+- **etag:** The `If-None-Match` parser no longer splits a quoted tag at a
+  comma (issue #3080). A response with the `ETag` `"a,b"` now gets a `304`
+  when the request sends `"a,b"`. A response with the `ETag` `"a"` no longer
+  gets a false `304` for that request. A malformed member, such as `"abc`,
+  does not match. `*` matches only when no `If-None-Match` field has a tag.
+
+- **scheduler:** a cron task that waits in the cost gate longer than its
+  window no longer claims that occurrence (issue #3071). Before, the claim
+  could succeed after the tick row expired, so the occurrence ran twice. The
+  tick-election protocol model found this bug.
+
+- **jobs:** `SQLite` stale-claim recovery draws its per-row jitter from the
+  app's entropy, not from `SQLite`'s `random()`, so a sim replays it.
+
+- **feature_flags:** `PgFlagStore` reads flags from an in-memory snapshot
+  (issue #3063). A flag read does not connect to the database on a Tokio
+  worker. A stale snapshot refreshes on the blocking pool. Loads run one at a
+  time, in order. Each store connection has a 5 s statement timeout, and a
+  5 s connect timeout when the URL sets none. Failed refreshes back off up to
+  30 s.
+- **feature_flags:** a database failure does not turn flags off. A failed
+  refresh keeps the last-known snapshot. A failed read in
+  `FeatureFlagService` uses the last-known value of the flag. Both log a
+  warning and count the error: `PgFlagStore::refresh_errors` and
+  `FeatureFlagService::store_errors`.
+  A successful write through the service updates the last-known value, so a
+  `disable` holds during a later outage.
+
+- **webhooks:** a second delivery job for a log that already got a `2xx`
+  response no longer sends the webhook again. `log_delivery` ignores a write
+  to a `2xx` log and a repeated or stale (older attempt) failure
+  (`webhook_outbound::log_delivery_ignores`), so a late duplicate job cannot
+  overwrite a success or count one failure twice. A DLQ move of a failed
+  attempt is not a new failure (`log_delivery_repeats_failure`).
+
+- **probes:** `/ready` no longer reads primary pool saturation (issue #3059).
+  A busy pool made a healthy replica unready. An idle pool made a dead
+  database look ready. Now `/ready` sends `SELECT 1` to the primary on one
+  dedicated connection outside the pool. A failed ping, or one slower than
+  `health.ping_timeout_ms`, makes `/ready` return `503`.
+- **probes:** the read-replica check and the `db:shard:<name>` indicators use
+  the same dedicated-connection ping. A busy replica or shard pool does not
+  make them fail.
+- **actuator:** the `db` component of `/actuator/health` uses the same cached
+  ping. It no longer goes `DOWN` when the pool is busy. With
+  `health.detailed = true`, its details show the ping `error`.
+
+- **cache:** `RedisCache` no longer drops a failed `DEL` (issue #3056). Each
+  invalidation retries with bounded, jittered backoff (`InvalidationRetry`,
+  default 3 attempts). The async methods return the final error. The sync
+  `invalidate` and `clear` log it with `warn!` and count it in the new
+  `autumn_cache_invalidation_failures_total` counter.
+- **cache:** a `#[repository]` with `invalidates(...)` now drops the declared
+  cached reads after each write commits, before its `after_create` or
+  `after_update` hook (issue #3056). Thus the hook reads the committed row. This
+  also runs when the write returns `Err`, panics, or is cancelled: a write can
+  commit and then fail in an `after_*` hook. You no longer need to
+  call `invalidate_declared_caches()`. In this process, a reader that read the
+  old row before the commit cannot put it back in the cache. With `commit_hooks`, the durable
+  runner also invalidates, so a crash after the commit is covered.
+
+- **scheduler:** the Postgres scheduler runs each fleet tick at most once
+  (issue #3052). It freed its session advisory lock when the leader finished.
+  A replica whose timer reached the same tick later ran it again. Now each
+  tick is a row in `autumn_scheduler_ticks`, inserted with
+  `ON CONFLICT DO NOTHING`. The row stays for the task's period (the delay, or
+  the time to the next cron occurrence) plus `scheduler.lease_ttl_secs`. A
+  leader that crashes mid-tick does not free its tick. The coordinator holds
+  no connection while a tick runs, so it works behind a transaction-mode
+  PgBouncer. In a rolling upgrade, a new replica does not claim a tick that
+  an old replica runs.
+- **scheduler:** the `sqlite` backend keeps a fixed-delay or cron tick
+  claimed for its period plus `scheduler.lease_ttl_secs`, not only for the
+  TTL.
+- **acme:** on a distributed scheduler backend, certificate renewal and
+  tenant-domain issuance hold their leader key for the whole order (up to two
+  hours if the leader crashes), then free it. Before, a second replica could
+  order the same certificate.
+
+- **db:** SQLite now treats `%00` in a URI as the end of that name or value.
+  `file:a?cache=shared%00x` is now found as shared-cache, so the shared-cache
+  boot warning shows (issue #3032).
+
+- **jobs:** the Postgres tracked-job store uses the database clock only to
+  expire records (issue #2875). Clock skew between replicas no longer changes
+  `jobs.tracking.ttl_secs`. The store clamps a TTL above 100 years to 100
+  years.
+
+- **serve (Windows):** five residual service defects (issue #2705).
+  - `icacls /reset` now runs recursively (`/T /L`), and `install-service` writes the
+    service record as a new file. A file that another local user pre-created
+    in a shared `AUTUMN_RUNTIME_DIR` no longer keeps its ACE.
+  - `serve restart` takes the daemon path only when the service does not
+    exist. A denied or failed service query is now an error.
+  - `uninstall-service` reads the record path from the service entry and
+    cleans the tree the service was installed under.
+  - A very large `prestop_grace_secs` or `shutdown_timeout_secs` no longer
+    panics the stop path. The stop wait is capped at 24 hours.
+  - The preshutdown timeout is set from the budget the app reports, not from a
+    guess made at install time. Until then it uses a 60s fallback.
+
+- **examples:** `blog`, `bookmarks`, `bookmarks-distributed`, `reddit-clone`,
+  `saas` (and its embedded `saas` starter), `teams`, `todo-app`, and `wiki`
+  now watch `autumn setup`'s Tailwind install path and `PATH`/`PATHEXT` from
+  their `build.rs`, matching the fix `cms` already had. Without it, a build
+  that ran before `autumn setup` installed the Tailwind CLI produced no CSS
+  and then never reran once the binary was installed, leaving the example
+  permanently unstyled until an unrelated source edit retriggered the script
+  (issue #2694).
+
+- **`#[model]`:** every generated `NewX` implements `Normalize` again (issue
+  #2692). 0.8.0 removed the impl when the model has no `#[normalize]` columns,
+  so `NewX::normalize()` and a `T: Normalize` bound did not compile. The impl
+  does nothing for such a model. The repository insert path still does not
+  clone the input for it (#2634).
+
+- **a11y:** a `RadioGroup` choice id is a valid CSS selector, so
+  `hx-target="#…"` and `querySelector` work on it (issue #2666). If the first
+  part of the id, after any leading `_`, does not start with a letter, the id
+  gets one more `_` at the start: group `1plan` gives `_1plan-…`, and `_1plan`
+  gives `__1plan-…`. Other ids do not change
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **derivations:** on SQLite, a `sum` derivation's backfill, `recompute`,
+  drift probe and bulk delete no longer fail with `integer overflow` when the
+  total is in range (issue #2663). Before, a running total outside `i64`
+  failed them, for example weights `i64::MAX, 1, -1`. A bulk delete also
+  lands when only the deleted rows' sum is outside `i64`. The delta paths
+  already accepted these rows. A total outside `i64` is still an error.
+
+- **custom domains:** apex detection uses the Public Suffix List (issue
+  #2643, [ADR-0026](docs/adr/0026-public-suffix-apex-detection.md)).
+  `clientco.co.uk`, `customer.com.au` and `tenant.co.jp` now get A/AAAA
+  instructions, not a CNAME that a DNS provider refuses. If no ingress
+  addresses are set, they get the "set `ingress_ipv4` / `ingress_ipv6`" error.
+  `autumn doctor` warns when a registered domain gets no DNS instructions.
+
+- **cli:** `autumn build` now finds the app binary for the static renderer
+  when `build.target` or `CARGO_BUILD_TARGET` is set (issue #2638). It uses
+  the `executable` path from the `cargo build` output. The other commands
+  use this path since issue #2374.
+- **cli:** when `build.target` names more than one triple, the CLI starts the
+  binary for the host triple of `rustc` (issue #2638). Before, it started the
+  binary that Cargo reported last, which can be for a different machine.
+
+- **openapi:** a referenced type now gets its schema from its position
+  (issue #2607). A request body or query uses the shape the type
+  deserializes from. A response uses the shape it serializes to. A route that
+  takes `Json<Model>` now shows the `#[private]`, `#[classified]` and hidden
+  `#[encrypted]` fields, and requires them unless they are `Option` or have a
+  default. A route that returns `Json<NewModel>` no
+  longer requires a classified field that the response does not have. A type
+  with two different shapes in use gets two components, `Widget` and
+  `WidgetRequest`. A type with one shape keeps one component. MCP tool
+  `inputSchema` uses the request shape. The `New*` schema now requires a
+  field that has `skip_serializing_if` on the model, because `New*` does not
+  copy that attribute.
+
+- **http-client:** `--no-default-features --features http-client` compiles
+  again. The capsule-replay check is behind `reporting`, which owns it.
+
+- **schema:** `autumn schema diff` on SQLite now writes the decimal `CHECK` that
+  `autumn generate` writes (issue #2598). Before, a declarative `CREATE TABLE`
+  had no `CHECK`. A table rebuild for a different change removed the `CHECK`
+  silently. The two lanes use one `CHECK` builder, so the SQL is the same byte
+  for byte.
+- **schema:** the model parser now reads
+  `#[decimal_shape(precision = p, scale = s)]` (issue #2598). Before, it read
+  each decimal as `{12, 2}`. On Postgres, `schema diff --dev-url` then
+  reported a false type change for a `decimal{10,2}` field. A bad
+  `#[decimal_shape]` skips the column with a diagnostic. A model from
+  `autumn generate` 0.8.0 has no `#[decimal_shape]`. Add it with the declared
+  precision and scale, or the declarative lane reads `{12, 2}`.
+- **schema:** on SQLite, a change of decimal precision or scale is now a type
+  change (issue #2598). Before, `schema diff` found no change, and the old
+  `CHECK` stayed.
+
+- **db:** `autumn db backup` opens a SQLite source with `mode=rw` and its own URI
+  options (such as `vfs`), so it never creates an empty database and its locks
+  match the app's (issue #2589). Non-UTF-8 sources and `--dir` paths, and a
+  `--dir` that starts with `file:`, are used exactly.
+- **db:** the SQLite URL resolver reads options as SQLite does: it decodes them,
+  the last `mode` and `vfs` win, and `vfs=memdb` is in memory. On Windows,
+  `file:///C:/…` names a drive path (issue #2589).
+- **db:** `autumn db restore` stops before the rename when the old owner could not
+  read and write the restored file (issue #2589).
+- **deploy:** `autumn deploy plan` shows the SQLite data-file steps. When
+  `app_dir` is a symlink, `deploy up` now records `sqlite-data-adopted` on the
+  first deploy, and creates `shared/data` on a fresh host (issue #2589).
+
+- **jobs:** a stale job attempt no longer publishes a terminal tracked status
+  (issue #2583). On `sqlite`, `postgres` and `redis`, the worker writes the
+  tracked `succeeded` or `failed` status only after the queue accepts its
+  claim-checked ack. Before, an attempt that lost its claim could write
+  `failed` for a job that was still running. The store then refused the
+  result of the new owner. See [tracked jobs](docs/guide/jobs.md#tracked-status-follows-the-queue-ack).
+
+- **openapi:** `Decimal`, `SqliteUuid` and `SqliteDecimal` fields now appear as
+  scalars in the OpenAPI spec and the MCP `inputSchema` (issue #2582). Before,
+  the spec showed an object `$ref`. `OpenApiSchema` now exists for `Uuid`,
+  `DateTime<Utc>`, `NaiveDate`, `NaiveDateTime` and `Decimal`. The JSON wire
+  format does not change. The spec for a Postgres `Decimal` field does change.
+  Regenerate your API clients. `Decimal` is `string` with `format: decimal`. It
+  is `number` if the build enables a `rust_decimal` number feature.
+
+- **migrate:** `autumn migrate check` now reports a SQLite `RENAME a TO b`
+  (without `COLUMN`) as `RENAME COLUMN` (issue #2580).
+- **migrate:** `autumn migrate check` no longer counts a comma inside quoted
+  text as a second `ALTER TABLE` action (issue #2580).
+- **generate:** the `down.sql` of a column removal no longer replaces a prior
+  `UNIQUE` index with a plain index of the same name. The rollback keeps the
+  `UNIQUE` (issue #2580).
+
+- **jobs:** Postgres admin retry restores a `unique_for = "pending"` key
+  (issue #2576). An equal enqueue stays deduplicated while the retry waits.
+
+- **dev, doctor:** an audit that reaches its deadline now kills the `cargo-deny`
+  process and the processes it started (issue #2575). Before, the audit kept
+  running and could hold Cargo's package-cache lock. A finished audit is never
+  killed.
+- **doctor:** without `cargo-deny`, the dependency check now says that doctor
+  cannot check `deny.toml`. CI can still reject a policy that breaks the
+  `cargo-deny` schema.
+
+- **reddit-clone:** a database trigger gives a taken post slug the next free
+  suffix, so a concurrent write through the generated repository no longer
+  fails with a unique violation. The edit route links to the stored slug
+  (issue #2573). [no-plugin]
+
+- **doctor:** `autumn doctor` gives no verdict when it and the CI workflow
+  list different checks for `deny.toml`. One case is a section header quoted
+  inside a TOML string (issue #2572).
+- **doctor:** a relative `db-path` in `deny.toml` is relative to the directory
+  that holds `deny.toml`. `autumn doctor` now shows the advisory data age when
+  you run it from a workspace member (issue #2572).
+
+- **doctor, dev:** In a workspace, `autumn doctor` and `autumn dev` now read
+  the outermost `deny.toml`, up to the `.git` folder (issue #2570). This is the
+  file CI reads. A `deny.toml` in a member crate no longer replaces it. A nested
+  workspace keeps its own policy. Without a `.git` folder, the nearest policy
+  is used.
+
+- **generate:** `autumn destroy` no longer leaves a shared-file edit behind
+  (issue #2560). `generate` now records its shared-file edits in
+  `.autumn/generated.toml`. If a project setting that the arguments do not
+  show (for example `[i18n] dir`) changes, and `destroy` would not revert a
+  recorded edit, `destroy` stops and names the edit. Undo the setting change,
+  or pass `--force`.
+
+- **cli:** `autumn destroy` removes a generated file that a newer template
+  renamed or dropped (issue #2557). It deletes the file only when its
+  recorded digest still matches, the templates still create a file in its
+  directory, and no other Rust file names it. It keeps every other such file
+  (edited, shared, a migration, recorded by Autumn 0.8.0) and names it in a
+  warning. `--dry-run` lists the sweep. `.autumn/generated.toml` entries now
+  carry a `scope` (`owned` or `shared`).
+
+- **ci:** `deploy_e2e` runs in its own `Test (Docker deploy)` job, on a fresh
+  runner disk. The Docker sweep no longer fills the runner disk
+  (issue #2547).
+
+- **feature flags, experiments, runtime config:** `PgFlagStore::new(url)`,
+  `PgExperimentStore::new(url)` and `PgConfigStore::new(url)` refuse a
+  non-Postgres target at the first connect, with a message that names the
+  cause. Before, libpq refused it and quoted the target with its credentials
+  (issue #2539).
+- **search:** `autumn-search` compiles under `autumn-web/sqlite`. On a SQLite
+  build, boot refuses `SearchPlugin::postgres()` and the Postgres store
+  refuses every query, with a clear message (issue #2539).
+
+- **auth:** generated account lockout logs `account_locked` once per lock
+  (issue #2531). `login` and `reauth` share one guarded `stamp_lockout`
+  helper. It reads the clock when it writes, so a slow request does not store an
+  old `locked_at`.
+
+- **plugin sandbox:** a call that changes state runs only when the fuel left
+  can also read its largest reply and the replies not yet read, at 128 units
+  per byte. After a write has run, every later call keeps this fuel too.
+  Before, a guest could send an outbound `POST`, then use all its fuel to read
+  the reply. The request failed, and a retry sent the `POST` again. Now the
+  call comes back `quota-exceeded` and nothing changes. With the default
+  `fuel` and `outbound_response_bytes`, an outbound write needs about 74
+  million of the 200 million units, so a plugin with less `fuel` cannot make
+  one. Lower `outbound_response_bytes` to need less. New item:
+  `CapabilityCall::commits` (issue #2523).
+- **plugin sandbox:** the activity log puts a dropped call in the window when
+  the call occurred, not when its request ended. New items: `DroppedCalls`,
+  `CapabilityRuntime::dropped_calls`,
+  `PluginActivityLog::ingest_dropped_calls`, and `dropped_calls` on
+  `SandboxOutcome` and `SandboxRenderOutcome` (issue #2523).
+
+- **plugin-sandbox:** a corrupt cache value now reaches a guest as a KV
+  failure, not as a missing key (issue #2523).
+- **plugin-sandbox:** `ActivitySummary::truncated` tells an operator that the
+  log shed drop counts. `PluginJob::is_for_artifact` lets a runner refuse a job
+  from an older artifact.
+
+- **plugin-sandbox:** a cache-backed plugin KV store now reports backend
+  failures to the guest (issue #2523). A failed write is no longer reported as
+  success. An outage is no longer read as a missing key. `Cache` gains
+  `try_get_value`, `try_insert_raw_bytes` and `try_invalidate`. Each has a
+  default, so other backends need no change. A wrapper cache must forward them.
+  `RedisCache` overrides them. New items: `try_get_cached`,
+  `try_insert_cached` and `CacheBackendError`.
+
+- **plugin sandbox:** the host counts the values and nesting of a guest frame
+  before it parses the frame. A frame that no legal guest sends is refused with
+  no large allocation (issue #2523).
+- **plugin sandbox:** a `db-query` page counts its JSON syntax toward the result
+  ceiling, so the reply always fits the room the host reserved (issue #2523).
+- **plugin sandbox:** a plugin that drops calls without a pause no longer keeps
+  one drop record open for hours. A summary window now counts only the drops
+  inside it (issue #2523).
+
+- **plugin sandbox:** the activity log keeps each call's own time. It keeps the
+  counts of dropped calls when its ledger is full. It reads both ledgers under
+  one lock. A failed DB call no longer counts as a table touched (issue #2523).
+- **plugin sandbox:** the host checks rows from a store against the write-side
+  limits, and refuses a row or job id that the guest cannot use. The new denial
+  `result-rejected` means the call ran: do not retry. A call refused for its
+  shape no longer uses its capability quota (issue #2523).
+- **plugin sandbox:** the host reserves reply room and fuel before it runs a
+  call that changes state, so a committed write cannot fail its own request.
+  A job carries the sha256 of its artifact. The host refuses at load a
+  manifest whose call frame is larger than the stdout line limit (issue #2523).
+
+- **graph:** two applications in one process serve their own architecture
+  graph (issue #2520). Before, every application served the graph of the
+  first one.
+- **graph:** a binary that links two versions of one crate keeps a node for
+  each version (issue #2520). An id that the versions share ends in
+  `@<version>`. Other ids do not change.
+
+- **graph:** close the served-surface gaps in the architecture graph
+  (issue #2520). The census now lists OpenAPI routes, framework asset
+  routes, and a worker's probe and actuator routes. `autumn graph` uses
+  the app's config loader and role.
+- **graph:** `--check` names a changed secondary mount and a changed
+  declared plugin mount. Declared plugin mounts keep their auth in
+  `completeness.declared_mounts`.
+- **graph:** SQL scan ignores quoted text, reads each statement of a
+  batch, and reads `COPY` and `TABLE`. A cron job records its timezone.
+- **graph:** repository edges match the model by name and table. Git
+  dependency paths no longer leak the build user's home directory.
+- **graph:** a job's access is set for each edge. A job that reads one
+  table and writes another no longer shows both as writes. A call such as
+  `repo.update(..)` on a repository parameter counts as a write.
+
+- **acme:** DNS-01 follow-ups (issue #2478).
+  - Cleanup now tries every record. One failed zone no longer strands
+    challenge records in the others.
+  - Route 53 zone lookup reads all pages for the name. A public zone on a
+    later page is found.
+  - `autumn doctor --online` checks a host that a wildcard covers for address
+    and port reachability. A wildcard-only config no longer warns.
+
+- **plugin:** `plugin remove` now drops the dependency when `[[bin]] path = "src/main.rs"`
+  is the only user of it (issue #2476).
+- **new:** `autumn new --daemon --with <plugin>` now fails. Before, the plugin put the
+  database stack back into the DB-free daemon (issue #2476).
+
+- **routes:** `routes posture` refuses a manifest that lists one route twice.
+  Before, it merged the two entries. A merge cannot show two alternative
+  guards, and it can hide a widening. A v3 or v4 baseline that lists a health
+  probe beside the user route that replaced it still reads, as the user route.
+- **routes:** the route dump no longer lists a built-in health probe that a
+  user route replaces, or any probe when `health.enabled = false`. The router
+  does not mount these probes.
+
+- **plugin-sandbox:** the host now charges fuel for parsing stdout, one unit
+  per byte, on top of the copy charge (issue #2460). A guest can no longer
+  pad a frame with whitespace to get CPU work at the bulk-copy rate.
+
+- **cli:** on Windows, `autumn dev` no longer stalls about a minute per edit
+  when the project's `autumn-web` is older than the CLI (issue #2458). The app
+  now writes a `capability shutdown-signal` line to its ready file. If an app
+  writes a budget-only ready file, the CLI stops it at once and tells you to
+  run `cargo update -p autumn-web`.
+
+- **cli:** `autumn dev` now waits 15 s more than the managed-Postgres stop limit
+  before it kills the app. A slow `pg_ctl stop` no longer leaves a running
+  Postgres cluster behind (#2456).
+
+- **idempotency:** the replay alias key is now locked before the session is
+  saved (issue #2455). A request with the same unrotated cookie can arrive
+  while the first response commits. It now gets `409 Conflict`. The handler
+  does not run again.
+
+- **agent authority:** the `#[agent_operable]` analyser now refuses these
+  shapes (issue #2451):
+  - a future assigned after it is declared, or shadowed in a block
+  - an opaque macro with no handle
+  - a named future given to `timeout`
+  - a fake `commit`, `sleep` or `cache`
+  - a callee that is not a path
+  - a diesel write to an aliased or unresolved table
+  - an assignment made in one branch only
+
+  A data-changing CTE now records every table it writes. A proof no longer
+  hides a declared effect. Qualified job paths and function-item aliases no
+  longer give false positives.
+- **agent authority:** the manifest keeps the first route per `operation_id`,
+  as the MCP server does. It marks a skipped route `not-exposed` with the
+  caveat `duplicate-operation-id`. `--check` does not fail on it.
+
+- **cli:** the default, `--api`, `--daemon` and `--bundled-pg` scaffolds now
+  write two fixes for the Windows PDB symbol limit (LNK4319, issue #2448). One
+  is `[profile.dev] debug = "line-tables-only"` in `Cargo.toml`, for the app
+  and its dependencies. The other is `.cargo/config.toml` with
+  `/DEBUG:LongSymbolTruncate` for Windows MSVC targets. Backtraces keep file
+  and line. Debuggers lose variable inspection: set `debug = true` in both
+  profile tables to get it back. Older projects: add the files yourself (see
+  the platform-support guide).
+
+- **cli:** on Windows, `autumn dev` no longer force-kills an app that is still
+  starting (issue #2444). It waits for the app to finish booting, then starts
+  the stop timer. After 15 minutes with no ready signal, it uses the normal
+  stop timer anyway.
+- **cli:** the `autumn dev` stop budget reads `.env` from the selected
+  package, not from the CLI's working directory.
+
+- **cli:** `autumn serve` and `autumn dev` now read the shutdown budget
+  from the profile's smart defaults (issue #2442). The `dev` profile
+  uses 0 s prestop and 1 s shutdown. The `prod` profile uses 5 s and 35 s.
+
+- **errors:** a NUL byte in a `JSONB` string is now a `422`, not a `500`
+  (issue #2439). The classifier matches the exact Postgres message and detail
+  of SQLSTATE `22P05`.
+- **repository:** the generated `#[repository(api = ...)]` create and update
+  handlers name the field that holds a NUL byte. The `422` now has an
+  `errors[]` entry, for example `body` or `meta.key`. A payload type without
+  `Serialize` gets an empty `errors[]`.
+
+- **compression:** the match for already-compressed types (`audio/`, `video/`,
+  archives, WOFF fonts) now ignores letter case (issue #2416). Before, the
+  server compressed `Audio/MPEG` again.
+
+- **doctor:** `autumn doctor --strict` now fails a non-string `cache_dir` or
+  `contact_email`, a non-table `[server.tls] acme`, and a non-list `domains`
+  (issue #2413). Each message names the bad value. Before, doctor passed
+  configs that the server refuses to start on.
+
+- **static:** ISR now refuses a regeneration that changes the `Content-Type`
+  on extensioned routes whose handler returns a bare `String` or `Vec<u8>`
+  (issue #2409). `autumn build` now stores the extension type in
+  `manifest.json` (for example `text/css; charset=utf-8`) where it stored
+  nothing. The served header does not change. Rebuild `dist/` to get the
+  guard on existing routes.
+
+- **capsule:** failure capsules now mask a credential split from its scheme by
+  HTAB or Unicode space, and the quoted spelling of a quoted cookie value
+  (issue #2408). A `Cookie:` header records at most 256 pairs.
+
+- **upgrade:** the server no longer resets a connection that it accepted just
+  before a drain or an in-place upgrade. It now waits up to 2 s for the first
+  request of that connection, then drains it (issue #2398).
+
+- **retention:** a failed audit write sets the dataset `error` (issue #2396).
+  `autumn db retention --purge` exits non-zero. The `autumn-retention-sweep`
+  task fails when any dataset reports an error. It runs all datasets first.
+  `/actuator/tasks` and the task failure alert show the error.
+
+- **retention:** the audit archive purge now rewrites the target of a symlinked
+  `audit.path` and keeps the file owner. It fails if it cannot keep the owner
+  (issue #2396).
+- **retention:** the audit archive sweep is its own `per_replica` task,
+  `autumn-retention-archive-sweep`. The fleet task no longer purges only one
+  replica's file (issue #2396).
+- **retention:** the report no longer implies enforcement it cannot do.
+  `job_history` on a `redis` or `local` jobs backend says `NOT enforced`. A
+  legal hold on `autumn_job_tracking` says `NOT preserved` off Postgres
+  (issue #2396).
+- **retention:** `autumn db retention --purge` is checked again inside the app,
+  with the profile the app resolved (issue #2396).
+- **migrations:** the standalone commit-hook migration set adds the retention
+  sweep index (issue #2396).
+
+- **retention:** a sweep that fails part way now reports `eligible_rows`, so the
+  audit record shows how many rows were due (issue #2396).
+- **retention:** the report note for the built-in idempotency (memory and
+  database), webhook replay, and job tracking stores now says the store removes
+  expired records only on later writes (issue #2396).
+
+- **sbom:** `autumn sbom --binary` no longer claims a crates.io purl for
+  alternate-registry packages, and no longer emits an empty `vcs_url=` for git
+  packages (issue #2386). These packages now have no purl. `cargo:source` still
+  records the origin.
+
+- **data-flow:** two incompatible versions of one crate in one binary no longer
+  merge into one manifest row (issue #2375). A patch release does not change
+  the key, except for a crate before 0.1
+  and a prerelease.
+
+- **cli:** `autumn serve` and the one-shot commands now find the app binary
+  when `build.target` is set (issue #2374). The CLI takes the `executable`
+  path from the `cargo build` output. It does not build the path itself.
+
+- **upgrade:** the drain of a fresh connection now ends at its head timer, not
+  only at the 2 s grace (issue #2372). A stuck make-service no longer hangs the
+  drain: after a shutdown, connection setup gets the same grace, then the
+  connection closes.
+
+- **cli:** every `autumn` subcommand that spawns the app binary in a one-shot
+  dump mode (`routes`, `routes audit`, `openapi export`, `cache audit`,
+  `data-flow`, `agents manifest`, `graph`, `jobs manifest`, `plugin-check`,
+  `task`, the capacity ladder's route probe) now clears every *other* dump
+  mode from the child's environment, not just the ones each call site
+  happened to list by hand. An ambient `AUTUMN_DUMP_OPENAPI=1` (or
+  `AUTUMN_BUILD_STATIC=1`, left over from an earlier `autumn build` in the
+  same shell) could silently win over the mode a command actually asked for
+  and hand it the wrong manifest instead of failing loudly (issue #2370).
+
+- **cli:** Fix the source-overwrite guard of `autumn db scrub --artifact`
+  (issue #2366). The guard no longer refuses because of the config overlay of
+  the profile that you scrub. The staging drill now works with an
+  `autumn-staging.toml` file. The guard still checks the profile that the
+  artifact came from. It also compares shard URLs and keyword-form
+  connection strings. It reads the host of a URL without a host from
+  `hostaddr`, `host` or `PGHOST`.
+
+- **`autumn db scrub`:** a partition-key column is now refused as PII (issue
+  #2366, item 3). A rewrite through the parent moved rows between partitions.
+  It aborted when no partition fit. Declare the key `safe`.
+
+- **sqlite fleet:** a database's idle clock now starts when it finishes opening,
+  not when it is claimed. A slow open could make a new database look idle at
+  once.
+
+- **db scrub:** fixes the remaining gaps from issue #2366.
+  - `--artifact` scrubs only the targets the artifact restored.
+  - The source-overwrite guard compares hostless URLs and shard URLs, and no longer blocks the destination profile.
+  - Purge targets are in the trigger warning.
+  - `#[encrypted]` columns are found in raw identifiers, inline modules and any `src/` file.
+  - A structural `#[encrypted]` column can be declared `safe`.
+  - Row-level security now refuses only a role that it binds.
+  - PII on an index-expression or exclusion-constraint column is refused. Partition-only constraints fold into the parent.
+  - Encrypted columns are type- and length-checked at plan time.
+  - A schema change after classification is refused.
+  - `#[cfg(test)]` anonymize registrations are ignored.
+
+- **cache:** an unrelated call such as `Config::load()` in a `#[cached]`
+  function no longer makes the read `derived` (issue #2362). `load`, `count`,
+  `list`, `page`, `all` and `first` no longer name a dependency. A read with
+  nothing else recovered is `undetermined`, so `autumn cache audit --strict`
+  reports it. `find_all`, `find_by_id` and `exists_by_id` still name the model.
+  `Post::count(db)` no longer derives `Post`: declare `reads(Post)`.
+
+- **cache:** same-named `#[cached]` associated functions in one module could
+  share cache keys (issue #2358). Add `#[cached_impl]` to the `impl` block, or
+  set `#[cached(scope = "Type")]`. This is opt-in. Scoped keys change, so those
+  reads start with a cold cache after deploy.
+
+- **plugin-sandbox:** all sandboxed plugins together can now run at most 128
+  guests at once (issue #2355). Before, one plugin with a high
+  `max_concurrency` could fill Tokio's blocking pool and delay host work such
+  as password hashing. A request over the limit gets 503 with `Retry-After`.
+  Change the limit with `plugin_sandbox::set_guest_slots`, called once at boot.
+
+- **plugin-sandbox:** close the open findings of issue #2355.
+  - A request body is now base64-encoded straight into the frame line. The
+    per-request footprint counts the body 4 times, not 5.
+  - A declared route on the configured OpenAPI, Swagger UI or MCP path is a
+    `RouterBuildError` at build time. It no longer panics at `Router::nest`.
+  - `autumn plugin inspect` now checks the HEAD that each declared GET also serves.
+  - `fd_seek` on an unknown descriptor returns `EBADF` and is recorded as a
+    denial.
+
+- **capsule:** cache removals (`invalidate`, `invalidate_namespace`, `clear`)
+  and the untyped `cache::get` / `cache::insert` are on the capsule seam. A
+  replay does not reach the installed cache backend. A coherence
+  `invalidate_namespace` records its combined answer, so a registered store
+  that failed replays as the `false` production returned.
+- **capsule:** a replay now diverges when it reads a cache key that the
+  recording only wrote, makes a tenant lookup the recording did not make, or
+  draws random bytes of a different width.
+- **capsule:** a plain `enqueue` no longer consumes a recorded delayed entry.
+  An `enqueue_at` with a past deadline now replays clean.
+- **capsule:** capture records a failed `*_after_commit` registration as a
+  failure. With no open transaction, capture records it once, not twice.
+- **capsule:** a masked cache write no longer refuses the capsule. Replay now
+  refuses a capsule when the echo mask changed a response, a cache hit or the
+  job's own payload.
+- **capsule:** replay refuses a capsule when compared data held the literal
+  text `[FILTERED]`. Replay reads that text as a wildcard.
+- **capsule:** replay masks a secret that reached the outcome through an
+  effect. Unchanged code then reproduces, and the verdict does not show the
+  secret.
+- **capsule:** a replayed job runs in the event, transaction-timeout and job
+  contexts of a production run.
+- **capsule:** the alternate mail body, every mail header and an enqueue error
+  count against the capsule size limits.
+- **jobs:** a job id is no longer drawn from the capsule's random tape. The
+  job capsule filter is built once per app, not per execution.
+
+- **upgrade:** a successor that dies just after an in-place upgrade no longer
+  loses the writes it acknowledged (issue #2350). The successor journals each
+  write to the handoff directory. The predecessor resumes from the journal. This
+  holds only when the state version is unchanged.
+
+- **upgrade:** In-place upgrade no longer kills a successor that is publishing
+  readiness (issue #2350). Both processes now take a lock in the handoff
+  directory for that step. A predecessor built before this fix has no lock
+  file. The successor then publishes without the lock.
+
+- **auth:** an operator who impersonates a user now spends their own throttle
+  budget, not the customer's. Per-user throttle buckets for impersonated
+  traffic move from the customer to the operator.
+
+- **upgrade:** `autumn upgrade` now ties CI workflow ownership to the git root
+  (issue #2344). A crate that is its own git root, such as a nested repository
+  or a submodule in a Cargo workspace, keeps `ci.yml` and `posture-gate.yml` in
+  scope. `--check` now catches a stale workflow there. `clippy.toml`,
+  `rustfmt.toml` and `rust-toolchain.toml` stay out of scope. See
+  `docs/guide/upgrading.md`.
+
+- **upgrade:** `autumn upgrade` compares `build.rs` with the planned codemod
+  text. Preview and `--apply` show the same diff (issue #2343).
+
+- **upgrade:** `autumn upgrade` no longer loses a concurrent write (#2342).
+  `--apply` refuses a scaffold file that changed after the preview. Two
+  `--accept` commands that run together keep both pins.
+
+- **tenancy:** notifications and Web Push subscriptions are now tenant-scoped
+  (issue #2337). Two tenants that use the same user id no longer share a feed,
+  an unread count, a channel topic or push devices. The tenant comes from the
+  resolved tenant of the request, never from the request body.
+
+- **push:** nine Web Push follow-ups (issue #2336).
+  - A `mailto:` VAPID subject with a space or a second `@` now fails at boot.
+  - `WebPush::new` trims the subject, so the JWT `sub` matches what was checked.
+  - A move to a full principal now returns `TooManySubscriptions` in the memory store.
+  - `send_many` serves up to four principals at once. Every recipient finishes before an error returns.
+  - One corrupt database row no longer stops a send. It is skipped and logged.
+  - The transport sends one request over all checked addresses. It does not re-send a POST after a late failure.
+  - The generated service worker opens the app root when a notification URL is malformed.
+  - The generated `autumnPushUnsubscribe()` revokes the browser subscription even when server cleanup fails.
+
+- **ledger:** a ledgered write that holds `NaN` or an infinite float now fails
+  with `LedgerError::NonFiniteValue`. Before, the snapshot stored `null` and the
+  record could not be read back (issue #2326).
+- **ledger:** `ledger_as_of` and `ledger_diff` return `ChainUnreadable`, naming
+  the column and revision, when they cannot decrypt an `#[encrypted]` column.
+  Before, they returned the ciphertext as the value (issue #2326).
+- **ledger:** a delete or restore revision on a `valid_time` model is valid from
+  the instant of the change. Before, it kept the row's old valid time and appeared in
+  valid-time queries about earlier instants (issue #2326).
+
+- **ledger:** `ledger_verify` no longer reports `LiveStateMismatch` for a record
+  whose head revision was written before a declared schema change (issue
+  #2326). It converts the head with the upcast function. It compares only the
+  columns that both shapes have. A head at the current version is still compared
+  strictly. Raise `schema_version` when you add a column.
+
+- **ledger:** a delete revision now snapshots the full row after the soft-delete
+  `UPDATE`. Before, a trigger that changed another column (such as `updated_at`)
+  made `ledger_verify` report `LedgerBreak::LiveStateMismatch` after every delete (issue #2326).
+- **ledger:** the ledger refuses a stored snapshot that is not in canonical form
+  (changed spacing, other key order, duplicate keys) with
+  `LedgerError::SnapshotNotCanonical`. `ledger_verify` reports it as
+  `LedgerBreak::SnapshotNotCanonical` (issue #2326).
+- **ledger:** a snapshot that does not decode into the current model returns
+  `LedgerError::SnapshotSchemaMismatch`, not `ChainUnreadable`. Add
+  `#[serde(default)]` to a new field to keep old revisions readable (issue #2326).
+
+- **ws [no-plugin]:** `#[ws]` routes now accept the HTTP/2 `CONNECT` upgrade (RFC 8441)
+  as well as `GET` (issue #2321). Before, a browser on `h2` got `405` for
+  `wss://`. CSRF, captcha and read-only mode now let this upgrade pass, like
+  the `GET` upgrade.
+
+- **query budgets:** an early `return`, `break` or `continue` no longer adds
+  its cost to the code it skips. `if cached { return repo.find_cached().await; }
+  repo.find_fresh().await` now costs 1 query, not 2. In a loop, a path that
+  leaves the loop is paid once, not once per pass (#2316).
+- **query budgets:** the analysis tracks a handle through every binding form:
+  `let`, `let`-`else`, assignment, `if let`, `while let`, `match` arms, `for`
+  patterns, closure and transaction parameters, and annotated statements.
+  After a branch, a name holds a handle if it holds one on any path. An
+  assignment inside a block stays after the block. A value that a block, a
+  `match` arm or a `break` gives keeps its handle. Before, some of these
+  forms lost the handle, and a query through it was not counted (#2316).
+- **query budgets:** a handle kept in a container is tracked. An index, a
+  field, a pattern, `?` or an element method that takes `self` (`unwrap`) on
+  `[repo]`, `vec![repo]`, `Some(repo)` or a `Vec`, `Option`, `Result`, map
+  or set parameter of a handle type gives a handle. `Arc<Vec<…>>` is a container,
+  and a container of containers keeps its shape. An unknown method on such
+  a container, or any method on a user struct that holds a handle, is
+  reported. A container method is known only for the container type that
+  has it, and only when it takes `self`: `sort` on a `VecDeque` is
+  reported, and so are `clone` and every method that borrows the
+  container. After `#[query_cost(0)] list.push(repo);` or
+  `fill(&mut list, &repo)`, `list` holds a handle. A type annotation made only of standard and primitive types
+  (`Vec<i64>`) marks a binding as plain (#2316).
+- **query budgets:** a parameter of type `Arc<PgPostRepository>`, `Box<…>`,
+  `Rc<…>`, `dyn PostRepository` or `impl PostRepository` is a handle, and so
+  is a `State<…>` or `Extension<…>` extractor of one
+  (`State(repo): State<PgPostRepository>`). A
+  handle assigned into a field (`deps.0 = repo`) is tracked. Before, a query
+  through these was not counted (#2316).
+- **query budgets:** `db.tx_immediate(…)`, `scoped_immediate_transaction`
+  and `maybe_immediate_transaction` count their callback like `db.tx(…)`.
+  A query future built inside `vec![…]` is counted. A function passed by
+  name as a transaction or iterator callback is reported (#2316).
+- **query budgets:** `tx` on a value that is not a database connection,
+  such as a repository, may run its callback many times and hand it a
+  connection. The callback's `conn` is now a handle. Before, a query through
+  it was not counted (#2316).
+- **query budgets:** an `.await` on a value that holds a handle is reported,
+  unless the value is a query or accessor on a handle, a call, or an `async`
+  block. An `async` constructor stored before its `.await`
+  (`let pending = PgPostRepository::new(&mut db);`) is no longer free (#2316).
+- **query budgets:** `#[query_cost]` and `#[query_exempt]` on an assignment
+  or compound-assignment statement (`=`, `+=`) now apply, as in
+  `#[query_cost(2)] links = load_links(&mut db).await?;`. Before, they were
+  ignored (#2316).
+- **query budgets:** an arithmetic, bit or unary operator handed a handle
+  (`repo + x`, `-repo`) is reported, like a helper handed it. A comparison is
+  not. A `return` or `?` inside a call argument or a `vec![…]` element no
+  longer adds its cost to the code after it. `transaction` on an
+  `impl AsyncConnection` runs its callback once (#2316).
+
+- **cli:** `autumn destroy scaffold` keeps the `storage` and `markdown`
+  features when your code imports the feature module
+  (`use autumn_web::storage;` or `use autumn_web::markdown as md;`).
+  Before this fix, `destroy` removed the feature and the build failed
+  (issue #2186).
+
+- **generate scaffold:** the CSV export reads its rows with one `list_rows`
+  (or `list_scoped_rows`) call, not one `list` page for each 100 rows
+  (#2185). The file now comes from one snapshot, and a full export is one
+  query, not ~200. This withdraws two caveats of the #1315 entry in 0.7.0:
+  "consistency is per batch" and "~100 page queries plus ~100 `COUNT(*)`s".
+  The per-IP throttle stays at 6 per minute, because an export still loads
+  up to 10 000 rows and builds the file in memory. A scaffold generated
+  before this change keeps the old loop. To update it, replace the loop with
+  one read, then delete the `CONSISTENCY` and `COST` doc paragraphs:
+  - an owner-scoped scaffold (the default):
+    `repo.list_scoped_rows(owner_id, &list_query, MAX_EXPORT_ROWS + 1)`.
+    Do not use `list_rows` here. It reads the rows of all users.
+  - a scaffold with no owner column:
+    `repo.list_rows(&list_query, MAX_EXPORT_ROWS + 1)`.
+
+- **schema:** `schema pull` lost the `ON DELETE` / `ON UPDATE` action of a
+  foreign key. A later SQLite recreate, or the `down.sql` of a dropped table,
+  then wrote `NO ACTION`. Run `autumn schema pull` again to record the
+  actions in an existing snapshot.
+- **schema:** on SQLite, `autumn schema pull` no longer records the shadow
+  tables of a non-FTS virtual table as app tables (issue #1975). Examples are
+  the rtree `_node`, `_parent` and `_rowid` tables. An app table such as
+  `boxes_data` beside an rtree `boxes` is no longer skipped.
+
+- **schema:** the schema parser reads `#[diesel(column_name = "...")]` and a
+  raw field name (`r#type`) as the SQL column name, as the `#[model]` macro
+  does. If a model uses one of these, run `autumn schema snapshot` (or
+  `autumn schema pull`) again to update the snapshot.
+
+- **media:** `DbRoomStore` joins from two processes no longer pass a room's
+  seat cap (issues #2864, #3104). Join, leave and the reaper's room delete each
+  lock the room row in one transaction. The schema does not change.
+- **media:** on `DbRoomStore`, a join that races the last leave or the reaper
+  no longer returns a seat that the room delete then removes (issue #2407). It
+  gets `404`, as for a room that is gone.
+
+- **deploy:** a failed kamal-proxy install no longer leaves a partial binary at
+  `/usr/local/bin/kamal-proxy`. Before, the install shell ignored errors, so a
+  failed copy was moved into place, and every later deploy refused to replace
+  it. apt now waits up to 5 minutes for its lock (issue #1974).
+
+- **edge:** `autumn build` no longer fails when the app has `#[edge]` routes
+  and no static routes. The capsule is then the build's output.
+
+### Security
+
+- Bumped `tokio` to 1.54.1 (RUSTSEC-2026-0386, `AsyncFd` I/O-safety unsoundness) and recorded a dated, reasoned `cargo-deny` waiver for RUSTSEC-2026-0387 (`crypto-bigint` 0.4.9 via `aws-sigv4`'s unused SigV4a path; no 0.4.x fix exists).
+
+- **idempotency:** `.idempotent()` scopes its cache by the bearer principal.
+  A request with no cookie-backed session used to carry no principal in its
+  storage key, so two token clients that sent the same `Idempotency-Key` and
+  body to a route that checks the token in the handler shared one cached
+  response, and the second never reached the handler. The key now carries the
+  principal `RequireApiToken` verified, or else a SHA-256 digest of the raw
+  `Authorization` header. Session-only apps keep the keys they had
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **release:** `autumn release init --target azure-container-apps` no longer
+  gives production credentials to the Container App while it runs the public
+  bootstrap image (#2314). The generated `main.tf` creates the app with no
+  managed identity, no registry and no Key Vault secret refs. A new generated
+  script, `azure-cutover.sh`, copies them from the migration job and sets the
+  real image in one write. It opens external ingress only when the new
+  revision runs the real image. `azure-deploy.yml` and the manual walkthrough
+  both run it. Terraform now ignores the app's env vars after it creates the
+  app. To change one, use `az containerapp update --set-env-vars`. Before you
+  use a regenerated workflow on an existing app, regenerate `main.tf`. Then
+  run `terraform apply`. If the app still runs the bootstrap image, then run
+  `bash azure-cutover.sh --remove-credentials`: the old template gave the
+  placeholder the credentials, and `terraform apply` does not remove them.
+  To turn Redis off, run `bash azure-cutover.sh --without-redis` first, then
+  set `enable_redis_cache = false` and run `terraform apply`. The script
+  needs all app secrets on the migration job.
+
+- **markdown:** `autumn-web` now needs `ammonia` 4.2.4 or later
+  (RUSTSEC-2026-0373). The old version matched the CSS `url()` function
+  case-sensitively, so a quoted `URL("...")` in an allowed inline style
+  skipped the URL scheme and domain filters.
+
+- **constela:** every byte a render or a dispatch keeps now charges one
+  budget (issue #2626). Before, a copy of a `state`, `var` or `param` value,
+  a portal target, a validation diagnostic, a loop binding and a component
+  param were not charged, so a hostile document could make one request keep
+  gigabytes. A read that only shows a value no longer copies it. A new
+  `constela` fuzz target and the `constela_memory` test check that peak
+  memory stays bounded. See `docs/adr/0025-constela-retention-accounting.md`.
+
+- **db:** the database-target redactor masks two more shapes (issue #2539,
+  #2571). An opaque URL such as `postgres:password=hunter2` keeps only its
+  scheme, unless the rest is one path-shaped token. An allowlisted query
+  value, such as `application_name`, is masked unless it is a simple token,
+  so a nested credentialed URL does not go into the boot log.
+
+- **deps:** update `rustls` to 0.23.46. It fixes RUSTSEC-2026-0346 to
+  RUSTSEC-2026-0349.
+
+- **media:** a room join refuses a `display_name` longer than 64 characters
+  with `400` (`RoomError::DisplayNameTooLong`), so one caller cannot store a
+  very large string in a room (issue #3104). On `DbRoomStore`, a leave with a
+  wrong token no longer takes the room lock.
+
+### Performance
+
+- **metrics:** recording through `metrics::counter`/`gauge`/`histogram`/`timer`
+  no longer copies its labels to look up a series that already exists. Once
+  a label set's series exists (the first sample registers it), a handle you
+  keep and reuse records without allocating; it used to make 3–5 allocations
+  per sample. The per-call
+  `counter(NAME).with_label(..).increment(1)` form makes half as many as
+  before: 3 instead of 6 for one label. A metric name that is already
+  registered is no longer re-validated on every call. See "Labels and
+  cardinality" in [the metrics guide](docs/guide/metrics.md).
+
+- **http:** the access log, the request-timeout layer and the log context
+  keep the request's matched route and request id as the shared values the
+  request already carries, instead of copying them into a `String` on every
+  request. The trusted-host check no longer lowercases a fresh copy of an
+  already-normal `Host` header. Log output is unchanged.
+- **proxies:** behind a trusted proxy, reading `X-Forwarded-For` no longer
+  copies the chain on every resolve. Resolving the client address
+  allocates nothing for a one-line chain (it made 2 allocations per call).
+- **db:** per-route DB query metrics no longer build their
+  `"{method} {route} {verb}"` keys as `String`s on every request and query.
+  Recording under a key already seen allocates nothing (it made 1–3
+  allocations per sample). Metric keys are unchanged.
+- **rate limiting:** a warm `#[throttle]` check makes 3 allocations instead
+  of 13. The limiter registry and the per-client buckets are probed by
+  borrowed key. On the Redis backend the Lua script is built once instead of
+  hashed on every decision, and the three 429 bodies are rendered once.
+- **i18n:** locale negotiation and the ambient locale scope share the
+  configured locale list and fallback chain instead of copying them per
+  request, and a `Translated` render no longer copies the active tag.
+- **realtime:** channel metrics, presence and the collaborative-editing hub
+  look up topics and members by borrow instead of copying the name on every
+  publish, join or cursor move. A presence stream counts members without
+  cloning the member list. The Redis channel backend encodes its envelope
+  without copying the payload, and the collaborative text CRDT no longer
+  copies each operation it applies. Wire formats are unchanged.
+- **security:** CSRF reuses the request's cookie token instead of copying
+  it several times per request, and CSRF and submit-token skip path
+  normalization when no exempt paths are configured. A successful response
+  no longer pays to render the error-page context's request id, method,
+  query and cookies; only error responses get that context. The log
+  parameter filter normalizes field names on the stack.
+- **generated code:** repositories with `broadcasts` or version history no
+  longer copy static topic names, OOB container ids or the actor on every
+  write. `#[state_machine]` `on_commit` effects serialize from borrowed
+  names to the same job payload.
+- **jobs:** the job claim loop, queue-slot accounting and the actuator's job
+  gauges borrow queue names instead of copying them per claim and per job.
+- **tenancy:** tenant bulkhead permits and tenant cell handles share one
+  tenant id. Feature-flag rollout and experiment bucketing hash their key in
+  parts instead of building a joined string; bucket assignments are
+  unchanged.
+
+- **forms:** the field helpers write their markup with one buffer. A 12-field
+  form render makes 13% fewer allocations and allocates 16% fewer bytes.
+
+- **db scrub:** the `--sample` closure walk joins only the keys the previous
+  pass added, not every key found so far (issue #2599). A deep hierarchy
+  needs one pass per level. Before this change, each pass read every key
+  found so far, so each pass was slower than the last. On a 500 000-node,
+  250-level tree the walk now takes 2.0 s, not 33.7 s. The rows
+  kept and the pass count do not change. A descent through a foreign key
+  column with no index still scans that table on each pass.
+
+### Documentation
+
+- **lock:** `Lock` is documented as mutual exclusion for efficiency, not
+  correctness, with a connection-pooler compatibility matrix.
+
+- **examples:** new `examples/escape-hatches`. One stockroom app shows each
+  kind of escape hatch, each with a real reason and a test. It starts from
+  `#[model]`, `#[repository]` and `with_lock`. It uses a hatch only where they
+  cannot do the job. The hatches: `Db::tx` with guarded Diesel writes, a
+  set-based `UPDATE`, `diesel::sql_query`, `#[intercept]`/`.scoped`/`.layer`
+  tower layers, raw Axum routers through `.nest` and a `Plugin`,
+  `.error_pages`, `.exception_filter`, and a `DatabasePoolProvider` that reads
+  a rotated password file.
+
+- **schema:** the declarative-schema guide now says that `schema pull` and
+  doctor's database-drift check support SQLite in a `--features sqlite` build.
+
+- **scheduler:** the `SQLite` lease coordinator reaps leases with each
+  process's own clock. Keep the clock difference between processes below
+  `scheduler.lease_ttl_secs`. Processes on one host use one clock.
+
+- **config:** a request that exceeds `server.timeouts.request_timeout_ms` gets
+  `503`, not `408`. The `RequestTimeoutsConfig` doc now says this.
+- **jobs:** an idle Postgres job worker polls every 200ms. Workers do not use
+  `LISTEN`/`NOTIFY`. The jobs guide and the code comments now say this.
+
+- **feature_flags:** the guides said that replicas use `LISTEN/NOTIFY`. They
+  poll. The guides now say so, and describe the store-failure behavior.
+
+- **ledger:** an `Option` field added to a ledgered model needs no attribute.
+  Old revisions read it as `None`. `ledger_diff` shows no change for it
+  (issue #2326).
+
+- **schema:** the declarative-schema guide explains how to adopt a model with
+  `#[model(managed)]` and the field attributes that change its table.
+
+### Testing
+
+- **reddit-clone:** the DST nightly sweep fails with a memory-leak message
+  when its process grows by more than 256 MiB, before the runner runs out of
+  memory.
+
+- **reddit-clone:** a DST nightly for the example. Each seed runs the whole
+  app: racing votes, virtual time, jobs, the scheduled rank sweep, replicas
+  with skewed clocks, a crash, `SimNet`, the LLM stub and SMTP faults. The
+  `sim-nightly.yml` workflow sweeps 4,000,000 seeds each night. A gate test
+  fails when a public `autumn_web::sim` function that does not need `sqlite`
+  has no call in the nightly. See
+  `docs/guide/simulation-testing.md`, "The reddit-clone nightly".
+
+- **verification:** Kani proofs over the shipped backoff, admission
+  partitions, AIMD limit, byte-range parser, outbox retry delay, certificate
+  backoff and time helpers (`cargo kani -p autumn-web --lib`, `kani.yml`).
+  Four new Verus specs: circuit-breaker half-open accounting, the retry
+  budget token bucket, the tenant bulkhead and backoff jitter. Shuttle checks
+  (`tests/shuttle_models.rs`) and new loom models drive the real
+  `RetryBudget`, `TenantBulkhead`, `CircuitBreaker` and `AdaptiveLimiter`
+  through a sync shim, instead of a copy of their algorithms.
+
+- **db:** the fleet "stranded drain" tests wait up to 60 s, not 5 s. A database
+  create takes seconds on the Windows CI runner, and the 5 s bound failed there.
+
+- **sim:** two-replica regression tests for the cron double-fire (#3052) and
+  the long-job double-run (#3051).
+
+- **verification:** a new `Verus proofs` workflow runs every spec in
+  `verification/`. It is not a required check yet.
+
+- **repository:** integration tests pin the cascade hook order and prove a
+  cascaded child's `after_delete_commit` runs once, after commit (issue #2427).
+
 ## [0.8.0] - 2026-10-01
 
 For a narrative tour of this release, see the

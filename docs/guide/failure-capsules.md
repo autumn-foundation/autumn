@@ -195,7 +195,7 @@ has one, which is how a capsule on disk is tied back to a log line.
   "format_version": 4,
   "id": "01JB2K7Q8N4W",
   "captured_at": "2026-08-12T10:14:13.882104Z",
-  "autumn_version": "0.8.0",
+  "autumn_version": "0.9.0",
   "app": { "name": "invoices", "profile": "production" },
   "request": {
     "method": "GET",

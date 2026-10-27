@@ -60,7 +60,7 @@ graph LR
 - A SQLite app with default features off compiles no Postgres client. CI
   checks this with clippy and `cargo tree`.
 - Breaking: a build with default features off that enables `db` without
-  `sqlite` must add `postgres`. See `docs/migrations/next.md`.
+  `sqlite` must add `postgres`. See `docs/migrations/0.9.0.md`.
 - `cargo hack --each-feature` skips `db`, `seed`, `repl`, `offline-sync` and
   `ledger-profile`. Curated combinations build them with each backend.
 - The semver gate names `postgres` for the current build only, until a

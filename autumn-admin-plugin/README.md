@@ -33,8 +33,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.8", features = ["db", "flash", "htmx", "maud"] }
-autumn-admin-plugin = "0.8"
+autumn-web = { version = "0.9", features = ["db", "flash", "htmx", "maud"] }
+autumn-admin-plugin = "0.9"
 ```
 
 `autumn-admin-plugin` expects a configured Autumn database pool: model

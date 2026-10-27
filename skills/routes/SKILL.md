@@ -91,9 +91,9 @@ omitted. They do not need to be shown unless the user asks:
 If `autumn routes` fails because the project has not been compiled, tell the
 user to run `cargo build` first, then retry.
 
-## Auth-coverage audit (unreleased — trunk-dev, issues #1604, #1850, #1627)
+## Auth-coverage audit (0.6.0, issues #1604, #1627; 0.7.0, issue #1850)
 
-On trunk-dev, `autumn routes audit` audits every route's authentication
+`autumn routes audit` audits every route's authentication
 exposure. It prints each route's classification — `gated`, `public`,
 `framework`, or `unclassified` — and emits a stable-ordered (by path, then
 method) JSON security manifest. It exits non-zero on any `unclassified` (or
@@ -155,7 +155,7 @@ list with the class they will eventually carry. See
 `docs/guide/security-posture-manifest.md` for the provenance rubric that
 decides a dimension's class.
 
-## Posture diffs and the merge gate (unreleased — trunk-dev, issue #1624)
+## Posture diffs and the merge gate (0.8.0, issue #1624)
 
 `autumn routes audit` says what the surface *is*. `autumn routes posture` says
 what a change *did to it*:
