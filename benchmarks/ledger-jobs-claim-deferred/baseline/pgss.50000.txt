@@ -1,0 +1,11 @@
+ calls |  blks  | shared_blks_hit | shared_blks_read | temp_blks_written | wal_bytes | rows |                                             q                                              
+-------+--------+-----------------+------------------+-------------------+-----------+------+--------------------------------------------------------------------------------------------
+   300 | 277957 |          276823 |             1134 |                 0 |    901357 |  300 | UPDATE autumn_jobs SET status = $1, started_at = NOW(), claimed_by = $2, claimed_at = NOW(
+   300 |   4598 |            4598 |                0 |                 0 |    118771 |  300 | UPDATE autumn_jobs SET status = $2, finished_at = NOW() WHERE id = $1
+   300 |   3778 |            3765 |               13 |                 0 |    173284 |  300 | INSERT INTO autumn_jobs (id, name, status, run_at, queue, payload) VALUES (md5(random()::t
+     1 |      0 |               0 |                0 |                 0 |         0 |    1 | SELECT pg_stat_reset()
+     1 |      0 |               0 |                0 |                 0 |         0 |    1 | SELECT pg_stat_statements_reset()
+     1 |      0 |               0 |                0 |                 0 |         0 |    1 | select pg_current_wal_lsn()
+     1 |      0 |               0 |                0 |                 0 |         0 |    1 | select pg_wal_lsn_diff(pg_current_wal_lsn(), $1)
+(7 rows)
+

@@ -11645,6 +11645,83 @@ fn pg_claim_sql_single_queue() -> String {
     )
 }
 
+/// Single-queue claim for the cost-deferral case (issue #1720): `deferred` is
+/// non-empty, so some job names are parked at the head of the queue.
+///
+/// `pg_claim_sql_single_queue` walks `idx_autumn_jobs_queue_ready` in `run_at`
+/// order and drops parked names with a heap-side filter, so a poll costs
+/// O(parked backlog) buffers, and the backlog grows because nothing claims the
+/// parked names. This variant instead skip-scans the distinct ready names on
+/// `idx_autumn_jobs_queue_name_ready (queue, name, run_at)` (one index-only
+/// probe per name), keeps the runnable ones with the `run_at` of their earliest
+/// due row (`heads`), and walks them in that order. Each probe returns the
+/// name's earliest concurrency-eligible row strictly earlier than the best found
+/// so far, and the walk stops at the first name whose head cannot beat the best,
+/// so a name with a large saturated backlog is never scanned past the point the
+/// plain claim would have stopped at. The claimed row is the one
+/// `pg_claim_sql_single_queue` would pick (ties on `run_at` stay unordered, as
+/// before). Row locks are taken per probe and drop with the statement, as in the
+/// multi-queue claim.
+///
+/// `heads` is referenced twice (the walk's base term tests it) so Postgres 12+
+/// materializes it instead of inlining it into every iteration; `AS MATERIALIZED`
+/// is not used because Postgres 11, the test-container default, rejects it.
+///
+/// Used only when `deferred` is non-empty, so the common path is untouched.
+#[cfg(feature = "postgres")]
+fn pg_claim_sql_single_queue_deferred() -> String {
+    format!(
+        "UPDATE autumn_jobs SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
+         pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
+         unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
+         WHERE id = ( \
+         WITH RECURSIVE names(n, skip) AS ( \
+         (SELECT name, name = ANY($3) FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 ORDER BY name LIMIT 1) \
+         UNION ALL \
+         SELECT nx.name, nx.name = ANY($3) FROM names \
+         CROSS JOIN LATERAL (SELECT name FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 AND name > names.n ORDER BY name LIMIT 1) nx \
+         ), \
+         heads AS ( \
+         SELECT names.n, h.head, row_number() OVER (ORDER BY h.head, names.n) AS i FROM names \
+         CROSS JOIN LATERAL (SELECT run_at AS head FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 AND name = names.n AND run_at <= NOW() \
+         ORDER BY run_at LIMIT 1) h \
+         WHERE NOT names.skip \
+         ), \
+         walk(i, best_at, best_id) AS ( \
+         SELECT 0::bigint, NULL::timestamptz, NULL::text WHERE EXISTS (SELECT 1 FROM heads) \
+         UNION ALL \
+         SELECT heads.i, COALESCE(p.run_at, walk.best_at), COALESCE(p.id, walk.best_id) \
+         FROM walk \
+         JOIN heads ON heads.i = walk.i + 1 AND (walk.best_at IS NULL OR heads.head < walk.best_at) \
+         LEFT JOIN LATERAL ( \
+         SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
+         WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+         AND (walk.best_at IS NULL OR candidate.run_at < walk.best_at) \
+         AND candidate.queue = $2 AND candidate.name = heads.n \
+         AND (candidate.concurrency_limit IS NULL OR (SELECT COUNT(*) FROM autumn_jobs running \
+         WHERE running.status = 'running' AND running.name = candidate.name \
+         AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key) < candidate.concurrency_limit) \
+         ORDER BY candidate.run_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) p ON true \
+         ) \
+         SELECT best_id FROM walk WHERE best_id IS NOT NULL ORDER BY i DESC LIMIT 1) \
+         RETURNING {PG_JOB_SELECT_COLS}"
+    )
+}
+
+/// The single-queue claim text for this poll: the plain claim, or the
+/// skip-scan variant while any job name is deferred.
+#[cfg(feature = "postgres")]
+fn pg_single_queue_claim_sql(deferred: &[String]) -> String {
+    if deferred.is_empty() {
+        pg_claim_sql_single_queue()
+    } else {
+        pg_claim_sql_single_queue_deferred()
+    }
+}
+
 #[cfg(all(feature = "postgres", test))]
 async fn pg_claim_next_job(
     pool: &PgPool,
@@ -11673,7 +11750,7 @@ async fn pg_claim_next_job_except(
     // `[jobs] queues` priority config — the common case) gets its own query
     // text rather than reusing `pg_claim_sql` with a one-element array.
     let claimed = if let [only_queue] = queue_order {
-        let sql = pg_claim_sql_single_queue();
+        let sql = pg_single_queue_claim_sql(deferred);
         let only_queue = only_queue.clone();
         let deferred = deferred.to_vec();
         if serialize_claims {
@@ -13225,7 +13302,7 @@ fn start_postgres_runtime(
 /// A shard-local job table is made from these same files, so it cannot drift
 /// from the control table. Each file is idempotent (`IF NOT EXISTS`).
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
-const SHARD_JOB_SCHEMA: [(&str, &str); 5] = [
+const SHARD_JOB_SCHEMA: [(&str, &str); 6] = [
     (
         "20260513000000_create_job_queue",
         include_str!("../migrations/20260513000000_create_job_queue/up.sql"),
@@ -13245,6 +13322,10 @@ const SHARD_JOB_SCHEMA: [(&str, &str); 5] = [
     (
         "20260628000000_add_queue_to_jobs",
         include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql"),
+    ),
+    (
+        "20261026170000_add_jobs_queue_name_ready_index",
+        include_str!("../migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql"),
     ),
 ];
 
@@ -20893,6 +20974,96 @@ mod tests {
         async fn pg_exec(pool: &PgPool, sql: &str) {
             let mut conn = pool.get().await.unwrap();
             diesel::sql_query(sql).execute(&mut *conn).await.unwrap();
+        }
+
+        #[test]
+        fn pg_deferred_claim_sql_binds_the_same_three_parameters_as_the_plain_claim() {
+            let plain = pg_claim_sql_single_queue();
+            let deferred = pg_claim_sql_single_queue_deferred();
+            for param in ["$1", "$2", "$3"] {
+                assert!(plain.contains(param), "plain claim binds {param}");
+                assert!(deferred.contains(param), "deferred claim binds {param}");
+            }
+            assert!(
+                !deferred.contains("$4"),
+                "diesel binds exactly three values"
+            );
+            // The skip scan must not filter parked names out of the run_at scan.
+            assert!(deferred.contains("WITH RECURSIVE names"));
+            assert!(deferred.contains("FOR UPDATE SKIP LOCKED"));
+            assert!(deferred.contains("RETURNING id, name, queue"));
+            assert_eq!(pg_single_queue_claim_sql(&[]), plain);
+            assert_eq!(pg_single_queue_claim_sql(&["parked".to_owned()]), deferred);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_deferred_claim_skips_parked_names_and_keeps_run_at_order() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            {
+                use diesel_async::SimpleAsyncConnection as _;
+                let mut conn = pool.get().await.unwrap();
+                conn.batch_execute(include_str!(
+                    "../migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql"
+                ))
+                .await
+                .unwrap();
+            }
+
+            // Parked backlog is the oldest work; `other` is later; `lim` is
+            // capped at one running job and one is already running.
+            pg_exec(
+                &pool,
+                "INSERT INTO autumn_jobs (id, name, status, run_at, queue, payload, \
+                 concurrency_limit) VALUES \
+                 ('p1', 'parked', 'enqueued', NOW() - interval '10 minutes', 'default', '{}', NULL), \
+                 ('p2', 'parked', 'enqueued', NOW() - interval '9 minutes', 'default', '{}', NULL), \
+                 ('l1', 'lim', 'enqueued', NOW() - interval '8 minutes', 'default', '{}', 1), \
+                 ('o2', 'other', 'enqueued', NOW() - interval '6 minutes', 'default', '{}', NULL), \
+                 ('o1', 'other', 'enqueued', NOW() - interval '7 minutes', 'default', '{}', NULL), \
+                 ('f1', 'other', 'enqueued', NOW() + interval '1 hour', 'default', '{}', NULL)",
+            )
+            .await;
+            pg_exec(
+                &pool,
+                "INSERT INTO autumn_jobs (id, name, status, run_at, queue, payload, claimed_at) \
+                 VALUES ('r1', 'lim', 'running', NOW(), 'default', '{}', NOW())",
+            )
+            .await;
+
+            let queues = ["default".to_string()];
+            let parked = vec!["parked".to_string()];
+            let first = pg_claim_next_job_except(&pool, "w", false, &queues, &parked)
+                .await
+                .expect("a runnable job exists behind the parked ones");
+            assert_eq!(
+                first.id, "o1",
+                "earliest runnable job; parked and capped skipped"
+            );
+            let second = pg_claim_next_job_except(&pool, "w", false, &queues, &parked)
+                .await
+                .expect("the next runnable job");
+            assert_eq!(second.id, "o2");
+            assert!(
+                pg_claim_next_job_except(&pool, "w", false, &queues, &parked)
+                    .await
+                    .is_none(),
+                "parked, concurrency-capped and future jobs are not claimable"
+            );
+
+            // With nothing deferred the plain claim still takes the oldest job.
+            let oldest = pg_claim_next_job(&pool, "w", false, &queues)
+                .await
+                .expect("parked job claimable once not deferred");
+            assert_eq!(oldest.id, "p1");
         }
 
         #[tokio::test]

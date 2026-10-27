@@ -1721,6 +1721,18 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
             || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
+          # The cost-deferral claim (#1720) is `--lib` too: it drives the
+          # crate-private `pg_claim_next_job_except`. Named by full path with a
+          # pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \
+              | tee "${RUNNER_TEMP}/pg-deferred-claim.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-deferred-claim.log" \
+            || { echo "::error::no pg deferred-claim test ran — the ci.yml filter no longer matches"; exit 1; }
           # Issue #2576: the Postgres admin-retry unique-key tests are `--lib`
           # (they drive the crate-private `PgJobAdminBackend`). Named by full
           # path, with a pass count, as above.
@@ -2501,6 +2513,14 @@ jobs:
             job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
             | tee "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
           grep -Eq "test result: ok\. 2 passed" "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
+          # Ledger (deferred job claim, #1720): the skip-scan claim runs only
+          # in this `--lib` Docker test, so the `Test (Docker)` sweep alone
+          # leaves it out of the patch gate. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored --test-threads=1 \
+            job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \
+            | tee "$RUNNER_TEMP/pg-deferred-claim-cov.log"
+          grep -Eq "test result: ok\. 1 passed" "$RUNNER_TEMP/pg-deferred-claim-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \

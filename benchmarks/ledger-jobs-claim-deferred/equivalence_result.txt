@@ -1,0 +1,9 @@
+                     deferred                     | claimed_baseline | claimed_after | same_run_at_sequence | same_tie_groups 
+--------------------------------------------------+------------------+---------------+----------------------+-----------------
+ {}                                               |              230 |           230 | t                    | t
+ {report.slow}                                    |              184 |           184 | t                    | t
+ {report.slow,job.n3,nonexistent}                 |              139 |           139 | t                    | t
+ {alpha,zeta,lim,report.slow,report.slow2,job.n3} |                0 |             0 | t                    | t
+ {report}                                         |              230 |           230 | t                    | t
+(5 rows)
+
