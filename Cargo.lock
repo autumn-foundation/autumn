@@ -569,7 +569,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "autumn-admin-plugin"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "axum",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-billing"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "chrono",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-cache-redis"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "redis",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-edge",
  "autumn-schema-core",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-edge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-macros",
  "axum",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-model"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-macros-support",
  "autumn-schema-core",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-repository"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-support"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-media-plugin"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "aws-config",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-plugin-reference"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "maud",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-schema-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-search"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "diesel",
@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-storage-s3"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "aws-config",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-web"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "allocation-counter",
@@ -913,6 +913,7 @@ dependencies = [
  "pq-sys",
  "printpdf",
  "proptest",
+ "psl",
  "pulldown-cmark",
  "rand 0.10.3",
  "rand_chacha 0.10.0",
@@ -1821,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "bookmarks"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "chrono",
@@ -1841,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "bookmarks-distributed"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-cache-redis",
  "autumn-web",
@@ -1866,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "bookmarks-sharded"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "chrono",
@@ -2299,7 +2300,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cms"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-web",
  "chrono",
@@ -7306,6 +7307,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl"
+version = "2.1.245"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46cce9bc841c0eeb395275a775d11e3cc91b904e6ab370a9a42369e111b3038e"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
 name = "psl-types"
 version = "2.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7705,7 +7715,7 @@ dependencies = [
 
 [[package]]
 name = "reddit-clone"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-stream",
  "autumn-storage-s3",
@@ -9941,9 +9951,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -11228,7 +11238,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "wiki"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-search",
  "autumn-web",

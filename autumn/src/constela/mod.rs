@@ -136,6 +136,7 @@
 )]
 
 pub mod ast;
+mod budget;
 mod dispatch;
 mod error;
 pub mod eval;
@@ -148,11 +149,11 @@ use serde_json::{Map, Value};
 
 pub use ast::Program;
 pub use dispatch::{Dispatched, Effect};
-pub use error::{ConstelaError, Diagnostic, codes};
+pub use error::{ConstelaError, Diagnostic, MAX_DIAGNOSTIC_FIELD_BYTES, codes};
 pub use eval::RouteValues;
 pub use parse::{Limits, parse_program};
 pub use render::{RenderContext, RenderLimits, RenderedPortal, RenderedUi};
-pub use validate::{SUPPORTED_VERSIONS, validate};
+pub use validate::{MAX_DIAGNOSTICS, SUPPORTED_VERSIONS, validate};
 
 /// A Constela program that has passed [`validate`].
 ///
@@ -298,11 +299,17 @@ impl Document {
             )]));
         };
 
-        let mut env = eval::Env::default();
-        env.vars
-            .extend(payload.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // Borrowed, so the payload is not copied. A step that keeps a payload
+        // value copies it then, and charges the budget.
+        let env = eval::Env {
+            vars: payload
+                .iter()
+                .map(|(k, v)| (k.as_str(), eval::Bound::Borrowed(v)))
+                .collect(),
+            ..eval::Env::default()
+        };
 
-        let budget = std::cell::Cell::new(RenderLimits::default().max_output_bytes);
+        let budget = budget::Budget::new(RenderLimits::default().max_output_bytes);
         let ctx = dispatch::DispatchCtx {
             route,
             styles: &self.program.styles,

@@ -1,12 +1,13 @@
-# autumn-web API Reference (0.8.0)
+# autumn-web API Reference (0.9.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.8.0**, the current release line,
+Version identity: this reference tracks **0.9.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
 arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
-earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries predate 0.6.0.
+earlier, **(0.8.0)** is absent from 0.7.x and earlier, and **(0.9.0)** is absent
+from 0.8.x and earlier. Unmarked entries predate 0.6.0.
 
 ## Published crates
 
@@ -28,7 +29,7 @@ earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries pred
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.8.0`. This table lists the same crates, in the same order, as
+together at `0.9.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 
@@ -409,8 +410,9 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `#[normalize(downcase)]` with a `unique` column yields case-insensitive
   uniqueness. Non-`String` fields are a compile error (mirrors `#[encrypted]`).
   Generated hooks: `impl autumn_web::normalize::Normalize` on the model and
-  `NewX`; `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on
-  every model.
+  on every `NewX` (a no-op when the model has no `#[normalize]` columns);
+  `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on every
+  model.
 
 ## Repository-generated methods (`#[repository]`)
 
@@ -771,7 +773,7 @@ Free functions rendering changeset-aware, accessible inputs:
   `form.text_input(...)`).
 - **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
-- **(Unreleased, #3395)**: `FieldOptions` + a `*_with` variant of each helper
+- **(0.9.0, #3395)**: `FieldOptions` + a `*_with` variant of each helper
   (`text_input_with`, `text_input_htmx_with(.., url, token_field, &opts)`,
   `password_input_with`, `textarea_input_with`, `checkbox_input_with`,
   `number_input_with`, `date_input_with`, `datetime_input_with`,
@@ -852,6 +854,11 @@ primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`,
 - `MenuItem::new(name)` (renders `role="menuitem"` on a `<button>`; `.href(..)`
   switches to `<a>`); `.icon(markup)` (name ⇒ `aria-label`) / `.class(..)`.
   WCAG 4.1.2.
+- The types prove that a name is present, not that it holds text. An empty or
+  blank name (`Img::new(src, "")`, `.aria_label("")`, a blank
+  `RadioOption`/`SelectOption` label) trips a `debug_assert!` at the call site
+  (#2666). Give a name from data a fallback (`a11y::is_blank(text)` uses the
+  same rule); use `Img::decorative(src)` for an image with no information.
 
 ### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` / `RadioGroup`)
 
@@ -891,7 +898,10 @@ Per-primitive setters (in addition to the shared set):
 - **`RadioGroup::new(name, first)`** — the first `RadioOption` is a constructor
   argument, so a group always has a choice; `.option(RadioOption)` /
   `.options(iter)`, `.checked_value(s)`, `.id_prefix(s)` (for the same group
-  rendered repeatedly). `RadioOption::new(value, label)`
+  rendered repeatedly). `.option` takes a built `RadioOption`, as `new` does;
+  `Select::option` takes the `(value, label)` pair. Choice ids are valid CSS
+  selectors: a first part that does not start with a letter after any
+  leading `_` gets one more `_` (`1plan` → `_1plan-…`). `RadioOption::new(value, label)`
   requires the choice label; `.checked()` / `.disabled()`. The group renders
   `<fieldset><legend>` (visible name) or `<div>` (ARIA name), both with
   `role="radiogroup"`; `aria-invalid` and `hx-*` land on each `<input>`,
@@ -1189,7 +1199,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
-- Unreleased (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
+- 0.9.0 (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
   durable claims renew on a heartbeat; `JobContext::lease_lost()`,
   `is_cancelled()`, `cancelled()`.
 
@@ -1371,7 +1381,7 @@ double-submits and replays.
 | `jobs(Vec<JobInfo>)` | Background jobs |
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
-| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived). Get the document out with `autumn openapi export` — no boot, no database (#802) |
+| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived, in both request and response positions). Get the document out with `autumn openapi export` — no boot, no database (#802). A type with different request and response shapes gets two components, `Widget` and `WidgetRequest` (#2607). To render a ref yourself, use `openapi::schema_entry_to_value_in(entry, &openapi::schema_component_index_for(&config, &routes), SchemaDirection::Request)` for a request; `schema_entry_to_value` renders a response |
 | `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)`, `mcp_tasks(config)`, `mcp_instructions(text)`, `mcp_catalog(catalog)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()/mcp_task()/mcp_core()` toggle exposure per route (plugin fluent opt-in); `mcp_tasks` sets task-tool limits; `mcp_instructions` sets the server instructions; `mcp_catalog(McpCatalog::Progressive)` lists core tools plus `search_tools` and `call_tool` |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
@@ -1573,7 +1583,7 @@ csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.8"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.9"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 

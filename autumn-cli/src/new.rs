@@ -917,9 +917,16 @@ fn strip_migrations(main_rs: &str) -> String {
 const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "reporting"];
 
 /// Default `autumn-web` features minus the HTML view stack (`maud`/`htmx`/
-/// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` so
-/// migrations and database features still work.
-const API_FEATURES: &[&str] = &["db", "cache-moka", "http-client", "reporting", "flash"];
+/// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` and its
+/// `postgres` backend so migrations and database features still work.
+const API_FEATURES: &[&str] = &[
+    "db",
+    "postgres",
+    "cache-moka",
+    "http-client",
+    "reporting",
+    "flash",
+];
 
 /// Anchor: first line of the DB-specific prerequisites/steps block in
 /// `README.md.tmpl` (the `- **A reachable Postgres**` bullet). Everything from
@@ -2285,6 +2292,10 @@ mod tests {
             "daemon starter must not enable db"
         );
         assert!(
+            !cargo.contains("\"postgres\""),
+            "daemon starter must not enable postgres"
+        );
+        assert!(
             !cargo.contains("diesel_migrations"),
             "daemon starter must not depend on diesel_migrations"
         );
@@ -3500,12 +3511,6 @@ mod tests {
                 opts.with_bundled_pg,
                 "the managed-pg-bundled waiver belongs to exactly the flavor whose \
                  tree can reach it"
-            );
-            assert_eq!(
-                policy.contains("RUSTSEC-2026-0381"),
-                opts.with_bundled_pg,
-                "the webpki-roots 0.26 shim arrives only through the \
-                 managed-pg-bundled stack"
             );
             assert!(
                 policy.contains("RUSTSEC-2023-0071"),

@@ -95,11 +95,13 @@ fn database_path(label: &str, url: &str) -> Result<PathBuf, ScrubError> {
 /// Open an existing database file and register `autumn_sha256`. Never creates a
 /// file.
 fn connect(label: &str, url: &str) -> Result<SqliteConnection, ScrubError> {
-    let path = database_path(label, url)?;
-    let mut conn = sqlite_snapshot::open(&path).map_err(|e| ScrubError::Introspect {
+    let introspect = |e: sqlite_snapshot::SnapshotError| ScrubError::Introspect {
         label: label.to_owned(),
         detail: e.to_string(),
-    })?;
+    };
+    // The target, not just its path: the URI options (a `vfs`) stay.
+    let target = sqlite_snapshot::database_target(url).map_err(introspect)?;
+    let mut conn = sqlite_snapshot::open_target(&target).map_err(introspect)?;
     autumn_sha256_utils::register_impl(&mut conn, |value: String| {
         hex::encode(Sha256::digest(value.as_bytes()))
     })

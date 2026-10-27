@@ -1619,7 +1619,7 @@ fn is_optional_dependency(table: &toml::Table, name: &str, resolver_v1: bool) ->
 /// such a manifest's real build compiles it out (Codex review on #2739,
 /// round 13, P2).
 #[must_use]
-fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &str) -> bool {
+pub fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &str) -> bool {
     let needle = format!("dep:{pkg}");
     features_table.is_some_and(|features| {
         features.values().any(|entries| {
@@ -1716,10 +1716,24 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
 /// `resolver_v1` (see [`resolver_v1_is_in_effect`]) is forwarded to
 /// [`is_optional_dependency`] for the strong-dependency-feature check below.
 #[must_use]
-fn enabled_features_from_manifest_for_resolver(
+pub fn enabled_features_from_manifest_for_resolver(
     manifest: &str,
     requested: &[&str],
     resolver_v1: bool,
+) -> BTreeSet<String> {
+    enabled_features_with_defaults(manifest, requested, resolver_v1, true)
+}
+
+/// [`enabled_features_from_manifest_for_resolver`], with `seed_default`
+/// false for `--no-default-features`: the `default` set is then on only when
+/// `requested` names it. Its definition stays, so `--features default`
+/// still turns its members on, as Cargo does.
+#[must_use]
+pub fn enabled_features_with_defaults(
+    manifest: &str,
+    requested: &[&str],
+    resolver_v1: bool,
+    seed_default: bool,
 ) -> BTreeSet<String> {
     let mut enabled = BTreeSet::new();
     let table = toml::from_str::<toml::Table>(manifest).ok();
@@ -1747,7 +1761,7 @@ fn enabled_features_from_manifest_for_resolver(
         .and_then(|features| features.get("default"))
         .and_then(toml::Value::as_array);
     let mut queue: Vec<String> = Vec::new();
-    if let Some(members) = default_members {
+    if let Some(members) = default_members.filter(|_| seed_default) {
         queue.push("default".to_owned());
         queue.extend(
             members
@@ -3309,10 +3323,16 @@ impl CfgPredicate {
 /// not understand. A caller treats `None` the same as `Some(true)` — kept in
 /// the scan — so only `Some(false)` ever excludes a function.
 fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> Option<bool> {
-    if !attr.path().is_ident("cfg") {
+    eval_cfg_meta(&attr.meta, default_features)
+}
+
+/// [`eval_cfg_attr`] on the body of an attribute (`cfg(...)`). `autumn a11y
+/// verify` reads tokens, not a `syn` AST, so it calls this directly.
+pub fn eval_cfg_meta(meta: &syn::Meta, default_features: &BTreeSet<String>) -> Option<bool> {
+    if !meta.path().is_ident("cfg") {
         return None;
     }
-    let syn::Meta::List(list) = &attr.meta else {
+    let syn::Meta::List(list) = meta else {
         return None;
     };
     syn::parse2::<CfgPredicate>(list.tokens.clone())

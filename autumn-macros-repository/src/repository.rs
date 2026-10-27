@@ -6334,19 +6334,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
-                // #1379: normalize `#[normalize]` columns on the insert path, before
-                // the `before_create` hook and the DB write, so validators and the
-                // database see the canonical value. Dispatches through the
-                // autoref-specialization probe: the `Yes` arm clones and canonicalizes
-                // only for models whose `New*` implements `Normalize`, and the `No`
-                // arm hands back the caller's borrow unchanged, so a model with no
-                // `#[normalize]` columns pays no clone. `Borrow` unifies the owned and
-                // borrowed arms to `&#new_name`.
+                // #1379: normalize `#[normalize]` columns before the
+                // `before_create` hook and the DB write. Validators and the
+                // database see the canonical value. The probe arms, in order:
+                // 1. `Noop`: returns the borrow. No clone (#2634).
+                // 2. `Yes`: clones and normalizes.
+                // 3. `No`: returns the borrow (a hand-written `New*`).
+                // `Borrow` unifies the arms to `&#new_name`.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeNo as _, SpezNormalizeNoop as _, SpezNormalizeYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert();
                 let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
@@ -6381,35 +6382,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #soft_delete_impl_methods
 
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
-                // #1379: normalize each `#[normalize]` column before the bulk
-                // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
-                // only for `Normalize` `New*` types; the `No` arm hands back the
-                // caller's slice unchanged (no clone) for everything else.
-                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
+                // #1379: normalize each row before the bulk insert. Same probe
+                // as `save`: only the `Yes` arm clones the batch.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _, SpezNormalizeManyYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert_many();
                 let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
 
             async fn save_many_skip_invalid(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)> {
-                // #2586: normalize before the per-row `#[validate]` pass inside
-                // the body, so a skip-invalid import judges — and stores — the
-                // same canonical value `save_many` does.
-                //
-                // #2634: no clone when there is nothing to normalize. `#[model]`
-                // emits `impl Normalize` for the `New*` only when the model
-                // declares `#[normalize]` columns, so the probe's `Yes` arm wins
-                // exactly when normalization can change something; otherwise the
-                // borrowed `No` arm hands the caller's slice back untouched.
+                // #2586: normalize before the per-row `#[validate]` pass, so a
+                // skip-invalid import checks and stores the same canonical
+                // value as `save_many`. Same probe as `save_many`.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _, SpezNormalizeManyYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert_many();
                 let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_skip_invalid_body
             }
@@ -19653,11 +19649,13 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                     // lookup: a found row is returned unchanged, because this
                     // call inserts nothing.
                     #[allow(unused_imports)]
-                    use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                    use ::autumn_web::normalize::{
+                        SpezNormalizeNo as _, SpezNormalizeNoop as _, SpezNormalizeYes as _,
+                    };
                     #[allow(unused_imports)]
                     use ::std::borrow::Borrow as _;
                     let __autumn_normalized =
-                        ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                        (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert();
                     let new: &#new_name = __autumn_normalized.borrow();
                     #validate_or_found
                     // Step 2: create on the primary with ON CONFLICT DO NOTHING.
@@ -22755,7 +22753,7 @@ mod tests {
         let section = section_between(&generated, "async fn save (", "async fn update (");
 
         let normalize_at = section
-            .find("spez_normalize ()")
+            .find("spez_normalize_insert ()")
             .expect("save must normalize the payload");
         // Pinned to the exact emitted form: `new` is already a `&New*`, so an
         // extra borrow would validate only via `validator`'s blanket
@@ -22851,7 +22849,7 @@ mod tests {
         );
 
         let normalize_at = section
-            .find("spez_normalize_many ()")
+            .find("spez_normalize_insert_many ()")
             .expect("skip-invalid must normalize rows");
         let validate_at = section
             .find("MaybeValidate (__autumn_row)")
@@ -26792,12 +26790,75 @@ mod tests {
         let generated =
             repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
         assert!(
-            generated.contains("SpezNormalize (new) . spez_normalize ()"),
+            generated.contains("SpezNormalize (new)) . spez_normalize_insert ()"),
             "save must normalize the New input before persisting: {generated}"
         );
+        assert_eq!(
+            generated
+                .matches("SpezNormalize (new)) . spez_normalize_insert_many ()")
+                .count(),
+            2,
+            "save_many and save_many_skip_invalid must normalize each New input: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_insert_probe_checks_noop_marker_first() {
+        // #2692: every `New*` implements `Normalize`, so the clone arm alone
+        // would always win. The probe starts at `&&SpezNormalize` so the
+        // `NormalizeNoop` arm wins first and returns the borrow (#2634).
+        let generated =
+            repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
+        // One `&` lets the clone arm win for every generated `New*`.
+        assert_eq!(
+            generated.matches("SpezNormalize (new)").count(),
+            generated
+                .matches("(&& :: autumn_web :: normalize :: SpezNormalize (new))")
+                .count(),
+            "every insert probe must start at `&&SpezNormalize`: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches("(&& :: autumn_web :: normalize :: SpezNormalize (new))")
+                .count(),
+            3,
+            "save, save_many and save_many_skip_invalid must each probe once: {generated}"
+        );
         assert!(
-            generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
-            "save_many must normalize each New input before persisting: {generated}"
+            generated.contains("SpezNormalizeNoop as _"),
+            "save must import the no-op arm: {generated}"
+        );
+        assert!(
+            generated.contains("SpezNormalizeManyNoop as _"),
+            "save_many must import the no-op arm: {generated}"
+        );
+
+        let generated = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    fn find_or_create_by_slug(&self, slug: String, new: &NewPost);
+                }
+            },
+        )
+        .to_string();
+        let start = generated
+            .find("pub async fn find_or_create_by_slug")
+            .expect("must generate find_or_create_by_slug");
+        assert!(
+            generated[start..].contains("pub async fn preload"),
+            "`preload` must follow, or the section runs to the end: {generated}"
+        );
+        let section = section_between(
+            &generated,
+            "pub async fn find_or_create_by_slug",
+            "pub async fn preload",
+        );
+        assert!(
+            section.contains(
+                "(&& :: autumn_web :: normalize :: SpezNormalize (new)) . spez_normalize_insert ()"
+            ) && section.contains("SpezNormalizeNoop as _"),
+            "find_or_create_by_* must use the three-arm probe: {section}"
         );
     }
 

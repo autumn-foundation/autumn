@@ -13,7 +13,7 @@ categories = ["web-programming", "web-programming::http-server"]
 autotests = false
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
 # Conflict-free collaborative editing (issue #1806). Adds
@@ -73,6 +73,9 @@ constela = ["maud"]
 # runtime at all, so a blocking client is the one shape both can share. It is
 # constructed, used and dropped only on those threads, never inside the async
 # runtime.
+#
+# `db` is the shared database layer. It has no Postgres client (#2605). Enable
+# a backend with it: `postgres` (on by default) or `sqlite`.
 db = [
     "dep:autumn-macros-model",
     "dep:autumn-macros-repository",
@@ -82,23 +85,31 @@ db = [
     "dep:diesel-async",
     "dep:diesel_migrations",
     "dep:libsqlite3-sys",
+    "dep:scoped-futures",
+    "diesel/chrono",
+    "diesel/serde_json",
+]
+# The Postgres backend (#2605): the Postgres client, its rustls TLS connector
+# and diesel's Postgres backend. On by default. A SQLite app turns default
+# features off and enables `sqlite`, so it compiles none of this.
+postgres = [
+    "db",
     "dep:pq-sys",
     "dep:pq-src",
-    "dep:scoped-futures",
     "dep:tokio-postgres",
     "dep:tokio-postgres-rustls",
     "dep:rustls",
     "dep:rustls-pki-types",
     "dep:webpki-roots",
     "diesel/postgres",
-    "diesel/chrono",
-    "diesel/serde_json",
+    "diesel-async/postgres",
 ]
 # Offline-first local store + background sync engine for occasionally-
 # connected apps (e.g. Tauri mobile, issue #1508). Local state lives in an
 # in-process SQLite database (`sync::SyncStore`, change-tracked with
 # tombstones); a `sync::SyncEngine` pushes/pulls changes to a remote Autumn
-# app that mounts `sync::server::router()` over Postgres shadow tables.
+# app that mounts `sync::server::router()` over Postgres shadow tables
+# (`PgSyncBackend` needs `postgres`).
 # Builds entirely on dependencies the `db` + `http-client` features already
 # compile (diesel's sqlite backend and the bundled libsqlite3-sys are
 # already in the graph) — zero new dependencies.
@@ -137,11 +148,11 @@ offline-sync = ["db", "http-client"]
 # `diesel_migrations` — which the SQLite migration path (`app.rs`
 # `apply_pending_sqlite_or_exit`, gated on `#[cfg(feature = "sqlite")]`) calls
 # directly. Without this edge, `--no-default-features --features sqlite` fails to
-# compile (`crate::migrate` configured out). This is NOT a second backend: the
-# `RuntimeConnection` alias (see `src/db.rs`) flips to SQLite purely on
-# `#[cfg(feature = "sqlite")]` regardless of `db`, so enabling `db` alongside
-# does not resurrect the Postgres runtime — it only supplies the plumbing. This
-# mirrors the ratified verification lane `--features "db test-support sqlite"`.
+# compile (`crate::migrate` configured out). `db` has no Postgres client
+# (#2605), so `--no-default-features --features sqlite` compiles no `pq-sys`,
+# `tokio-postgres` or diesel Postgres backend. With default features on,
+# `postgres` is on too: the runtime is still SQLite, but the Postgres client
+# compiles. A SQLite-only app turns default features off.
 # The bundled SQLite amalgamation (`libsqlite3-sys` workspace dep pins
 # `features = ["bundled"]`, which `db` already pulls in) compiles with
 # `SQLITE_ENABLE_FTS5` defined, so FTS5 full-text search (issue #1910:
@@ -238,8 +249,8 @@ system-tests = ["dep:chromiumoxide"]
 # Managed local Postgres: a `ManagedPostgresPoolProvider` that provisions
 # (initdb) and supervises a local `postgres` child in the app's data dir,
 # surfaced through the pluggable pool-provider seam. Postgres binaries are
-# downloaded on first run. Implies `db`.
-managed-pg = ["db", "dep:postgresql_embedded"]
+# downloaded on first run. Implies `postgres`.
+managed-pg = ["postgres", "dep:postgresql_embedded"]
 # Bundled single-binary mode: embed the Postgres binaries into the app
 # executable at build time (no first-run download). Per-target build, large
 # binary (tens-to-~150MB), still a supervised child process with an on-disk
@@ -303,7 +314,7 @@ edge = ["dep:autumn-edge"]
 plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
-autumn-edge = { version = "0.8.0", path = "../autumn-edge", optional = true }
+autumn-edge = { version = "0.9.0", path = "../autumn-edge", optional = true }
 # Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
@@ -315,11 +326,11 @@ wasmi = { version = "0.40", optional = true }
 # could never reach those macros anyway (their re-exports are `#[cfg(feature =
 # "db")]` in `src/lib.rs`), and skipping them cuts macro compile time by ~90%
 # on the no-DB onboarding path (issue #2309).
-autumn-macros = { version = "0.8.0", path = "../autumn-macros", default-features = false }
+autumn-macros = { version = "0.9.0", path = "../autumn-macros", default-features = false }
 # Database-layer proc macros, split out of `autumn-macros` so a no-database
 # build never compiles their codegen. Optional: enabled by the `db` feature.
-autumn-macros-model = { version = "0.8.0", path = "../autumn-macros-model", optional = true }
-autumn-macros-repository = { version = "0.8.0", path = "../autumn-macros-repository", optional = true }
+autumn-macros-model = { version = "0.9.0", path = "../autumn-macros-model", optional = true }
+autumn-macros-repository = { version = "0.9.0", path = "../autumn-macros-repository", optional = true }
 axum.workspace = true
 # 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
 # sandbox concurrency permit and release it exactly when the last handle drops.
@@ -487,6 +498,9 @@ zeroize = "1"
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "std"] }
 getrandom = "0.2"
 hex = "0.4"
+# Public Suffix List for custom-domain apex detection (issue #2643, ADR 0026).
+# The crate contains the list as code. It shares `psl-types` with `publicsuffix`.
+psl = "2.1"
 include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
 # Pure-Rust PDF writer for `autumn_web::pdf` (issue #1317). `default-features
@@ -588,7 +602,7 @@ rustls-pki-types = { version = "1", features = ["std"] }
 #   test-support   — only meaningful in test binary contexts
 [package.metadata.docs.rs]
 features = [
-  "maud", "htmx", "tailwind", "db", "cache-moka",
+  "maud", "htmx", "tailwind", "db", "postgres", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "repl", "system-info", "markdown",
   "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
@@ -778,6 +792,13 @@ path = "tests/cost_reconcile.rs"
 [[test]]
 name = "password_policy_alloc_gate"
 path = "tests/password_policy_alloc_gate.rs"
+
+# Constela: a hostile document uses bounded peak memory (issue #2626). Own
+# binary for the `allocation-counter` global-allocator reason above.
+[[test]]
+name = "constela_memory"
+path = "tests/constela_memory.rs"
+required-features = ["constela"]
 
 # Adaptive admission adds no allocations to an admitted request (issue #3068).
 # Own binary for the same `allocation-counter` global-allocator reason as
@@ -1073,6 +1094,13 @@ path = "tests/sqlite_money_ledger.rs"
 [[test]]
 name = "sqlite_derivation"
 path = "tests/sqlite_derivation.rs"
+
+# SQLite proof that a `sum` derivation's repair paths accept partial sums
+# that leave `i64` (issue #2663). Own binary: the backfill runs every
+# registered derivation, so this binary registers only one.
+[[test]]
+name = "sqlite_derivation_wide_sum"
+path = "tests/sqlite_derivation_wide_sum.rs"
 
 # SQLite version-history end-to-end proof (issue #1996). Drives a
 # `versioned = true` repository against an in-memory SQLite pool: a create +

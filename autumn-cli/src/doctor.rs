@@ -1950,6 +1950,9 @@ pub fn check_custom_domains_config_impl(
             hint: Some("Raise [server.tls.acme.custom_domains] max_domains"),
         });
     }
+    if let Some(warn) = check_custom_domain_instructions(cd, registry) {
+        return Some(warn);
+    }
     Some(CheckResult {
         name: "custom_domains",
         status: CheckStatus::Pass,
@@ -1958,6 +1961,51 @@ pub fn check_custom_domains_config_impl(
             cd.max_domains
         )),
         hint: None,
+    })
+}
+
+/// Warn when a registered domain gets no DNS instructions (#2643).
+///
+/// Uses [`RoutingRecord::for_hostname`](autumn_web::custom_domain::RoutingRecord::for_hostname),
+/// as the tenant view does, so the two use one apex rule.
+fn check_custom_domain_instructions(
+    cd: &autumn_web::config::CustomDomainsConfig,
+    registry: &CustomDomainRegistryRead,
+) -> Option<CheckResult> {
+    use std::fmt::Write as _;
+    const SHOWN: usize = 5;
+    let ingress = cd.ingress();
+    let unusable: Vec<(&str, String)> = registry
+        .domains
+        .iter()
+        .filter_map(|(hostname, ..)| {
+            autumn_web::custom_domain::RoutingRecord::for_hostname(hostname, &ingress)
+                .err()
+                .map(|e| (hostname.as_str(), e))
+        })
+        .collect();
+    let (_, first) = unusable.first()?;
+    let mut names = unusable
+        .iter()
+        .take(SHOWN)
+        .map(|(hostname, _)| *hostname)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unusable.len() > SHOWN {
+        let _ = write!(names, " and {} more", unusable.len() - SHOWN);
+    }
+    let count = match unusable.len() {
+        1 => "1 registered domain gets".to_owned(),
+        n => format!("{n} registered domains get"),
+    };
+    Some(CheckResult {
+        name: "custom_domains",
+        status: CheckStatus::Warn,
+        detail: Some(format!("{count} no DNS instructions ({names}): {first}")),
+        hint: Some(
+            "Set [server.tls.acme.custom_domains] ingress_ipv4 / ingress_ipv6 for apex \
+             domains, and ingress_hostname for subdomains",
+        ),
     })
 }
 
@@ -14844,6 +14892,85 @@ pub struct Vault {
                 .status,
             CheckStatus::Warn
         );
+    }
+
+    /// A read of one healthy record per hostname.
+    fn read_of_hosts(hosts: &[&str]) -> CustomDomainRegistryRead {
+        CustomDomainRegistryRead {
+            domains: hosts
+                .iter()
+                .map(|h| {
+                    (
+                        (*h).to_owned(),
+                        "tenant-a".to_owned(),
+                        "pending_dns".to_owned(),
+                        None,
+                    )
+                })
+                .collect(),
+            ..CustomDomainRegistryRead::default()
+        }
+    }
+
+    /// #2643: doctor warns when a registered domain gets no DNS instructions.
+    /// It uses the same builder as the tenant view.
+    #[test]
+    fn custom_domains_config_check_warns_when_a_domain_gets_no_dns_instructions() {
+        let hostname_only = custom_domains_config(true);
+        let warn = check_custom_domains_config_impl(
+            Some(&hostname_only),
+            None,
+            &read_of_hosts(&["app.clientco.com", "clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(warn.status, CheckStatus::Warn);
+        let detail = warn.detail.unwrap();
+        assert!(detail.starts_with("1 registered domain gets"), "{detail}");
+        assert!(detail.contains("clientco.co.uk"), "{detail}");
+        assert!(!detail.contains("app.clientco.com"), "{detail}");
+        assert!(warn.hint.unwrap().contains("ingress_ipv4"));
+
+        // Subdomains only: a CNAME serves them all.
+        let subs = check_custom_domains_config_impl(
+            Some(&hostname_only),
+            None,
+            &read_of_hosts(&["app.clientco.com", "app.clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(subs.status, CheckStatus::Pass);
+
+        // Addresses configured: the apex has its A records.
+        let mut with_addresses = custom_domains_config(true);
+        with_addresses.ingress_ipv4 = vec!["203.0.113.10".to_owned()];
+        let pass = check_custom_domains_config_impl(
+            Some(&with_addresses),
+            None,
+            &read_of_hosts(&["clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(pass.status, CheckStatus::Pass);
+
+        // Addresses only: a subdomain gets no CNAME target.
+        with_addresses.ingress_hostname = None;
+        let no_cname = check_custom_domains_config_impl(
+            Some(&with_addresses),
+            None,
+            &read_of_hosts(&["app.clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(no_cname.status, CheckStatus::Warn);
+        assert!(no_cname.hint.unwrap().contains("ingress_hostname"));
+
+        // Many domains: the detail shows five names and a count.
+        let hosts: Vec<String> = (1..=7).map(|i| format!("c{i}.co.uk")).collect();
+        let hosts: Vec<&str> = hosts.iter().map(String::as_str).collect();
+        let many =
+            check_custom_domains_config_impl(Some(&hostname_only), None, &read_of_hosts(&hosts))
+                .unwrap();
+        let detail = many.detail.unwrap();
+        assert!(detail.starts_with("7 registered domains get"), "{detail}");
+        assert!(detail.contains("c5.co.uk and 2 more"), "{detail}");
+        assert!(!detail.contains("c6.co.uk"), "{detail}");
     }
 
     fn probe(status: &str, dns: CustomDomainDns) -> CustomDomainProbe {

@@ -102,6 +102,16 @@ ignore = [
     # passed, take the newest autumn-web and re-run the audit.
     # Review-by: 2026-11-12.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (not a vulnerability); reaches this app only through autumn-web's serde_yaml, which serializes the OpenAPI document and parses no untrusted YAML; no safe upgrade; review-by 2026-11-12" },
+    # RUSTSEC-2026-0387 — `crypto-bigint` has secret-dependent branches in
+    # nominally constant-time operations.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0387
+    #
+    # Ships pre-waived because the fix is only in crypto-bigint >=0.7.6 and the
+    # RustCrypto elliptic-curve stack that autumn-web's `jsonwebtoken`
+    # (ES256/ES384) uses is still on 0.5.x. A microarchitectural timing leak on
+    # ECDSA secrets; no network-reachable signing oracle. Drop this waiver when
+    # `cargo update` resolves crypto-bigint >=0.7.6. Review-by: 2026-11-08.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x via jsonwebtoken ES256/ES384 -> p256/p384 -> elliptic-curve 0.13; fix needs crypto-bigint >=0.7.6; review-by 2026-11-08" },
     # >>> autumn:bundled-pg-waiver
     # RUSTSEC-2024-0384 — `instant` is unmaintained.
     # https://rustsec.org/advisories/RUSTSEC-2024-0384
@@ -114,14 +124,6 @@ ignore = [
     # exploit here, and no safe upgrade (the author recommends `web-time`).
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2026-0381 — `webpki-roots` bundles a root that allows distrusted
-    # emSign intermediates. https://rustsec.org/advisories/RUSTSEC-2026-0381
-    #
-    # Present for the same reason: webpki-roots 0.26.11 arrives through
-    # sqlx-core 0.8.6 under (build) postgresql_embedded. No patched 0.26.x
-    # exists. That sqlx talks to a local embedded Postgres, so it trusts no
-    # public CA chain. Review-by: 2026-11-20.
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only, via sqlx-core 0.8.6 under the build-time managed-pg-bundled stack; no patched 0.26.x; local embedded Postgres only; review-by 2026-11-20" },
     # <<< autumn:bundled-pg-waiver
 ]
 

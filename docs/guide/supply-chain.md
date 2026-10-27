@@ -317,7 +317,7 @@ Run the same gate yourself against any checkout:
 
 ```bash
 ./scripts/check-sbom.sh                     # against the working tree
-RELEASE_TAG=v0.8.0 ./scripts/check-sbom.sh  # also enforce tag agreement
+RELEASE_TAG=v0.9.0 ./scripts/check-sbom.sh  # also enforce tag agreement
 ```
 
 **Downloads during an image build are checksum-verified.** Every artifact the
@@ -400,7 +400,7 @@ error[vulnerability]: Marvin Attack: potential key recovery through timing sidec
     ├ Solution: No safe upgrade is available!
     ├ rsa v0.9.10
       └── jsonwebtoken v10.1.0
-          └── autumn-web v0.8.0
+          └── autumn-web v0.9.0
               └── my-app v0.1.0
 
 advisories FAILED
@@ -450,8 +450,7 @@ Your generated `deny.toml` ships with a waiver already in it:
 which `autumn-web` depends on unconditionally, and no patched `rsa` release
 exists. An app generated with `--bundled-pg` gets a second one
 (`RUSTSEC-2024-0384`, `instant`, unmaintained, reachable only through the
-embedded-Postgres build stack) and a third (`RUSTSEC-2026-0381`, the
-`webpki-roots` 0.26 copy that the same stack pins). Only that flavor gets them, so cargo-deny's
+embedded-Postgres build stack). Only that flavor gets it, so cargo-deny's
 "this waiver is unused" warning stays available to tell you when one of *your*
 waivers has gone stale.
 

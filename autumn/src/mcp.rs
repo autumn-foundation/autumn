@@ -76,7 +76,7 @@ use tower::ServiceExt as _;
 
 use crate::sse::{Event, Sse};
 
-use crate::openapi::{ApiDoc, schema_entry_to_value};
+use crate::openapi::{ApiDoc, SchemaDirection, schema_entry_to_value_in};
 
 mod catalog;
 mod modern;
@@ -593,12 +593,20 @@ fn build_input_schema(
     }
 
     if let Some(query) = &doc.query_schema {
-        let schema = rewrite_refs(schema_entry_to_value(query, index), components, &mut defs);
+        let schema = rewrite_refs(
+            schema_entry_to_value_in(query, index, SchemaDirection::Request),
+            components,
+            &mut defs,
+        );
         properties.insert("query".to_owned(), schema);
     }
 
     if let Some(body) = &doc.request_body {
-        let schema = rewrite_refs(schema_entry_to_value(body, index), components, &mut defs);
+        let schema = rewrite_refs(
+            schema_entry_to_value_in(body, index, SchemaDirection::Request),
+            components,
+            &mut defs,
+        );
         properties.insert("body".to_owned(), schema);
         required.push(json!("body"));
     }
@@ -781,7 +789,7 @@ pub fn derive_tools(
     // mapping the OpenAPI generator used, so a tool's inlined `$defs` refs match
     // the served component names even when two types share a last segment
     // (issue #1972).
-    let index = crate::openapi::build_schema_component_index(&refs);
+    let index = crate::openapi::schema_component_index_for(&config, &refs);
 
     let mut tools = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();

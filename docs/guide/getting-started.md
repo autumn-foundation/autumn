@@ -11,7 +11,7 @@ endpoints, profile-aware configuration, and a project CLI behind a Spring
 Boot-style developer experience.
 
 > **Version note:** This guide tracks the published `autumn-web` and
-> `autumn-cli` **0.8.x** release line. If you are working from a source
+> `autumn-cli` **0.9.x** release line. If you are working from a source
 > checkout of the Autumn repository, the workspace may be ahead of the
 > published crates — see [local development](#local-development) below.
 
@@ -27,7 +27,7 @@ around Rust web frameworks and just want CRUD on screen, jump straight to
 
 - **Rust 1.88.0+** (edition 2024) — install via [rustup](https://rustup.rs/)
 - **The PostgreSQL client library (`libpq`)** — required to *build*, not just
-  to run. The `db` feature is on by default, so a fresh project links `libpq`
+  to run. The `postgres` feature is on by default, so a fresh project links `libpq`
   even before you configure a database. Install `libpq-dev` (Debian/Ubuntu),
   `libpq` (Homebrew), or `postgresql-devel` (Fedora/RHEL).
 - **A reachable PostgreSQL server** — needed from
@@ -85,7 +85,7 @@ directory.
 To build it from crates.io instead:
 
 ```bash
-cargo install autumn-cli --version 0.8.0
+cargo install autumn-cli --version 0.9.0
 ```
 
 ### Local development
@@ -103,8 +103,8 @@ work, only for a release. So `autumn new` pins whatever `autumn-web` version
 your source-built CLI was compiled with, and that number is normally already
 on crates.io; it is the *code* behind it that has moved on. That means
 `autumn doctor`'s `version_compat` check, which compares version strings, will
-print a reassuring `✅ version_compat — autumn-cli 0.8.0 matches autumn-web
-0.8.0` even when your checkout and the published crate have diverged — it has
+print a reassuring `✅ version_compat — autumn-cli 0.9.0 matches autumn-web
+0.9.0` even when your checkout and the published crate have diverged — it has
 no way to see API drift that the version number doesn't carry.
 
 The real symptom is a `cargo build` failure right after `autumn new`, usually
@@ -220,7 +220,7 @@ On a fresh project, before `autumn setup`, you will see something like:
 🍂 autumn doctor
 
 ✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
-✅ version_compat — autumn-cli 0.8.0 matches autumn-web 0.8.0
+✅ version_compat — autumn-cli 0.9.0 matches autumn-web 0.9.0
 ✅ autumn_toml — autumn.toml and profile configurations are valid
 ✅ database_topology — database not configured
 ✅ port_bindable — port 3000 is available
@@ -302,7 +302,7 @@ routes are live immediately:
 `/health` responds with:
 
 ```json
-{ "status": "ok", "version": "0.8.0" }
+{ "status": "ok", "version": "0.9.0" }
 ```
 
 Press **Ctrl+C** to stop the server. Shutdown is graceful, draining in-flight
@@ -758,7 +758,7 @@ your code referred to Diesel's traits:
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
+autumn-web = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.9", features = ["postgres"] }

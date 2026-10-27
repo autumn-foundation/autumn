@@ -43,6 +43,22 @@ guide is the published contract for exactly which is which.
 
 Enable the runtime by building the application with the `sqlite` cargo feature (it must be enabled only by the end application, never by a library). Autumn then boots and serves against a `sqlite://` URL:
 
+- **No Postgres client (#2605).** The `postgres` feature adds `pq-sys`,
+  `tokio-postgres` and diesel's Postgres backend. It is a default feature. To
+  compile none of them, turn default features off and do not enable
+  `postgres`:
+
+  ```toml
+  autumn-web = { version = "0.9", default-features = false, features = [
+      "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
+  ] }
+  ```
+
+  If you keep default features on, the runtime is still SQLite, but the build
+  also compiles the Postgres client. A build without `postgres` does not have
+  the Postgres-only items (for example `DbApiTokenStore`, the `pg` stores and
+  `PgSyncBackend`). CI checks a SQLite-only build with `cargo tree`.
+
 - **Connection type.** A `RuntimeConnection` alias abstracts the backend: `diesel_async::AsyncPgConnection` by default, and a `SyncConnectionWrapper<SqliteConnection>` under the `sqlite` feature. Generated repositories and hand-written queries take `&mut RuntimeConnection`, so they compile against either backend.
 - **Pool pragmas.** Each pooled connection is set up with `PRAGMA busy_timeout = 5000` (first, so later statements queue on it), `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA foreign_keys = ON`. A read-only SQLite target skips the two writing pragmas (WAL + `synchronous`). An in-memory database is pinned to a single pooled connection.
 - **Migrations.** Startup migrations run through diesel's `MigrationHarness` on a plain `SqliteConnection` with **no advisory lock** (SQLite is single-writer, so there is nothing to coordinate). Only `busy_timeout` is set on the migration connection — `foreign_keys = ON` is deliberately *omitted* there because it breaks table-recreating migrations. This applies to **file-backed** SQLite only: an **in-memory** target (`sqlite::memory:` / `:memory:` / `file::memory:`, including `cache=shared`) with registered startup migrations is **refused at boot** (`std::process::exit(1)`), because the schema is applied on a transient migration connection and is lost before the runtime pool anchors it. An in-memory target with *no* registered migrations is unaffected (it is the default test-harness configuration).
@@ -439,6 +455,12 @@ no SQLite equivalent of installing `postgresql-client`.
 autumn db backup --keep 7 --dir /var/backups/myapp
 ```
 
+The backup opens the database with the same URI options the app uses (for
+example `vfs=unix-dotfile`), so its locks match the app's. It opens the file with
+`mode=rw`, so it never creates a database: a file that is removed before the
+backup opens it fails the run. The `--dir` path is used exactly, also when it is not UTF-8
+or starts with `file:`.
+
 The run directory is the same one Postgres backups write — `manifest.json` plus
 one artifact per target — except the artifact is `control.sqlite`, a real SQLite
 database you can open with any tool, and the manifest records
@@ -451,8 +473,11 @@ says `SQLite snapshot` so there is no ambiguity).
 touching the database, stages a copy beside the target, verifies that copy too,
 removes the target's `-wal`, `-shm` and `-journal` — a leftover journal describes
 pages of the file being replaced, and SQLite would replay it onto the restored one
-— and renames the copy into place, keeping the target's mode and owner. A restore
-refused at verification leaves the target byte-identical. The production guard is
+— and renames the copy into place, keeping the target's mode and owner. When the
+restore cannot give the copy to the old owner (only root can `chown`) and the mode
+does not let that owner read and write it, the restore stops before the rename and
+tells you which account to use. A restore refused at verification leaves the
+target byte-identical. The production guard is
 the same as Postgres: a non-dev/test profile needs `--force`.
 
 **Stop the app before restoring.** A running process keeps open handles to the
@@ -460,7 +485,10 @@ old file, so after the rename it serves the pre-restore database and loses every
 write it makes. This differs from Postgres, where `pg_restore` goes through the
 server.
 
-An **in-memory** database is refused by both: there is no file to snapshot.
+An **in-memory** database is refused by both: there is no file to snapshot. The
+check reads the URI as SQLite does: option names and values are percent-decoded,
+the last `mode` and the last `vfs` win, and `mode=memory` or `vfs=memdb` is in
+memory. On Windows, `file:///C:/data/app.db` names `C:\data\app.db`.
 
 [`db scrub`](./data-scrubbing.md#sqlite) (#1602) and the
 [retention sweeps](./data-retention.md) (#1605) run against the SQLite file

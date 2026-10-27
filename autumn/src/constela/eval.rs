@@ -24,9 +24,17 @@
 //! [`validate`](super::validate) has already rejected every reference that
 //! *statically* cannot resolve, so a null here means a value genuinely absent
 //! at runtime (an optional route query parameter, say) rather than a typo.
-//! The one failure mode is exceeding
+//! The two failure modes are exceeding
 //! [`RenderLimits::max_depth`](super::RenderLimits::max_depth), which is a
-//! guard against a document engineered to overflow the stack.
+//! guard against a document engineered to overflow the stack, and exceeding
+//! the byte budget.
+//!
+//! # Copies
+//!
+//! A read borrows. `eval_ref` returns a [`Cow`]: a `lit`, `state`, `var` or
+//! `param` read is a borrow, and so is `get` or `index` on one. A value is
+//! copied only when the caller keeps it, and the copy charges the budget
+//! first. See `docs/adr/0025-constela-retention-accounting.md`.
 
 // autumn-panic-gate: request-path module — it parses, validates and renders a
 // document written by a language model, so every panic in it is reachable by
@@ -49,12 +57,14 @@
     )
 )]
 
-use std::cell::Cell;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use serde_json::{Map, Value};
 
 use super::ast::{BinaryOp, Expr, RouteSource, StylePreset};
+use super::budget::{Budget, SLOT_BYTES};
 use super::error::{ConstelaError, Diagnostic, codes};
 
 /// The route values an [`Expr::Route`] reads.
@@ -68,67 +78,92 @@ pub struct RouteValues {
     pub path: String,
 }
 
+/// A value bound in an [`Env`]. Cloning one never copies the value.
+#[derive(Debug, Clone)]
+pub(crate) enum Bound<'a> {
+    /// Borrowed from the document, the state, the payload or an outer scope.
+    Borrowed(&'a Value),
+    /// Built during the render, and shared by each scope that binds it.
+    Shared(Rc<Value>),
+}
+
+impl Bound<'_> {
+    /// The bound value.
+    pub(crate) fn get(&self) -> &Value {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl<'a> From<Cow<'a, Value>> for Bound<'a> {
+    fn from(value: Cow<'a, Value>) -> Self {
+        match value {
+            Cow::Borrowed(value) => Self::Borrowed(value),
+            Cow::Owned(value) => Self::Shared(Rc::new(value)),
+        }
+    }
+}
+
 /// The lexical environment a view node is evaluated in: the component
 /// parameters in scope, and the loop bindings in scope.
 ///
 /// Cloned when entering a component or a loop body, so a nested scope can
-/// never leak a binding back out to its parent.
+/// never leak a binding back out to its parent. A clone copies no value: a
+/// loop pass shares the outer bindings.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Env {
+pub(crate) struct Env<'a> {
     /// Parameters of the innermost enclosing component, empty at the top level.
-    pub params: BTreeMap<String, Value>,
+    pub params: Rc<BTreeMap<&'a str, Bound<'a>>>,
     /// Loop and payload bindings, innermost last.
-    pub vars: Vec<(String, Value)>,
+    pub vars: Vec<(&'a str, Bound<'a>)>,
 }
 
-impl Env {
+impl<'a> Env<'a> {
     /// Look up a `var` binding, innermost first.
     fn var(&self, name: &str) -> Option<&Value> {
         self.vars
             .iter()
             .rev()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value)
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.get())
+    }
+
+    /// Look up a component parameter.
+    fn param(&self, name: &str) -> Option<&Value> {
+        self.params.get(name).map(Bound::get)
     }
 
     /// Bind `name` for the duration of a nested render.
-    pub(crate) fn with_var(&self, name: &str, value: Value) -> Self {
+    pub(crate) fn with_var(&self, name: &'a str, value: Bound<'a>) -> Self {
         let mut next = self.clone();
-        next.vars.push((name.to_string(), value));
+        next.vars.push((name, value));
         next
     }
 }
 
 /// Everything an expression can read.
+#[derive(Clone, Copy)]
 pub(crate) struct EvalCtx<'a> {
     /// The current state values.
     pub state: &'a Map<String, Value>,
     /// The lexical environment.
-    pub env: &'a Env,
+    pub env: &'a Env<'a>,
     /// Route values.
     pub route: &'a RouteValues,
     /// Style presets, for [`Expr::Style`].
     pub styles: &'a BTreeMap<String, StylePreset>,
     /// Remaining recursion budget.
     pub depth: usize,
-    /// Bytes an expression may still allocate while *building* a value.
-    ///
-    /// The renderer's output budget cannot see this: `concat`, `array`, `obj`
-    /// and string `+` construct their result inside the evaluator and hand back
-    /// a finished `Value`, so a document that concatenates a 1 MiB state string
-    /// a few thousand times allocates gigabytes before a single byte reaches
-    /// the output buffer. Every construction charges against this first.
-    ///
-    /// A [`Cell`] because evaluation takes `&self` throughout and the budget
-    /// has to be spent *across* sibling sub-expressions, not merely bounded per
-    /// expression — a thousand small concats are the same attack as one large
-    /// one.
-    pub budget: &'a Cell<usize>,
+    /// Bytes an expression may still build or copy. Shared by every
+    /// expression in the render or the dispatch. See [`Budget`].
+    pub budget: &'a Budget,
 }
 
 impl EvalCtx<'_> {
     /// A context one level deeper, or an error if the budget is spent.
-    fn descend(&self, path: &str) -> Result<EvalCtx<'_>, ConstelaError> {
+    fn descend(&self, path: &str) -> Result<Self, ConstelaError> {
         if self.depth == 0 {
             return Err(ConstelaError::Render(Diagnostic::new(
                 path,
@@ -136,16 +171,12 @@ impl EvalCtx<'_> {
                 "expression nests deeper than the configured render depth limit",
             )));
         }
-        Ok(EvalCtx {
-            state: self.state,
-            env: self.env,
-            route: self.route,
-            styles: self.styles,
+        Ok(Self {
             // Guarded by the zero check above; `saturating_sub` rather than
             // `-` so a future edit to that guard cannot turn this into a panic
             // on a hostile document.
             depth: self.depth.saturating_sub(1),
-            budget: self.budget,
+            ..*self
         })
     }
 }
@@ -210,6 +241,37 @@ pub fn text_of(value: &Value) -> String {
     }
 }
 
+/// [`js_string`], without a copy for a string. Another value is charged to
+/// `budget` before it is converted, because the conversion allocates. The
+/// result is then owned and already charged: a caller that keeps it charges
+/// only a borrowed result.
+pub(crate) fn coerce<'v>(
+    value: &'v Value,
+    budget: &Budget,
+    path: &str,
+) -> Result<Cow<'v, str>, ConstelaError> {
+    match value {
+        Value::String(text) => Ok(Cow::Borrowed(text)),
+        other => {
+            budget.charge_value(other, path)?;
+            Ok(Cow::Owned(js_string(other)))
+        }
+    }
+}
+
+/// [`text_of`], without a copy for a string. As [`coerce`], `null` aside.
+pub(crate) fn text_coerce<'v>(
+    value: &'v Value,
+    budget: &Budget,
+    path: &str,
+) -> Result<Cow<'v, str>, ConstelaError> {
+    if value.is_null() {
+        Ok(Cow::Borrowed(""))
+    } else {
+        coerce(value, budget, path)
+    }
+}
+
 /// Format a number the way JavaScript's `String` does for the common cases:
 /// an integral value has no fractional part.
 fn number_to_string(n: &serde_json::Number) -> String {
@@ -243,56 +305,6 @@ fn number_to_string(n: &serde_json::Number) -> String {
     } else {
         f.to_string()
     }
-}
-
-/// Roughly how many bytes a value occupies, counted iteratively and stopping
-/// once `cap` is passed.
-///
-/// Iterative because it runs on values a document produced; early-exiting
-/// because the only question asked of it is "is this already too big", which a
-/// partial walk answers as well as a complete one.
-fn approx_bytes(value: &Value, cap: usize) -> usize {
-    let mut total = 0usize;
-    let mut stack = vec![value];
-    while let Some(current) = stack.pop() {
-        total = total.saturating_add(match current {
-            Value::Null | Value::Bool(_) | Value::Number(_) => 8,
-            Value::String(text) => text.len(),
-            Value::Array(items) => {
-                stack.extend(items.iter());
-                8
-            }
-            Value::Object(entries) => {
-                stack.extend(entries.iter().map(|(_, value)| value));
-                entries
-                    .keys()
-                    .map(String::len)
-                    .sum::<usize>()
-                    .saturating_add(8)
-            }
-        });
-        if total > cap {
-            return total;
-        }
-    }
-    total
-}
-
-/// Charge `bytes` against the evaluator's construction budget.
-///
-/// Charged *before* the allocation wherever the size is knowable in advance, so
-/// an oversized value is refused rather than built and then measured.
-fn charge(ctx: &EvalCtx<'_>, bytes: usize, path: &str) -> Result<(), ConstelaError> {
-    let remaining = ctx.budget.get();
-    if bytes > remaining {
-        return Err(ConstelaError::Render(Diagnostic::new(
-            path,
-            codes::RENDER_LIMIT,
-            "expression builds a value larger than the render byte budget allows",
-        )));
-    }
-    ctx.budget.set(remaining.saturating_sub(bytes));
-    Ok(())
 }
 
 /// The numeric value of `value`, or `0.0` — JavaScript's behaviour for the
@@ -361,15 +373,65 @@ fn follow_path<'a>(mut current: &'a Value, path: &str) -> &'a Value {
     current
 }
 
-/// Apply an optional dotted path to a looked-up base value.
-fn resolve(base: Option<&Value>, path: Option<&String>) -> Value {
-    let Some(base) = base else {
-        return Value::Null;
-    };
-    path.map_or_else(|| base.clone(), |path| follow_path(base, path).clone())
+/// [`follow_path`] on an owned value: move the target out, so no copy is
+/// made.
+fn take_path(mut current: Value, path: &str) -> Value {
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            continue;
+        }
+        current = match current {
+            Value::Object(mut map) => map.remove(segment).unwrap_or(Value::Null),
+            Value::Array(items) => segment
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| items.into_iter().nth(i))
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+        if current.is_null() {
+            return Value::Null;
+        }
+    }
+    current
 }
 
-/// Evaluate `expr`.
+/// Apply a dotted path to a value, borrowed or owned. Neither form copies.
+fn select_path<'a>(base: Cow<'a, Value>, path: &str) -> Cow<'a, Value> {
+    match base {
+        Cow::Borrowed(base) => Cow::Borrowed(follow_path(base, path)),
+        Cow::Owned(base) => Cow::Owned(take_path(base, path)),
+    }
+}
+
+/// Apply an optional dotted path to a looked-up base value. Borrows.
+fn lookup<'a>(base: Option<&'a Value>, path: Option<&str>) -> Cow<'a, Value> {
+    let Some(base) = base else {
+        return null();
+    };
+    Cow::Borrowed(path.map_or(base, |path| follow_path(base, path)))
+}
+
+/// Evaluate `expr` to a value the caller owns.
+///
+/// A borrowed result is charged to the budget, then copied. This is the call
+/// for a value that is kept: a state write, an effect operand, an `array`
+/// element.
+///
+/// # Errors
+///
+/// As [`eval_ref`].
+pub(crate) fn eval(expr: &Expr, ctx: &EvalCtx<'_>, path: &str) -> Result<Value, ConstelaError> {
+    let value = eval_ref(expr, ctx, path)?;
+    ctx.budget.own(value, path)
+}
+
+/// Evaluate `expr`, and borrow the result where possible.
+///
+/// A `lit`, `state`, `var` or `param` read borrows. So do `get`, `index`,
+/// `cond`, `&&` and `||` on a borrowed operand. A form that builds a value
+/// charges the budget before it allocates. This is the call for a value that
+/// is only read: a text node, a condition, an attribute.
 ///
 /// `path` locates the expression in the submitted document and is used only
 /// for diagnostics.
@@ -377,128 +439,179 @@ fn resolve(base: Option<&Value>, path: Option<&String>) -> Value {
 /// # Errors
 ///
 /// [`ConstelaError::Render`] when evaluation nests deeper than the context's
-/// remaining depth budget. Every other failure mode resolves to
-/// [`Value::Null`]; see the module docs.
-pub(crate) fn eval(expr: &Expr, ctx: &EvalCtx<'_>, path: &str) -> Result<Value, ConstelaError> {
+/// remaining depth budget, or builds more than its byte budget allows. Every
+/// other failure mode resolves to [`Value::Null`]; see the module docs.
+pub(crate) fn eval_ref<'a>(
+    expr: &'a Expr,
+    ctx: &EvalCtx<'a>,
+    path: &str,
+) -> Result<Cow<'a, Value>, ConstelaError> {
     let inner = ctx.descend(path)?;
     match expr {
-        Expr::Lit { value } => Ok(value.clone()),
-        Expr::State { name, path: sub } => Ok(resolve(ctx.state.get(name), sub.as_ref())),
-        Expr::Var { name, path: sub } => Ok(resolve(ctx.env.var(name), sub.as_ref())),
-        Expr::Param { name, path: sub } => Ok(resolve(ctx.env.params.get(name), sub.as_ref())),
+        Expr::Lit { value } => Ok(Cow::Borrowed(value)),
+        Expr::State { name, path: sub } => Ok(lookup(ctx.state.get(name), sub.as_deref())),
+        Expr::Var { name, path: sub } => Ok(lookup(ctx.env.var(name), sub.as_deref())),
+        Expr::Param { name, path: sub } => Ok(lookup(ctx.env.param(name), sub.as_deref())),
         Expr::Route { name, source } => {
             let looked_up = match source {
-                RouteSource::Param => ctx.route.params.get(name).cloned(),
-                RouteSource::Query => ctx.route.query.get(name).cloned(),
-                RouteSource::Path => Some(ctx.route.path.clone()),
+                RouteSource::Param => ctx.route.params.get(name).map(String::as_str),
+                RouteSource::Query => ctx.route.query.get(name).map(String::as_str),
+                RouteSource::Path => Some(ctx.route.path.as_str()),
             };
-            Ok(looked_up.map_or(Value::Null, Value::String))
+            let Some(text) = looked_up else {
+                return Ok(null());
+            };
+            ctx.budget.charge(text.len(), path)?;
+            Ok(Cow::Owned(Value::String(text.to_string())))
         }
         Expr::Not { operand } => {
-            let value = eval(operand, &inner, &format!("{path}.operand"))?;
-            Ok(Value::Bool(!truthy(&value)))
+            let value = eval_ref(operand, &inner, &format!("{path}.operand"))?;
+            Ok(Cow::Owned(Value::Bool(!truthy(&value))))
         }
         Expr::Cond {
             condition,
             then,
             otherwise,
         } => {
-            let test = eval(condition, &inner, &format!("{path}.if"))?;
+            let test = eval_ref(condition, &inner, &format!("{path}.if"))?;
             if truthy(&test) {
-                eval(then, &inner, &format!("{path}.then"))
+                eval_ref(then, &inner, &format!("{path}.then"))
             } else {
-                eval(otherwise, &inner, &format!("{path}.else"))
+                eval_ref(otherwise, &inner, &format!("{path}.else"))
             }
         }
         Expr::Get { base, path: sub } => {
-            let base = eval(base, &inner, &format!("{path}.base"))?;
-            Ok(follow_path(&base, sub).clone())
+            let base = eval_ref(base, &inner, &format!("{path}.base"))?;
+            Ok(select_path(base, sub))
         }
         Expr::Index { base, key } => {
-            let base = eval(base, &inner, &format!("{path}.base"))?;
-            let key = eval(key, &inner, &format!("{path}.key"))?;
-            Ok(index_into(&base, &key))
+            let base = eval_ref(base, &inner, &format!("{path}.base"))?;
+            let key = eval_ref(key, &inner, &format!("{path}.key"))?;
+            index_into(base, &key, ctx.budget, path)
         }
         Expr::Concat { items } => {
             let mut out = String::new();
             for (i, item) in items.iter().enumerate() {
-                let value = eval(item, &inner, &format!("{path}.items[{i}]"))?;
-                let piece = text_of(&value);
+                let value = eval_ref(item, &inner, &format!("{path}.items[{i}]"))?;
                 // Charged per piece, so the string is refused as it grows
-                // rather than after it is whole.
-                charge(ctx, piece.len(), path)?;
-                out.push_str(&piece);
+                // rather than after it is whole. A converted piece was
+                // charged when it was converted.
+                match text_coerce(&value, ctx.budget, path)? {
+                    Cow::Borrowed(piece) => {
+                        ctx.budget.charge(piece.len(), path)?;
+                        out.push_str(piece);
+                    }
+                    Cow::Owned(piece) => out.push_str(&piece),
+                }
             }
-            Ok(Value::String(out))
+            Ok(Cow::Owned(Value::String(out)))
         }
         Expr::Array { elements } => {
+            ctx.budget
+                .charge(SLOT_BYTES.saturating_mul(elements.len()), path)?;
             let mut out = Vec::with_capacity(elements.len());
             for (i, element) in elements.iter().enumerate() {
-                let value = eval(element, &inner, &format!("{path}.elements[{i}]"))?;
-                // An element can be a whole state field, so `array` repeated
-                // over a large one amplifies just as `concat` does.
-                charge(ctx, approx_bytes(&value, ctx.budget.get()), path)?;
-                out.push(value);
+                // `eval`, not `eval_ref`: the element is kept, so a borrowed
+                // one is charged and copied.
+                out.push(eval(element, &inner, &format!("{path}.elements[{i}]"))?);
             }
-            Ok(Value::Array(out))
+            Ok(Cow::Owned(Value::Array(out)))
         }
         Expr::Obj { props } => {
             let mut out = Map::new();
             for (key, value) in props {
+                ctx.budget
+                    .charge(key.len().saturating_add(SLOT_BYTES), path)?;
                 let value = eval(value, &inner, &format!("{path}.props.{key}"))?;
-                charge(ctx, approx_bytes(&value, ctx.budget.get()), path)?;
                 out.insert(key.clone(), value);
             }
-            Ok(Value::Object(out))
+            Ok(Cow::Owned(Value::Object(out)))
         }
         Expr::Bin { op, left, right } => eval_binary(*op, left, right, &inner, path),
         Expr::Style { name, variants } => {
             let Some(preset) = ctx.styles.get(name) else {
-                return Ok(Value::String(String::new()));
+                return Ok(Cow::Owned(Value::String(String::new())));
             };
-            let mut selected = BTreeMap::new();
+            let mut values = Vec::with_capacity(variants.len());
             for (axis, expr) in variants {
-                let value = eval(expr, &inner, &format!("{path}.variants.{axis}"))?;
-                selected.insert(axis.clone(), text_of(&value));
+                let value = eval_ref(expr, &inner, &format!("{path}.variants.{axis}"))?;
+                values.push((axis.as_str(), value));
             }
-            Ok(Value::String(resolve_style(preset, &selected)))
+            let mut selected = BTreeMap::new();
+            for (axis, value) in &values {
+                selected.insert(*axis, text_coerce(value, ctx.budget, path)?);
+            }
+            let classes = resolve_style(preset, &selected);
+            ctx.budget.charge(classes.len(), path)?;
+            Ok(Cow::Owned(Value::String(classes)))
         }
     }
 }
 
-/// Dynamic member access: a number indexes an array, anything else is
-/// stringified and looks up an object key.
-fn index_into(base: &Value, key: &Value) -> Value {
-    match base {
-        Value::Array(items) => {
-            let Some(index) = key.as_f64() else {
-                return Value::Null;
-            };
-            if index < 0.0 || index.fract() != 0.0 {
-                return Value::Null;
-            }
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "guarded above: non-negative and integral"
-            )]
-            let index = index as usize;
-            items.get(index).cloned().unwrap_or(Value::Null)
-        }
-        Value::Object(map) => map.get(&js_string(key)).cloned().unwrap_or(Value::Null),
-        Value::String(s) => {
-            // JS indexes a string by code unit; indexing by chars is the
-            // closest total equivalent that cannot split a UTF-8 sequence.
-            let Some(index) = key.as_u64() else {
-                return Value::Null;
-            };
-            usize::try_from(index)
-                .ok()
-                .and_then(|i| s.chars().nth(i))
-                .map_or(Value::Null, |c| Value::String(c.to_string()))
-        }
-        _ => Value::Null,
+/// `null`, borrowed.
+const fn null<'a>() -> Cow<'a, Value> {
+    Cow::Borrowed(&Value::Null)
+}
+
+/// Read a key as an array index: non-negative and integral.
+fn array_slot(key: &Value) -> Option<usize> {
+    let index = key.as_f64()?;
+    if index < 0.0 || index.fract() != 0.0 {
+        return None;
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "guarded above: non-negative and integral"
+    )]
+    let index = index as usize;
+    Some(index)
+}
+
+/// One character of a string, as a string.
+///
+/// JS indexes a string by code unit; indexing by chars is the closest total
+/// equivalent that cannot split a UTF-8 sequence.
+fn string_char<'a>(text: &str, key: &Value) -> Cow<'a, Value> {
+    key.as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| text.chars().nth(index))
+        .map_or_else(null, |c| Cow::Owned(Value::String(c.to_string())))
+}
+
+/// Dynamic member access: a number indexes an array, anything else is
+/// stringified and looks up an object key. Neither form copies the element:
+/// a borrowed base yields a borrow, an owned base gives up the element.
+fn index_into<'a>(
+    base: Cow<'a, Value>,
+    key: &Value,
+    budget: &Budget,
+    path: &str,
+) -> Result<Cow<'a, Value>, ConstelaError> {
+    Ok(match base {
+        Cow::Borrowed(base) => match base {
+            Value::Array(items) => array_slot(key)
+                .and_then(|index| items.get(index))
+                .map_or_else(null, Cow::Borrowed),
+            Value::Object(map) => {
+                let key = coerce(key, budget, path)?;
+                map.get(key.as_ref()).map_or_else(null, Cow::Borrowed)
+            }
+            Value::String(text) => string_char(text, key),
+            _ => null(),
+        },
+        Cow::Owned(base) => match base {
+            Value::Array(items) => array_slot(key)
+                .and_then(|index| items.into_iter().nth(index))
+                .map_or_else(null, Cow::Owned),
+            Value::Object(mut map) => {
+                let key = coerce(key, budget, path)?;
+                map.remove(key.as_ref()).map_or_else(null, Cow::Owned)
+            }
+            Value::String(text) => string_char(&text, key),
+            _ => null(),
+        },
+    })
 }
 
 /// Assemble a style preset's class string for the selected variants.
@@ -506,15 +619,16 @@ fn index_into(base: &Value, key: &Value) -> Value {
 /// Axes the caller did not select fall back to `defaultVariants`; a selection
 /// naming an axis or option the preset does not have contributes nothing,
 /// rather than failing the render.
-fn resolve_style(preset: &StylePreset, selected: &BTreeMap<String, String>) -> String {
+fn resolve_style(preset: &StylePreset, selected: &BTreeMap<&str, Cow<'_, str>>) -> String {
     let mut classes = Vec::new();
     if !preset.base.is_empty() {
         classes.push(preset.base.as_str());
     }
     for (axis, options) in &preset.variants {
         let choice = selected
-            .get(axis)
-            .or_else(|| preset.default_variants.get(axis));
+            .get(axis.as_str())
+            .map(AsRef::as_ref)
+            .or_else(|| preset.default_variants.get(axis).map(String::as_str));
         if let Some(class) = choice.and_then(|choice| options.get(choice))
             && !class.is_empty()
         {
@@ -525,20 +639,20 @@ fn resolve_style(preset: &StylePreset, selected: &BTreeMap<String, String>) -> S
 }
 
 /// Evaluate a binary operation, short-circuiting `&&` and `||`.
-fn eval_binary(
+fn eval_binary<'a>(
     op: BinaryOp,
-    left: &Expr,
-    right: &Expr,
-    ctx: &EvalCtx<'_>,
+    left: &'a Expr,
+    right: &'a Expr,
+    ctx: &EvalCtx<'a>,
     path: &str,
-) -> Result<Value, ConstelaError> {
+) -> Result<Cow<'a, Value>, ConstelaError> {
     let left_path = format!("{path}.left");
     let right_path = format!("{path}.right");
 
     // Short-circuit first, and yield the *operand*, not a boolean — `a || b`
     // is JavaScript's, not Rust's.
     if matches!(op, BinaryOp::And | BinaryOp::Or) {
-        let left = eval(left, ctx, &left_path)?;
+        let left = eval_ref(left, ctx, &left_path)?;
         let take_left = if op == BinaryOp::And {
             !truthy(&left)
         } else {
@@ -547,20 +661,31 @@ fn eval_binary(
         return if take_left {
             Ok(left)
         } else {
-            eval(right, ctx, &right_path)
+            eval_ref(right, ctx, &right_path)
         };
     }
 
-    let left = eval(left, ctx, &left_path)?;
-    let right = eval(right, ctx, &right_path)?;
+    let left = eval_ref(left, ctx, &left_path)?;
+    let right = eval_ref(right, ctx, &right_path)?;
 
-    Ok(match op {
+    Ok(Cow::Owned(match op {
         BinaryOp::Add => {
             if left.is_number() && right.is_number() {
                 number_value(as_number(&left) + as_number(&right))
             } else {
-                let joined = format!("{}{}", js_string(&left), js_string(&right));
-                charge(ctx, joined.len(), path)?;
+                let left = coerce(&left, ctx.budget, path)?;
+                let right = coerce(&right, ctx.budget, path)?;
+                // A converted operand was charged when it was converted.
+                let borrowed = |text: &Cow<'_, str>| match text {
+                    Cow::Borrowed(text) => text.len(),
+                    Cow::Owned(_) => 0,
+                };
+                ctx.budget
+                    .charge(borrowed(&left).saturating_add(borrowed(&right)), path)?;
+                let len = left.len().saturating_add(right.len());
+                let mut joined = String::with_capacity(len);
+                joined.push_str(&left);
+                joined.push_str(&right);
                 Value::String(joined)
             }
         }
@@ -589,10 +714,10 @@ fn eval_binary(
             let ordering = if left.is_number() && right.is_number() {
                 as_number(&left).partial_cmp(&as_number(&right))
             } else {
-                Some(js_string(&left).cmp(&js_string(&right)))
+                Some(coerce(&left, ctx.budget, path)?.cmp(&coerce(&right, ctx.budget, path)?))
             };
             let Some(ordering) = ordering else {
-                return Ok(Value::Bool(false));
+                return Ok(Cow::Owned(Value::Bool(false)));
             };
             Value::Bool(match op {
                 BinaryOp::Lt => ordering.is_lt(),
@@ -610,7 +735,7 @@ fn eval_binary(
             debug_assert!(false, "&& and || are short-circuited above");
             Value::Bool(false)
         }
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -626,7 +751,7 @@ mod tests {
         let expr: Expr = serde_json::from_str(source).expect("expression parses");
         let styles = BTreeMap::new();
         let route = RouteValues::default();
-        let budget = Cell::new(usize::MAX);
+        let budget = Budget::new(usize::MAX);
         let ctx = EvalCtx {
             state,
             env,
@@ -847,12 +972,12 @@ mod tests {
         )
         .expect("preset parses");
         let mut selected = BTreeMap::new();
-        selected.insert("size".to_string(), "lg".to_string());
+        selected.insert("size", Cow::Borrowed("lg"));
         assert_eq!(resolve_style(&preset, &selected), "btn btn-lg btn-primary");
 
         // An unknown option contributes nothing rather than failing.
         let mut unknown = BTreeMap::new();
-        unknown.insert("size".to_string(), "xl".to_string());
+        unknown.insert("size", Cow::Borrowed("xl"));
         assert_eq!(resolve_style(&preset, &unknown), "btn btn-primary");
     }
 
@@ -871,7 +996,7 @@ mod tests {
         let route = RouteValues::default();
         let state = Map::new();
         let env = Env::default();
-        let budget = Cell::new(usize::MAX);
+        let budget = Budget::new(usize::MAX);
         let ctx = EvalCtx {
             state: &state,
             env: &env,
@@ -882,5 +1007,247 @@ mod tests {
         };
         let err = eval(&expr, &ctx, "expr").expect_err("over budget");
         assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    }
+
+    /// Evaluate with route values and style presets in scope, and a budget.
+    fn eval_full(
+        source: &str,
+        route: &RouteValues,
+        styles: &BTreeMap<String, StylePreset>,
+        budget: &Budget,
+    ) -> Result<Value, ConstelaError> {
+        let expr: Expr = serde_json::from_str(source).expect("expression parses");
+        let state = Map::new();
+        let env = Env::default();
+        let ctx = EvalCtx {
+            state: &state,
+            env: &env,
+            route,
+            styles,
+            depth: 64,
+            budget,
+        };
+        eval(&expr, &ctx, "expr")
+    }
+
+    #[test]
+    fn get_and_index_move_out_of_a_built_value() {
+        let built = r#"{"expr":"obj","props":{"a":{"expr":"array","elements":[
+            {"expr":"lit","value":"x"},{"expr":"lit","value":{"k":"v"}}]}}}"#;
+        assert_eq!(
+            eval_str(&format!(
+                r#"{{"expr":"get","base":{built},"path":"a.1.k"}}"#
+            )),
+            json!("v")
+        );
+        assert_eq!(
+            eval_str(&format!(r#"{{"expr":"get","base":{built},"path":"a.9"}}"#)),
+            json!(null)
+        );
+        assert_eq!(
+            eval_str(&format!(
+                r#"{{"expr":"index","base":{built},"key":{{"expr":"lit","value":"a"}}}}"#
+            )),
+            json!(["x", {"k": "v"}])
+        );
+        let list =
+            r#"{"expr":"array","elements":[{"expr":"lit","value":1},{"expr":"lit","value":2}]}"#;
+        assert_eq!(
+            eval_str(&format!(
+                r#"{{"expr":"index","base":{list},"key":{{"expr":"lit","value":1}}}}"#
+            )),
+            json!(2)
+        );
+        assert_eq!(
+            eval_str(&format!(
+                r#"{{"expr":"index","base":{list},"key":{{"expr":"lit","value":5}}}}"#
+            )),
+            json!(null)
+        );
+    }
+
+    #[test]
+    fn index_reads_objects_strings_and_nothing_else() {
+        let read = |base: &str, key: &str| {
+            eval_str(&format!(
+                r#"{{"expr":"index","base":{{"expr":"lit","value":{base}}},"key":{{"expr":"lit","value":{key}}}}}"#
+            ))
+        };
+        assert_eq!(read(r#"{"1":"one"}"#, "1"), json!("one"));
+        assert_eq!(read(r#"{"a":1}"#, r#""b""#), json!(null));
+        assert_eq!(read(r#""héllo""#, "1"), json!("é"));
+        assert_eq!(read(r#""abc""#, "9"), json!(null));
+        assert_eq!(read(r#""abc""#, r#""x""#), json!(null));
+        assert_eq!(read("7", "0"), json!(null));
+        // A built string indexes the same way.
+        assert_eq!(
+            eval_str(
+                r#"{"expr":"index","base":{"expr":"concat","items":[{"expr":"lit","value":"ab"}]},
+                    "key":{"expr":"lit","value":1}}"#
+            ),
+            json!("b")
+        );
+    }
+
+    #[test]
+    fn route_values_are_read_by_source() {
+        let mut route = RouteValues::default();
+        route.params.insert("id".into(), "7".into());
+        route.query.insert("q".into(), "tea".into());
+        route.path = "/posts/7".into();
+        let styles = BTreeMap::new();
+        let budget = Budget::new(usize::MAX);
+        let read = |source: &str| {
+            eval_full(
+                &format!(
+                    r#"{{"expr":"route","name":"{}","source":"{source}"}}"#,
+                    if source == "query" { "q" } else { "id" }
+                ),
+                &route,
+                &styles,
+                &budget,
+            )
+            .expect("evaluates")
+        };
+        assert_eq!(read("param"), json!("7"));
+        assert_eq!(read("query"), json!("tea"));
+        assert_eq!(read("path"), json!("/posts/7"));
+        assert_eq!(
+            eval_full(
+                r#"{"expr":"route","name":"missing","source":"param"}"#,
+                &route,
+                &styles,
+                &budget
+            )
+            .expect("evaluates"),
+            json!(null)
+        );
+    }
+
+    #[test]
+    fn a_style_expression_resolves_its_preset() {
+        let mut styles = BTreeMap::new();
+        styles.insert(
+            "btn".to_string(),
+            serde_json::from_str::<StylePreset>(
+                r#"{"base":"btn","variants":{"size":{"lg":"btn-lg"}}}"#,
+            )
+            .expect("preset parses"),
+        );
+        let route = RouteValues::default();
+        let budget = Budget::new(usize::MAX);
+        assert_eq!(
+            eval_full(
+                r#"{"expr":"style","name":"btn","variants":{"size":{"expr":"lit","value":"lg"}}}"#,
+                &route,
+                &styles,
+                &budget
+            )
+            .expect("evaluates"),
+            json!("btn btn-lg")
+        );
+        assert_eq!(
+            eval_full(
+                r#"{"expr":"style","name":"none"}"#,
+                &route,
+                &styles,
+                &budget
+            )
+            .expect("evaluates"),
+            json!("")
+        );
+    }
+
+    #[test]
+    fn coercions_follow_javascript() {
+        let bin = |op: &str, left: &str, right: &str| {
+            eval_str(&format!(
+                r#"{{"expr":"bin","op":"{op}","left":{{"expr":"lit","value":{left}}},"right":{{"expr":"lit","value":{right}}}}}"#
+            ))
+        };
+        assert_eq!(bin("+", "true", r#""x""#), json!("truex"));
+        assert_eq!(bin("+", "null", r#""x""#), json!("nullx"));
+        assert_eq!(bin("+", "[1,2]", "3"), json!("1,23"));
+        assert_eq!(bin("<", "[1]", r#""2""#), json!(true));
+        assert_eq!(bin(">=", r#""b""#, r#""a""#), json!(true));
+        assert_eq!(bin("<=", "1", "1"), json!(true));
+        assert_eq!(bin("!=", "1", "2"), json!(true));
+        assert_eq!(bin("*", "3", "4"), json!(12));
+        assert_eq!(bin("%", "7", "4"), json!(3));
+        assert_eq!(bin("/", "7", "2"), json!(3.5));
+        assert_eq!(
+            eval_str(
+                r#"{"expr":"concat","items":[{"expr":"lit","value":1},{"expr":"lit","value":null},{"expr":"lit","value":true}]}"#
+            ),
+            json!("1true")
+        );
+        assert_eq!(
+            eval_str(
+                r#"{"expr":"cond","if":{"expr":"lit","value":0},"then":{"expr":"lit","value":"a"},"else":{"expr":"lit","value":"b"}}"#
+            ),
+            json!("b")
+        );
+        assert_eq!(
+            eval_str(r#"{"expr":"not","operand":{"expr":"lit","value":[]}}"#),
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn a_read_borrows_and_a_kept_copy_charges() {
+        let mut state = Map::new();
+        state.insert("big".into(), json!("x".repeat(100)));
+        let expr: Expr = serde_json::from_str(r#"{"expr":"state","name":"big"}"#).expect("parses");
+        let styles = BTreeMap::new();
+        let route = RouteValues::default();
+        let env = Env::default();
+        let budget = Budget::new(10);
+        let ctx = EvalCtx {
+            state: &state,
+            env: &env,
+            route: &route,
+            styles: &styles,
+            depth: 64,
+            budget: &budget,
+        };
+        // Borrowed: no charge, so a 10-byte budget is enough.
+        let read = eval_ref(&expr, &ctx, "expr").expect("borrows");
+        assert!(matches!(read, Cow::Borrowed(_)));
+        // Owned: the copy is charged, and 100 bytes is over the budget.
+        let err = eval(&expr, &ctx, "expr").expect_err("copy over budget");
+        assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    }
+
+    #[test]
+    fn coercing_a_non_string_charges_the_budget() {
+        let budget = Budget::new(4);
+        let value = json!([1, 2, 3]);
+        coerce(&value, &budget, "p").expect_err("over a 4-byte budget");
+        let text = json!("plain");
+        assert!(matches!(
+            coerce(&text, &Budget::new(0), "p").expect("strings borrow"),
+            Cow::Borrowed("plain")
+        ));
+        assert_eq!(
+            text_coerce(&json!(null), &Budget::new(0), "p").expect("null is empty"),
+            ""
+        );
+    }
+
+    #[test]
+    fn env_bindings_resolve_innermost_first() {
+        let outer = json!("outer");
+        let env = Env::default()
+            .with_var("v", Bound::Borrowed(&outer))
+            .with_var("v", Bound::Shared(Rc::new(json!("inner"))));
+        assert_eq!(env.var("v"), Some(&json!("inner")));
+        assert_eq!(env.var("missing"), None);
+        let mut params = BTreeMap::new();
+        params.insert("p", Bound::from(Cow::Owned(json!(1))));
+        let env = Env {
+            params: Rc::new(params),
+            vars: Vec::new(),
+        };
+        assert_eq!(env.param("p"), Some(&json!(1)));
     }
 }

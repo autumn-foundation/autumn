@@ -90,6 +90,21 @@ pub struct CapabilityEvent {
     pub at: Instant,
 }
 
+/// Calls one request made that its ledger could not hold, and when.
+///
+/// It keeps only the first and last times. The ledger had no room for the time
+/// of each call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DroppedCalls {
+    /// How many calls.
+    pub count: u64,
+    /// The time of the first dropped call.
+    pub first: Instant,
+    /// The time of the last dropped call.
+    pub last: Instant,
+}
+
 /// The most events one plugin's log holds.
 ///
 /// Bounded, because the log is fed by an untrusted plugin's call rate and an
@@ -130,7 +145,7 @@ struct LogState {
     /// Counts the full `dropped` ledger folded away, by plugin and hour, with
     /// the newest time folded into each bucket. A summary reports a bucket
     /// while that time is in its window. It can over-report by under one hour
-    /// of drops, and never under-reports.
+    /// plus the longest drop span of one request. It never under-reports.
     folded: BTreeMap<(String, u64), (Instant, u64)>,
     /// The time the hour buckets count from. Set by the first fold.
     origin: Option<Instant>,
@@ -150,7 +165,7 @@ struct DroppedRecord {
     plugin: String,
     count: u64,
     /// The time of the first drop. A record spans at most [`DROPPED_BUCKET`]
-    /// from here.
+    /// from here, or the span of one request's drops if that is longer.
     first: Instant,
 }
 
@@ -196,7 +211,7 @@ impl PluginActivityLog {
                 // An evicted event is a call the summary can no longer show.
                 // It is recorded under its own time, so a drop that has aged
                 // out of the window stops being reported with it.
-                state.note_dropped(at, &who, 1);
+                state.note_dropped(at, at, &who, 1);
             }
             state.seq = state.seq.wrapping_add(1);
             let key = (event.at, state.seq);
@@ -210,12 +225,31 @@ impl PluginActivityLog {
     /// event: there is nothing to say about the calls beyond that they happened
     /// and are not below. An operator reading a summary needs to know that
     /// before they read the counts.
+    ///
+    /// Records the drops at the current time. Use
+    /// [`ingest_dropped_calls`](Self::ingest_dropped_calls) when you know the
+    /// times of the drops.
     pub fn ingest_dropped(&self, plugin: &str, dropped: u64) {
         if dropped == 0 {
             return;
         }
-        self.lock()
-            .note_dropped(crate::time::ambient_instant(), plugin, dropped);
+        let now = crate::time::ambient_instant();
+        self.lock().note_dropped(now, now, plugin, dropped);
+    }
+
+    /// Record the calls one request's ledger could not hold, at their own times.
+    ///
+    /// A slow request ends long after its drops. This method records the drops
+    /// at their own times, not at the time of ingest (#2523). The record counts
+    /// while `calls.last` is in the window. It can over-report by the span of
+    /// the drops. It never under-reports.
+    pub fn ingest_dropped_calls(&self, plugin: &str, calls: DroppedCalls) {
+        if calls.count == 0 {
+            return;
+        }
+        // Ordered, so the key is never before a drop it counts.
+        let (first, last) = (calls.first.min(calls.last), calls.first.max(calls.last));
+        self.lock().note_dropped(first, last, plugin, calls.count);
     }
 
     /// What `plugin` did within `window`.
@@ -278,34 +312,37 @@ impl PluginActivityLog {
 }
 
 impl LogState {
-    /// Add `count` dropped calls for `plugin` at `at`.
+    /// Add `count` dropped calls for `plugin`, made from `first` to `last`.
     ///
     /// Coalesces into the newest record when it is the same plugin and within
-    /// one [`DROPPED_BUCKET`] of that record's first drop. Bounded by [`MAX_LOG_EVENTS`]: the oldest record, by
-    /// time, folds into `folded` rather than vanishing.
-    fn note_dropped(&mut self, at: Instant, plugin: &str, count: u64) {
+    /// one [`DROPPED_BUCKET`] of that record's first drop. Bounded by
+    /// [`MAX_LOG_EVENTS`]: the oldest record, by time, folds into `folded`
+    /// rather than vanishing.
+    fn note_dropped(&mut self, first: Instant, last: Instant, plugin: &str, count: u64) {
         // Measured from the first drop, not the newest. A steady dropper would
         // otherwise keep one record open for hours.
-        if let Some((&(last, seq), record)) = self.dropped.last_key_value()
+        if let Some((&(newest, seq), record)) = self.dropped.last_key_value()
             && record.plugin == plugin
-            && apart(at, record.first) < DROPPED_BUCKET
-            && apart(at, last) < DROPPED_BUCKET
+            && apart(first, record.first) < DROPPED_BUCKET
+            && apart(last, record.first) < DROPPED_BUCKET
+            && apart(last, newest) < DROPPED_BUCKET
         {
             // Keyed by the newer time: the record counts while any drop in it
             // is inside the window.
-            if let Some(mut record) = self.dropped.remove(&(last, seq)) {
+            if let Some(mut record) = self.dropped.remove(&(newest, seq)) {
                 record.count = record.count.saturating_add(count);
-                self.dropped.insert((last.max(at), seq), record);
+                record.first = record.first.min(first);
+                self.dropped.insert((newest.max(last), seq), record);
             }
             return;
         }
         self.seq = self.seq.wrapping_add(1);
         self.dropped.insert(
-            (at, self.seq),
+            (last, self.seq),
             DroppedRecord {
                 plugin: plugin.to_owned(),
                 count,
-                first: at,
+                first,
             },
         );
         while self.dropped.len() > MAX_LOG_EVENTS {
@@ -572,6 +609,46 @@ mod tests {
         let summary = log.summary("shop", hour);
         assert_eq!(summary.allowed.get("kv-get"), None);
         assert_eq!(summary.dropped, 0);
+    }
+
+    #[test]
+    fn a_request_s_drops_count_while_its_last_drop_is_in_the_window() {
+        // #2523 finding 18. The span of one request's drops is known, not the
+        // time of each drop. Key the record at the last drop: never under-report.
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let minute = Duration::from_secs(60);
+        let clock = TickingClock::starting_at(
+            chrono::Utc
+                .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
+                .single()
+                .expect("a valid date"),
+        );
+        let _clock = install_ambient(Arc::new(clock.clone()));
+        let log = PluginActivityLog::new();
+        let first = crate::time::ambient_instant();
+        clock.advance(90 * minute);
+        let last = crate::time::ambient_instant();
+        clock.advance(30 * minute);
+        log.ingest_dropped_calls(
+            "shop",
+            DroppedCalls {
+                count: 4,
+                first,
+                last,
+            },
+        );
+        // The request ended now, but its last drop was 30 minutes ago.
+        assert_eq!(log.summary("shop", 40 * minute).dropped, 4);
+        assert_eq!(log.summary("shop", 20 * minute).dropped, 0);
+        // A drop on the eviction path later still makes a record of its own.
+        log.ingest_dropped("shop", 1);
+        assert_eq!(log.summary("shop", 20 * minute).dropped, 1);
+        assert_eq!(log.summary("shop", 40 * minute).dropped, 5);
     }
 
     #[test]

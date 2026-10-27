@@ -436,7 +436,9 @@ impl SandboxedPlugin {
             // blocking task runs on, and recording after the `.await` lost the
             // whole record of what the hook did.
             ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
-            ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_events);
+            if let Some(dropped) = outcome.dropped_calls {
+                ingest_log.ingest_dropped_calls(&ingest_plugin, dropped);
+            }
             drop(permit);
             drop(slot_permit);
             outcome
@@ -727,7 +729,9 @@ async fn serve_inner(
     let outcome = crate::time::spawn_blocking(move || {
         let outcome = host.run_with(&request, services);
         ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
-        ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_activity);
+        if let Some(dropped) = outcome.dropped_calls {
+            ingest_log.ingest_dropped_calls(&ingest_plugin, dropped);
+        }
         drop(slot);
         (outcome, permit)
     })

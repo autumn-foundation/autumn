@@ -33,8 +33,10 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[cfg(feature = "postgres")]
 use diesel::RunQueryDsl;
 use diesel::migration::{Migration, MigrationSource};
+#[cfg(feature = "postgres")]
 use diesel::pg::Pg;
 use diesel_migrations::{FileBasedMigrations, HarnessWithOutput, MigrationHarness};
 use sha2::{Digest, Sha256};
@@ -229,6 +231,7 @@ pub fn retry_on_lock_timeout<T>(
 
 /// The `SET LOCAL lock_timeout` statement for `timeout`, in milliseconds,
 /// capped at the Postgres maximum (`i32::MAX`).
+#[cfg(feature = "postgres")]
 fn lock_timeout_statement(timeout: std::time::Duration) -> String {
     format!("SET LOCAL lock_timeout = {}", lock_timeout_ms(timeout))
 }
@@ -236,11 +239,13 @@ fn lock_timeout_statement(timeout: std::time::Duration) -> String {
 /// The session `SET lock_timeout` each attempt runs first. It covers the
 /// harness's own queries on `__diesel_schema_migrations`, which run before
 /// any migration's [`migration_lock_sql`].
+#[cfg(feature = "postgres")]
 fn session_lock_timeout_statement(timeout: std::time::Duration) -> String {
     format!("SET lock_timeout = {}", lock_timeout_ms(timeout))
 }
 
 /// `timeout` in milliseconds, capped at the Postgres maximum.
+#[cfg(feature = "postgres")]
 fn lock_timeout_ms(timeout: std::time::Duration) -> u64 {
     u64::try_from(timeout.as_millis())
         .unwrap_or(u64::MAX)
@@ -254,6 +259,7 @@ fn lock_timeout_ms(timeout: std::time::Duration) -> u64 {
 /// non-transactional one (`CREATE INDEX CONCURRENTLY`) gets
 /// `SET lock_timeout = 0`: it must wait for older transactions, and a timeout
 /// would leave an INVALID index.
+#[cfg(feature = "postgres")]
 fn migration_lock_sql(run_in_transaction: bool, timeout: std::time::Duration) -> String {
     if run_in_transaction {
         lock_timeout_statement(timeout)
@@ -263,17 +269,20 @@ fn migration_lock_sql(run_in_transaction: bool, timeout: std::time::Duration) ->
 }
 
 /// Names of the migrations that ran, kept across retries.
+#[cfg(feature = "postgres")]
 type AppliedLog = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
 
 /// A [`MigrationSource`] that borrows another one, so a retry can read the
 /// same migrations again. Each migration it returns is a
 /// [`LockTimeoutMigration`].
+#[cfg(feature = "postgres")]
 struct LockTimeoutSource<'a, S> {
     inner: &'a S,
     lock_timeout: std::time::Duration,
     applied: AppliedLog,
 }
 
+#[cfg(feature = "postgres")]
 impl<S: MigrationSource<Pg>> MigrationSource<Pg> for LockTimeoutSource<'_, S> {
     fn migrations(&self) -> diesel::migration::Result<Vec<Box<dyn Migration<Pg>>>> {
         Ok(self
@@ -293,12 +302,14 @@ impl<S: MigrationSource<Pg>> MigrationSource<Pg> for LockTimeoutSource<'_, S> {
 
 /// A migration that sets its `lock_timeout` ([`migration_lock_sql`]) before
 /// it runs, and logs its version when it succeeds.
+#[cfg(feature = "postgres")]
 struct LockTimeoutMigration {
     inner: Box<dyn Migration<Pg>>,
     lock_timeout: std::time::Duration,
     applied: AppliedLog,
 }
 
+#[cfg(feature = "postgres")]
 impl Migration<Pg> for LockTimeoutMigration {
     fn run(
         &self,
@@ -345,6 +356,7 @@ impl Migration<Pg> for LockTimeoutMigration {
     clippy::needless_pass_by_value,
     reason = "callers move it into the migration thread; a borrow there needs `Sync`"
 )]
+#[cfg(feature = "postgres")]
 fn apply_pending_with_policy<C>(
     conn: &mut C,
     migrations: impl MigrationSource<Pg>,
@@ -398,6 +410,7 @@ where
 /// `log` with repeats removed, first one kept. A version logs again when its
 /// transaction rolled back after `run` (the version insert hit the lock
 /// timeout) and a retry ran it again.
+#[cfg(feature = "postgres")]
 fn dedup_applied(log: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     log.into_iter()
@@ -429,6 +442,7 @@ fn dedup_applied(log: Vec<String>) -> Vec<String> {
 /// `scope` (rather than a plain `'static` `std::thread::spawn`) lets `$body`
 /// borrow from the enclosing function (e.g. an `Option<&HashMap<..>>`
 /// parameter) without needing to be `'static`.
+#[cfg(feature = "postgres")]
 macro_rules! with_migration_connection {
     ($url:expr, |$conn:ident| $body:expr) => {
         std::thread::scope(|scope| {
@@ -495,18 +509,21 @@ pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x6175_746E_5F6D_6967_u64.cast_sign
 pub const DEFAULT_LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(diesel::QueryableByName)]
+#[cfg(feature = "postgres")]
 struct AdvisoryLockRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     acquired: bool,
 }
 
 #[derive(diesel::QueryableByName)]
+#[cfg(feature = "postgres")]
 struct AdvisoryUnlockRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     released: bool,
 }
 
 #[derive(diesel::QueryableByName)]
+#[cfg(feature = "postgres")]
 struct AppliedMigrationVersion {
     #[diesel(sql_type = diesel::sql_types::Text)]
     version: String,
@@ -514,6 +531,7 @@ struct AppliedMigrationVersion {
 
 /// Runtime readiness state for a configured read replica's schema version.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub(crate) enum ReplicaMigrationReadiness {
     /// Primary and replica report the same applied migration versions.
     Ready,
@@ -588,6 +606,7 @@ impl<DB: diesel::backend::Backend> diesel::migration::MigrationSource<DB>
 /// Returns [`MigrationError::Connection`] if the database is unreachable,
 /// [`MigrationError::Migration`] if a migration fails, or
 /// [`MigrationError::LockContention`] if every attempt timed out on a lock.
+#[cfg(feature = "postgres")]
 pub fn run_pending(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -601,6 +620,7 @@ pub fn run_pending(
 ///
 /// As [`run_pending`], plus [`MigrationError::LockContention`] when every
 /// attempt timed out on a table lock.
+#[cfg(feature = "postgres")]
 pub fn run_pending_with_policy(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -619,6 +639,7 @@ pub fn run_pending_with_policy(
 /// the role may not set stops the connection, so it is not sent blindly.
 #[doc(hidden)]
 #[must_use]
+#[cfg(feature = "postgres")]
 pub fn can_set_lc_messages(database_url: &str) -> bool {
     let result: Result<(), MigrationError> = with_migration_connection!(database_url, |conn| {
         use diesel::connection::SimpleConnection as _;
@@ -642,6 +663,7 @@ pub fn can_set_lc_messages(database_url: &str) -> bool {
 /// role or database default.
 #[doc(hidden)]
 #[must_use]
+#[cfg(feature = "postgres")]
 pub fn server_lock_timeout_is_off(database_url: &str) -> bool {
     let result: Result<String, MigrationError> = with_migration_connection!(database_url, |conn| {
         use diesel::RunQueryDsl as _;
@@ -665,6 +687,7 @@ pub fn server_lock_timeout_is_off(database_url: &str) -> bool {
 /// As [`pending_migrations`]. A lock timeout is a [`MigrationError::Migration`]
 /// that [`retry_on_lock_timeout`] retries.
 #[doc(hidden)]
+#[cfg(feature = "postgres")]
 pub fn pending_migrations_with_lock_timeout(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -692,6 +715,7 @@ pub fn pending_migrations_with_lock_timeout(
 ///
 /// Returns [`MigrationError::Connection`] if the database is unreachable,
 /// or [`MigrationError::Migration`] if status cannot be determined.
+#[cfg(feature = "postgres")]
 pub fn pending_migrations(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -960,6 +984,7 @@ pub(crate) fn pending_migrations_sqlite(
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 pub(crate) fn compare_replica_migration_versions(
     primary: &[String],
     replica: &[String],
@@ -983,6 +1008,7 @@ pub(crate) fn compare_replica_migration_versions(
     }
 }
 
+#[cfg(feature = "postgres")]
 fn applied_migration_versions(database_url: &str) -> Result<Vec<String>, MigrationError> {
     with_migration_connection!(database_url, |conn| {
         let rows =
@@ -994,6 +1020,29 @@ fn applied_migration_versions(database_url: &str) -> Result<Vec<String>, Migrati
     })
 }
 
+/// A build without `postgres` cannot read a Postgres replica.
+#[cfg(not(feature = "postgres"))]
+pub(crate) fn check_replica_migration_readiness(
+    _primary_url: &str,
+    _replica_url: &str,
+) -> ReplicaMigrationReadiness {
+    ReplicaMigrationReadiness::Unknown(NO_POSTGRES_MSG.to_owned())
+}
+
+/// A build without `postgres` cannot read a Postgres replica.
+#[cfg(not(feature = "postgres"))]
+#[allow(
+    clippy::unused_async,
+    reason = "same signature as the Postgres version"
+)]
+pub(crate) async fn check_replica_migration_readiness_blocking(
+    primary_url: String,
+    replica_url: String,
+) -> ReplicaMigrationReadiness {
+    check_replica_migration_readiness(&primary_url, &replica_url)
+}
+
+#[cfg(feature = "postgres")]
 pub(crate) fn check_replica_migration_readiness(
     primary_url: &str,
     replica_url: &str,
@@ -1010,6 +1059,7 @@ pub(crate) fn check_replica_migration_readiness(
     compare_replica_migration_versions(&primary, &replica)
 }
 
+#[cfg(feature = "postgres")]
 pub(crate) async fn check_replica_migration_readiness_blocking(
     primary_url: String,
     replica_url: String,
@@ -1040,6 +1090,7 @@ pub(crate) async fn check_replica_migration_readiness_blocking(
 ///
 /// Returns [`MigrationError::Migration`] if the database query fails, or
 /// [`MigrationError::LockTimeout`] if the lock is not acquired within `timeout`.
+#[cfg(feature = "postgres")]
 pub fn acquire_migration_lock(
     conn: &mut diesel::PgConnection,
     timeout: std::time::Duration,
@@ -1050,6 +1101,7 @@ pub fn acquire_migration_lock(
 /// Generic body of [`acquire_migration_lock`], usable with both the native
 /// `PgConnection` and the rustls migration wrapper (see
 /// [`crate::db::MigrationConnection`]).
+#[cfg(feature = "postgres")]
 fn acquire_migration_lock_on<C>(
     conn: &mut C,
     timeout: std::time::Duration,
@@ -1108,12 +1160,14 @@ where
 /// success and `WARN` if the lock was not held or the query fails. `PostgreSQL`
 /// also releases session-level advisory locks automatically when the connection
 /// closes, so a missed explicit release is safe.
+#[cfg(feature = "postgres")]
 pub fn release_migration_lock(conn: &mut diesel::PgConnection) {
     release_migration_lock_on(conn);
 }
 
 /// Generic body of [`release_migration_lock`], usable with both the native
 /// `PgConnection` and the rustls migration wrapper.
+#[cfg(feature = "postgres")]
 fn release_migration_lock_on<C>(conn: &mut C)
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
@@ -1146,6 +1200,7 @@ where
 /// `SQLite` and in-memory test harnesses do not support advisory locks and do
 /// not need cross-process serialization (they are single-process by nature).
 /// Skip this guard when running against those backends.
+#[cfg(feature = "postgres")]
 pub struct MigrationLockGuard {
     // TLS-aware (issue #1585 review): `autumn migrate` acquires this lock
     // BEFORE spawning the external diesel CLI, so the lock connection itself
@@ -1154,12 +1209,14 @@ pub struct MigrationLockGuard {
     conn: crate::db::MigrationConnection,
 }
 
+#[cfg(feature = "postgres")]
 impl std::fmt::Debug for MigrationLockGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MigrationLockGuard").finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "postgres")]
 impl Drop for MigrationLockGuard {
     fn drop(&mut self) {
         match &mut self.conn {
@@ -1211,6 +1268,7 @@ pub struct AppliedUserMigration {
 /// target they are recorded in `__diesel_schema_migrations` but have no user
 /// `down.sql`, so without this exclusion `autumn migrate down --shard` would
 /// plan one of them as a user migration and fail.
+#[cfg(feature = "postgres")]
 fn framework_migration_versions() -> Result<std::collections::BTreeSet<String>, MigrationError> {
     framework_migration_versions_for::<Pg>()
 }
@@ -1220,6 +1278,7 @@ fn framework_migration_versions() -> Result<std::collections::BTreeSet<String>, 
 /// names), so the `SQLite` rollback path (issue #2058) can enumerate the same
 /// framework-owned set through the `Sqlite` `MigrationSource` impl without
 /// duplicating the list.
+#[cfg(feature = "postgres")]
 fn framework_migration_versions_for<DB>()
 -> Result<std::collections::BTreeSet<String>, MigrationError>
 where
@@ -1321,6 +1380,7 @@ impl FrameworkTarget {
 ///
 /// Returns [`MigrationError::Migration`] if the directory or an embedded set
 /// cannot be enumerated.
+#[cfg(feature = "postgres")]
 pub fn app_framework_version_collisions(
     migrations_dir: &Path,
     target: FrameworkTarget,
@@ -1457,11 +1517,10 @@ where
 pub(crate) fn compute_migration_disambiguation(
     named_sets: &[(&str, &EmbeddedMigrations)],
 ) -> HashMap<String, String> {
-    compute_migration_disambiguation_from_names(
-        named_sets
-            .iter()
-            .filter_map(|(_, set)| migration_versions_and_names::<Pg, _>(*set).ok()),
-    )
+    // Names do not depend on the backend. Any backend type reads them.
+    compute_migration_disambiguation_from_names(named_sets.iter().filter_map(|(_, set)| {
+        migration_versions_and_names::<crate::db::RuntimeBackend, _>(*set).ok()
+    }))
 }
 
 /// [`compute_migration_disambiguation`] over already-enumerated sets, each a
@@ -1890,6 +1949,7 @@ where
 // ── DB helpers: autumn_migration_checksums ───────────────────────────────
 
 #[derive(diesel::QueryableByName)]
+#[cfg(feature = "postgres")]
 struct RecordedChecksumRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     version: String,
@@ -1898,6 +1958,7 @@ struct RecordedChecksumRow {
 }
 
 #[derive(diesel::QueryableByName)]
+#[cfg(feature = "postgres")]
 struct TableExistsRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     present: bool,
@@ -1927,6 +1988,7 @@ struct TableExistsRow {
 /// a read-only connection). Best-effort record callers log the warning and
 /// continue; validate callers surface it the same way they surface any other DB
 /// error, and it never masks a real checksum mismatch.
+#[cfg(feature = "postgres")]
 fn ensure_checksum_table<C>(conn: &mut C) -> Result<(), MigrationError>
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
@@ -1968,6 +2030,7 @@ where
 /// # Errors
 ///
 /// Returns [`MigrationError::Migration`] for any database error.
+#[cfg(feature = "postgres")]
 pub fn recorded_checksums<C>(conn: &mut C) -> Result<HashMap<String, String>, MigrationError>
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
@@ -1995,6 +2058,7 @@ where
 /// # Errors
 ///
 /// Returns [`MigrationError::Migration`] on any database error.
+#[cfg(feature = "postgres")]
 pub fn record_checksum<C>(conn: &mut C, version: &str, checksum: &str) -> Result<(), MigrationError>
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
@@ -2024,6 +2088,7 @@ where
 /// # Errors
 ///
 /// Returns [`MigrationError::Migration`] on any database error.
+#[cfg(feature = "postgres")]
 pub fn rebaseline_checksum<C>(
     conn: &mut C,
     version: &str,
@@ -2082,6 +2147,7 @@ where
 /// # Errors
 ///
 /// Returns [`MigrationError::Migration`] on any database error.
+#[cfg(feature = "postgres")]
 pub fn delete_checksum<C>(conn: &mut C, version: &str) -> Result<(), MigrationError>
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
@@ -2104,6 +2170,7 @@ where
 /// # Errors
 ///
 /// Returns [`MigrationError::Migration`] on any database error.
+#[cfg(feature = "postgres")]
 pub fn delete_checksums<C>(conn: &mut C, versions: &[String]) -> Result<usize, MigrationError>
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
@@ -2133,6 +2200,7 @@ where
 /// # Errors
 ///
 /// Returns [`MigrationError::Migration`] on any database error.
+#[cfg(feature = "postgres")]
 pub fn record_checksums<C, S>(
     conn: &mut C,
     applied: &[String],
@@ -2173,6 +2241,7 @@ where
 ///
 /// Returns [`MigrationError::Migration`] if `migrations_dir` itself cannot
 /// be read as a migration source.
+#[cfg(feature = "postgres")]
 pub fn read_up_sql_by_version(
     migrations_dir: &Path,
 ) -> Result<HashMap<String, String>, MigrationError> {
@@ -2213,6 +2282,7 @@ pub fn read_up_sql_by_version(
 /// * [`MigrationError::Connection`] — the database is unreachable.
 /// * [`MigrationError::Migration`] — a mismatch was found (message names the
 ///   offending version and both hashes), or the migrations dir cannot be read.
+#[cfg(feature = "postgres")]
 pub fn validate_recorded_checksums_against_dir(
     database_url: &str,
     migrations_dir: &Path,
@@ -2234,6 +2304,7 @@ pub fn validate_recorded_checksums_against_dir(
 /// As [`validate_recorded_checksums_against_dir`], plus
 /// [`MigrationError::LockContention`] when a lock outlasts the retries.
 #[doc(hidden)]
+#[cfg(feature = "postgres")]
 pub fn validate_recorded_checksums_against_dir_with_policy(
     database_url: &str,
     migrations_dir: &Path,
@@ -2253,6 +2324,7 @@ pub fn validate_recorded_checksums_against_dir_with_policy(
 /// As [`record_checksums_from_dir`], plus [`MigrationError::LockContention`]
 /// when a lock outlasts the retries.
 #[doc(hidden)]
+#[cfg(feature = "postgres")]
 pub fn record_checksums_from_dir_with_policy(
     database_url: &str,
     migrations_dir: &Path,
@@ -2270,6 +2342,7 @@ pub fn record_checksums_from_dir_with_policy(
 /// Read `__diesel_schema_migrations`, returning an empty list when the table
 /// does not yet exist (the fresh-DB case, before Diesel's first apply creates
 /// it). Any other error is propagated.
+#[cfg(feature = "postgres")]
 fn load_applied_versions_lenient<C>(conn: &mut C) -> Result<Vec<String>, MigrationError>
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
@@ -2308,6 +2381,7 @@ where
 /// * [`MigrationError::Connection`] — the database is unreachable.
 /// * [`MigrationError::Migration`] — the migrations dir cannot be read or a
 ///   database error occurred.
+#[cfg(feature = "postgres")]
 pub fn record_checksums_from_dir(
     database_url: &str,
     migrations_dir: &Path,
@@ -2332,6 +2406,7 @@ pub fn record_checksums_from_dir(
 /// * [`MigrationError::Connection`] — the database is unreachable.
 /// * [`MigrationError::Migration`] — the version isn't currently applied, its
 ///   on-disk `up.sql` is unreadable, or a database error occurred.
+#[cfg(feature = "postgres")]
 pub fn rebaseline_checksum_from_dir(
     database_url: &str,
     migrations_dir: &Path,
@@ -2384,6 +2459,7 @@ pub fn rebaseline_checksum_from_dir(
 ///   within `wait_timeout`.
 /// * [`MigrationError::Migration`] — the migrations dir cannot be read or a
 ///   database error occurred.
+#[cfg(feature = "postgres")]
 pub fn record_checksums_from_dir_locked(
     database_url: &str,
     migrations_dir: &Path,
@@ -2424,6 +2500,7 @@ pub fn record_checksums_from_dir_locked(
 ///   within `wait_timeout`.
 /// * [`MigrationError::Migration`] — the version isn't currently applied, its
 ///   on-disk `up.sql` is unreadable, or a database error occurred.
+#[cfg(feature = "postgres")]
 pub fn rebaseline_checksum_from_dir_locked(
     database_url: &str,
     migrations_dir: &Path,
@@ -2475,6 +2552,7 @@ pub fn rebaseline_checksum_from_dir_locked(
 /// * [`MigrationError::Connection`] — the database is unreachable.
 /// * [`MigrationError::Migration`] — the migrations dir cannot be read or a
 ///   database error occurred.
+#[cfg(feature = "postgres")]
 pub fn checksum_status(
     database_url: &str,
     migrations_dir: &Path,
@@ -2505,6 +2583,7 @@ pub fn checksum_status(
 /// This mirrors the rollback filter in [`classify_applied_user_migrations`]
 /// (`by_version.contains_key(v) || !framework.contains(v)`) so status and
 /// rollback share one definition of "framework-owned".
+#[cfg(feature = "postgres")]
 fn user_applied_versions<S>(
     applied: &[String],
     up_sql_by_version: &HashMap<String, String, S>,
@@ -2527,6 +2606,7 @@ where
 /// Generic over the connection so it works with both the native
 /// `PgConnection` and the rustls migration wrapper (see
 /// [`crate::db::MigrationConnection`]).
+#[cfg(feature = "postgres")]
 fn resolve_applied_user_migrations<C: MigrationHarness<Pg>>(
     conn: &mut C,
     all_migrations: &[Box<dyn Migration<Pg>>],
@@ -2619,6 +2699,7 @@ fn classify_applied_user_migrations(
 /// - [`MigrationError::Connection`] if the database is unreachable.
 /// - [`MigrationError::Migration`] if `migrations_dir` cannot be read or if
 ///   querying applied versions from the database fails.
+#[cfg(feature = "postgres")]
 pub fn applied_user_migrations(
     database_url: &str,
     migrations_dir: &Path,
@@ -2660,6 +2741,7 @@ pub fn applied_user_migrations(
 /// - [`MigrationError::LockTimeout`] if the advisory lock cannot be acquired.
 /// - [`MigrationError::Migration`] if `plan` returns an error, a revert fails,
 ///   or a planned version is not present in `migrations_dir`.
+#[cfg(feature = "postgres")]
 pub fn revert_user_migrations_locked<P, F>(
     database_url: &str,
     migrations_dir: &Path,
@@ -3010,6 +3092,7 @@ where
 
 /// A single connect attempt returned by the injected `try_connect` closure.
 #[derive(Debug)]
+#[cfg(feature = "postgres")]
 pub(crate) enum AttemptError {
     /// The server is not yet reachable (connection refused, starting up, …).
     /// Carries the raw error message so a timeout can include the last error.
@@ -3026,6 +3109,7 @@ pub(crate) enum AttemptError {
 /// The default is **fatal** (deny-list for retry) so that unknown errors always
 /// fail fast rather than silently burning the whole startup-wait window.
 /// Only "server not yet reachable" patterns are allowed to retry (AC #5).
+#[cfg(feature = "postgres")]
 pub(crate) fn is_retryable_connection_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("connection refused")
@@ -3053,6 +3137,7 @@ pub(crate) fn is_retryable_connection_error(msg: &str) -> bool {
 /// Capped exponential backoff for the startup wait loop.
 ///
 /// Returns `500ms * 2^(attempt - 1)`, capped at `5s`.
+#[cfg(feature = "postgres")]
 pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
     let ms = 500u64.saturating_mul(1u64 << (attempt.saturating_sub(1).min(10)));
     std::time::Duration::from_millis(ms.min(5_000))
@@ -3063,6 +3148,7 @@ pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
 /// Thin alias for the shared redactor. The local implementation this replaced
 /// recognized `postgres://` / `postgresql://` tokens only, so a
 /// `mysql://user:pw@host` in a driver message went out whole.
+#[cfg(feature = "postgres")]
 pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
     crate::db_url::redact_targets_in_message(msg)
 }
@@ -3083,6 +3169,7 @@ pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
 /// * `elapsed` — returns the total time elapsed since the wait started
 /// * `on_retry` — called **before** sleeping with `(attempt, next_delay)` so
 ///   the caller can print a user-visible retry message (AC #4)
+#[cfg(feature = "postgres")]
 pub(crate) fn wait_for_database_inner(
     max_wait: std::time::Duration,
     mut try_connect: impl FnMut() -> Result<(), AttemptError>,
@@ -3129,6 +3216,7 @@ pub(crate) fn wait_for_database_inner(
     }
 }
 
+#[cfg(feature = "postgres")]
 fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
     if crate::pg_conn_str::is_url(url) {
         // Splice `connect_timeout` directly into the raw percent-encoded query
@@ -3184,6 +3272,7 @@ fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
 ///
 /// Returns [`MigrationError::Connection`] when a fatal (non-retryable) error
 /// is encountered or when `max_wait` elapses without a successful connection.
+#[cfg(feature = "postgres")]
 pub fn wait_for_database(
     database_url: &str,
     max_wait: std::time::Duration,
@@ -3251,6 +3340,7 @@ pub fn wait_for_database(
 /// Returns [`MigrationError::Connection`] if the database is unreachable, or
 /// [`MigrationError::LockTimeout`] if the lock cannot be acquired within
 /// `wait_timeout`.
+#[cfg(feature = "postgres")]
 pub fn hold_migration_lock(
     database_url: &str,
     wait_timeout: std::time::Duration,
@@ -3306,6 +3396,7 @@ pub fn hold_migration_lock(
 /// within `wait_timeout`, [`MigrationError::Migration`] if a migration
 /// fails to apply, or [`MigrationError::LockContention`] if every attempt
 /// timed out on a table lock.
+#[cfg(feature = "postgres")]
 pub fn run_pending_locked(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -3326,6 +3417,7 @@ pub fn run_pending_locked(
 ///
 /// As [`run_pending_locked`], plus [`MigrationError::LockContention`] when
 /// every attempt timed out on a table lock.
+#[cfg(feature = "postgres")]
 pub fn run_pending_locked_with_policy(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -3374,6 +3466,7 @@ pub fn run_pending_locked_with_policy(
 /// `up_sql_by_version` is pre-read by the caller (best-effort), so a missing or
 /// unreadable migrations dir simply yields `None` and disables the checksum
 /// steps rather than failing the migration run.
+#[cfg(feature = "postgres")]
 fn run_pending_locked_inner(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -3444,6 +3537,7 @@ fn run_pending_locked_inner(
 /// For the bookkeeping reads and writes around an apply, so a lock on
 /// `__diesel_schema_migrations` or `autumn_migration_checksums` fails fast
 /// instead of blocking.
+#[cfg(feature = "postgres")]
 fn under_lock_policy<C, T>(
     conn: &mut C,
     policy: MigrationLockPolicy,
@@ -3474,6 +3568,7 @@ where
 
 /// Compare the recorded checksums with `up_sql_by_version` under `policy`
 /// ([`under_lock_policy`]). Steps (2) and (5) of [`run_pending_locked_inner`].
+#[cfg(feature = "postgres")]
 fn validate_checksums_under_policy<C>(
     conn: &mut C,
     up_sql_by_version: &HashMap<String, String>,
@@ -3528,6 +3623,7 @@ pub(crate) const fn shard_framework_migration_sets() -> [&'static EmbeddedMigrat
 ///
 /// Returns [`MigrationError::Connection`] if the database is unreachable,
 /// or [`MigrationError::Migration`] if a migration fails to apply.
+#[cfg(feature = "postgres")]
 pub fn run_pending_shard_framework_migrations(
     database_url: &str,
 ) -> Result<MigrationResult, MigrationError> {
@@ -3542,6 +3638,7 @@ pub fn run_pending_shard_framework_migrations(
 /// As [`run_pending_shard_framework_migrations`], plus
 /// [`MigrationError::LockContention`] when every attempt timed out on a
 /// table lock.
+#[cfg(feature = "postgres")]
 pub fn run_pending_shard_framework_migrations_with_policy(
     database_url: &str,
     policy: MigrationLockPolicy,
@@ -3997,6 +4094,7 @@ fn sqlite_table_exists(
 ///
 /// Returns [`MigrationError::Connection`] if the database is unreachable, or
 /// [`MigrationError::Migration`] if status cannot be determined.
+#[cfg(feature = "postgres")]
 pub fn pending_shard_framework_migrations(
     database_url: &str,
 ) -> Result<Vec<String>, MigrationError> {
@@ -4046,6 +4144,27 @@ pub(crate) fn should_auto_apply(
     auto_migrate_in_production
 }
 
+/// The message a build without `postgres` gives for a non-SQLite target.
+#[cfg(not(feature = "postgres"))]
+pub(crate) const NO_POSTGRES_MSG: &str = "this build of autumn-web has no Postgres backend; use a \
+     `sqlite://` URL or enable the `postgres` feature";
+
+/// A build without `postgres` cannot migrate a Postgres target. It logs an
+/// error and exits.
+#[cfg(not(feature = "postgres"))]
+pub(crate) fn auto_migrate(
+    _database_url: &str,
+    _profile: Option<&str>,
+    _auto_migrate: Option<bool>,
+    _auto_migrate_in_production: bool,
+    _migrations: impl MigrationSource<crate::db::RuntimeBackend> + Send,
+    target: &str,
+    _policy: MigrationLockPolicy,
+) {
+    tracing::error!(target = %target, "{NO_POSTGRES_MSG}");
+    std::process::exit(1);
+}
+
 /// Run migrations according to the active profile and migration policy
 /// (decision by [`should_auto_apply`], issue #1903).
 ///
@@ -4065,6 +4184,7 @@ pub(crate) fn should_auto_apply(
 /// Called internally by [`AppBuilder::run`](crate::app::AppBuilder::run)
 /// when migrations are registered via `.migrations()`.
 #[allow(clippy::cognitive_complexity)]
+#[cfg(feature = "postgres")]
 pub(crate) fn auto_migrate(
     database_url: &str,
     profile: Option<&str>,

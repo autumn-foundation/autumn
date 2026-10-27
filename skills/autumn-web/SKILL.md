@@ -4,7 +4,7 @@ description: >
   Use when building, debugging, documenting, or upgrading Rust web applications
   with autumn-web, autumn-cli, or first-party Autumn crates; also use for
   Autumn route/model/repository/job/webhook/admin macros, AppBuilder setup,
-  Maud + htmx server-rendered UI, Diesel async Postgres, and Autumn 0.8.x
+  Maud + htmx server-rendered UI, Diesel async Postgres, and Autumn 0.9.x
   migration or release work.
 ---
 
@@ -12,19 +12,19 @@ description: >
 
 **Repository**: https://github.com/autumn-foundation/autumn
 **Branch**: `trunk-dev`
-**Latest release**: 0.8.0 | **Edition**: 2024 | **MSRV**: 1.88.0
+**Latest release**: 0.9.0 | **Edition**: 2024 | **MSRV**: 1.88.0
 
 **Version identity trip wire**: the workspace on `trunk-dev` is versioned
-0.8.0, and `v0.8.0` is the current release line — `autumn-web = "0.8"`,
-`cargo install autumn-cli --version 0.8.0`. Features below carry the release
-they arrived in — **(0.8.0)** is **absent from 0.7.x and earlier**,
-**(0.7.0)** is absent from 0.6.x and earlier, and **(0.6.0)** is absent from
-0.5.x: if an app pins an older line, check
-[`CHANGELOG.md`](../../CHANGELOG.md) before using them. Unmarked features
-predate 0.6.0. An app moving up from 0.7.x follows
-[`docs/migrations/0.8.0.md`](../../docs/migrations/0.8.0.md); one moving up from
-0.6.x follows [`docs/migrations/0.7.0.md`](../../docs/migrations/0.7.0.md) and
-then the 0.8.0 guide. Run `autumn upgrade` first.
+0.9.0, and `v0.9.0` is the current release line — `autumn-web = "0.9"`,
+`cargo install autumn-cli --version 0.9.0`. Features below carry the release
+they arrived in — **(0.9.0)** is **absent from 0.8.x and earlier**,
+**(0.8.0)** is absent from 0.7.x and earlier, **(0.7.0)** is absent from 0.6.x
+and earlier, and **(0.6.0)** is absent from 0.5.x: if an app pins an older
+line, check [`CHANGELOG.md`](../../CHANGELOG.md) before using them. Unmarked
+features predate 0.6.0. An app moving up from 0.8.x follows
+[`docs/migrations/0.9.0.md`](../../docs/migrations/0.9.0.md); one moving up from
+0.7.x follows [`docs/migrations/0.8.0.md`](../../docs/migrations/0.8.0.md) and
+then the 0.9.0 guide. Run `autumn upgrade` first.
 
 autumn-web is a Spring Boot-style web framework for Rust, built on Axum. It
 assembles Axum, Diesel, Maud, htmx, Tailwind, Tokio, tracing, and production
@@ -43,7 +43,7 @@ when their details matter:
   exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
-- `references/examples.md` - official 0.8.0 example patterns for minimal apps,
+- `references/examples.md` - official 0.9.0 example patterns for minimal apps,
   CRUD, production-ish jobs, Redis channels, S3 storage plugins, and signed
   webhooks. Use this before generating full app code.
 - `docs/guide/accessibility.md` - accessible-by-construction UI. Prefer the
@@ -59,7 +59,8 @@ when their details matter:
   `.aria_required()`, `.aria_invalid()`, `.described_by()`, per-type
   min/max/length) plus a `.hx(name, value)` escape hatch for arbitrary `hx-*`
   attributes. Treat `autumn a11y verify` as an advisory/best-effort CI net, not
-  a guarantee — the typed primitives are the compile-time proof (0.6.0,
+  a guarantee (its route attribution reads `#[cfg(feature)]` against the
+  default features; add `--features x` / `--all-features` to match your build) — the typed primitives are the compile-time proof (0.6.0,
   #1706). See `skills/autumn-web/references/api-reference.md` for the full
   setter surface. To check rendered HTML from a test, shell out to `autumn
   check --a11y --html "<markup>"` and assert on the exit code (0 = no
@@ -222,7 +223,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autumn-web = { version = "0.8", features = ["db", "htmx", "maud"] }
+autumn-web = { version = "0.9", features = ["db", "htmx", "maud"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -239,7 +240,7 @@ when avoiding a system libpq install.
 
 For a reddit-clone-style app with live feeds, file uploads, and blob variants:
 ```toml
-autumn-web = { version = "0.8", features = [
+autumn-web = { version = "0.9", features = [
     "mail",       # transactional email + mailer previews
     "ws",         # WebSocket routes, SSE, broadcast channels
     "presence",   # Presence extractor for online-user tracking
@@ -277,8 +278,8 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `offline-sync` | Offline-first local `SQLite` store plus a background sync engine |
 | `collab` | `#[collaborative]` text fields merged by an in-tree CRDT, with live sessions over the channel/presence seams — see [collaboration](../../docs/guide/collaboration.md) |
 
-For S3 storage add `autumn-storage-s3 = "0.8"`; `storage-s3` is no longer an
-`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.8"`.
+For S3 storage add `autumn-storage-s3 = "0.9"`; `storage-s3` is no longer an
+`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.9"`.
 For keyword + vector search with lifecycle-synced indexes add `autumn-search`.
 
 ## main.rs pattern
@@ -1702,7 +1703,7 @@ this is *provider-reported* failure.
   the store and `with_mail_suppression_store` above are not:
 
   ```toml
-  autumn-web = { version = "0.8", features = ["mail", "inbound-mail"] }
+  autumn-web = { version = "0.9", features = ["mail", "inbound-mail"] }
   ```
 
   ```rust
@@ -1877,7 +1878,7 @@ Job attributes beyond `name`/`max_attempts`/`backoff_ms` (0.5.0):
 `concurrency = N` + `concurrency_key = "field"` caps simultaneous runs. A
 coalesced enqueue is a no-op `Ok(())`.
 
-Claim leases and timeouts (unreleased, #3051): durable workers renew each
+Claim leases and timeouts (0.9.0, #3051): durable workers renew each
 claim every third of the visibility timeout. While renewals succeed, a long job
 does not run on a second worker. If the claim is lost, the worker stops the
 handler. With `#[job(timeout = "30s")]` (or `jobs.default_timeout_ms`; `0` = no
@@ -2013,7 +2014,7 @@ fn contract(&self) -> Option<PluginContract> {
     Some(
         PluginContract::new(env!("CARGO_PKG_NAME"))
             .plugin_version(env!("CARGO_PKG_VERSION"))
-            .autumn_web("0.8")            // Cargo requirement: "0.8", ">=0.7, <0.10", "=0.8.1"
+            .autumn_web("0.9")            // Cargo requirement: "0.9", ">=0.8, <0.10", "=0.9.1"
             .uses_experimental("AppBuilder::with_edge_kv"),  // only if you actually do
     )
 }
@@ -2143,8 +2144,8 @@ reports leftovers as `plugin_residue` — see the doctor skill.
 For local or pluggable file storage:
 
 ```toml
-autumn-web = { version = "0.8", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.8" # when storage.backend = "s3"
+autumn-web = { version = "0.9", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.9" # when storage.backend = "s3"
 ```
 
 ```rust
@@ -2157,7 +2158,7 @@ autumn_web::app().with_blob_store(store).run().await;
 For keyword **and** vector search with an index that stays in sync:
 
 ```toml
-autumn-search = "0.8"
+autumn-search = "0.9"
 ```
 
 ```rust
@@ -2198,8 +2199,8 @@ let hits = search.similar::<Article>("how do I add auth?", 5).await?; // k-NN
 For shared Redis cache:
 
 ```toml
-autumn-web = { version = "0.8", features = ["redis"] }
-autumn-cache-redis = "0.8"
+autumn-web = { version = "0.9", features = ["redis"] }
+autumn-cache-redis = "0.9"
 ```
 
 ```rust
@@ -2765,7 +2766,7 @@ in a `--release` binary with the cargo env unset at runtime. Sample payload:
 ```json
 {
   "app":     { "name": "my_app", "version": "1.4.2" },
-  "autumn":  { "version": "0.8.0", "profile": "prod" },
+  "autumn":  { "version": "0.9.0", "profile": "prod" },
   "runtime": { "uptime": "3h 12m" },
   "build": {
     "version": "1.4.2",
@@ -3473,7 +3474,7 @@ Guide: `docs/guide/sandboxed-plugins.md`. Trust model: `docs/plugins.md`.
 ## CLI
 
 ```bash
-cargo install autumn-cli --version 0.8.0
+cargo install autumn-cli --version 0.9.0
 
 autumn new my-app
 autumn setup
@@ -3556,7 +3557,7 @@ autumn migrate new add_widget_archived_at   # collision-free migration dir: pref
 autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
 autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (0.8.0, issue #1615)
 autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
-autumn sbom --verify sbom.cdx.json --expect-version 0.8.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
+autumn sbom --verify sbom.cdx.json --expect-version 0.9.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
 autumn sbom --binary /usr/local/bin/my-app         # crate versions compiled INTO a binary (cargo-auditable `.dep-v0`; ELF/Mach-O/PE) — no source tree, no lockfile
 autumn build --auditable         # compile through `cargo auditable` so the binary carries its own dependency list (the generated release Dockerfile passes this) (0.8.0, issue #1615)
 autumn upgrade                   # preview BOTH halves as per-file diffs, writing nothing: each release's mechanical app-code migrations (renames), and drift between the project's framework-owned files and this release's scaffold (#1629, #1593)
@@ -3598,6 +3599,14 @@ reports the component schemas that degraded to the opaque placeholder, naming
 the operations reaching them; those are the types a generated client can only
 see as `unknown` / `serde_json::Value`. Fix each with
 `#[derive(OpenApiSchema)]` on the type. See `docs/guide/openapi.md`.
+
+A request body or `Query<T>` uses the shape a type deserializes from. A
+response uses the shape it serializes to (#2607). A `#[model]` with
+`#[private]`, `#[classified]` or hidden `#[encrypted]` fields has two shapes.
+When both positions use it, the spec has two components: `Widget` (response)
+and `WidgetRequest`. Expect both in a generated client. A `#[model]` with
+`deserialize_with`, `with`, `flatten`, `alias`, `from`, `try_from`,
+`transparent` or `tag` is opaque in a request.
 
 Reach for `autumn graph` before reading a codebase to answer a structural
 question. It is derived from the macros at compile time and embedded in the
@@ -4422,7 +4431,7 @@ Full API: `skills/autumn-web/references/api-reference.md`; guide:
 ## 0.7.0 release traps
 
 - `AUTUMN_SECURITY__SIGNING_SECRET` is required in `prod` / `production`.
-- Use `autumn-storage-s3 = "0.8"` and `autumn-cache-redis = "0.8"`; these
+- Use `autumn-storage-s3 = "0.9"` and `autumn-cache-redis = "0.9"`; these
   are companion crates, not `autumn-web` feature names.
 - Repository-generated APIs require a policy in production unless
   `security.allow_unauthorized_repository_api = true` is explicit.
@@ -4446,7 +4455,7 @@ Full API: `skills/autumn-web/references/api-reference.md`; guide:
 ## Release and PR workflow
 
 - Base branch is `trunk-dev`, not `trunk`.
-- Release tag for this line is `v0.8.0`.
+- Release tag for this line is `v0.9.0`.
 - Published crates are released together at the same workspace version:
   `autumn-macros`, `autumn-web`, `autumn-cli`, `autumn-admin-plugin`,
   `autumn-storage-s3`, `autumn-cache-redis`, and `autumn-search`.

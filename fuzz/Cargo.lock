@@ -80,6 +80,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocation-counter"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -190,13 +196,15 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "autumn-fuzz"
 version = "0.0.0"
 dependencies = [
+ "allocation-counter",
  "autumn-web",
  "libfuzzer-sys",
+ "serde_json",
 ]
 
 [[package]]
 name = "autumn-macros"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -209,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-model"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -220,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-repository"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -231,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-support"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -241,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-web"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "aes-gcm",
  "autumn-macros",
@@ -288,6 +296,7 @@ dependencies = [
  "pin-project-lite",
  "pq-src",
  "pq-sys",
+ "psl",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "rcgen",
@@ -1316,7 +1325,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2393,7 +2402,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2831,6 +2840,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl"
+version = "2.1.245"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46cce9bc841c0eeb395275a775d11e3cc91b904e6ab370a9a42369e111b3038e"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
+name = "psl-types"
+version = "2.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
+
+[[package]]
 name = "ptr_meta"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2903,7 +2927,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3317,7 +3341,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4006,9 +4030,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -4724,7 +4748,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

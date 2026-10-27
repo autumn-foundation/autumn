@@ -4520,6 +4520,18 @@ impl AppBuilder {
             state.begin_shutdown();
         }
 
+        // Clone class: this interceptor-wiring block (mail/job/db/channels,
+        // including the channels -> presence -> collab backend swap, and
+        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
+        // and `run_one_off_task_mode()`. It was born duplicated by #862,
+        // whose own follow-up commit ("fix: wire interceptors into
+        // one-off task mode") is a missed-fix this duplication already
+        // produced once: the one-off task path first shipped without this
+        // block, so its interceptors were silently inert. #1806 later had
+        // to hand-repeat the channels/presence/collab swap in all three
+        // copies again. Change one, change the other two --
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
+        // below fails if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -6816,6 +6828,18 @@ impl AppBuilder {
             state.log_levels().attach_reload_handle(handle);
         }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
+        // Clone class: this interceptor-wiring block (mail/job/db/channels,
+        // including the channels -> presence -> collab backend swap, and
+        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
+        // and `run_one_off_task_mode()`. It was born duplicated by #862,
+        // whose own follow-up commit ("fix: wire interceptors into
+        // one-off task mode") is a missed-fix this duplication already
+        // produced once: the one-off task path first shipped without this
+        // block, so its interceptors were silently inert. #1806 later had
+        // to hand-repeat the channels/presence/collab swap in all three
+        // copies again. Change one, change the other two --
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
+        // below fails if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -8499,6 +8523,18 @@ impl AppBuilder {
         if let Some(handle) = telemetry_guard.filter_reload.clone() {
             state.log_levels().attach_reload_handle(handle);
         }
+        // Clone class: this interceptor-wiring block (mail/job/db/channels,
+        // including the channels -> presence -> collab backend swap, and
+        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
+        // and `run_one_off_task_mode()`. It was born duplicated by #862,
+        // whose own follow-up commit ("fix: wire interceptors into
+        // one-off task mode") is a missed-fix this duplication already
+        // produced once: the one-off task path first shipped without this
+        // block, so its interceptors were silently inert. #1806 later had
+        // to hand-repeat the channels/presence/collab swap in all three
+        // copies again. Change one, change the other two --
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
+        // below fails if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -13034,6 +13070,7 @@ async fn resolve_shard_set(
                     // Detach: the listener runs for the life of the process;
                     // dropping the JoinHandle leaves the task running rather than
                     // aborting it.
+                    #[cfg(feature = "postgres")]
                     drop(
                         crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
                             Arc::clone(&dir_router),
@@ -13041,6 +13078,9 @@ async fn resolve_shard_set(
                             crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL,
                         ),
                     );
+                    // LISTEN needs `postgres`. Without it, no listener starts.
+                    #[cfg(not(feature = "postgres"))]
+                    let _ = control_url;
                 } else {
                     // Directory routing is active but there is no control URL for
                     // a dedicated LISTEN connection — a custom
@@ -13604,7 +13644,7 @@ fn spawn_derivation_backfill(
 /// `shard:<name>`): the underlying [`MigrationError`](crate::migrate::MigrationError)
 /// can wrap a driver string that embeds the connection URL, and the deploy path
 /// must never print a DB URL or secret.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn apply_pending_or_exit(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
@@ -13637,6 +13677,22 @@ fn apply_pending_or_exit(
             std::process::exit(1);
         }
     }
+}
+
+/// A build without `postgres` cannot migrate a Postgres target. It prints an
+/// error and exits.
+#[cfg(all(feature = "db", not(feature = "postgres")))]
+fn apply_pending_or_exit(
+    _database_url: &str,
+    _migrations: impl diesel::migration::MigrationSource<crate::db::RuntimeBackend> + Send,
+    target: &str,
+    _lock_policy: crate::migrate::MigrationLockPolicy,
+) -> usize {
+    eprintln!(
+        "autumn migrate: {} (target {target})",
+        crate::migrate::NO_POSTGRES_MSG
+    );
+    std::process::exit(1);
 }
 
 /// Apply pending migrations for one `SQLite` target in the `AUTUMN_MIGRATE=1`
@@ -14563,7 +14619,7 @@ const fn shard_map_migration_is_required(
 }
 
 /// Row type for reading `_autumn_shard_map`.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct ShardMapRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -14584,7 +14640,7 @@ struct ShardMapRow {
 ///
 /// Returns a `String` error when the computed auto-split map differs from the
 /// stored map, indicating a topology change that would silently misroute data.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn run_shard_map_guard(
     control_pool: &deadpool::managed::Pool<
         diesel_async::pooled_connection::AsyncDieselConnectionManager<
@@ -14780,14 +14836,15 @@ fn shard_applied_sets_include(
     migrations: &[(&'static str, crate::migrate::EmbeddedMigrations)],
     migration_name: &str,
 ) -> bool {
+    use crate::db::RuntimeBackend;
     use diesel::migration::{Migration, MigrationSource as _};
-    use diesel::pg::Pg;
 
     migrations
         .iter()
         .filter(|(_, set)| !migration_set_is_control_framework(set))
         .any(|(_, source)| {
-            let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
+            let Ok(source_migrations): Result<Vec<Box<dyn Migration<RuntimeBackend>>>, _> =
+                source.migrations()
             else {
                 return false;
             };
@@ -14810,11 +14867,12 @@ fn shard_applied_sets_include(
 /// sets and strip them from shards.
 #[cfg(feature = "db")]
 fn migration_set_is_control_framework(set: &crate::migrate::EmbeddedMigrations) -> bool {
+    use crate::db::RuntimeBackend;
     use diesel::migration::{Migration, MigrationSource as _};
-    use diesel::pg::Pg;
 
     fn names(set: &crate::migrate::EmbeddedMigrations) -> std::collections::HashSet<String> {
-        let migrations: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
+        let migrations: Vec<Box<dyn Migration<RuntimeBackend>>> =
+            set.migrations().unwrap_or_default();
         migrations.iter().map(|m| m.name().to_string()).collect()
     }
 
@@ -18654,6 +18712,59 @@ mod tests {
         assert!(
             task_initializer < task_job,
             "task runner startup must install state-initialized resources before job workers start"
+        );
+    }
+
+    #[test]
+    fn optional_interceptor_wiring_matches_across_all_three_run_modes() {
+        // See the clone-class comment above the `mail_interceptor` arm in
+        // each of the three functions: this exact block (mail/job/db/
+        // channels+presence+collab/http) is meant to stay byte-for-byte
+        // identical across `run()`, `run_build_mode()` and
+        // `run_one_off_task_mode()`. #862's own history shows what drift
+        // here costs (a silently-inert one-off-task interceptor), so pin
+        // the invariant rather than rely on reviewers to notice a divergent
+        // copy-paste.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let start_marker =
+            "#[cfg(feature = \"mail\")]\n        if let Some(interceptor) = mail_interceptor {";
+        let end_marker = "if let Some(interceptor) = http_interceptor {\n            \
+                           state.insert_extension(interceptor);\n        }\n";
+
+        let run_start = source.find("pub async fn run(self)").expect("run() exists");
+        let build_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("run_build_mode() follows run()");
+        let task_start = source
+            .find("async fn run_one_off_task_mode(self, requested_name: String)")
+            .expect("run_one_off_task_mode() follows run_build_mode()");
+
+        let extract = |region: &str| -> String {
+            let s = region
+                .find(start_marker)
+                .expect("the interceptor-wiring block starts with the mail arm");
+            let e = region[s..]
+                .find(end_marker)
+                .map(|offset| s + offset + end_marker.len())
+                .expect("the interceptor-wiring block ends with the http arm");
+            region[s..e].to_owned()
+        };
+
+        let run_block = extract(&source[run_start..build_start]);
+        let build_block = extract(&source[build_start..task_start]);
+        // `run_one_off_task_mode` is the last fn in this `impl AppBuilder`;
+        // a generous bound stands in for hunting down the next `fn`.
+        let task_block = extract(&source[task_start..(task_start + 20_000).min(source.len())]);
+
+        assert_eq!(
+            run_block, build_block,
+            "run() and run_build_mode() must wire the five optional interceptors identically"
+        );
+        assert_eq!(
+            run_block, task_block,
+            "run() and run_one_off_task_mode() must wire the five optional interceptors \
+             identically (this exact drift shipped once, fixed by #862's \"wire interceptors \
+             into one-off task mode\")"
         );
     }
 

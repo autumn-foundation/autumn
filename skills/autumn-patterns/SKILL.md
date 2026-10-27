@@ -37,7 +37,7 @@ server is needed. Add the feature for tests only:
 
 ```toml
 [dev-dependencies]
-autumn-web = { version = "0.8", features = ["test-support"] }
+autumn-web = { version = "0.9", features = ["test-support"] }
 ```
 
 ```rust
@@ -232,7 +232,7 @@ they may run more than once.
 
 The `#[job]` macro takes `AppState` and a typed args struct (serializable).
 The macro generates a `PascalCaseJob` struct with a static `enqueue` method.
-On trunk-dev (unreleased — not in published 0.5.0) a job may also accept an
+Since 0.6.0 a job may also accept an
 optional third `JobContext` argument for progress reporting on tracked jobs,
 and a `queue = "name"` attribute for named priority queues.
 

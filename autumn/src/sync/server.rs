@@ -50,8 +50,11 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
+#[cfg(feature = "postgres")]
 use diesel::prelude::*;
+#[cfg(feature = "postgres")]
 use diesel::sql_query;
+#[cfg(feature = "postgres")]
 use diesel::sql_types::{Array, BigInt, Bool, Jsonb, Nullable, Text, Timestamptz};
 
 use super::SyncError;
@@ -61,6 +64,7 @@ use super::protocol::{
 };
 use super::resolver::{ConflictResolver, Resolution};
 
+#[cfg(feature = "postgres")]
 fn backend_err(err: impl std::fmt::Display) -> SyncError {
     SyncError::Backend(err.to_string())
 }
@@ -844,6 +848,7 @@ impl SyncBackend for MemorySyncBackend {
 /// Idempotent DDL for the server-side shadow tables. Deliberately not part
 /// of the framework migrations, so apps that never mount the sync router
 /// see zero schema churn.
+#[cfg(feature = "postgres")]
 const PG_SCHEMA_DDL: &str = "
 CREATE SEQUENCE IF NOT EXISTS autumn_sync_version_seq;
 CREATE TABLE IF NOT EXISTS autumn_sync_rows (
@@ -918,8 +923,10 @@ CREATE TABLE IF NOT EXISTS autumn_sync_horizons (
 ///
 /// [`pg_advisory_xact_lock`]:
 ///     https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS
+#[cfg(feature = "postgres")]
 const PG_PUSH_ADVISORY_LOCK_KEY: i64 = 0x4154_4D4E_5359_4E43; // "ATMNSYNC"
 
+#[cfg(feature = "postgres")]
 #[derive(QueryableByName)]
 struct PgRowRecord {
     #[diesel(sql_type = Text)]
@@ -940,6 +947,7 @@ struct PgRowRecord {
     created_version: i64,
 }
 
+#[cfg(feature = "postgres")]
 impl PgRowRecord {
     fn into_server_row(self) -> ServerRow {
         ServerRow {
@@ -957,6 +965,7 @@ impl PgRowRecord {
     }
 }
 
+#[cfg(feature = "postgres")]
 #[derive(QueryableByName)]
 struct PgVersionRecord {
     #[diesel(sql_type = BigInt)]
@@ -967,6 +976,7 @@ struct PgVersionRecord {
 /// one row per matched `change_id`, so the caller needs it to key the result
 /// back to the change), plus the originally assigned version and the
 /// resolved-row snapshot for `Resolved` outcomes (see [`AppliedRecord`]).
+#[cfg(feature = "postgres")]
 #[derive(QueryableByName)]
 struct PgAppliedRecord {
     #[diesel(sql_type = Text)]
@@ -979,6 +989,7 @@ struct PgAppliedRecord {
 
 /// One dropped tombstone from the GC sweep's `DELETE … RETURNING`: enough
 /// to advance the dropped row's scope's horizon.
+#[cfg(feature = "postgres")]
 #[derive(QueryableByName)]
 struct PgDroppedRecord {
     #[diesel(sql_type = Text)]
@@ -987,6 +998,7 @@ struct PgDroppedRecord {
     version: i64,
 }
 
+#[cfg(feature = "postgres")]
 #[derive(QueryableByName)]
 struct PgSequenceRecord {
     #[diesel(sql_type = BigInt)]
@@ -1003,6 +1015,7 @@ struct PgSequenceRecord {
 /// twice (Postgres raises "ON CONFLICT DO UPDATE command cannot affect row a
 /// second time"). [`SyncBackend::apply_push`] satisfies this by keeping only
 /// the LAST decided state per key in its `current` map before calling here.
+#[cfg(feature = "postgres")]
 fn pg_upsert_rows<'a, C>(
     conn: &mut C,
     scope: &str,
@@ -1056,6 +1069,7 @@ where
 /// `UNNEST`-driven multi-row `INSERT`, instead of one `INSERT` per change.
 /// `change_id` is batch-unique (`validate_push` rejects repeats), so this
 /// insert can never collide with itself.
+#[cfg(feature = "postgres")]
 fn pg_insert_applied<C>(
     conn: &mut C,
     scope: &str,
@@ -1100,6 +1114,7 @@ where
 /// (`nextval()` is `PARALLEL UNSAFE`, so this can't actually be parallelized
 /// today, but the explicit ordinal makes that a documented guarantee rather
 /// than an accident of the current planner).
+#[cfg(feature = "postgres")]
 fn pg_next_versions<C>(conn: &mut C, n: usize) -> Result<Vec<Version>, diesel::result::Error>
 where
     C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
@@ -1119,6 +1134,7 @@ where
 
 /// The scope's tombstone GC horizon — `0` when no tombstone of that scope
 /// was ever dropped.
+#[cfg(feature = "postgres")]
 fn pg_horizon<C>(conn: &mut C, scope: &str) -> Result<Version, diesel::result::Error>
 where
     C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
@@ -1132,6 +1148,7 @@ where
 
 /// The most recently assigned version — the sequence's `last_value` once it
 /// has been called, `0` on a fresh backend.
+#[cfg(feature = "postgres")]
 fn pg_latest_version<C>(conn: &mut C) -> Result<Version, diesel::result::Error>
 where
     C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
@@ -1158,6 +1175,7 @@ where
 /// rustls connector as the app's pool, because the workspace bundles
 /// libpq WITHOUT SSL support and a raw [`PgConnection`] cannot reach
 /// TLS-only servers at all.
+#[cfg(feature = "postgres")]
 #[derive(Debug, Clone)]
 pub struct PgSyncBackend {
     database_url: String,
@@ -1182,6 +1200,7 @@ fn with_sync_tx_set_local<T>(set_local: Option<String>, f: impl FnOnce() -> T) -
 
 /// The `SET LOCAL` timeout batch for this blocking sync call, if the route
 /// handler passed one.
+#[cfg(feature = "postgres")]
 fn sync_tx_set_local() -> Option<String> {
     SYNC_TX_SET_LOCAL.with(|cell| cell.borrow().clone())
 }
@@ -1230,6 +1249,7 @@ fn request_tx_set_local(
 /// safe. `scope` (rather than a plain `'static` `std::thread::spawn`) lets
 /// `$body` borrow from the enclosing method (e.g. `&self`, request data)
 /// without needing to be `'static`.
+#[cfg(feature = "postgres")]
 macro_rules! with_sync_pg_connection {
     ($url:expr, |$conn:ident| $body:expr) => {
         std::thread::scope(|scope| {
@@ -1260,6 +1280,7 @@ macro_rules! with_sync_pg_connection {
     };
 }
 
+#[cfg(feature = "postgres")]
 impl PgSyncBackend {
     /// A backend connecting to `database_url`. Call [`Self::ensure_schema`]
     /// once at startup before serving.
@@ -1288,6 +1309,7 @@ impl PgSyncBackend {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl SyncBackend for PgSyncBackend {
     /// Batches the per-change round trips into a fixed number of statements
     /// for the whole push, independent of `request.changes.len()`: one dedup

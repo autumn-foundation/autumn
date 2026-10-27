@@ -52,7 +52,10 @@ pub mod s3;
 pub mod segment;
 pub mod sqlite;
 pub mod status;
+pub mod uri;
 pub mod wal;
+
+pub use uri::{DatabaseTarget, database_target, file_uri, no_create_uri};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -187,106 +190,10 @@ impl fmt::Debug for ReplicationRuntime {
 /// Accepts every spelling #1614 recognizes: `sqlite:///abs/path`,
 /// `sqlite:path`, `file:path` (query string and all), and rejects the in-memory
 /// forms — private and shared-cache alike — because neither survives the process
-/// that holds it.
+/// that holds it. See [`database_target`] for the rules.
 #[must_use]
 pub fn database_file(url: &str) -> Option<PathBuf> {
-    let target = if url.starts_with("file:") {
-        url.to_owned()
-    } else {
-        let rest = url
-            .strip_prefix("sqlite://")
-            .or_else(|| url.strip_prefix("sqlite:"))?;
-        if rest.is_empty() {
-            return None;
-        }
-        rest.to_owned()
-    };
-    if target == ":memory:"
-        || target == "file::memory:"
-        || target.starts_with("file::memory:?")
-        || uri_asks_for_memory(&target)
-    {
-        return None;
-    }
-    // A `file:` target is a URI, and `SQLite` reads it as one: the query string
-    // carries options rather than path, an empty or `localhost` authority is
-    // dropped, and the filename is percent-decoded. diesel opens with
-    // `SQLITE_OPEN_URI`, so `file:app%20data.db` really does name `app data.db` —
-    // returning the raw text would point every caller at a file that does not
-    // exist. Every other spelling is handed to `sqlite3_open` as a literal path
-    // and is returned verbatim.
-    let Some(uri) = target.strip_prefix("file:") else {
-        return Some(PathBuf::from(target));
-    };
-    let path = uri.split(['?', '#']).next().unwrap_or(uri);
-    // `file://<authority>/path`: SQLite accepts only an empty or `localhost`
-    // authority, and the path starts at the `/` that ends it.
-    let path = path.strip_prefix("//").map_or(path, |rest| {
-        rest.find('/')
-            .map_or("", |slash| rest.get(slash..).unwrap_or_default())
-    });
-    let decoded = percent_decode(path);
-    // `SQLite` hands the decoded name to a NUL-terminated C API, so an encoded NUL
-    // ends the filename: `file:app%00ignored.db` opens `app`. Keeping the tail
-    // would name a path the OS rejects outright — a backup would report the live
-    // database missing, and a deploy would carry a NUL into a remote command.
-    let decoded = decoded
-        .split(|byte| *byte == 0)
-        .next()
-        .unwrap_or_default()
-        .to_vec();
-    // Re-check for the in-memory token AFTER decoding: the checks above see the
-    // raw target, so `file:%3Amemory%3A` and `file::memory:#fragment` both reach
-    // here as `:memory:`. Returning that as a path would have the deploy link a
-    // persistence file the app never opens.
-    if decoded.is_empty() || decoded == b":memory:" {
-        return None;
-    }
-    decoded_path(decoded)
-}
-
-/// Turn decoded `SQLite` URI bytes into a path.
-///
-/// `SQLite` percent-decodes to BYTES and hands them to `open(2)`, so
-/// `file:app%FF.db` names `app\xFF.db` — a real filename on a POSIX host and not
-/// valid UTF-8. A lossy conversion would name `app\u{FFFD}.db` instead: a
-/// different file, which is how a backup comes to report a live database missing.
-#[cfg(unix)]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the non-unix sibling genuinely refuses; one signature keeps the caller single"
-)]
-fn decoded_path(bytes: Vec<u8>) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStringExt as _;
-
-    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
-}
-
-/// Non-POSIX hosts name files in UTF-16, so a non-UTF-8 byte sequence names no
-/// file at all. Refuse it rather than guess with a replacement character.
-#[cfg(not(unix))]
-fn decoded_path(bytes: Vec<u8>) -> Option<PathBuf> {
-    String::from_utf8(bytes).ok().map(PathBuf::from)
-}
-
-/// Whether a `file:` URI asks for an in-memory database through its QUERY.
-///
-/// A substring test would refuse a durable file that merely happens to be named
-/// `mode=memory.db`, which `SQLite` opens as an ordinary file. Only `mode=memory`
-/// standing alone as a query parameter means in-memory.
-fn uri_asks_for_memory(target: &str) -> bool {
-    let Some(uri) = target.strip_prefix("file:") else {
-        return false;
-    };
-    // A fragment ends the query.
-    let uri = uri.split('#').next().unwrap_or(uri);
-    let Some((_, query)) = uri.split_once('?') else {
-        return false;
-    };
-    // `&` only: SQLite does not treat `;` as a separator, so in
-    // `file:app.db?x=1;mode=memory` the semicolon is part of `x`'s value and the
-    // target is the durable `app.db`.
-    query.split('&').any(|parameter| parameter == "mode=memory")
+    database_target(url).map(DatabaseTarget::into_path)
 }
 
 /// The string to hand `sqlite3_open` for an already-resolved database FILE.
@@ -307,40 +214,6 @@ pub fn connection_string(path: &Path) -> Option<String> {
     } else {
         text.to_owned()
     })
-}
-
-/// Percent-decode a `SQLite` URI path the way `sqlite3_open` does.
-///
-/// `%HH` with two hex digits becomes that byte; anything else — a stray `%`, a
-/// truncated or non-hex escape — is left alone, matching `SQLite`'s own lenient
-/// parser. Returns BYTES, not a `String`: the result is a filename, and a
-/// filename need not be valid UTF-8.
-fn percent_decode(path: &str) -> Vec<u8> {
-    let bytes = path.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while let Some(&byte) = bytes.get(index) {
-        let decoded = if byte == b'%' {
-            bytes
-                .get(index.saturating_add(1))
-                .zip(bytes.get(index.saturating_add(2)))
-                .and_then(|(high, low)| {
-                    let high = char::from(*high).to_digit(16)?;
-                    let low = char::from(*low).to_digit(16)?;
-                    u8::try_from(high.saturating_mul(16).saturating_add(low)).ok()
-                })
-        } else {
-            None
-        };
-        if let Some(value) = decoded {
-            out.push(value);
-            index = index.saturating_add(3);
-        } else {
-            out.push(byte);
-            index = index.saturating_add(1);
-        }
-    }
-    out
 }
 
 /// Strip `scheme://user:pass@` userinfo out of every URL embedded in `detail`.

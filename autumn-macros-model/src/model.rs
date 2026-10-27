@@ -21,9 +21,10 @@ use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_co
 use autumn_macros_support::cascade::{CASCADE_LEVELS, CascadeLeg, any_const, cascade_level};
 use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
 use autumn_macros_support::schema::{
-    apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
-    field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
-    field_serde_serialize_rename, has_attr, is_option_type, schema_property_name, serde_bare_word,
+    SerdeSide, apply_serde_rename_all_rule, emit_request_schema_fn_body, emit_schema_fn_body_full,
+    emit_schema_fn_body_named, field_has_skip_serializing_if, field_is_collaborative,
+    field_is_translatable, field_serde_serialize_rename, has_attr, has_serde_default,
+    is_option_type, schema_property_name, serde_bare_word, serde_rename_all_rule_for,
     serde_rename_all_serialize_rule, serde_valued_key, type_name_str,
 };
 
@@ -7768,7 +7769,9 @@ fn emit_state_machine_on_conn(
         })
         .collect();
 
+    // The method takes `AsyncPgConnection`, so it needs `postgres` (#2605).
     quote! {
+        ::autumn_web::__if_postgres! {
         impl #model_name {
             /// Validates a `{field}` transition and, for the fired edge, runs
             /// its declared effects on `conn` (issue #1973): first a sync
@@ -7789,6 +7792,7 @@ fn emit_state_machine_on_conn(
                 }
                 ::core::result::Result::Ok(__new_state)
             }
+        }
         }
     }
 }
@@ -9754,7 +9758,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if upsert_columns.is_empty() {
         upsert_columns.push(quote! {
-            #table_ident::id.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::id))
+            #table_ident::id.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::id))
         });
     }
 
@@ -10498,12 +10502,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // it just cannot be `required`, because a response that trips the predicate
     // omits it and a strict client would reject that response.
     //
-    // Sound HERE and only here, because this schema describes a RESPONSE: the
-    // generated repository API takes `New*` / `Update*` as its request bodies,
-    // never the query struct. `#[derive(OpenApiSchema)]` has no such guarantee
-    // — the same type may be a `Json<T>` request — so it refuses the shape
-    // instead, since `skip_serializing_if` governs serialization alone and
-    // serde still rejects a request that omits the field.
+    // Sound because this schema describes a RESPONSE only. A request body of
+    // the model type uses the request schema below (#2607).
+    // `#[derive(OpenApiSchema)]` has one schema for both directions, so it
+    // refuses the shape instead: serde still rejects a request that omits the
+    // field.
     let query_struct_schema_body = emit_schema_fn_body_full(
         &serializable_field_refs,
         false,
@@ -10567,6 +10570,123 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     name: stringify!(#name),
                     identity: ::autumn_web::openapi::type_name_of::<#name>,
                     schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+                }
+            }
+        }
+    };
+
+    // #2607: a custom route can take `Json<Model>`. That request includes the
+    // fields the read schema skips (`#[private]`, hidden `#[encrypted]`,
+    // `#[classified]`), and `skip_serializing_if` does not make a field
+    // optional in it. Submit the request schema as an override. The spec
+    // builder makes one component when the two schemas are equal.
+    //
+    // A deserialize-side adapter makes the field types wrong for a request.
+    // An `alias` adds a second accepted name. Then the override has no schema,
+    // and the request is the placeholder. `#[derive(OpenApiSchema)]` refuses
+    // the same attributes.
+    let request_field_refs: Vec<&&Field> = all_field_refs
+        .iter()
+        .filter(|f| serde_bare_word(&f.attrs, &["skip", "skip_deserializing"]).is_none())
+        .copied()
+        .collect();
+    let request_reshaped = serde_bare_word(outer_attrs, &["transparent"]).is_some()
+        || serde_valued_key(outer_attrs, &["from", "try_from", "tag"]).is_some()
+        || request_field_refs.iter().any(|f| {
+            serde_bare_word(&f.attrs, &["flatten"]).is_some()
+                || serde_valued_key(&f.attrs, &["with", "deserialize_with", "alias"]).is_some()
+        });
+    let request_schema_descriptor = if request_reshaped {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Request,
+                    schema: ::core::option::Option::None,
+                }
+            }
+        }
+    } else {
+        let request_rename_all_rule =
+            serde_rename_all_rule_for(outer_attrs, SerdeSide::Deserialize);
+        let container_default = has_serde_default(outer_attrs);
+        let request_schema_body = emit_request_schema_fn_body(
+            &request_field_refs,
+            request_rename_all_rule.as_deref(),
+            &|f: &Field| container_default || has_serde_default(&f.attrs),
+        );
+        // `deny_unknown_fields` rejects every key not in the schema.
+        let request_schema_body =
+            if serde_bare_word(outer_attrs, &["deny_unknown_fields"]).is_some() {
+                quote! {{
+                    let mut __autumn_request = { #request_schema_body };
+                    if let ::core::option::Option::Some(__autumn_object) =
+                        __autumn_request.as_object_mut()
+                    {
+                        __autumn_object.insert(
+                            "additionalProperties".to_owned(),
+                            ::autumn_web::reexports::serde_json::json!(false),
+                        );
+                    }
+                    __autumn_request
+                }}
+            } else {
+                request_schema_body
+            };
+        quote! {
+            impl #name {
+                #[doc(hidden)]
+                pub fn __autumn_openapi_request_schema()
+                    -> ::autumn_web::reexports::serde_json::Value
+                {
+                    #request_schema_body
+                }
+            }
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Request,
+                    schema: ::core::option::Option::Some(#name::__autumn_openapi_request_schema),
+                }
+            }
+        }
+    };
+
+    // #2607: `NewModel` skips a classified field on serialize. Thus a response
+    // does not have it, but its one schema requires it. Submit a response
+    // schema without those fields. With no classified field, submit nothing.
+    let new_response_hidden: Vec<String> = fields_for_new
+        .iter()
+        .filter(|f| field_is_classified(f))
+        .filter_map(|f| f.ident.as_ref().map(unraw_ident))
+        .collect();
+    let new_response_schema_descriptor = if new_response_hidden.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            impl #new_name {
+                #[doc(hidden)]
+                pub fn __autumn_openapi_response_schema()
+                    -> ::autumn_web::reexports::serde_json::Value
+                {
+                    let mut __schema =
+                        <#new_name as ::autumn_web::openapi::OpenApiSchema>::schema();
+                    ::autumn_web::openapi::remove_schema_properties(
+                        &mut __schema,
+                        &[#(#new_response_hidden),*],
+                    );
+                    __schema
+                }
+            }
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#new_name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Response,
+                    schema: ::core::option::Option::Some(
+                        #new_name::__autumn_openapi_response_schema
+                    ),
                 }
             }
         }
@@ -10994,27 +11114,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #lookup_key => ::core::option::Option::Some(#expr), }
         })
         .collect();
-    // #2634: gate the `New*` `Normalize` impl on the insert struct actually
-    // having `#[normalize]` columns. With no columns the `Yes` arm of the
-    // repository autoref probe (`SpezNormalizeManyYes`) would win and clone
-    // the whole batch to run an empty `normalize()` — a guaranteed no-op.
-    // Omitting the impl lets the probe's `No` arm win, so `save` /
-    // `save_many` / `save_many_skip_invalid` / `find_or_create_by_*` pay no
-    // clone for unnormalized models. The read-model impl stays unconditional:
-    // it is `&mut self` in place (no clone involved) and user code may call
-    // `.normalize()` on it directly, so removing it would be a compile break.
-    // `NormalizedModel` stays unconditional too: derived finders call
-    // `normalize_lookup` for every model and rely on the `None` arm.
-    let normalize_new_impl = if normalize_new_stmts.is_empty() {
-        quote! {}
+    // #2692: emit `impl Normalize` for every `New*`, so a `T: Normalize`
+    // bound accepts it. If the `New*` has no `#[normalize]` columns, the impl
+    // does nothing. Then also emit `NormalizeNoop`, so the repository probe
+    // skips the clone (#2634). The read-model impl and `NormalizedModel` are
+    // unconditional.
+    let normalize_new_noop = if normalize_new_stmts.is_empty() {
+        quote! { impl ::autumn_web::normalize::NormalizeNoop for #new_name {} }
     } else {
-        quote! {
-            impl ::autumn_web::normalize::Normalize for #new_name {
-                fn normalize(&mut self) {
-                    #(#normalize_new_stmts)*
-                }
+        quote! {}
+    };
+    let normalize_new_impl = quote! {
+        impl ::autumn_web::normalize::Normalize for #new_name {
+            fn normalize(&mut self) {
+                #(#normalize_new_stmts)*
             }
         }
+        #normalize_new_noop
     };
     let normalize_impls = quote! {
         #normalize_new_impl
@@ -11807,6 +11923,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // in every generated client — even though the real schema was compiled
         // in all along.
         #query_schema_descriptor
+        #request_schema_descriptor
+        #new_response_schema_descriptor
 
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::openapi::DerivedSchemaDescriptor {
@@ -17714,12 +17832,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_impl_for_new_is_gated_on_normalize_columns() {
-        // #2634: a model with no `#[normalize]` columns must not get
-        // `impl Normalize for New*` — otherwise the repository probe's `Yes`
-        // arm always wins and `save_many` clones a batch whose normalization
-        // is a guaranteed no-op. The read-model impl and `NormalizedModel`
-        // stay unconditional (public API surface and the finder `None` arm).
+    fn normalize_impl_for_new_is_unconditional_and_noop_is_marked() {
+        // #2692: every `New*` implements `Normalize`, so a `T: Normalize`
+        // bound accepts it. With no `#[normalize]` columns the impl is a
+        // no-op, and the `NormalizeNoop` marker tells the repository probe to
+        // skip the clone (#2634).
         let output = model_macro(
             TokenStream::new(),
             quote! {
@@ -17732,8 +17849,12 @@ mod tests {
         );
         let generated = output.to_string();
         assert!(
-            !generated.contains("normalize :: Normalize for NewUser"),
-            "must NOT generate `impl Normalize for NewUser` with no normalize columns: {generated}"
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark the no-op `NewUser` impl with `NormalizeNoop`: {generated}"
         );
         assert!(
             generated.contains("normalize :: Normalize for User"),
@@ -17742,6 +17863,65 @@ mod tests {
         assert!(
             generated.contains("normalize :: NormalizedModel for User"),
             "must keep `impl NormalizedModel for User`: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_noop_marker_is_absent_when_new_has_normalize_columns() {
+        // #2692: the marker skips normalization on insert. A `New*` with a
+        // `#[normalize]` column must not get it.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            !generated.contains("NormalizeNoop"),
+            "must not mark a normalizing `NewUser` as no-op: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_noop_marker_when_normalize_column_is_not_in_new() {
+        // #2692: a `#[default]` column is not in `NewUser`. `NewUser` has
+        // nothing to normalize, so it gets the marker. `User` still
+        // normalizes the column.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[default]
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark `NewUser` as no-op: {generated}"
+        );
+        let user_impl = generated
+            .split("normalize :: Normalize for User")
+            .nth(1)
+            .expect("must generate `impl Normalize for User`");
+        let user_body = user_impl.split("impl").next().unwrap_or_default();
+        assert!(
+            user_body.contains("normalize :: trim"),
+            "`User` must still trim the column: {user_body}"
         );
     }
 
@@ -19279,6 +19459,56 @@ mod tests {
             generated.contains("enqueue_on_conn")
                 && generated.contains("< SendShippedEmailJob > :: NAME"),
             "the effect must enqueue the named job on the connection: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_conn_method_needs_the_postgres_feature() {
+        // The method takes `AsyncPgConnection`. A SQLite-only app has no such
+        // type, so the method compiles only with `postgres` (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let gate = generated
+            .find(":: autumn_web :: __if_postgres !")
+            .expect("the `_on_conn` impl must sit in `__if_postgres!`");
+        let method = generated
+            .find("transition_status_to_on_conn")
+            .expect("the `_on_conn` method must be emitted");
+        assert!(gate < method, "{generated}");
+    }
+
+    #[test]
+    fn id_only_model_upsert_uses_the_backend_neutral_excluded() {
+        // `diesel::pg` does not exist in a SQLite-only build (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Tag {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("pg :: upsert :: excluded"),
+            "an id-only model must not name `diesel::pg`: {generated}"
+        );
+        assert!(
+            generated.contains("diesel :: upsert :: excluded"),
+            "{generated}"
         );
     }
 

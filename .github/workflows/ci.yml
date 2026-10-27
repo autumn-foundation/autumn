@@ -883,7 +883,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.87.28
+      - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-deny@0.20.2
       # The shared gate (issue #1600) makes PR CI, the publish gate and a local
@@ -1237,11 +1237,15 @@ jobs:
         # `markdown` node kind reachable: without it that node fails validation
         # with `constela.feature_required` and the sanitizing render path is
         # never exercised.
+        #
+        # `constela_memory` is its own binary (a counting global allocator).
+        # It checks that a hostile document uses bounded peak memory (#2626).
         run: |
           cargo test -p autumn-web --features constela --lib constela::
           cargo test -p autumn-web --features constela --doc constela
           cargo test -p autumn-web --features constela --test integration_tests constela
           cargo test -p autumn-web --features "constela,markdown" --test integration_tests constela
+          cargo test -p autumn-web --features constela --test constela_memory
       - name: Run inbound-mail-gated tests (untrusted MIME parsing)
         if: matrix.lane == 'inbound-mail'
         # `inbound-mail` and its provider aliases are not default features, so
@@ -1748,6 +1752,18 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
             || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
+          # The cost-deferral claim (#1720) is `--lib` too: it drives the
+          # crate-private `pg_claim_next_job_except`. Named by full path with a
+          # pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \
+              | tee "${RUNNER_TEMP}/pg-deferred-claim.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-deferred-claim.log" \
+            || { echo "::error::no pg deferred-claim test ran — the ci.yml filter no longer matches"; exit 1; }
           # Issue #2576: the Postgres admin-retry unique-key tests are `--lib`
           # (they drive the crate-private `PgJobAdminBackend`). Named by full
           # path, with a pass count, as above.
@@ -2033,7 +2049,8 @@ jobs:
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
-            --skip capture_overhead_on_a_successful_query_request
+            --skip capture_overhead_on_a_successful_query_request \
+            --skip outbox_claim_profile
           # `deploy_e2e` runs in `test-docker-deploy`, on a fresh disk (#2547).
           # Example apps are NOT auto-swept the way autumn-web's consolidated
           # `integration_tests` binary is (Codex review finding on #2530):
@@ -2238,7 +2255,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.28
+        uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)
@@ -2388,6 +2405,14 @@ jobs:
           # rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet_sweeper
+          # Issue #2663: the SQLite split-sum aggregate and bulk decrement in
+          # `counter_cache.rs` are sqlite-only. Same features, so no rebuild.
+          # A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --lib -- counter_cache::tests::sqlite_sum | tee "$RUNNER_TEMP/sqlite-sum-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/sqlite-sum-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_derivation_wide_sum
           # Issue #3233: slot ownership driven by its renew loop in virtual
           # time. Single-threaded, like its CI step. Same features, so no
           # rebuild.
@@ -2458,6 +2483,15 @@ jobs:
             --test integration_tests -- --ignored test_db_reset_table:: \
             | tee "$RUNNER_TEMP/test-db-reset-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/test-db-reset-cov.log"
+          # Ledger (outbox claim index): the existing-tables branch of
+          # `outbox::ensure_schema` runs only in this Docker test, so the
+          # `Test (Docker)` sweep alone leaves it out of the patch gate. The
+          # filter stops at `docker::`: `docker_webhook_store` is a different
+          # suite that does not pass in this lane.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored --test-threads=1 outbox_pg::docker:: \
+            | tee "$RUNNER_TEMP/outbox-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/outbox-pg-cov.log"
           # Issue #3061: the Postgres side of the database idempotency store
           # runs only in these Docker tests, the `--lib` pg_tests and the
           # consolidated binary's idempotency suites. Both filters are checked
@@ -2510,6 +2544,14 @@ jobs:
             job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
             | tee "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
           grep -Eq "test result: ok\. 2 passed" "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
+          # Ledger (deferred job claim, #1720): the skip-scan claim runs only
+          # in this `--lib` Docker test, so the `Test (Docker)` sweep alone
+          # leaves it out of the patch gate. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored --test-threads=1 \
+            job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \
+            | tee "$RUNNER_TEMP/pg-deferred-claim-cov.log"
+          grep -Eq "test result: ok\. 1 passed" "$RUNNER_TEMP/pg-deferred-claim-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
@@ -2656,6 +2698,19 @@ jobs:
             tests::parse_edge \
             | tee "$RUNNER_TEMP/cli-edge-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-edge-cov.log"
+          # Issue #2666: same gap for `autumn a11y verify` (`a11y::`), the cfg
+          # and feature reader it shares (`edge_scan::`), and its flags
+          # (`tests::parse_a11y`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- a11y:: edge_scan:: \
+            tests::parse_a11y \
+            | tee "$RUNNER_TEMP/cli-a11y-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-a11y-cov.log"
+          # Issue #2589: same gap for `deploy::` (the SQLite data-file ops and
+          # `deploy plan`) and `db::sqlite_snapshot::` (backup and restore).
+          # Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deploy:: db::sqlite_snapshot:: \
+            | tee "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2733,6 +2788,27 @@ jobs:
         # does, but only at tag-push time. This is also the enforcing lane that
         # retires the panic-gate exemption for `middleware/trace_context.rs`.
         run: cargo clippy -p autumn-web --features "sqlite,telemetry-otlp" --lib -- -D warnings
+      - name: Clippy autumn-web as a SQLite-only app (no Postgres client)
+        # Issue #2605. Default features are off, so `postgres` is off. The list
+        # is the default set without `postgres`, plus each feature that does
+        # not need Postgres, except the test-only features.
+        # `autumn/tests/integration/sqlite_postgres_free.rs` keeps it complete.
+        # `cargo tree` then shows that no Postgres crate is in the graph. The
+        # step writes the tree to a file. Then a failed `cargo tree` fails the
+        # step.
+        env:
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile
+        run: |
+          cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
+          tree="${RUNNER_TEMP}/sqlite-only-tree.txt"
+          cargo tree -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" \
+            -e normal,build --prefix none --format '{p}' > "$tree"
+          grep -q '^libsqlite3-sys ' "$tree" \
+            || { echo "::error::the SQLite-only tree has no libsqlite3-sys; the check is broken"; exit 1; }
+          if grep -E '^(pq-sys|pq-src|tokio-postgres|tokio-postgres-rustls|postgresql_embedded) ' "$tree"; then
+            echo "::error::a SQLite-only build links a Postgres crate (#2605)"
+            exit 1
+          fi
       - name: Clippy (autumn-web lib, sim-testing op-driver)
         # `sim-testing` (W6 PR2, issue #1797) promotes `proptest` to a library
         # dependency for `sim::op` — lint it here (alongside the sqlite lib
@@ -2872,6 +2948,7 @@ jobs:
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_derivation \
+            --test sqlite_derivation_wide_sum \
             --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
             --test sqlite_commentable \

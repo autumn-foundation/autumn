@@ -11,10 +11,10 @@ mio. Only the native `node` feature uses them.
 
 ```toml
 [dependencies]
-autumn-edge = "0.8.0"
+autumn-edge = "0.9.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-autumn-web = { version = "0.8.0", features = ["edge"] }
+autumn-web = { version = "0.9.0", features = ["edge"] }
 ```
 
 ## What is here

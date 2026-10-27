@@ -1677,12 +1677,13 @@ mod tests {
     #[test]
     fn a_sum_recompute_sums_the_contribution() {
         let sql = crate::counter_cache::recompute_update_sql(&sum_def().sql_view(), "5");
+        let score_sum = crate::counter_cache::sum_expr("__autumn_cc_child.\"score\"");
         assert!(
-            sql.starts_with(
+            sql.starts_with(&format!(
                 "UPDATE \"dv_posts\" SET \"visible_score\" = \
-                 (SELECT COALESCE(SUM(__autumn_cc_child.\"score\"), 0) \
+                 (SELECT {score_sum} \
                   FROM \"dv_comments\" AS __autumn_cc_child"
-            ),
+            )),
             "{sql}"
         );
         assert!(

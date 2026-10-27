@@ -23,7 +23,7 @@ The spec types and the served endpoints live behind the `openapi` feature:
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-web = { version = "0.8", features = ["openapi"] }
+autumn-web = { version = "0.9", features = ["openapi"] }
 ```
 
 Then hand `AppBuilder` an `OpenApiConfig`:
@@ -437,29 +437,22 @@ guessed at because serde's representation for them depends on
 `#[serde(tag/content/untagged)]`, so an inferred shape could confidently
 advertise a contract the handler does not accept.
 
-The rename handling is exact for the ordinary symmetric attributes. The **split
-form** — `#[serde(rename_all(serialize = "kebab-case", deserialize =
-"camelCase"))]`, and its field-level equivalent — is the exception: the schema
-takes the *serialize* side, while `Query<T>` and `Json<T>` accept the
-*deserialize* side. On a request type that would advertise a key the handler
-will not accept, so name request fields with a symmetric `rename` /
-`rename_all`, or register the schema by hand.
+The derive handles these serde attributes:
 
-> **"Field-accurate" means the fields, not every serde attribute.** Renaming is
-> the only serde behavior the derive interprets. It emits *every* named field
-> and marks *every* non-`Option` field `required`, so these diverge from the
-> real wire shape:
->
-> | Attribute | What the schema says | What actually happens |
-> |---|---|---|
-> | `#[serde(default)]` | `required` | The field may be omitted |
-> | `#[serde(skip)]` / `skip_deserializing` | Present as a property | Never read from the wire |
-> | `#[serde(skip_serializing_if = "…")]` | Always present | May be absent from the response |
-> | `#[serde(flatten)]` | A nested object property | The inner fields are inlined |
->
-> Reach for `register_schema` when a type uses these — and note that a manual
-> registration is only as accurate as the JSON you hand it; nothing checks it
-> against the type.
+| Attribute | Schema |
+|---|---|
+| `rename` / `rename_all` (symmetric) | The renamed property |
+| `skip` | No property |
+| `default` (field or container) | The property is not `required` |
+| `skip_serializing_if` with a `default` | The property is not `required` |
+
+It refuses, with a compile error, the attributes that one schema cannot
+describe: `transparent`, `into`, `from`, `try_from`, `tag`, `untagged`,
+`flatten`, `with`, `serialize_with`, `deserialize_with`, `alias`, a one-way
+`skip_serializing` / `skip_deserializing`, a split `rename` / `rename_all`, and
+`skip_serializing_if` without a `default`. Register the schema by hand for
+those. A manual registration is only as accurate as the JSON you give it.
+Nothing checks it against the type.
 
 For a type you cannot annotate (a foreign type, or a payload whose JSON shape
 differs from its Rust shape):
@@ -497,6 +490,34 @@ unambiguous, and wrong the moment it isn't — if `create::Args` and
 while your hand-written `#/components/schemas/Args` keeps pointing at a key
 nothing defines. **In a manually registered schema, write the
 collision-resolved key you actually want.**
+
+### Request and response components
+
+A type can have two wire shapes. `#[private]`, `#[classified]` and a hidden
+`#[encrypted]` field are skipped on serialize only. As a result, a request has
+these fields and a response does not. See
+[ADR-0025](../adr/0025-direction-aware-openapi-schemas.md).
+
+The generator picks the schema by position. A request body and a `Query<T>`
+use the shape the type deserializes from. A response body uses the shape it
+serializes to. A nested `$ref` has the position of the schema it is in. A
+`$ref` in a schema you register always uses the response key.
+
+| How the type is used | Components |
+|---|---|
+| In one position only | One, with the schema of that position |
+| In both positions, one shape | One (`Widget`) |
+| In both positions, two shapes | Two: `Widget` (response) and `WidgetRequest` |
+
+When `WidgetRequest` is already a key, the request component is
+`WidgetRequest-2`. Your own registrations keep their keys. When you register
+the main key (`Widget`), both positions use your schema. MCP tool
+`inputSchema` uses the request shape.
+
+A `#[model]` with a field attribute `with`, `deserialize_with`, `flatten` or
+`alias`, or a container attribute `from`, `try_from`, `transparent` or `tag`,
+has no accurate request schema. Its request component is the opaque
+placeholder. `autumn openapi export` names it, and `--strict` fails.
 
 ---
 

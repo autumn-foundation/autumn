@@ -2288,7 +2288,7 @@ fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
 /// than `rust_decimal` can hold would compile and migrate cleanly, then fail
 /// at runtime the first time a value actually needing that extra precision
 /// is deserialized into the generated `#[model]` field.
-const MAX_DECIMAL_PRECISION: u32 = 28;
+pub const MAX_DECIMAL_PRECISION: u32 = 28;
 
 /// Parse a `decimal` (optionally `Option<decimal>`) type token, with an
 /// optional `{precision,scale}` modifier (`decimal{10,2}`). Accepts both

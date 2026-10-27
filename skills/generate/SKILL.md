@@ -189,7 +189,7 @@ three additive scaffold behaviors (issues #1388, #1146, #1718):
   --count/--model` resolves the model's factory; `autumn destroy` removes those
   links again. See `docs/guide/generators.md`.
 
-**Constrained-required numerics & `--live-validation` parity (unreleased — trunk-dev, issues #1748, #1750)**: two refinements to the `{…}` block above:
+**Constrained-required numerics & `--live-validation` parity (0.6.0, issues #1748, #1750)**: two refinements to the `{…}` block above:
 
 - **Blank-state for constrained required numerics** — a required numeric field
   with a `{min,max}` range (e.g. `age:i32{min=0,max=130}`) is emitted as
@@ -550,9 +550,9 @@ Next steps:
    `magic_link_token`).
 ```
 
-**Magic-link account-lock recheck (trunk-dev)**: the generated `POST
-/login/magic/verify` handler re-checks the account lock **(unreleased —
-trunk-dev, issue #1777)** after consuming the single-use token and before
+**Magic-link account-lock recheck (0.6.0)**: the generated `POST
+/login/magic/verify` handler re-checks the account lock **(0.6.0,
+issue #1777)** after consuming the single-use token and before
 establishing a session, so a magic link minted before an account was locked can
 no longer complete a login after lockout. The recheck is a fresh guarded
 `UPDATE` on `locked_at` (same time-bounded `[auth.lockout]` cool-off semantics

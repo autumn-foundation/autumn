@@ -453,10 +453,7 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// one memcpy and no allocation of its own.
 fn escape_into(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && !NEEDS_ATTENTION[bytes[i] as usize] {
-        i += 1;
-    }
+    let mut i = skip_clean(bytes, 0);
     if i == bytes.len() {
         out.push_str(s);
         return;
@@ -467,7 +464,7 @@ fn escape_into(out: &mut String, s: &str) {
     let mut run_start = 0;
     while i < bytes.len() {
         if !NEEDS_ATTENTION[bytes[i] as usize] {
-            i += 1;
+            i = skip_clean(bytes, i + 1);
             continue;
         }
         let (replacement, len) = match bytes[i] {
@@ -489,6 +486,38 @@ fn escape_into(out: &mut String, s: &str) {
         run_start = i;
     }
     out.push_str(&s[run_start..]);
+}
+
+/// Index of the first byte at or after `from` that [`NEEDS_ATTENTION`] flags
+/// (`bytes.len()` if none). Whole 16-byte blocks are rejected with branchless
+/// compares that vectorize on baseline SSE2; the block test is conservative
+/// (it flags every byte below `0x20`, tab/newline/CR included), so a flagged
+/// block just falls through to the exact per-byte table scan.
+fn skip_clean(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while let Some(block) = bytes.get(i..i + 16) {
+        // Accumulating into a `u8` (not a `bool`) is what lets LLVM vectorize
+        // the loop. `b | 1 == 0x27` matches `&`/`'`, `b | 2 == 0x3E` matches `<`/`>`;
+        // both are exact for the two characters they name and may over-flag
+        // others, which only sends the block to the exact table scan below.
+        let mut flagged = 0u8;
+        for &b in block {
+            // Non-short-circuit `|` on purpose: branch-free is what vectorizes.
+            #[allow(clippy::needless_bitwise_bool)]
+            let hit = (b < 0x20) | (b | 1 == 0x27) | (b | 2 == 0x3E) | (b == b'"') | (b == 0xEF);
+            flagged |= u8::from(hit);
+        }
+        if flagged != 0
+            && let Some(off) = block.iter().position(|&b| NEEDS_ATTENTION[b as usize])
+        {
+            return i + off;
+        }
+        i += 16;
+    }
+    while i < bytes.len() && !NEEDS_ATTENTION[bytes[i] as usize] {
+        i += 1;
+    }
+    i
 }
 
 /// Append `prefix`, the escaped `text`, then `suffix` to `out`. Escaping in
@@ -566,6 +595,36 @@ mod proptests {
             .replace("&quot;", "\"")
             .replace("&apos;", "'")
             .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn escape_agrees_with_the_oracle_across_block_boundaries() {
+        // Specials at every offset around the 16-byte block size, plus tab /
+        // newline (flagged by the block test, clean per the table).
+        for len in 0..40 {
+            for special in [
+                '&', '<', '>', '"', '\'', '\u{1}', '\t', '\n', '\u{FFFE}', 'é',
+            ] {
+                for at in 0..len {
+                    let mut chars: Vec<char> = vec!['a'; len];
+                    chars[at] = special;
+                    let input: String = chars.into_iter().collect();
+                    let expected: String = input
+                        .chars()
+                        .filter(|&c| is_xml_char(c))
+                        .map(|c| match c {
+                            '&' => "&amp;".to_owned(),
+                            '<' => "&lt;".to_owned(),
+                            '>' => "&gt;".to_owned(),
+                            '"' => "&quot;".to_owned(),
+                            '\'' => "&apos;".to_owned(),
+                            c => c.to_string(),
+                        })
+                        .collect();
+                    assert_eq!(escape(&input), expected, "{input:?}");
+                }
+            }
+        }
     }
 
     #[test]

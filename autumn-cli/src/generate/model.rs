@@ -1081,9 +1081,9 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
 /// Same shape, different backend: diesel on its `sqlite` feature with the
 /// bundled `libsqlite3-sys` amalgamation, `diesel-async` on the sync-connection
 /// wrapper that `autumn-web`'s `sqlite` feature runs the pool through, and no
-/// `pq-sys` — a `SQLite` app has no reason to name libpq itself. (`autumn-web`'s
-/// `db` feature still pulls it in transitively, so this trims the app's direct
-/// dependency list, not its link line.) `returning_clauses_for_sqlite_3_35`
+/// `pq-sys` — a `SQLite` app has no reason to name libpq itself. (With default
+/// features on, `autumn-web`'s `postgres` feature still pulls it in, so this
+/// trims the app's direct dependency list, not its link line; see #2605.) `returning_clauses_for_sqlite_3_35`
 /// matches `autumn-web`, so the two never disagree about `RETURNING` support.
 pub(super) const MODEL_DEPS_SQLITE: &[(&str, &str)] = &[
     ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
@@ -4366,6 +4366,155 @@ mod tests {
             assert!(
                 !schema.contains("Jsonb"),
                 "SQLite schema.rs leaked `Jsonb`: {schema}"
+            );
+        });
+    }
+
+    /// One `TEXT` cell, read with `sql_query`.
+    #[derive(diesel::QueryableByName)]
+    struct TextCell {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        sql: String,
+    }
+
+    /// The `CREATE TABLE` text of `products`, as `SQLite` stores it.
+    fn products_sql(conn: &mut diesel::SqliteConnection) -> String {
+        use diesel::RunQueryDsl as _;
+        let rows: Vec<TextCell> =
+            diesel::sql_query("SELECT sql FROM sqlite_master WHERE name = 'products'")
+                .load(conn)
+                .expect("read sqlite_master");
+        rows.into_iter().next().expect("products exists").sql
+    }
+
+    /// Whether `products` accepts a row with the SQL literal `price`.
+    fn insert_price(conn: &mut diesel::SqliteConnection, price: &str) -> bool {
+        use diesel::connection::SimpleConnection as _;
+        conn.batch_execute(&format!(
+            "INSERT INTO products (title, price) VALUES ('x', {price});"
+        ))
+        .is_ok()
+    }
+
+    /// `products` has the generator `CHECK` for `price decimal{10,2}` byte for
+    /// byte, and the `CHECK` rejects each value of the generator test.
+    fn assert_price_check_holds(conn: &mut diesel::SqliteConnection, when: &str) {
+        use crate::generate::schema_edit::{SQLITE_DECIMAL_10_2_REJECTS, sqlite_decimal_check};
+        assert!(
+            products_sql(conn).contains(&sqlite_decimal_check("price", 10, 2)),
+            "{when}: the table has no generator CHECK"
+        );
+        for value in SQLITE_DECIMAL_10_2_REJECTS {
+            assert!(
+                !insert_price(conn, &format!("'{value}'")),
+                "{when}: the CHECK accepts '{value}'"
+            );
+        }
+        assert!(
+            !insert_price(conn, "x'31392e3939'"),
+            "{when}: the CHECK accepts a blob"
+        );
+    }
+
+    /// #2598 round trip. The generator writes a `decimal{10,2}` table on
+    /// `SQLite`. The baseline comes from the real database, as `--dev-url` and
+    /// `schema pull` read it, so `price` is plain `TEXT`. The declarative lane
+    /// finds no diff. A rebuild for a different change, and its rollback, keep
+    /// the generator `CHECK`. The rebuilt table rejects the values that the
+    /// `CHECK` rejects.
+    #[test]
+    fn sqlite_decimal_check_survives_a_declarative_rebuild() {
+        use crate::schema::diff::{
+            DiffOptions, SchemaChange, SchemaContext, diff_schema, emit_down_sql_with_context,
+            emit_up_sql_with_context, guard_plan,
+        };
+        use crate::schema::introspect::introspect_sqlite_conn;
+        use crate::schema::parse::parse_models_path;
+        use autumn_schema_core::Backend;
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model(
+                tmp.path(),
+                "Product",
+                &["title:String".into(), "price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .expect("execute");
+
+            let generated_up = fs::read_dir(tmp.path().join("migrations"))
+                .expect("migrations dir")
+                .map(|entry| entry.expect("entry").path().join("up.sql"))
+                .find(|path| path.exists())
+                .expect("the generator wrote an up.sql");
+            let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+            conn.batch_execute(&fs::read_to_string(generated_up).expect("read up.sql"))
+                .expect("apply the generated migration");
+            conn.batch_execute("INSERT INTO products (title, price) VALUES ('a', '19.99');")
+                .expect("seed a row");
+            assert_price_check_holds(&mut conn, "after the generator");
+
+            // Mark the model `managed`, so that the declarative lane reads it.
+            let models = tmp.path().join("src/models");
+            let model_path = models.join("product.rs");
+            let model = fs::read_to_string(&model_path).expect("read model");
+            assert!(model.contains("#[autumn_web::model]\n"), "{model}");
+            let model = model.replace("#[autumn_web::model]\n", "#[autumn_web::model(managed)]\n");
+            fs::write(&model_path, &model).expect("mark the model managed");
+            let desired = parse_models_path(&models, Backend::Sqlite).expect("parse models");
+            assert!(desired.diagnostics.is_empty(), "{:?}", desired.diagnostics);
+            let baseline = introspect_sqlite_conn(&mut conn).expect("introspect");
+            let clean = diff_schema(&baseline, &desired, DiffOptions::default());
+            assert!(
+                clean.changes.is_empty(),
+                "the generator table and the model have a diff: {:?}",
+                clean.changes
+            );
+
+            // A different change. SQLite applies it only with a rebuild.
+            assert!(model.contains("pub title: String,"), "{model}");
+            fs::write(
+                &model_path,
+                model.replace("pub title: String,", "pub title: Option<String>,"),
+            )
+            .expect("edit model");
+            let desired = parse_models_path(&models, Backend::Sqlite).expect("parse models");
+            let plan = diff_schema(&baseline, &desired, DiffOptions::default());
+            assert!(
+                matches!(
+                    plan.changes.as_slice(),
+                    [SchemaChange::DropNotNull { column, .. }] if column == "title"
+                ),
+                "{:?}",
+                plan.changes
+            );
+            guard_plan(&plan, DiffOptions::default()).expect("guard");
+            let ctx = SchemaContext::from_tables(&desired.tables, &baseline);
+            let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+            assert!(
+                up.contains("writes a new decimal CHECK for column(s) price."),
+                "the up SQL has no advisory: {up}"
+            );
+            conn.batch_execute(&up).expect("apply the rebuild");
+            assert_price_check_holds(&mut conn, "after the rebuild");
+            assert!(insert_price(&mut conn, "'0.5'"), "the CHECK rejects '0.5'");
+
+            let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+            conn.batch_execute(&down).expect("apply the rollback");
+            assert_price_check_holds(&mut conn, "after the rollback");
+            let titles: Vec<TextCell> =
+                diesel::sql_query("SELECT title AS sql FROM products ORDER BY id")
+                    .load(&mut conn)
+                    .expect("read rows");
+            let titles: Vec<&str> = titles.iter().map(|row| row.sql.as_str()).collect();
+            assert_eq!(
+                titles,
+                ["a", "x"],
+                "the rebuild and the rollback keep the rows"
             );
         });
     }
