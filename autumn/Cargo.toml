@@ -493,7 +493,7 @@ zeroize = "1"
 # direct edge plus the `ecdh` feature, which is a feature flag on the
 # already-compiled `elliptic-curve`, not a new dependency.
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "std"] }
-getrandom = "0.2"
+getrandom = "0.4"
 hex = "0.4"
 # Public Suffix List for custom-domain apex detection (issue #2643, ADR 0026).
 # The crate contains the list as code. It shares `psl-types` with `publicsuffix`.
