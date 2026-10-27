@@ -64,13 +64,13 @@ Statements per poll are unchanged (3). `temp_blks_written` 0 before and after.
 ## Saturated-backlog check (regression found in review, fixed)
 
 One claim, a non-deferred name `sat` with N due rows, `concurrency_limit = 1` and one running,
-an earlier eligible `ok` job, and a 1,000-row parked name (`saturated.sh`, `saturated_result.txt`):
+an earlier eligible `ok` job, and a 1,000-row backlog of the deferred name (`saturated.sh`, `saturated_result.txt`; the script asserts every variant claims `ok1`):
 
 | `sat` backlog | shipped claim | first rewrite | final claim |
 | --- | ---: | ---: | ---: |
-| 20k | 23 | 40,430 | 51 |
-| 100k | 25 | 201,976 | 95 |
-| 200k | 26 | 403,898 | 61 |
+| 20k | 42 | 20,426 | 51 |
+| 100k | 43 | 101,971 | 91 |
+| 200k | 44 | 203,893 | 60 |
 
 The first rewrite scanned the whole saturated backlog on every claim; the final claim is flat.
 

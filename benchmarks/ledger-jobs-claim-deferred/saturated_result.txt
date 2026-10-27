@@ -1,9 +1,9 @@
-sat_backlog=20000 variant=baseline  Buffers: shared hit=23
-sat_backlog=20000 variant=after_v1_regressed  Buffers: shared hit=40430
-sat_backlog=20000 variant=after  Buffers: shared hit=51
-sat_backlog=100000 variant=baseline  Buffers: shared hit=25
-sat_backlog=100000 variant=after_v1_regressed  Buffers: shared hit=201976
-sat_backlog=100000 variant=after  Buffers: shared hit=95
-sat_backlog=200000 variant=baseline  Buffers: shared hit=26
-sat_backlog=200000 variant=after_v1_regressed  Buffers: shared hit=403898
-sat_backlog=200000 variant=after  Buffers: shared hit=61
+sat_backlog=20000 variant=baseline claimed=ok1  Buffers: shared hit=42
+sat_backlog=20000 variant=after_v1_regressed claimed=ok1  Buffers: shared hit=20426
+sat_backlog=20000 variant=after claimed=ok1  Buffers: shared hit=51
+sat_backlog=100000 variant=baseline claimed=ok1  Buffers: shared hit=43
+sat_backlog=100000 variant=after_v1_regressed claimed=ok1  Buffers: shared hit=101971
+sat_backlog=100000 variant=after claimed=ok1  Buffers: shared hit=91
+sat_backlog=200000 variant=baseline claimed=ok1  Buffers: shared hit=44
+sat_backlog=200000 variant=after_v1_regressed claimed=ok1  Buffers: shared hit=203893
+sat_backlog=200000 variant=after claimed=ok1  Buffers: shared hit=60
