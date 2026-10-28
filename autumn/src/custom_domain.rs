@@ -3385,6 +3385,38 @@ mod tests {
     }
 
     #[test]
+    fn usage_drops_a_domain_exactly_one_day_after_its_attempt() {
+        let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
+        limiter.record_attempt("a.test", 1000);
+        let last_inside = limiter.usage(1000 + PER_DOMAIN_WINDOW_SECS - 1);
+        assert_eq!(last_inside.domains_at_limit, vec!["a.test".to_owned()]);
+        let first_outside = limiter.usage(1000 + PER_DOMAIN_WINDOW_SECS);
+        assert!(first_outside.domains_at_limit.is_empty());
+    }
+
+    #[test]
+    fn usage_forgets_an_offboarded_domain_but_keeps_its_global_orders() {
+        let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
+        limiter.record_attempt("a.test", 1000);
+        limiter.forget("a.test");
+        let usage = limiter.usage(1100);
+        assert!(usage.domains_at_limit.is_empty());
+        assert_eq!(usage.global_used, 1);
+    }
+
+    #[test]
+    fn usage_lists_domains_at_the_limit_in_sorted_order() {
+        let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
+        for host in ["c.test", "a.test", "b.test"] {
+            limiter.record_attempt(host, 1000);
+        }
+        assert_eq!(
+            limiter.usage(1100).domains_at_limit,
+            ["a.test", "b.test", "c.test"]
+        );
+    }
+
+    #[test]
     fn usage_of_an_unused_limiter_is_empty() {
         let usage = IssuanceLimiter::new(2, 3, 300, 3600).usage(1000);
         assert_eq!(usage.global_used, 0);
