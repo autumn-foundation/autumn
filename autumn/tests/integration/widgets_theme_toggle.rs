@@ -144,6 +144,9 @@ fn widget_script_cases_pass_under_node() {
         .expect("run node");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "theme toggle cases failed:\n{stdout}\n{stderr}");
+    assert!(
+        out.status.success(),
+        "theme toggle cases failed:\n{stdout}\n{stderr}"
+    );
     assert!(stdout.contains("all passed"), "{stdout}\n{stderr}");
 }
