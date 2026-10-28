@@ -1,6 +1,6 @@
-//! Stand-ins for the idempotency hooks. Built when `idempotency` is off.
-//!
-//! Unstable. Only macro output may name these items.
+// Stand-ins for the idempotency hooks. Built when `idempotency` is off.
+//
+// Unstable. Only macro output may name these items.
 
 use axum::body::Body;
 use axum::http::Response;
